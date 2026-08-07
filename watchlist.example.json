@@ -1,0 +1,13 @@
+{
+  "_comment": "Copy to watchlist.json and edit. Entries may be a bare ticker string (inherits default_schedule / default_min_change_pct) or an object overriding either.",
+
+  "default_schedule": "daily",
+  "default_min_change_pct": 0,
+
+  "tickers": [
+    { "ticker": "NBIS", "schedule": "weekly" },
+    { "ticker": "NVDA", "schedule": "daily", "min_change_pct": 3 },
+    { "ticker": "MSFT", "schedule": "hourly", "min_change_pct": 1.5 },
+    "AAPL"
+  ]
+}

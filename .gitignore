@@ -1,0 +1,11 @@
+# NTFY_TOPIC lives here -- an ntfy topic is effectively a shared secret and
+# this repo is public. Never commit it.
+.env
+.env.local
+
+# Your personal watchlist; watchlist.example.json is the committed template.
+watchlist.json
+
+__pycache__/
+*.pyc
+.venv/

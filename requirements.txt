@@ -1,0 +1,4 @@
+# No third-party dependencies -- watch.py is stdlib only (urllib for both the
+# Yahoo Finance fetch and the ntfy push, argparse/json for the rest). This
+# file exists so `pip install -r requirements.txt` is a no-op rather than an
+# error, and as the place to add a dep if one ever becomes necessary.
