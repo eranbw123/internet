@@ -7,10 +7,15 @@ the pipeline holds an LLMProvider, so a fake object with `complete_json` /
 `search_json` is the whole seam.
 """
 import dataclasses
+import io
 import json
 import os
+import sys
 import tempfile
+import types
 import unittest
+import urllib.parse
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import mock
 
@@ -579,10 +584,16 @@ class InterestsFileTests(unittest.TestCase):
     def test_sample_file_loads_with_defaults_applied(self):
         loaded = interests.load_file("interests.json")
         keys = [i.key for i in loaded]
-        self.assertEqual(keys, ["narcolepsy-eds", "nbis-nebius", "behavioral-psychology"])
-        nbis = loaded[1]
+        # Anchor on the two interests other tests and collectors lean on rather
+        # than the full list -- interests.json is real user config and changes.
+        self.assertIn("narcolepsy-eds", keys)
+        self.assertIn("nbis-nebius", keys)
+        nbis = loaded[keys.index("nbis-nebius")]
         self.assertIn("stocks", nbis.sources)
         self.assertEqual(nbis.source_config["stocks"]["tickers"][0]["ticker"], "NBIS")
+        youtube_cfg = loaded[keys.index("narcolepsy-eds")].source_config["youtube"]
+        self.assertIn("max_candidate_videos", youtube_cfg)
+        self.assertIn("max_transcript_fetches", youtube_cfg)
 
     def test_sample_file_thresholds_are_on_the_0_1_scale(self):
         for interest in interests.load_file("interests.json"):
@@ -752,6 +763,34 @@ class StocksCollectorTests(unittest.TestCase):
         self.assertIn("NBIS -8.40% today", item.title)
         self.assertIn("no provider", item.text)
 
+    def test_market_events_on_different_days_are_not_url_deduped(self):
+        # Regression: the market_event URL used to be ticker-only
+        # (finance.yahoo.com/quote/NBIS), constant across every day the
+        # ticker crossed its threshold. dedup.find_duplicate() checks
+        # url_hash before dedup_key is ever consulted, so a second day's
+        # genuinely distinct event was silently swallowed as "duplicate:
+        # same url" and never scored or alerted -- forever, for that ticker.
+        interest = an_interest(
+            sources=["stocks"],
+            source_config={"stocks": {"tickers": ["NBIS"]}},
+        )
+        with mock.patch.object(
+            stocks.watch, "price_change", side_effect=self._prices(daily_pct=8.4, weekly_pct=8.4)
+        ):
+            (day1,) = stocks.collect(interest, CFG, None)
+        day1 = normalize.normalize(day1)
+
+        later = self._change("daily", -9.5, "1d")
+        later["now_at"] = later["now_at"].replace(day=later["now_at"].day + 7)
+        with mock.patch.object(
+            stocks.watch, "price_change",
+            side_effect=lambda ticker, schedule: later if schedule == "daily" else later,
+        ):
+            (day2,) = stocks.collect(interest, CFG, None)
+
+        self.assertNotEqual(day1.url, day2.url)
+        self.assertNotEqual(day1.url_hash, normalize.normalize(day2).url_hash)
+
     def test_weekly_threshold_alone_still_triggers(self):
         interest = an_interest(
             sources=["stocks"],
@@ -913,19 +952,52 @@ class FakeSnippet:
         self.duration = duration
 
 
+# Real video ids are 11 chars of [A-Za-z0-9_-]; _video_id_from_url enforces
+# that, so test ids must look real.
+VID1, VID2, VID3 = "vid00000001", "vid00000002", "vid00000003"
+
+
+def recent_ts(days=1):
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def a_video(**kw):
+    """An enriched video dict as _list_videos returns it (verification passed)."""
     base = dict(
-        video_id="vid1",
+        video_id=VID1,
         video_title="Some Podcast",
         channel="A Channel",
-        published_at="2026-08-01T00:00:00Z",
-        video_url="https://www.youtube.com/watch?v=vid1",
+        description="",
+        published_at=recent_ts(),
+        duration_seconds=3600,
     )
     base.update(kw)
+    base.setdefault("video_url", f"https://www.youtube.com/watch?v={base['video_id']}")
     return base
 
 
+def a_discovery_entry(video_id=VID1, estimate=0.8, why="looks on-topic"):
+    """One entry of the Stage-1 search_json reply."""
+    return {"url": f"https://www.youtube.com/watch?v={video_id}", "estimate": estimate, "why": why}
+
+
+def listed(*videos):
+    return {v["video_id"]: v for v in videos}
+
+
 class YoutubeCollectorTests(unittest.TestCase):
+    def setUp(self):
+        # Fetch pacing exists for the live endpoint, not for tests.
+        patcher = mock.patch.object(youtube, "FETCH_SLEEP_SECONDS", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.cfg = dataclasses.replace(CFG, youtube_api_key="key")
+
+    def interest(self, **kw):
+        kw.setdefault("sources", ["youtube"])
+        kw.setdefault("source_config", {"youtube": {}})
+        return an_interest(**kw)
+
     def test_chunk_transcript_slides_with_overlap(self):
         snippets = [FakeSnippet(f"word{i}", i * 10, 10) for i in range(10)]  # 0..100s
         chunks = youtube._chunk_transcript(snippets, window_seconds=30, overlap_seconds=10)
@@ -937,43 +1009,41 @@ class YoutubeCollectorTests(unittest.TestCase):
         self.assertEqual(youtube._chunk_transcript([], 30, 10), [])
         self.assertEqual(youtube._chunk_transcript([FakeSnippet("  ", 0, 5)], 30, 10), [])
 
-    def test_no_channels_or_queries_returns_empty_without_needing_a_key(self):
-        interest = an_interest(sources=["youtube"], source_config={"youtube": {}})
-        self.assertEqual(youtube.collect(interest, CFG, None), [])
-
     def test_missing_api_key_raises(self):
-        interest = an_interest(
-            sources=["youtube"], source_config={"youtube": {"channels": ["UC1"]}}
-        )
         with self.assertRaises(youtube.YoutubeCollectorError):
-            youtube.collect(interest, CFG, None)
+            youtube.collect(self.interest(), CFG, None)
+
+    def test_no_provider_or_no_search_capability_is_a_clean_skip(self):
+        """Discovery has no fallback path: without a searching provider the
+        cycle skips youtube entirely -- and spends nothing."""
+        with mock.patch.object(youtube, "_list_videos") as lv:
+            self.assertEqual(youtube.collect(self.interest(), self.cfg, None), [])
+            # FakeProvider with search_results=None raises UnsupportedCapability.
+            self.assertEqual(youtube.collect(self.interest(), self.cfg, FakeProvider()), [])
+            lv.assert_not_called()
 
     def test_collect_shapes_one_candidate_per_segment(self):
-        cfg = dataclasses.replace(CFG, youtube_api_key="key")
-        interest = an_interest(
-            sources=["youtube"],
-            source_config={
-                "youtube": {
-                    "channels": ["UC1"],
-                    "chunk_seconds": 30,
-                    "chunk_overlap_seconds": 10,
-                }
-            },
+        interest = self.interest(
+            source_config={"youtube": {"chunk_seconds": 30, "chunk_overlap_seconds": 10}}
         )
+        provider = FakeProvider(search_results=[a_discovery_entry(estimate=0.9)])
         snippets = [FakeSnippet(f"segment about {i} orexin", i * 10, 10) for i in range(6)]
-        with mock.patch.object(youtube, "_search_videos", return_value=[a_video()]), \
+        with mock.patch.object(youtube, "_list_videos", return_value=listed(a_video())), \
              mock.patch.object(youtube, "_fetch_transcript", return_value=snippets):
-            items = youtube.collect(interest, cfg, None)
+            items = youtube.collect(interest, self.cfg, provider)
 
         self.assertGreaterEqual(len(items), 2)
         first, second = items[0], items[1]
         self.assertEqual(first.source, "youtube")
         self.assertEqual(first.type, "video_segment")
-        self.assertEqual(first.metadata["video_id"], "vid1")
+        self.assertEqual(first.metadata["video_id"], VID1)
         self.assertEqual(first.metadata["channel"], "A Channel")
         self.assertEqual(first.metadata["start_time"], 0)
         self.assertIn("orexin", first.metadata["transcript"])
-        self.assertTrue(first.url.startswith("https://www.youtube.com/watch?v=vid1&t="))
+        # Stage-1 provenance rides along for discovery-vs-score calibration.
+        self.assertEqual(first.metadata["discovery_estimate"], 0.9)
+        self.assertEqual(first.metadata["discovery_why"], "looks on-topic")
+        self.assertTrue(first.url.startswith(f"https://www.youtube.com/watch?v={VID1}&t="))
 
         # Two segments of the same video must not collide on any dedup layer:
         # distinct urls (survives fragment-stripping normalize.canonical_url),
@@ -982,58 +1052,281 @@ class YoutubeCollectorTests(unittest.TestCase):
         self.assertNotEqual(first.title, second.title)
         self.assertNotEqual(first.dedup_key, second.dedup_key)
 
-    def test_an_already_chunked_video_is_not_re_fetched(self):
-        """A search job re-lists the same uploads every few hours. Without the
-        check, each run re-fetches and re-chunks a transcript whose segments
-        dedup.py is only going to reject again."""
+    def test_transcript_success_yields_only_segments_no_video_level_item(self):
+        """A clean fetch never produces a video-level fallback alongside the
+        segments -- a video is one or the other, never both."""
+        provider = FakeProvider(search_results=[a_discovery_entry(estimate=0.9)])
+        snippets = [FakeSnippet("orexin content", 0, 10)]
+        with mock.patch.object(youtube, "_list_videos", return_value=listed(a_video())), \
+             mock.patch.object(youtube, "_fetch_transcript", return_value=snippets):
+            items = youtube.collect(self.interest(), self.cfg, provider)
+
+        self.assertTrue(items)
+        self.assertTrue(all(i.type == "video_segment" for i in items))
+        self.assertFalse(any(i.type == "video" for i in items))
+        self.assertFalse(any(i.dedup_key.endswith(":video") for i in items))
+
+    def test_a_stored_video_level_row_blocks_re_listing_and_re_fetching(self):
+        """A video-level fallback is a full seen row: the video is done for
+        good, exactly like a segmented one -- no re-list, no re-fetch."""
         conn = db.connect(":memory:")
         db.init(conn)
         self.addCleanup(conn.close)
-        cfg = dataclasses.replace(CFG, youtube_api_key="key")
-        interest = an_interest(
-            sources=["youtube"], source_config={"youtube": {"channels": ["UC1"]}}
-        )
+        provider = FakeProvider(search_results=[a_discovery_entry()])
+
+        with mock.patch.object(youtube, "_list_videos", return_value=listed(a_video())) as lv, \
+             mock.patch.object(youtube, "_fetch_transcript", return_value=None) as fetch:
+            items = youtube.collect(self.interest(), self.cfg, provider, conn)
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0].type, "video")
+            normalize.normalize(items[0])
+            db.insert_item(conn, items[0])
+            self.assertEqual(lv.call_count, 1)
+            self.assertEqual(fetch.call_count, 1)
+
+            self.assertEqual(youtube.collect(self.interest(), self.cfg, provider, conn), [])
+            self.assertEqual(lv.call_count, 1)      # zero quota spent on a seen video
+            self.assertEqual(fetch.call_count, 1)   # zero transcript requests either
+
+    def test_an_already_chunked_video_is_not_re_listed_or_fetched(self):
+        """Discovery legitimately re-finds the same video next cycle. The
+        seen-prefix check must drop it BEFORE the videos.list spend, not just
+        before the transcript fetch."""
+        conn = db.connect(":memory:")
+        db.init(conn)
+        self.addCleanup(conn.close)
+        provider = FakeProvider(search_results=[a_discovery_entry()])
         snippets = [FakeSnippet("real content about orexin agonists", 0, 10)]
 
-        with mock.patch.object(youtube, "_search_videos", return_value=[a_video()]), \
+        with mock.patch.object(youtube, "_list_videos", return_value=listed(a_video())) as lv, \
              mock.patch.object(youtube, "_fetch_transcript", return_value=snippets) as fetch:
-            items = youtube.collect(interest, cfg, None, conn)
+            items = youtube.collect(self.interest(), self.cfg, provider, conn)
             for item in items:
                 normalize.normalize(item)
                 db.insert_item(conn, item)
+            self.assertEqual(lv.call_count, 1)
             self.assertEqual(fetch.call_count, 1)
 
-            self.assertEqual(youtube.collect(interest, cfg, None, conn), [])
-            self.assertEqual(fetch.call_count, 1)
+            self.assertEqual(youtube.collect(self.interest(), self.cfg, provider, conn), [])
+            self.assertEqual(lv.call_count, 1)      # zero quota spent on a seen video
+            self.assertEqual(fetch.call_count, 1)   # zero transcript requests either
 
-    def test_a_video_with_no_transcript_is_skipped_not_fatal(self):
-        interest = an_interest(
-            sources=["youtube"], source_config={"youtube": {"channels": ["UC1"]}}
+    def test_hallucinated_and_stale_ids_are_dropped_by_verify(self):
+        """videos.list is authoritative: ids it doesn't return don't exist
+        (hallucinated/deleted), and its publishedAt overrules the model's
+        recency claim."""
+        provider = FakeProvider(search_results=[
+            a_discovery_entry(VID1, estimate=0.9),
+            a_discovery_entry(VID2, estimate=0.8),   # hallucinated: absent from videos.list
+            a_discovery_entry(VID3, estimate=0.7),   # real but a year old
+        ])
+        returned = listed(a_video(video_id=VID1),
+                          a_video(video_id=VID3, published_at=recent_ts(days=365)))
+        snippets = [FakeSnippet("real content here today", 0, 10)]
+
+        with mock.patch.object(youtube, "_list_videos", return_value=returned), \
+             mock.patch.object(youtube, "_fetch_transcript", return_value=snippets) as fetch:
+            items = youtube.collect(self.interest(), self.cfg, provider)
+
+        fetch.assert_called_once_with(VID1, ["en"])
+        self.assertTrue(items)
+        self.assertTrue(all(i.metadata["video_id"] == VID1 for i in items))
+
+    def test_verify_is_one_batched_call_with_every_unseen_id(self):
+        provider = FakeProvider(search_results=[
+            a_discovery_entry(VID1), a_discovery_entry(VID2), a_discovery_entry(VID3),
+        ])
+        with mock.patch.object(youtube, "_list_videos", return_value={}) as lv:
+            self.assertEqual(youtube.collect(self.interest(), self.cfg, provider), [])
+        lv.assert_called_once_with("key", [VID1, VID2, VID3])
+
+    def test_list_videos_batches_50_per_request_and_unescapes(self):
+        """1 quota unit per ≤50 ids; entities in API strings must not reach
+        Telegram verbatim."""
+        ids = [f"vid{i:08d}" for i in range(60)]
+        calls = []
+
+        class FakeResponse(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=0):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(request.full_url).query)
+            batch = query["id"][0].split(",")
+            calls.append(batch)
+            payload = {"items": [
+                {
+                    "id": vid,
+                    "snippet": {
+                        "title": "Let&#39;s Test Claude &amp; Friends",
+                        "channelTitle": "A &amp; B",
+                        "description": "details &amp; data",
+                        "publishedAt": "2026-08-01T00:00:00Z",
+                    },
+                    "contentDetails": {"duration": "PT1H2M3S"},
+                }
+                for vid in batch
+            ]}
+            return FakeResponse(json.dumps(payload).encode("utf-8"))
+
+        with mock.patch.object(youtube.urllib.request, "urlopen", side_effect=fake_urlopen):
+            found = youtube._list_videos("key", ids)
+
+        self.assertEqual([len(batch) for batch in calls], [50, 10])
+        self.assertEqual(len(found), 60)
+        video = found[ids[0]]
+        self.assertEqual(video["video_title"], "Let's Test Claude & Friends")
+        self.assertEqual(video["channel"], "A & B")
+        self.assertEqual(video["duration_seconds"], 3723)
+
+    def test_rank_is_estimate_first_keyword_match_tiebreak(self):
+        """The model rates, code ranks: fetch order is discovery-estimate
+        descending, _match_one on title+description breaking ties."""
+        interest = self.interest(
+            title="Orexin research", positive_signals=["orexin agonist trial"]
         )
-        cfg = dataclasses.replace(CFG, youtube_api_key="key")
-        videos = [a_video(video_id="no-transcript"), a_video(video_id="has-transcript")]
+        provider = FakeProvider(search_results=[
+            a_discovery_entry(VID1, estimate=0.5),   # tie, no keyword overlap
+            a_discovery_entry(VID2, estimate=0.9),   # top estimate wins outright
+            a_discovery_entry(VID3, estimate=0.5),   # tie, strong keyword match
+        ])
+        returned = listed(
+            a_video(video_id=VID1, video_title="Unrelated chat", description="nothing much"),
+            a_video(video_id=VID2, video_title="Also unrelated", description="nothing much"),
+            a_video(video_id=VID3, video_title="Orexin agonist trial results",
+                    description="deep dive on the orexin agonist trial data"),
+        )
+        order = []
+
+        def fake_fetch(video_id, languages):
+            order.append(video_id)
+            return None
+
+        with mock.patch.object(youtube, "_list_videos", return_value=returned), \
+             mock.patch.object(youtube, "_fetch_transcript", side_effect=fake_fetch):
+            youtube.collect(interest, self.cfg, provider)
+
+        self.assertEqual(order, [VID2, VID3, VID1])
+
+    def test_videos_over_the_fetch_budget_fall_back_to_video_level_same_cycle(self):
+        """A video ranked below `max_transcript_fetches` is never fetched, but
+        it isn't dropped either -- it lands as a video-level item this same
+        cycle, and its seen row then blocks any future re-listing."""
+        conn = db.connect(":memory:")
+        db.init(conn)
+        self.addCleanup(conn.close)
+        interest = self.interest(source_config={"youtube": {"max_transcript_fetches": 1}})
+        provider = FakeProvider(search_results=[
+            a_discovery_entry(VID1, estimate=0.9), a_discovery_entry(VID2, estimate=0.5),
+        ])
+        returned = listed(a_video(video_id=VID1), a_video(video_id=VID2))
+        snippets = [FakeSnippet("real content about orexin", 0, 10)]
+        fetched = []
+
+        def fake_fetch(video_id, languages):
+            fetched.append(video_id)
+            return snippets
+
+        with mock.patch.object(
+            youtube, "_list_videos",
+            side_effect=lambda key, ids: {v: returned[v] for v in ids},
+        ) as lv, mock.patch.object(youtube, "_fetch_transcript", side_effect=fake_fetch):
+            items = youtube.collect(interest, self.cfg, provider, conn)
+            self.assertEqual(fetched, [VID1])   # VID2 ranked below the budget: never fetched
+            by_video = {i.metadata["video_id"]: i for i in items}
+            self.assertEqual(by_video[VID1].type, "video_segment")
+            self.assertEqual(by_video[VID2].type, "video")
+            self.assertEqual(by_video[VID2].dedup_key, f"{VID2}:video")
+            for item in items:
+                normalize.normalize(item)
+                db.insert_item(conn, item)
+
+            second = youtube.collect(interest, self.cfg, provider, conn)
+
+        self.assertEqual(fetched, [VID1])  # no further fetch attempt for VID2
+        # Both videos are already seen (video-level counts too): nothing to
+        # re-list, let alone re-fetch, next cycle.
+        self.assertEqual(second, [])
+        lv.assert_called_once()
+
+    def test_circuit_breaker_stops_fetching_but_keeps_emitting_video_level_items(self):
+        """One RequestBlocked/IpBlocked means every further fetch this cycle
+        would fail and prolong the block: stop *fetching*, but the remaining
+        ranked videos still cost nothing to emit as video-level items."""
+        provider = FakeProvider(search_results=[
+            a_discovery_entry(VID1, estimate=0.9),
+            a_discovery_entry(VID2, estimate=0.8),
+            a_discovery_entry(VID3, estimate=0.7),
+        ])
+        returned = listed(a_video(video_id=VID1), a_video(video_id=VID2),
+                          a_video(video_id=VID3))
+        calls = []
+
+        def fake_fetch(video_id, languages):
+            calls.append(video_id)
+            if video_id == VID1:
+                return [FakeSnippet("good content before the block", 0, 10)]
+            raise youtube.TranscriptBlocked("ip blocked")
+
+        with mock.patch.object(youtube, "_list_videos", return_value=returned), \
+             mock.patch.object(youtube, "_fetch_transcript", side_effect=fake_fetch):
+            items = youtube.collect(self.interest(), self.cfg, provider)
+
+        self.assertEqual(calls, [VID1, VID2])   # the block trips on VID2; VID3 never attempted
+        by_video = {i.metadata["video_id"]: i for i in items}
+        self.assertEqual(len(items), 3)
+        self.assertEqual(by_video[VID1].type, "video_segment")
+        self.assertEqual(by_video[VID2].type, "video")   # blocked -> video-level fallback
+        self.assertEqual(by_video[VID3].type, "video")   # never even attempted -> video-level
+
+    def test_a_video_with_no_transcript_falls_back_to_a_video_level_item(self):
+        """A transcript miss is not fatal: the video's title+description is
+        emitted as a single video-level item instead of being discarded."""
+        provider = FakeProvider(search_results=[
+            a_discovery_entry(VID1, estimate=0.9), a_discovery_entry(VID2, estimate=0.5),
+        ])
+        returned = listed(
+            a_video(video_id=VID1, video_title="Video One", description="all about orexin"),
+            a_video(video_id=VID2),
+        )
         snippets = [FakeSnippet("some real content here", 0, 10)]
 
         def fake_fetch(video_id, languages):
-            return snippets if video_id == "has-transcript" else None
+            return snippets if video_id == VID2 else None
 
-        with mock.patch.object(youtube, "_search_videos", return_value=videos), \
+        with mock.patch.object(youtube, "_list_videos", return_value=returned), \
              mock.patch.object(youtube, "_fetch_transcript", side_effect=fake_fetch):
-            items = youtube.collect(interest, cfg, None)
+            items = youtube.collect(self.interest(), self.cfg, provider)
 
-        self.assertTrue(items)
-        self.assertTrue(all(i.metadata["video_id"] == "has-transcript" for i in items))
+        by_video = {i.metadata["video_id"]: i for i in items}
+        self.assertEqual(len(items), 2)  # VID2's one segment + VID1's video-level fallback
+
+        video_item = by_video[VID1]
+        self.assertEqual(video_item.type, "video")
+        self.assertEqual(video_item.dedup_key, f"{VID1}:video")
+        self.assertEqual(video_item.url, f"https://www.youtube.com/watch?v={VID1}")
+        self.assertEqual(video_item.title, "Video One")
+        self.assertIn("Video One", video_item.text)
+        self.assertIn("all about orexin", video_item.text)
+        self.assertEqual(video_item.metadata["discovery_estimate"], 0.9)
+
+        segment_item = by_video[VID2]
+        self.assertEqual(segment_item.type, "video_segment")
 
     def test_limit_stops_at_video_boundaries_never_mid_video(self):
         """A video is chunked in full or not at all: the seen-prefix skip means
         a half-chunked video would permanently lose its later segments."""
-        interest = an_interest(
-            sources=["youtube"],
-            source_config={"youtube": {"channels": ["UC1"], "limit": 1,
-                                       "chunk_seconds": 30, "chunk_overlap_seconds": 10}},
+        interest = self.interest(
+            source_config={"youtube": {"limit": 1, "chunk_seconds": 30,
+                                       "chunk_overlap_seconds": 10}},
         )
-        cfg = dataclasses.replace(CFG, youtube_api_key="key")
-        videos = [a_video(video_id="first"), a_video(video_id="second")]
+        provider = FakeProvider(search_results=[
+            a_discovery_entry(VID1, estimate=0.9), a_discovery_entry(VID2, estimate=0.5),
+        ])
+        returned = listed(a_video(video_id=VID1), a_video(video_id=VID2))
         snippets = [FakeSnippet(f"word{i}", i * 10, 10) for i in range(10)]  # 5 chunks
         fetched = []
 
@@ -1041,15 +1334,149 @@ class YoutubeCollectorTests(unittest.TestCase):
             fetched.append(video_id)
             return snippets
 
-        with mock.patch.object(youtube, "_search_videos", return_value=videos), \
+        with mock.patch.object(youtube, "_list_videos", return_value=returned), \
              mock.patch.object(youtube, "_fetch_transcript", side_effect=fake_fetch):
-            items = youtube.collect(interest, cfg, None)
+            items = youtube.collect(interest, self.cfg, provider)
 
         # The first video overshoots the limit but is emitted whole; the
         # second is never even fetched.
         self.assertEqual(len(items), 5)
-        self.assertEqual(fetched, ["first"])
-        self.assertTrue(all(i.metadata["video_id"] == "first" for i in items))
+        self.assertEqual(fetched, [VID1])
+        self.assertTrue(all(i.metadata["video_id"] == VID1 for i in items))
+
+    def test_video_id_from_url_handles_watch_youtu_be_and_shorts(self):
+        for url in (
+            f"https://www.youtube.com/watch?v={VID1}",
+            f"https://m.youtube.com/watch?v={VID1}&list=PL123&index=2",
+            f"https://youtu.be/{VID1}?t=30",
+            f"https://www.youtube.com/shorts/{VID1}",
+            f"https://www.youtube.com/live/{VID1}",
+            f"https://www.youtube.com/embed/{VID1}",
+        ):
+            self.assertEqual(youtube._video_id_from_url(url), VID1, url)
+        for url in (
+            f"https://example.com/watch?v={VID1}",       # not YouTube
+            "https://www.youtube.com/watch?v=short",     # not an 11-char id
+            "https://www.youtube.com/@somechannel",      # channel, not a video
+            "https://www.youtube.com/playlist?list=PL1",
+            "not a url at all",
+            "",
+        ):
+            self.assertIsNone(youtube._video_id_from_url(url), url)
+
+    def test_video_level_item_survives_prefilter_on_a_real_description(self):
+        """The video-level fallback's text must actually clear the same
+        cheap pre-filter every other item goes through (cfg.min_text_chars)."""
+        video = a_video(
+            video_title="Deep dive on orexin agonists",
+            description="A " * 40,  # well past min_text_chars=40
+        )
+        item = youtube._to_video_item(video)
+        matches = [(self.interest(), 0.5, ["orexin"])]
+        ok, reason = matching.prefilter(item, matches, self.cfg)
+        self.assertTrue(ok, reason)
+
+    def test_video_level_item_dies_on_prefilter_with_an_empty_description(self):
+        video = a_video(video_title="X", description="")
+        item = youtube._to_video_item(video)
+        matches = [(self.interest(), 0.5, ["orexin"])]
+        ok, reason = matching.prefilter(item, matches, self.cfg)
+        self.assertFalse(ok)
+        self.assertIn("chars", reason)
+
+    def _fake_transcript_api_modules(self, api_cls):
+        """sys.modules stand-ins for youtube-transcript-api, which CI does not
+        install -- _fetch_transcript imports it lazily, so patching sys.modules
+        is the whole seam."""
+        mod = types.ModuleType("youtube_transcript_api")
+        errors = types.ModuleType("youtube_transcript_api._errors")
+
+        class YouTubeTranscriptApiException(Exception):
+            pass
+
+        class NoTranscriptFound(YouTubeTranscriptApiException):
+            pass
+
+        errors.YouTubeTranscriptApiException = YouTubeTranscriptApiException
+        errors.NoTranscriptFound = NoTranscriptFound
+        mod.YouTubeTranscriptApi = api_cls
+        mod._errors = errors
+        return mod, errors
+
+    def test_fetch_transcript_falls_back_to_regional_variant(self):
+        """languages=["en"] must still fetch a video whose only English track
+        is "en-US" -- the library alone matches codes exactly and misses it."""
+        snippets = [FakeSnippet("real words", 0, 5)]
+
+        class FakeTrack:
+            language_code = "en-US"
+
+            def fetch(self):
+                return snippets
+
+        holder = {}
+
+        class FakeApi:
+            def fetch(self, video_id, languages=None):
+                raise holder["NoTranscriptFound"]()
+
+            def list(self, video_id):
+                return [FakeTrack()]
+
+        mod, errors = self._fake_transcript_api_modules(FakeApi)
+        holder["NoTranscriptFound"] = errors.NoTranscriptFound
+        with mock.patch.dict(
+            sys.modules,
+            {"youtube_transcript_api": mod, "youtube_transcript_api._errors": errors},
+        ):
+            result = youtube._fetch_transcript("vid1", ["en"])
+        self.assertEqual(result, snippets)
+
+    def test_fetch_transcript_no_variant_matches_returns_none(self):
+        class FakeTrack:
+            language_code = "ko"
+
+            def fetch(self):  # pragma: no cover -- must not be called
+                raise AssertionError("fetched a non-matching language")
+
+        holder = {}
+
+        class FakeApi:
+            def fetch(self, video_id, languages=None):
+                raise holder["NoTranscriptFound"]()
+
+            def list(self, video_id):
+                return [FakeTrack()]
+
+        mod, errors = self._fake_transcript_api_modules(FakeApi)
+        holder["NoTranscriptFound"] = errors.NoTranscriptFound
+        with mock.patch.dict(
+            sys.modules,
+            {"youtube_transcript_api": mod, "youtube_transcript_api._errors": errors},
+        ):
+            self.assertIsNone(youtube._fetch_transcript("vid1", ["en"]))
+
+    def test_fetch_transcript_raises_transcript_blocked_on_ip_block(self):
+        """RequestBlocked/IpBlocked must escape as TranscriptBlocked (for the
+        circuit breaker), not be swallowed like an ordinary per-video miss."""
+        holder = {}
+
+        class FakeApi:
+            def fetch(self, video_id, languages=None):
+                raise holder["IpBlocked"]("YouTube is blocking requests from your IP")
+
+        mod, errors = self._fake_transcript_api_modules(FakeApi)
+
+        class IpBlocked(errors.YouTubeTranscriptApiException):
+            pass
+
+        holder["IpBlocked"] = IpBlocked
+        with mock.patch.dict(
+            sys.modules,
+            {"youtube_transcript_api": mod, "youtube_transcript_api._errors": errors},
+        ):
+            with self.assertRaises(youtube.TranscriptBlocked):
+                youtube._fetch_transcript("vid1", ["en"])
 
 
 class NotifyTests(unittest.TestCase):
@@ -1186,6 +1613,24 @@ class PipelineTests(unittest.TestCase):
         )
         summary = self._run(FakeProvider({"Good": 0.9, "Meh": 0.1}))
         self.assertEqual((summary["duplicate"], summary["scored"], summary["notified"]), (2, 1, 0))
+
+    def test_scoring_sets_the_outcomes_score_id_to_the_saved_row(self):
+        # Regression: _score() used to call db.save_score() and discard the
+        # returned id, so outcome.score.id stayed None forever -- unlike
+        # item.id, which ingest() already assigns from db.insert_item()'s
+        # return value one line above it. Nothing in the production pipeline
+        # happened to read it back this way (deliver()/send_digest() always
+        # re-query score_id fresh from the DB), but any caller reasonably
+        # expecting the same contract item.id already carries would get a
+        # silent None instead of the real row id.
+        provider = FakeProvider({"A title": 0.9})
+        outcome = pipeline.ingest(self.conn, provider, CFG, an_item(), self.interests, "k")
+        self.assertEqual(outcome.stage, "scored")
+        self.assertIsNotNone(outcome.score.id)
+        row = self.conn.execute(
+            "SELECT id FROM scores WHERE item_id = ?", (outcome.item.id,)
+        ).fetchone()
+        self.assertEqual(outcome.score.id, row["id"])
 
     def test_a_duplicate_reports_the_item_it_collided_with(self):
         provider = FakeProvider({"A title": 0.9})
@@ -1334,6 +1779,52 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(metrics["scored"], 2)
         usage = self.conn.execute("SELECT * FROM llm_usage").fetchone()
         self.assertEqual((usage["model"], usage["input_tokens"]), ("fake-1", 40))
+
+    def test_a_crash_after_the_first_item_still_leaves_its_metrics_recorded(self):
+        # Regression: counts used to accumulate in a local Counter() and flush
+        # via one db.bump() call at the very end of run_once() -- so an
+        # exception anywhere after the first item (a real one already hit
+        # this: notify.print_safe missing in __main__.py's own discover loop,
+        # see the sibling fix there) silently discarded every already-scored
+        # item's funnel counters, even though their DB rows were already
+        # durably committed by ingest(). Metrics must now survive that.
+        provider = FakeProvider({"Good": 0.9, "Meh": 0.5})
+
+        def collector(interest, cfg, provider, conn=None):
+            return [
+                an_item(source="fake", url="https://e.com/good", title="Good"),
+                an_item(source="fake", url="https://e.com/meh", title="Meh"),
+            ]
+
+        # Neither item needs to fail scoring itself -- ingest() already
+        # handles that internally (an "errors" outcome, still bumped). What
+        # this simulates is any *other* exception landing between items
+        # (a print crash, a bad future change, an OS hiccup): patch db.bump
+        # itself to blow up on its second call, i.e. right as "Meh"'s metrics
+        # would be flushed -- after "Good"'s have already landed for real.
+        calls = []
+        real_bump = db.bump
+
+        def flaky_bump(conn, counts):
+            calls.append(counts)
+            if len(calls) == 2:
+                raise RuntimeError("simulated crash mid-cycle")
+            real_bump(conn, counts)
+
+        with mock.patch.dict(COLLECTORS, {"fake": collector}), \
+             mock.patch.object(db, "bump", flaky_bump):
+            with self.assertRaises(RuntimeError):
+                pipeline.run_once(self.conn, provider, CFG, dry_run=True)
+
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        # "Good"'s own collected/scored counts made it in before the crash --
+        # they are not held hostage by whatever happens to "Meh" right after.
+        self.assertEqual(metrics.get("collected"), 1)
+        self.assertEqual(metrics.get("scored"), 1)
+        score_row = self.conn.execute(
+            "SELECT 1 FROM candidate_items WHERE title = 'Good'"
+        ).fetchone()
+        self.assertIsNotNone(score_row)  # and its DB row is there regardless
 
     def test_collectors_are_handed_the_connection_for_skip_checks(self):
         seen = []
@@ -1872,6 +2363,49 @@ class CLITests(unittest.TestCase):
         )
         self.assertEqual(code, 2)
         self.assertIn("unknown provider 'bogus'", err)
+
+
+class CLIPrintSafetyTests(unittest.TestCase):
+    """Regression: __main__.py's own output helpers must survive a narrow
+    console codepage the same way notify.print_safe already does. They used
+    plain print() instead of the already-imported print_safe, so a
+    model-generated character outside e.g. Windows cp1255 (a real one seen
+    live: '≥') crashed `discover`/`items` mid-run with a traceback and
+    lost every remaining candidate's output instead of just substituting
+    a '?' for the one unprintable character."""
+
+    def _narrow_stdout(self):
+        import io
+
+        return io.TextIOWrapper(io.BytesIO(), encoding="cp1255", errors="strict")
+
+    def test_print_discovered_survives_a_narrow_codepage(self):
+        from discovery.__main__ import _print_discovered
+        from discovery.pipeline import Outcome
+
+        item = an_item(title="Non-ASCII ≥ in the title")
+        score = a_score(item_id=1, interest_id=1, final_score=0.8)
+        score.reason = "Effect size ≥ threshold"
+        outcome = Outcome("scored", item, "", [], score)
+
+        with mock.patch("sys.stdout", self._narrow_stdout()):
+            _print_discovered(an_interest(), item, outcome)  # must not raise
+
+    def test_list_items_survives_a_narrow_codepage(self):
+        from discovery.__main__ import _list_items
+
+        conn = db.connect(":memory:")
+        self.addCleanup(conn.close)
+        db.init(conn)
+        db.upsert_interest(conn, an_interest())
+        item = stored_item(conn, title="Item", text=BODY)
+        interest_row = db.interest_by_key(conn, "k")
+        score = a_score(item.id, interest_row.id, 0.8)
+        score.reason = "Effect size ≥ threshold"
+        db.save_score(conn, score)
+
+        with mock.patch("sys.stdout", self._narrow_stdout()):
+            _list_items(conn, limit=10, min_score=0.0)  # must not raise
 
 
 if __name__ == "__main__":

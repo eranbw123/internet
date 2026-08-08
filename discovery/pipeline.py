@@ -87,13 +87,21 @@ def run_once(conn, provider, cfg, sources=None, dry_run=False):
                 origin_interest=interest.key, budget=budget,
             )
             counts[outcome.stage] += 1
+            # Flushed per item, not once at the end of the whole cycle: this
+            # loop does real per-item I/O (LLM calls, external fetches), each
+            # a chance to throw. Every item's own DB rows are already durably
+            # committed by ingest() regardless -- only the funnel counters
+            # were at risk of vanishing for a cycle that scored real items
+            # and then died before reaching the trailing db.bump() below.
+            db.bump(conn, {"collected": 1, outcome.stage: 1})
 
     # Items stored on an earlier cycle that passed the filter but never got a
     # score (the run died, the API was down, the budget ran out) -- scored with
     # whatever budget this cycle's own candidates left over.
-    counts["scored"] += _score_backlog(conn, provider, interests, budget)
+    backlog_scored = _score_backlog(conn, provider, interests, budget)
+    counts["scored"] += backlog_scored
     counts["notified"] = deliver(conn, cfg, dry_run)
-    db.bump(conn, counts)
+    db.bump(conn, {"scored": backlog_scored, "notified": counts["notified"]})
     db.record_usage(conn, provider)   # per cycle, so `run` reports without exiting
     return {stage: counts[stage] for stage in STAGES}
 
@@ -171,7 +179,14 @@ def _score(conn, provider, item, matches, detail=""):
         # of re-failing this item on every cycle while the provider is down.
         db.mark_score_attempt(conn, item.id)
         return Outcome("errors", item, str(e), matches)
-    db.save_score(conn, score)
+    # Mirrors item.id = db.insert_item(conn, item) above: the caller gets a
+    # ScoreResult whose id actually reflects the row just written, the same
+    # contract CandidateItem.id already carries. Nothing in the current
+    # pipeline reads it back off this object (deliver()/send_digest() re-query
+    # score_id from the DB), but leaving it None was still a real inconsistency
+    # -- exactly the kind of stale-id bug that bites the next caller who
+    # reasonably assumes it works like item.id.
+    score.id = db.save_score(conn, score)
     return Outcome("scored", item, detail, matches, score)
 
 

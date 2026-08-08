@@ -212,10 +212,14 @@ def _explain(interest, provider, opts, ticker, daily, weekly):
 
 # --- the market_event candidate + its combined summary ------------------------
 
+def _event_date(daily):
+    return daily["now_at"].date().isoformat()
+
+
 def _event_key(ticker, daily):
     """The same ticker can cross its threshold again tomorrow, so the URL alone
     would collapse every day's event into one row."""
-    return f"{ticker}:{daily['now_at'].date().isoformat()}"
+    return f"{ticker}:{_event_date(daily)}"
 
 
 def _market_event(ticker, daily, weekly, catalyst, news_items):
@@ -223,7 +227,13 @@ def _market_event(ticker, daily, weekly, catalyst, news_items):
         source="stocks",
         type="market_event",
         title=f"{ticker} {daily['pct']:+.2f}% today ({weekly['pct']:+.2f}% this week)",
-        url=f"https://finance.yahoo.com/quote/{ticker}",
+        # The date query param (harmless to Yahoo, still a real working link --
+        # same trick as youtube.py's `&t=`) keeps each day's event at its own
+        # URL. Without it every day's market_event for this ticker shares one
+        # constant URL, and dedup.find_duplicate()'s url_hash check -- which
+        # runs before dedup_key is ever consulted -- would silently swallow
+        # every event after the first as "duplicate: same url", forever.
+        url=f"https://finance.yahoo.com/quote/{ticker}?event={_event_date(daily)}",
         text=_summary(ticker, daily, weekly, catalyst, news_items),
         published_at=daily["now_at"].isoformat(),
         metadata={
