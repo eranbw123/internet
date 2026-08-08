@@ -64,8 +64,8 @@ green; CI on push/PR.
 ## Known issues
 claude.ai endpoints undocumented/ToS-gray (volume bounded by
 DISCOVERY_MAX_SCORES). YouTube transcript path live-unverified end-to-end
-(IP block). PR #1 (`add-discovery-engine`) still open; youtube redesign
-uncommitted on top.
+(IP block). PR #1 (`add-discovery-engine`) still open; youtube redesign on
+top of it in PR #4 (`youtube-video-level-fallback`).
 
 ## Commands
 ```bash
