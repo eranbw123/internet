@@ -11,6 +11,7 @@ import json
 import os
 import tempfile
 import unittest
+from types import SimpleNamespace
 from unittest import mock
 
 from discovery import (
@@ -31,7 +32,9 @@ from discovery import (
 from discovery.collectors import COLLECTORS, stocks, web, web_search, youtube
 from discovery.models import CandidateItem, Interest, ScoreResult
 from discovery.providers import PROVIDERS, claude_chat
+from discovery.providers.anthropic_provider import AnthropicProvider
 from discovery.providers.base import LLMProvider, ProviderError, UnsupportedCapability
+from discovery.providers.openai_provider import OpenAIProvider
 
 CFG = config.Config(
     db_path=":memory:",
@@ -1695,6 +1698,153 @@ class ClaudeChatProviderTests(unittest.TestCase):
         # deserialized (same quirk council_bot.parse_completion_result handles).
         provider = self._provider({"text": '{"a": 2}'})
         self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 2})
+
+
+class FakeAnthropicClient:
+    """Stands in for anthropic.Anthropic() -- only .messages.create is used.
+    Constructed with a fake client (never None), so these tests never need
+    the anthropic SDK installed."""
+
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.calls = []
+        self.messages = self
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+def anthropic_response(text_blocks, stop_reason="end_turn", input_tokens=0,
+                        output_tokens=0, web_searches=None, usage=True):
+    if isinstance(text_blocks, str):
+        text_blocks = [text_blocks]
+    content = [SimpleNamespace(type="text", text=t) for t in text_blocks]
+    content.insert(0, SimpleNamespace(type="thinking", text="ignored"))
+    server_tool_use = (
+        SimpleNamespace(web_search_requests=web_searches) if web_searches is not None else None
+    )
+    return SimpleNamespace(
+        stop_reason=stop_reason,
+        content=content,
+        usage=SimpleNamespace(
+            input_tokens=input_tokens, output_tokens=output_tokens,
+            server_tool_use=server_tool_use,
+        ) if usage else None,
+    )
+
+
+class AnthropicProviderTests(unittest.TestCase):
+    """The direct-API provider, with the SDK client faked out entirely."""
+
+    SCHEMA = {
+        "type": "object",
+        "properties": {"a": {"type": "number"}},
+        "required": ["a"],
+        "additionalProperties": False,
+    }
+
+    def test_registered_under_its_config_name(self):
+        self.assertIs(PROVIDERS["anthropic"], AnthropicProvider)
+
+    def test_complete_json_parses_the_reply_and_records_token_usage(self):
+        client = FakeAnthropicClient(
+            anthropic_response('{"a": 1}', input_tokens=100, output_tokens=20)
+        )
+        provider = AnthropicProvider("claude-opus-5", client=client)
+        self.assertEqual(provider.complete_json("sys", "prompt", self.SCHEMA), {"a": 1})
+        self.assertEqual(provider.usage["input_tokens"], 100)
+        self.assertEqual(provider.usage["output_tokens"], 20)
+        self.assertEqual(provider.usage["calls"], 1)
+
+    def test_complete_json_joins_multiple_text_blocks(self):
+        client = FakeAnthropicClient(anthropic_response(['{"a": ', "1}"]))
+        provider = AnthropicProvider("claude-opus-5", client=client)
+        self.assertEqual(provider.complete_json("sys", "prompt", self.SCHEMA), {"a": 1})
+
+    def test_a_refusal_or_truncation_raises_before_parsing(self):
+        client = FakeAnthropicClient(anthropic_response('{"a"', stop_reason="max_tokens"))
+        provider = AnthropicProvider("claude-opus-5", client=client)
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json("sys", "prompt", self.SCHEMA)
+        self.assertIn("max_tokens", str(ctx.exception))
+
+    def test_search_json_records_server_side_search_usage(self):
+        client = FakeAnthropicClient(
+            anthropic_response('[{"url": "https://e.com/a"}]', web_searches=3)
+        )
+        provider = AnthropicProvider("claude-opus-5", client=client)
+        result = provider.search_json("prompt", max_searches=3)
+        self.assertEqual(result, [{"url": "https://e.com/a"}])
+        self.assertEqual(provider.usage["web_searches"], 3)
+        kwargs = client.calls[0]
+        self.assertEqual(kwargs["tools"][0]["max_uses"], 3)
+
+    def test_missing_usage_on_the_response_is_not_fatal(self):
+        client = FakeAnthropicClient(anthropic_response('{"a": 1}', usage=False))
+        provider = AnthropicProvider("claude-opus-5", client=client)
+        self.assertEqual(provider.complete_json("sys", "prompt", self.SCHEMA), {"a": 1})
+        self.assertEqual(provider.usage["calls"], 0)  # nothing to record from
+
+
+class FakeOpenAIClient:
+    """Stands in for openai.OpenAI() -- only .chat.completions.create is used."""
+
+    def __init__(self, *responses):
+        self.responses = list(responses)
+        self.calls = []
+        self.chat = self
+        self.completions = self
+
+    def create(self, **kwargs):
+        self.calls.append(kwargs)
+        return self.responses.pop(0)
+
+
+def openai_response(content, prompt_tokens=0, completion_tokens=0):
+    return SimpleNamespace(
+        choices=[SimpleNamespace(message=SimpleNamespace(content=content))],
+        usage=SimpleNamespace(prompt_tokens=prompt_tokens, completion_tokens=completion_tokens),
+    )
+
+
+class OpenAIProviderTests(unittest.TestCase):
+    """No search capability, so the pipeline's UnsupportedCapability skip path
+    is what makes this provider usable at all for the web_search collector."""
+
+    SCHEMA = {
+        "type": "object",
+        "properties": {"a": {"type": "number"}},
+        "required": ["a"],
+        "additionalProperties": False,
+    }
+
+    def test_registered_under_its_config_name(self):
+        self.assertIs(PROVIDERS["openai"], OpenAIProvider)
+
+    def test_complete_json_parses_the_reply_and_records_token_usage(self):
+        client = FakeOpenAIClient(openai_response('{"a": 1}', prompt_tokens=50, completion_tokens=5))
+        provider = OpenAIProvider("gpt-5", client=client)
+        self.assertEqual(provider.complete_json("sys", "prompt", self.SCHEMA), {"a": 1})
+        self.assertEqual(provider.usage["input_tokens"], 50)
+        self.assertEqual(provider.usage["output_tokens"], 5)
+        kwargs = client.calls[0]
+        self.assertEqual(kwargs["response_format"]["json_schema"]["schema"], self.SCHEMA)
+        self.assertTrue(kwargs["response_format"]["json_schema"]["strict"])
+
+    def test_missing_usage_on_the_response_is_not_fatal(self):
+        response = openai_response('{"a": 1}')
+        response.usage = None
+        client = FakeOpenAIClient(response)
+        provider = OpenAIProvider("gpt-5", client=client)
+        self.assertEqual(provider.complete_json("sys", "prompt", self.SCHEMA), {"a": 1})
+        self.assertEqual(provider.usage["calls"], 1)  # record_usage still called, with zeros
+        self.assertEqual(provider.usage["input_tokens"], 0)
+
+    def test_search_json_always_raises_unsupported(self):
+        provider = OpenAIProvider("gpt-5", client=FakeOpenAIClient())
+        with self.assertRaises(UnsupportedCapability):
+            provider.search_json("prompt")
 
 
 class SchemaContractTests(unittest.TestCase):
