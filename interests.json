@@ -49,7 +49,7 @@
       "sources": ["web_search", "stocks"],
       "source_config": {
         "web_search": { "limit": 8, "max_searches": 5 },
-        "stocks": { "tickers": ["NBIS"], "schedule": "daily", "min_change_pct": 4 }
+        "stocks": { "tickers": [{ "ticker": "NBIS", "daily_percent_move": 6, "weekly_percent_move": 12 }] }
       }
     },
 

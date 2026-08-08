@@ -18,8 +18,8 @@ remembers queries or results between runs.
 """
 import sys
 
-from ..models import CandidateItem
 from ..providers.base import ProviderError, UnsupportedCapability
+from . import _search
 
 DEFAULT_NUM_QUERIES = 4
 DEFAULT_RECENCY_DAYS = 14
@@ -30,6 +30,7 @@ QUERY_SCHEMA = {
         "queries": {"type": "array", "items": {"type": "string"}},
     },
     "required": ["queries"],
+    "additionalProperties": False,   # structured outputs require it on every object
 }
 
 QUERY_SYSTEM = (
@@ -57,15 +58,11 @@ Only return results plausibly published within the last {recency_days} days.
 Return AT MOST {limit} items as a JSON array. Prefer primary sources (papers,
 filings, release notes, original posts) over aggregators.
 
-Return only the JSON array, no prose around it. Each element:
-  {{"title": str, "url": str, "summary": str, "author": str|null,
-    "published_at": "YYYY-MM-DD"|null}}
-`summary` is 2-4 sentences of what the item actually says -- enough for a
-relevance judgement without opening the link. Use [] if nothing qualifies.
+{result_spec}
 """
 
 
-def collect(interest, cfg, provider):
+def collect(interest, cfg, provider, conn=None):
     opts = interest.source_config.get("web", {})
     num_queries = opts.get("num_queries", DEFAULT_NUM_QUERIES)
     recency_days = opts.get("recency_days", DEFAULT_RECENCY_DAYS)
@@ -78,7 +75,8 @@ def collect(interest, cfg, provider):
         try:
             raw_items = provider.search_json(
                 SEARCH_PROMPT.format(
-                    query=query, recency_days=recency_days, limit=per_query_limit
+                    query=query, recency_days=recency_days, limit=per_query_limit,
+                    result_spec=_search.RESULT_SPEC,
                 ),
                 max_searches=1,
             )
@@ -88,7 +86,9 @@ def collect(interest, cfg, provider):
             # One bad query shouldn't sink the others queued for this interest.
             print(f"web collector: query {query!r} failed: {e}", file=sys.stderr)
             continue
-        for item in _to_items(raw_items, query, per_query_limit):
+        for item in _search.to_items(
+            raw_items, "web", per_query_limit, metadata={"query": query}
+        ):
             if item.url in seen_urls:
                 continue
             seen_urls.add(item.url)
@@ -116,26 +116,3 @@ def _queries(interest, provider, num_queries):
     # A model that returns nothing usable still leaves the collector able to
     # search on the interest title rather than yielding zero candidates.
     return queries[:num_queries] or [interest.title]
-
-
-def _to_items(raw_items, query, limit):
-    items = []
-    for raw in raw_items[:limit]:
-        if not isinstance(raw, dict):
-            continue
-        url = (raw.get("url") or "").strip()
-        if not url:
-            continue
-        items.append(
-            CandidateItem(
-                source="web",
-                type="article",
-                title=raw.get("title") or url,
-                url=url,
-                text=raw.get("summary") or "",
-                author=raw.get("author"),
-                published_at=raw.get("published_at"),
-                metadata={"query": query},
-            )
-        )
-    return items

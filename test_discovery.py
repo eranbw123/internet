@@ -6,6 +6,7 @@ network fully stubbed. Nothing here touches an LLM API, Telegram, or Yahoo --
 the pipeline holds an LLMProvider, so a fake object with `complete_json` /
 `search_json` is the whole seam.
 """
+import dataclasses
 import json
 import os
 import tempfile
@@ -16,17 +17,21 @@ from discovery import (
     config,
     db,
     dedup,
+    feedback_listener,
     interests,
     matching,
     models,
     normalize,
     notify,
     pipeline,
+    scheduler,
     scoring,
+    stats,
 )
-from discovery.collectors import COLLECTORS, stocks, web, web_search
+from discovery.collectors import COLLECTORS, stocks, web, web_search, youtube
 from discovery.models import CandidateItem, Interest, ScoreResult
-from discovery.providers.base import LLMProvider, UnsupportedCapability
+from discovery.providers import PROVIDERS, claude_chat
+from discovery.providers.base import LLMProvider, ProviderError, UnsupportedCapability
 
 CFG = config.Config(
     db_path=":memory:",
@@ -34,7 +39,6 @@ CFG = config.Config(
     provider="fake",
     model="fake-1",
     max_items_per_source=5,
-    interval_seconds=60,
     min_match_score=0.25,
     min_text_chars=40,
     telegram_bot_token="",
@@ -414,6 +418,159 @@ class DBTests(unittest.TestCase):
         self.assertEqual([r["title"] for r in rows], ["Second", "First"])
         self.assertEqual(rows[0]["note"], "off topic")
 
+    def test_feedback_stores_the_original_score(self):
+        db.upsert_interest(self.conn, an_interest())
+        (interest,) = db.active_interests(self.conn)
+        item = stored_item(self.conn)
+        db.add_feedback(self.conn, item.id, interest.id, "fire", original_score=0.91)
+        row = self.conn.execute(
+            "SELECT verdict, original_score FROM feedback WHERE item_id = ?", (item.id,)
+        ).fetchone()
+        self.assertEqual((row["verdict"], row["original_score"]), ("fire", 0.91))
+
+    def test_score_by_id_round_trips_what_a_feedback_button_needs(self):
+        db.upsert_interest(self.conn, an_interest())
+        (interest,) = db.active_interests(self.conn)
+        item = stored_item(self.conn)
+        score_id = db.save_score(self.conn, a_score(item.id, interest.id, 0.8))
+        row = db.score_by_id(self.conn, score_id)
+        self.assertEqual((row["item_id"], row["interest_id"]), (item.id, interest.id))
+        self.assertAlmostEqual(row["final_score"], 0.8)
+        self.assertIsNone(db.score_by_id(self.conn, score_id + 999))
+
+    def test_metrics_accumulate_per_day_and_ignore_zero_counts(self):
+        db.bump(self.conn, {"collected": 3, "filtered": 1, "errors": 0})
+        db.bump(self.conn, {"collected": 2})
+        rows = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(rows, {"collected": 5, "filtered": 1})
+
+    def test_seen_dedup_keys_filters_by_source_and_prefix(self):
+        stored_item(self.conn, source="youtube", url="https://y/1", dedup_key="vid1:0-360")
+        stored_item(self.conn, source="youtube", url="https://y/2", dedup_key="vid2:0-360")
+        stored_item(self.conn, source="stocks", url="https://s/1", dedup_key="NBIS:2026-08-08")
+        self.assertEqual(db.seen_dedup_keys(self.conn, "youtube", "vid1:"), {"vid1:0-360"})
+        self.assertEqual(db.seen_dedup_keys(self.conn, "youtube", "nope:"), set())
+        self.assertEqual(db.seen_dedup_keys(self.conn, "stocks"), {"NBIS:2026-08-08"})
+
+    def test_seen_dedup_keys_treats_like_wildcards_in_the_prefix_literally(self):
+        """YouTube ids contain underscores; '_' must not match any character."""
+        stored_item(self.conn, source="youtube", url="https://y/3", dedup_key="abcXdef:0-360")
+        self.assertEqual(db.seen_dedup_keys(self.conn, "youtube", "abc_def:"), set())
+        stored_item(self.conn, source="youtube", url="https://y/4", dedup_key="abc_def:0-360")
+        self.assertEqual(
+            db.seen_dedup_keys(self.conn, "youtube", "abc_def:"), {"abc_def:0-360"}
+        )
+
+    def test_record_usage_sums_per_model_and_resets_the_provider(self):
+        provider = FakeProvider(model="m1")
+        provider.record_usage(input_tokens=100, output_tokens=10, web_searches=2)
+        provider.record_usage(input_tokens=50, output_tokens=5)
+        db.record_usage(self.conn, provider)
+        self.assertEqual(provider.usage, {})   # drained, so a second flush is a no-op
+        db.record_usage(self.conn, provider)
+
+        row = self.conn.execute("SELECT * FROM llm_usage").fetchone()
+        self.assertEqual(
+            (row["model"], row["calls"], row["input_tokens"], row["output_tokens"],
+             row["web_searches"]),
+            ("m1", 2, 150, 15, 2),
+        )
+
+
+class StatsTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        db.upsert_interest(self.conn, an_interest())
+        (self.interest,) = db.active_interests(self.conn)
+
+    def _notified(self, url, score, verdict=None):
+        item = stored_item(self.conn, url=url)
+        score_id = db.save_score(self.conn, a_score(item.id, self.interest.id, score))
+        db.record_notification(self.conn, score_id, "telegram", True)
+        if verdict:
+            db.add_feedback(
+                self.conn, item.id, self.interest.id, verdict, original_score=score
+            )
+        return item
+
+    def test_empty_db_still_reports_rather_than_crashing(self):
+        text = stats.report(self.conn, days=7)
+        self.assertIn("candidates collected", text)
+        self.assertIn("nothing rated yet", text)
+        self.assertIn("no usage recorded", text)
+
+    def test_funnel_shows_survivors_and_what_reached_the_llm(self):
+        db.bump(self.conn, {"collected": 100, "duplicate": 40, "filtered": 30,
+                            "scored": 25, "errors": 5})
+        lines = stats.report(self.conn, days=7).splitlines()
+        survived = next(l for l in lines if l.startswith("survived cheap filtering"))
+        to_llm = next(l for l in lines if l.startswith("sent to the LLM"))
+        self.assertIn("30", survived)          # 100 - 40 - 30
+        self.assertIn("30", to_llm)            # scored + errors, both were LLM calls
+        self.assertIn("30.0%", to_llm)
+
+    def test_feedback_rates_and_average_score_per_verdict(self):
+        self._notified("https://e.com/1", 0.90, "fire")
+        self._notified("https://e.com/2", 0.80, "fire")
+        self._notified("https://e.com/3", 0.75, "up")
+        self._notified("https://e.com/4", 0.71, "trash")
+        text = stats.report(self.conn, days=7)
+
+        self.assertIn("4 rated (100% of sent)", text)
+        self.assertRegex(text, r"🔥 fire\s+2\s+50\.0%")
+        self.assertRegex(text, r"negative \(👎 \+ 🗑\)\s+1\s+25\.0%")
+        # The point of the section: loved items must outscore rejected ones.
+        self.assertRegex(text, r"🔥 fire\s+0\.85\s+\(n=2\)")
+        self.assertRegex(text, r"🗑 trash\s+0\.71\s+\(n=1\)")
+
+    def test_notifications_per_interest(self):
+        self._notified("https://e.com/1", 0.90)
+        self._notified("https://e.com/2", 0.85)
+        text = stats.report(self.conn, days=7)
+        self.assertRegex(text, r"(?m)^k\s+2\s+2\s+100%")
+
+    def test_cost_prices_known_models_and_flags_unknown_ones(self):
+        provider = FakeProvider(model="claude-opus-5")
+        provider.record_usage(input_tokens=1_000_000, output_tokens=200_000, web_searches=100)
+        db.record_usage(self.conn, provider)
+        text = stats.report(self.conn, days=7)
+        # 1M in * $5 + 0.2M out * $25 = $10.00; 100 searches at $10/1k = $1.00
+        self.assertIn("tokens $10.00 + web search $1.00 = $11.00", text)
+        self.assertIn("TOTAL $11.00", text)
+
+        unknown = FakeProvider(model="some-new-model")
+        unknown.record_usage(input_tokens=500_000, output_tokens=100_000)
+        db.record_usage(self.conn, unknown)
+        text = stats.report(self.conn, days=7)
+        self.assertIn("no list price on record", text)
+        self.assertIn("excludes token spend for: some-new-model", text)
+
+    def test_claude_chat_usage_reports_calls_but_never_a_dollar_figure(self):
+        # claude_chat rides the claude.ai subscription: no token counts on the
+        # wire, so a priced total would be fabricated -- even though its model
+        # name has an API list price.
+        chat = FakeProvider(model="claude-opus-5")
+        chat.name = "claude_chat"
+        for _ in range(3):
+            chat.record_usage()
+        db.record_usage(self.conn, chat)
+        text = stats.report(self.conn, days=7)
+        self.assertIn("3 calls via the claude.ai session", text)
+        self.assertIn("dollar cost not applicable", text)
+        self.assertNotIn("TOTAL", text)
+        self.assertIn("no API-billed usage", text)
+
+        # Mixed usage: the API-billed rows are totalled, claude_chat is not.
+        api = FakeProvider(model="claude-opus-5")
+        api.name = "anthropic"
+        api.record_usage(input_tokens=1_000_000, output_tokens=200_000)
+        db.record_usage(self.conn, api)
+        text = stats.report(self.conn, days=7)
+        self.assertIn("TOTAL $10.00", text)
+        self.assertIn("3 calls via the claude.ai session", text)
+
 
 class InterestsFileTests(unittest.TestCase):
     def test_sample_file_loads_with_defaults_applied(self):
@@ -422,7 +579,7 @@ class InterestsFileTests(unittest.TestCase):
         self.assertEqual(keys, ["narcolepsy-eds", "nbis-nebius", "behavioral-psychology"])
         nbis = loaded[1]
         self.assertIn("stocks", nbis.sources)
-        self.assertEqual(nbis.source_config["stocks"]["tickers"], ["NBIS"])
+        self.assertEqual(nbis.source_config["stocks"]["tickers"][0]["ticker"], "NBIS")
 
     def test_sample_file_thresholds_are_on_the_0_1_scale(self):
         for interest in interests.load_file("interests.json"):
@@ -448,6 +605,14 @@ class InterestsFileTests(unittest.TestCase):
             "interests": [{"key": "x", "title": "X"}],
         })
         self.assertEqual(from_defaults.min_score, 0.70)
+
+    def test_a_bom_from_a_windows_editor_does_not_break_loading(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "i.json")
+            with open(path, "w", encoding="utf-8-sig") as fh:
+                json.dump({"interests": [{"key": "x", "title": "X"}]}, fh)
+            (loaded,) = interests.load_file(path)
+        self.assertEqual(loaded.key, "x")
 
     def _load(self, data):
         with tempfile.TemporaryDirectory() as tmp:
@@ -498,12 +663,16 @@ class ScoringTests(unittest.TestCase):
         self.assertEqual(provider.prompts, [])
 
     def test_prompt_carries_signals_and_past_verdicts(self):
-        rows = [{"verdict": "down", "title": "Sleep hygiene tips", "note": "listicle"}]
+        rows = [
+            {"verdict": "down", "title": "Sleep hygiene tips", "note": "listicle"},
+            {"verdict": "trash", "title": "Supplement ad", "note": ""},
+        ]
         item, matches = self._matches(an_interest(id=1))
         prompt = scoring._prompt(item, matches, rows)
         self.assertIn("good stuff", prompt)
         self.assertIn("bad stuff", prompt)
-        self.assertIn("rejected: Sleep hygiene tips", prompt)
+        self.assertIn("disliked: Sleep hygiene tips", prompt)
+        self.assertIn("rejected as a bad match: Supplement ad", prompt)
         self.assertIn('key="k"', prompt)
 
 
@@ -578,13 +747,13 @@ class WebCollectorTests(unittest.TestCase):
 
 
 class StocksCollectorTests(unittest.TestCase):
-    def _change(self, pct):
+    def _change(self, schedule, pct, label):
         from datetime import datetime, timezone
 
         return {
             "ticker": "NBIS",
-            "schedule": "daily",
-            "label": "1d",
+            "schedule": schedule,
+            "label": label,
             "currency": "USD",
             "then_price": 100.0,
             "then_at": datetime(2026, 8, 6, tzinfo=timezone.utc),
@@ -594,24 +763,334 @@ class StocksCollectorTests(unittest.TestCase):
             "pct": pct,
         }
 
-    def test_dedup_key_is_per_day_so_moves_do_not_collapse(self):
-        interest = an_interest(
-            sources=["stocks"],
-            source_config={"stocks": {"tickers": ["NBIS"], "min_change_pct": 1}},
-        )
-        with mock.patch.object(stocks.watch, "price_change", return_value=self._change(5.0)):
-            (item,) = stocks.collect(interest, CFG, None)
-        self.assertEqual(item.key(), "NBIS:daily:2026-08-07")
-        self.assertEqual(item.type, "price_move")
-        self.assertAlmostEqual(item.metadata["pct"], 5.0)
+    def _prices(self, daily_pct=0.5, weekly_pct=0.5):
+        def fake(ticker, schedule):
+            return (
+                self._change("daily", daily_pct, "1d")
+                if schedule == "daily"
+                else self._change("weekly", weekly_pct, "1w")
+            )
 
-    def test_move_below_threshold_is_dropped(self):
+        return fake
+
+    def test_daily_threshold_crossed_produces_a_market_event(self):
         interest = an_interest(
             sources=["stocks"],
-            source_config={"stocks": {"tickers": ["NBIS"], "min_change_pct": 4}},
+            source_config={
+                "stocks": {
+                    "tickers": [{"ticker": "NBIS", "daily_percent_move": 6, "weekly_percent_move": 12}]
+                }
+            },
         )
-        with mock.patch.object(stocks.watch, "price_change", return_value=self._change(0.5)):
+        with mock.patch.object(
+            stocks.watch, "price_change", side_effect=self._prices(daily_pct=-8.4, weekly_pct=-2.0)
+        ):
+            (item,) = stocks.collect(interest, CFG, None)
+        self.assertEqual(item.type, "market_event")
+        self.assertEqual(item.key(), "NBIS:2026-08-07")
+        self.assertAlmostEqual(item.metadata["daily_pct"], -8.4)
+        self.assertAlmostEqual(item.metadata["weekly_pct"], -2.0)
+        self.assertIn("NBIS -8.40% today", item.title)
+        self.assertIn("no provider", item.text)
+
+    def test_weekly_threshold_alone_still_triggers(self):
+        interest = an_interest(
+            sources=["stocks"],
+            source_config={
+                "stocks": {
+                    "tickers": [{"ticker": "NBIS", "daily_percent_move": 6, "weekly_percent_move": 12}]
+                }
+            },
+        )
+        with mock.patch.object(
+            stocks.watch, "price_change", side_effect=self._prices(daily_pct=1.0, weekly_pct=15.0)
+        ):
+            (item,) = stocks.collect(interest, CFG, None)
+        self.assertEqual(item.type, "market_event")
+
+    def test_move_below_both_thresholds_is_dropped(self):
+        interest = an_interest(
+            sources=["stocks"],
+            source_config={"stocks": {"tickers": ["NBIS"]}},
+        )
+        with mock.patch.object(
+            stocks.watch, "price_change", side_effect=self._prices(daily_pct=0.5, weekly_pct=0.5)
+        ):
             self.assertEqual(stocks.collect(interest, CFG, None), [])
+
+    def test_bare_string_ticker_uses_default_thresholds(self):
+        interest = an_interest(
+            sources=["stocks"],
+            source_config={"stocks": {"tickers": ["NBIS"]}},
+        )
+        with mock.patch.object(
+            stocks.watch, "price_change", side_effect=self._prices(daily_pct=6.5, weekly_pct=1.0)
+        ):
+            (item,) = stocks.collect(interest, CFG, None)
+        self.assertEqual(item.metadata["ticker"], "NBIS")
+
+    def test_an_event_already_in_the_db_costs_nothing_to_re_poll(self):
+        """The hourly stocks job re-crosses the same threshold all day. Dedup
+        would throw the repeat away -- but only after two LLM calls had already
+        been paid for it, so the check has to happen here instead."""
+        conn = db.connect(":memory:")
+        db.init(conn)
+        self.addCleanup(conn.close)
+        interest = an_interest(sources=["stocks"], source_config={"stocks": {"tickers": ["NBIS"]}})
+        provider = FakeProvider(
+            search_results=[{"title": "Earnings beat", "url": "https://n/1", "summary": "x" * 60}]
+        )
+        provider.complete_json = lambda *a, **kw: {
+            "catalyst": "confirmed", "explanation": "Earnings beat.", "confidence": "high",
+        }
+
+        with mock.patch.object(
+            stocks.watch, "price_change", side_effect=self._prices(daily_pct=8.0, weekly_pct=1.0)
+        ):
+            first = stocks.collect(interest, CFG, provider, conn)
+            for item in first:
+                normalize.normalize(item)
+                db.insert_item(conn, item)
+            self.assertEqual(len(provider.search_prompts), 1)
+
+            again = stocks.collect(interest, CFG, provider, conn)
+        self.assertEqual(again, [])
+        self.assertEqual(len(provider.search_prompts), 1)   # no second explanation
+
+    def test_no_provider_skips_explanation_but_still_fires(self):
+        interest = an_interest(
+            sources=["stocks"],
+            source_config={"stocks": {"tickers": ["NBIS"]}},
+        )
+        with mock.patch.object(
+            stocks.watch, "price_change", side_effect=self._prices(daily_pct=8.0, weekly_pct=1.0)
+        ):
+            (item,) = stocks.collect(interest, CFG, None)
+        self.assertIsNone(item.metadata["catalyst"])
+        self.assertIn("not checked", item.text)
+
+    def test_explain_false_skips_explanation_even_with_a_provider(self):
+        interest = an_interest(
+            sources=["stocks"],
+            source_config={"stocks": {"tickers": ["NBIS"], "explain": False}},
+        )
+        provider = FakeProvider()
+        with mock.patch.object(
+            stocks.watch, "price_change", side_effect=self._prices(daily_pct=8.0, weekly_pct=1.0)
+        ):
+            (item,) = stocks.collect(interest, CFG, provider)
+        self.assertIsNone(item.metadata["catalyst"])
+        self.assertEqual(provider.search_prompts, [])
+
+    def test_no_news_found_reports_no_catalyst_without_inventing_one(self):
+        interest = an_interest(
+            sources=["stocks"],
+            source_config={"stocks": {"tickers": ["NBIS"]}},
+        )
+        provider = FakeProvider(search_results=[])
+        with mock.patch.object(
+            stocks.watch, "price_change", side_effect=self._prices(daily_pct=8.0, weekly_pct=1.0)
+        ):
+            items = stocks.collect(interest, CFG, provider)
+        (event,) = items
+        self.assertEqual(event.metadata["catalyst"], "none")
+        self.assertIn("no obvious catalyst found", event.text)
+
+    def test_news_grades_the_catalyst_from_snippets_and_flows_to_scoring(self):
+        interest = an_interest(
+            sources=["stocks"],
+            source_config={"stocks": {"tickers": ["NBIS"]}},
+        )
+        provider = FakeProvider(
+            search_results=[
+                {
+                    "title": "Nebius signs large GPU capacity deal",
+                    "url": "https://e.com/nbis-deal",
+                    "summary": "A named hyperscaler signed a multi-year contract.",
+                    "published_at": "2026-08-07",
+                }
+            ]
+        )
+        provider.complete_json = lambda *a, **kw: {
+            "catalyst": "confirmed",
+            "explanation": "A large signed GPU capacity contract was disclosed.",
+            "confidence": "medium",
+        }
+        with mock.patch.object(
+            stocks.watch, "price_change", side_effect=self._prices(daily_pct=-8.4, weekly_pct=-2.0)
+        ):
+            items = stocks.collect(interest, CFG, provider)
+
+        event, news = items
+        self.assertEqual(event.type, "market_event")
+        self.assertEqual(event.metadata["catalyst"], "confirmed")
+        self.assertIn("Confirmed catalyst", event.text)
+        self.assertIn("Nebius signs large GPU capacity deal", event.text)
+        self.assertIn("NBIS", provider.search_prompts[0])
+
+        self.assertEqual(news.type, "article")
+        self.assertEqual(news.url, "https://e.com/nbis-deal")
+        self.assertEqual(news.metadata["ticker"], "NBIS")
+
+    def test_a_provider_without_search_still_fires_the_event(self):
+        interest = an_interest(
+            sources=["stocks"],
+            source_config={"stocks": {"tickers": ["NBIS"]}},
+        )
+        provider = FakeProvider()  # search_results=None -> UnsupportedCapability
+        with mock.patch.object(
+            stocks.watch, "price_change", side_effect=self._prices(daily_pct=8.0, weekly_pct=1.0)
+        ):
+            (item,) = stocks.collect(interest, CFG, provider)
+        self.assertIsNone(item.metadata["catalyst"])
+
+
+class FakeSnippet:
+    """Stands in for youtube_transcript_api's FetchedTranscriptSnippet."""
+
+    def __init__(self, text, start, duration):
+        self.text = text
+        self.start = start
+        self.duration = duration
+
+
+def a_video(**kw):
+    base = dict(
+        video_id="vid1",
+        video_title="Some Podcast",
+        channel="A Channel",
+        published_at="2026-08-01T00:00:00Z",
+        video_url="https://www.youtube.com/watch?v=vid1",
+    )
+    base.update(kw)
+    return base
+
+
+class YoutubeCollectorTests(unittest.TestCase):
+    def test_chunk_transcript_slides_with_overlap(self):
+        snippets = [FakeSnippet(f"word{i}", i * 10, 10) for i in range(10)]  # 0..100s
+        chunks = youtube._chunk_transcript(snippets, window_seconds=30, overlap_seconds=10)
+        starts = [c[0] for c in chunks]
+        self.assertEqual(starts, [0, 20, 40, 60, 80])
+        self.assertIn("word0", chunks[0][2])
+
+    def test_chunk_transcript_empty_input(self):
+        self.assertEqual(youtube._chunk_transcript([], 30, 10), [])
+        self.assertEqual(youtube._chunk_transcript([FakeSnippet("  ", 0, 5)], 30, 10), [])
+
+    def test_no_channels_or_queries_returns_empty_without_needing_a_key(self):
+        interest = an_interest(sources=["youtube"], source_config={"youtube": {}})
+        self.assertEqual(youtube.collect(interest, CFG, None), [])
+
+    def test_missing_api_key_raises(self):
+        interest = an_interest(
+            sources=["youtube"], source_config={"youtube": {"channels": ["UC1"]}}
+        )
+        with self.assertRaises(youtube.YoutubeCollectorError):
+            youtube.collect(interest, CFG, None)
+
+    def test_collect_shapes_one_candidate_per_segment(self):
+        cfg = dataclasses.replace(CFG, youtube_api_key="key")
+        interest = an_interest(
+            sources=["youtube"],
+            source_config={
+                "youtube": {
+                    "channels": ["UC1"],
+                    "chunk_seconds": 30,
+                    "chunk_overlap_seconds": 10,
+                }
+            },
+        )
+        snippets = [FakeSnippet(f"segment about {i} orexin", i * 10, 10) for i in range(6)]
+        with mock.patch.object(youtube, "_search_videos", return_value=[a_video()]), \
+             mock.patch.object(youtube, "_fetch_transcript", return_value=snippets):
+            items = youtube.collect(interest, cfg, None)
+
+        self.assertGreaterEqual(len(items), 2)
+        first, second = items[0], items[1]
+        self.assertEqual(first.source, "youtube")
+        self.assertEqual(first.type, "video_segment")
+        self.assertEqual(first.metadata["video_id"], "vid1")
+        self.assertEqual(first.metadata["channel"], "A Channel")
+        self.assertEqual(first.metadata["start_time"], 0)
+        self.assertIn("orexin", first.metadata["transcript"])
+        self.assertTrue(first.url.startswith("https://www.youtube.com/watch?v=vid1&t="))
+
+        # Two segments of the same video must not collide on any dedup layer:
+        # distinct urls (survives fragment-stripping normalize.canonical_url),
+        # distinct titles (mm:ss range), distinct dedup_keys.
+        self.assertNotEqual(normalize.canonical_url(first.url), normalize.canonical_url(second.url))
+        self.assertNotEqual(first.title, second.title)
+        self.assertNotEqual(first.dedup_key, second.dedup_key)
+
+    def test_an_already_chunked_video_is_not_re_fetched(self):
+        """A search job re-lists the same uploads every few hours. Without the
+        check, each run re-fetches and re-chunks a transcript whose segments
+        dedup.py is only going to reject again."""
+        conn = db.connect(":memory:")
+        db.init(conn)
+        self.addCleanup(conn.close)
+        cfg = dataclasses.replace(CFG, youtube_api_key="key")
+        interest = an_interest(
+            sources=["youtube"], source_config={"youtube": {"channels": ["UC1"]}}
+        )
+        snippets = [FakeSnippet("real content about orexin agonists", 0, 10)]
+
+        with mock.patch.object(youtube, "_search_videos", return_value=[a_video()]), \
+             mock.patch.object(youtube, "_fetch_transcript", return_value=snippets) as fetch:
+            items = youtube.collect(interest, cfg, None, conn)
+            for item in items:
+                normalize.normalize(item)
+                db.insert_item(conn, item)
+            self.assertEqual(fetch.call_count, 1)
+
+            self.assertEqual(youtube.collect(interest, cfg, None, conn), [])
+            self.assertEqual(fetch.call_count, 1)
+
+    def test_a_video_with_no_transcript_is_skipped_not_fatal(self):
+        interest = an_interest(
+            sources=["youtube"], source_config={"youtube": {"channels": ["UC1"]}}
+        )
+        cfg = dataclasses.replace(CFG, youtube_api_key="key")
+        videos = [a_video(video_id="no-transcript"), a_video(video_id="has-transcript")]
+        snippets = [FakeSnippet("some real content here", 0, 10)]
+
+        def fake_fetch(video_id, languages):
+            return snippets if video_id == "has-transcript" else None
+
+        with mock.patch.object(youtube, "_search_videos", return_value=videos), \
+             mock.patch.object(youtube, "_fetch_transcript", side_effect=fake_fetch):
+            items = youtube.collect(interest, cfg, None)
+
+        self.assertTrue(items)
+        self.assertTrue(all(i.metadata["video_id"] == "has-transcript" for i in items))
+
+    def test_limit_stops_at_video_boundaries_never_mid_video(self):
+        """A video is chunked in full or not at all: the seen-prefix skip means
+        a half-chunked video would permanently lose its later segments."""
+        interest = an_interest(
+            sources=["youtube"],
+            source_config={"youtube": {"channels": ["UC1"], "limit": 1,
+                                       "chunk_seconds": 30, "chunk_overlap_seconds": 10}},
+        )
+        cfg = dataclasses.replace(CFG, youtube_api_key="key")
+        videos = [a_video(video_id="first"), a_video(video_id="second")]
+        snippets = [FakeSnippet(f"word{i}", i * 10, 10) for i in range(10)]  # 5 chunks
+        fetched = []
+
+        def fake_fetch(video_id, languages):
+            fetched.append(video_id)
+            return snippets
+
+        with mock.patch.object(youtube, "_search_videos", return_value=videos), \
+             mock.patch.object(youtube, "_fetch_transcript", side_effect=fake_fetch):
+            items = youtube.collect(interest, cfg, None)
+
+        # The first video overshoots the limit but is emitted whole; the
+        # second is never even fetched.
+        self.assertEqual(len(items), 5)
+        self.assertEqual(fetched, ["first"])
+        self.assertTrue(all(i.metadata["video_id"] == "first" for i in items))
 
 
 class NotifyTests(unittest.TestCase):
@@ -620,18 +1099,57 @@ class NotifyTests(unittest.TestCase):
             self.assertTrue(notify.send(CFG, "hello", dry_run=True))
         urlopen.assert_not_called()
 
-    def test_message_shows_the_score_out_of_100_with_reason_and_url(self):
+    def test_message_shows_the_score_reason_why_it_matches_and_url(self):
         text = notify.format_message(an_interest(), an_item(), 0.91, "Real data.", "Has numbers.")
-        self.assertIn("[91]", text)
+        self.assertIn("91%", text)
         self.assertIn("Real data.", text)
+        self.assertIn("Why this matches me:", text)
         self.assertIn("Has numbers.", text)
         self.assertIn("https://e.com/a", text)
+
+    def test_an_article_is_labelled_discovery_a_market_event_alert(self):
+        text = notify.format_message(an_interest(), an_item(), 0.91, "r")
+        self.assertIn("DISCOVERY", text)
+        item = an_item(type="market_event", text="NBIS -8.40% today")
+        text = notify.format_message(an_interest(), item, 0.91, "r")
+        self.assertIn("ALERT", text)
+        self.assertNotIn("DISCOVERY", text)
 
     def test_low_confidence_is_flagged_in_the_header(self):
         text = notify.format_message(an_interest(), an_item(), 0.91, "r", confidence=0.3)
         self.assertIn("low confidence", text.splitlines()[0])
         text = notify.format_message(an_interest(), an_item(), 0.91, "r", confidence=0.8)
         self.assertNotIn("low confidence", text)
+
+    def test_market_event_shows_the_combined_summary_not_the_score_reason(self):
+        item = an_item(
+            type="market_event",
+            text="NBIS -8.40% today (-2.00% this week)\n\nConfidence:\nmedium",
+        )
+        text = notify.format_message(an_interest(), item, 0.91, "a generic scorer sentence")
+        self.assertIn("NBIS -8.40% today", text)
+        self.assertNotIn("a generic scorer sentence", text)
+
+    def test_video_segment_shows_a_timestamp_range(self):
+        item = an_item(type="video_segment", metadata={"start_time": 754, "end_time": 1082})
+        text = notify.format_message(an_interest(), item, 0.91, "r")
+        self.assertIn("12:34-18:02", text)
+
+    def test_a_non_video_item_has_no_timestamp_range(self):
+        text = notify.format_message(an_interest(), an_item(), 0.91, "r")
+        self.assertNotIn("⏱", text)
+
+    def test_is_alert_matches_only_registered_types(self):
+        self.assertTrue(notify.is_alert(an_item(type="market_event")))
+        self.assertFalse(notify.is_alert(an_item(type="article")))
+
+    def test_feedback_keyboard_has_all_four_verdicts_keyed_to_the_score_id(self):
+        markup = notify.feedback_keyboard(42)
+        buttons = [b for row in markup["inline_keyboard"] for b in row]
+        self.assertEqual(len(buttons), 4)
+        codes = {b["callback_data"].split(":")[1] for b in buttons}
+        self.assertEqual(codes, set(notify.FEEDBACK_VERDICTS))
+        self.assertTrue(all(b["callback_data"].endswith(":42") for b in buttons))
 
 
 class PipelineTests(unittest.TestCase):
@@ -645,7 +1163,7 @@ class PipelineTests(unittest.TestCase):
     def _collector(self):
         """A fresh pair of items per call -- ingest() mutates what it is given,
         so a shared list would make the second cycle test a lie."""
-        return lambda interest, cfg, provider: [
+        return lambda interest, cfg, provider, conn=None: [
             an_item(source="fake", url="https://e.com/good", title="Good"),
             an_item(source="fake", url="https://e.com/meh", title="Meh"),
         ]
@@ -654,14 +1172,18 @@ class PipelineTests(unittest.TestCase):
         with mock.patch.dict(COLLECTORS, {"fake": collector or self._collector()}):
             return pipeline.run_once(self.conn, provider, CFG, dry_run=True)
 
-    def test_full_cycle_scores_everything_and_notifies_only_above_the_bar(self):
+    def test_full_cycle_scores_everything_but_a_discovery_item_awaits_the_digest(self):
+        # "Good"/"Meh" are plain article-type items -- DISCOVERY, not ALERT --
+        # so run_once's own deliver() (Alerts only) sends nothing; the item
+        # above the bar is left pending for send_digest() (see below).
         provider = FakeProvider({"Good": 0.9, "Meh": 0.2})
         summary = self._run(provider)
         self.assertEqual(
             summary,
             {"collected": 2, "duplicate": 0, "filtered": 0, "already_scored": 0,
-             "scored": 2, "errors": 0, "notified": 1},
+             "scored": 2, "deferred": 0, "errors": 0, "notified": 0},
         )
+        self.assertEqual(pipeline.send_digest(self.conn, CFG, dry_run=True), 1)
 
     def test_a_second_cycle_re_collects_but_never_re_scores_or_re_notifies(self):
         provider = FakeProvider({"Good": 0.9, "Meh": 0.2})
@@ -672,7 +1194,7 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(len(provider.prompts), 2)  # only the first cycle paid
 
     def test_a_failing_collector_does_not_abort_the_cycle(self):
-        def boom(interest, cfg, provider):
+        def boom(interest, cfg, provider, conn=None):
             raise RuntimeError("network down")
 
         summary = self._run(FakeProvider(), collector=boom)
@@ -682,7 +1204,7 @@ class PipelineTests(unittest.TestCase):
     def test_a_failing_score_skips_only_that_item(self):
         provider = FakeProvider({"Good": RuntimeError("bad json"), "Meh": 0.95})
         summary = self._run(provider)
-        self.assertEqual((summary["errors"], summary["scored"], summary["notified"]), (1, 1, 1))
+        self.assertEqual((summary["errors"], summary["scored"], summary["notified"]), (1, 1, 0))
 
     def test_an_item_left_unscored_by_a_dead_cycle_is_picked_up_next_time(self):
         provider = FakeProvider({"Good": RuntimeError("api down"), "Meh": 0.1})
@@ -693,9 +1215,18 @@ class PipelineTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual([r["title"] for r in unscored], ["Good"])
 
-        # Next cycle: collection dedups both, but the backlog still gets scored.
+        # Immediately after the failure the backlog leaves the item alone --
+        # its cool-off has not passed, so an outage is not re-failed per cycle.
         summary = self._run(FakeProvider({"Good": 0.9, "Meh": 0.1}))
-        self.assertEqual((summary["duplicate"], summary["scored"], summary["notified"]), (2, 1, 1))
+        self.assertEqual((summary["duplicate"], summary["scored"], summary["notified"]), (2, 0, 0))
+
+        # Once the cool-off has elapsed the item is scored -- never lost.
+        self.conn.execute(
+            "UPDATE candidate_items SET score_attempted_at = ?",
+            (db.ago(db.SCORE_RETRY_SECONDS + 60),),
+        )
+        summary = self._run(FakeProvider({"Good": 0.9, "Meh": 0.1}))
+        self.assertEqual((summary["duplicate"], summary["scored"], summary["notified"]), (2, 1, 0))
 
     def test_a_duplicate_reports_the_item_it_collided_with(self):
         provider = FakeProvider({"A title": 0.9})
@@ -761,6 +1292,481 @@ class PipelineTests(unittest.TestCase):
         db.upsert_interest(self.conn, an_interest(key="bogus", sources=["nope"]))
         summary = self._run(FakeProvider({"Good": 0.9, "Meh": 0.2}))
         self.assertEqual(summary["collected"], 2)
+
+    def test_deliver_sends_only_alert_type_items_immediately(self):
+        db.upsert_interest(self.conn, an_interest())
+        (interest,) = db.active_interests(self.conn)
+        alert = stored_item(self.conn, type="market_event", url="https://e.com/alert", title="Alert")
+        discovery = stored_item(self.conn, url="https://e.com/disc", title="Disc")
+        db.save_score(self.conn, a_score(alert.id, interest.id, 0.9))
+        db.save_score(self.conn, a_score(discovery.id, interest.id, 0.9))
+
+        self.assertEqual(pipeline.deliver(self.conn, CFG, dry_run=True), 1)
+        pending = [r["item_id"] for r in db.pending_notifications(self.conn)]
+        self.assertEqual(pending, [discovery.id])
+
+    def test_send_digest_sorts_by_score_and_caps_leaving_the_rest_pending(self):
+        db.upsert_interest(self.conn, an_interest())
+        (interest,) = db.active_interests(self.conn)
+        low = stored_item(self.conn, url="https://e.com/low", title="Low")
+        high = stored_item(self.conn, url="https://e.com/high", title="High")
+        db.save_score(self.conn, a_score(low.id, interest.id, 0.71))
+        db.save_score(self.conn, a_score(high.id, interest.id, 0.95))
+
+        cfg = dataclasses.replace(CFG, digest_max_items=1)
+        self.assertEqual(pipeline.send_digest(self.conn, cfg, dry_run=True), 1)
+        still_pending = {
+            db.get_item(self.conn, r["item_id"]).title for r in db.pending_notifications(self.conn)
+        }
+        self.assertEqual(still_pending, {"Low"})
+
+    def test_send_digest_never_touches_alert_items(self):
+        db.upsert_interest(self.conn, an_interest())
+        (interest,) = db.active_interests(self.conn)
+        alert = stored_item(self.conn, type="market_event", url="https://e.com/alert", title="Alert")
+        db.save_score(self.conn, a_score(alert.id, interest.id, 0.9))
+        self.assertEqual(pipeline.send_digest(self.conn, CFG, dry_run=True), 0)
+
+    def test_run_once_sources_restricts_which_collectors_run(self):
+        db.upsert_interest(self.conn, an_interest(sources=["fake", "fake2"]))
+        calls = []
+        with mock.patch.dict(
+            COLLECTORS,
+            {
+                "fake": lambda i, c, p, conn=None: calls.append("fake") or [],
+                "fake2": lambda i, c, p, conn=None: calls.append("fake2") or [],
+            },
+        ):
+            pipeline.run_once(self.conn, FakeProvider(), CFG, sources=["fake"], dry_run=True)
+        self.assertEqual(calls, ["fake"])
+
+    def test_the_cycle_score_budget_defers_the_surplus_instead_of_paying(self):
+        cfg = dataclasses.replace(CFG, max_scores_per_cycle=1)
+        provider = FakeProvider({"Good": 0.9, "Meh": 0.2})
+        with mock.patch.dict(COLLECTORS, {"fake": self._collector()}):
+            summary = pipeline.run_once(self.conn, provider, cfg, dry_run=True)
+        self.assertEqual((summary["scored"], summary["deferred"]), (1, 1))
+        self.assertEqual(len(provider.prompts), 1)
+
+        # The deferred item was stored and pre-filtered, so the next cycle's
+        # backlog pass picks it up rather than it being lost.
+        with mock.patch.dict(COLLECTORS, {"fake": self._collector()}):
+            summary = pipeline.run_once(self.conn, provider, cfg, dry_run=True)
+        self.assertEqual((summary["duplicate"], summary["scored"]), (2, 1))
+        self.assertEqual(len(provider.prompts), 2)
+
+    def test_the_backlog_pass_is_capped_by_the_same_budget(self):
+        cfg = dataclasses.replace(CFG, max_scores_per_cycle=2)
+        for n in range(5):
+            item = stored_item(self.conn, url=f"https://e.com/backlog-{n}", title="Meh")
+            db.set_prefilter(self.conn, item.id, True, "ok")
+        provider = FakeProvider({"Meh": 0.5})
+        with mock.patch.dict(COLLECTORS, {"fake": lambda i, c, p, conn=None: []}):
+            summary = pipeline.run_once(self.conn, provider, cfg, dry_run=True)
+        self.assertEqual(summary["scored"], 2)
+        self.assertEqual(len(provider.prompts), 2)
+
+    def test_run_once_records_the_funnel_and_the_provider_spend(self):
+        provider = FakeProvider({"Good": 0.9, "Meh": 0.2})
+        provider.record_usage(input_tokens=40, output_tokens=4)
+        self._run(provider)
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics["collected"], 2)
+        self.assertEqual(metrics["scored"], 2)
+        usage = self.conn.execute("SELECT * FROM llm_usage").fetchone()
+        self.assertEqual((usage["model"], usage["input_tokens"]), ("fake-1", 40))
+
+    def test_collectors_are_handed_the_connection_for_skip_checks(self):
+        seen = []
+        with mock.patch.dict(
+            COLLECTORS, {"fake": lambda i, c, p, conn=None: seen.append(conn) or []}
+        ):
+            pipeline.run_once(self.conn, FakeProvider(), CFG, dry_run=True)
+        self.assertEqual(seen, [self.conn])
+
+    # --- failed-send retry ----------------------------------------------------
+
+    def _pending_titles(self):
+        return [
+            db.get_item(self.conn, r["item_id"]).title
+            for r in db.pending_notifications(self.conn)
+        ]
+
+    def _failed_send(self):
+        """One alert whose Telegram send failed (send() returned False)."""
+        db.upsert_interest(self.conn, an_interest())
+        (interest,) = db.active_interests(self.conn)
+        alert = stored_item(self.conn, type="market_event", url="https://e.com/alert", title="Alert")
+        score_id = db.save_score(self.conn, a_score(alert.id, interest.id, 0.9))
+        with mock.patch.object(notify, "send", return_value=False):
+            self.assertEqual(pipeline.deliver(self.conn, CFG), 1)
+        return score_id
+
+    def test_a_failed_send_is_not_marked_delivered_and_retries_after_cooloff(self):
+        score_id = self._failed_send()
+        row = self.conn.execute(
+            "SELECT ok, attempts FROM notifications WHERE score_id = ?", (score_id,)
+        ).fetchone()
+        self.assertEqual((row["ok"], row["attempts"]), (0, 1))
+
+        # Fresh failure: not yet eligible, so the next cycle does not hammer it.
+        self.assertEqual(self._pending_titles(), [])
+
+        # After the cool-off it is pending again; a successful retry is final.
+        self.conn.execute(
+            "UPDATE notifications SET sent_at = ?",
+            (db.ago(db.RESEND_FAILED_AFTER_SECONDS + 60),),
+        )
+        self.assertEqual(self._pending_titles(), ["Alert"])
+        with mock.patch.object(notify, "send", return_value=True):
+            self.assertEqual(pipeline.deliver(self.conn, CFG), 1)
+        row = self.conn.execute(
+            "SELECT ok, attempts FROM notifications WHERE score_id = ?", (score_id,)
+        ).fetchone()
+        self.assertEqual((row["ok"], row["attempts"]), (1, 2))
+        self.assertEqual(self._pending_titles(), [])  # never re-sent after success
+
+    def test_a_send_that_keeps_failing_gives_up_after_the_attempt_cap(self):
+        score_id = self._failed_send()
+        for _ in range(db.MAX_SEND_ATTEMPTS - 1):
+            self.conn.execute(
+                "UPDATE notifications SET sent_at = ?",
+                (db.ago(db.RESEND_FAILED_AFTER_SECONDS + 60),),
+            )
+            self.assertEqual(self._pending_titles(), ["Alert"])
+            with mock.patch.object(notify, "send", return_value=False):
+                pipeline.deliver(self.conn, CFG)
+
+        row = self.conn.execute(
+            "SELECT ok, attempts FROM notifications WHERE score_id = ?", (score_id,)
+        ).fetchone()
+        self.assertEqual((row["ok"], row["attempts"]), (0, db.MAX_SEND_ATTEMPTS))
+        # Cap reached: even a stale failure is no longer pending.
+        self.conn.execute(
+            "UPDATE notifications SET sent_at = ?",
+            (db.ago(db.RESEND_FAILED_AFTER_SECONDS + 60),),
+        )
+        self.assertEqual(self._pending_titles(), [])
+
+
+class SchedulerTests(unittest.TestCase):
+    def _calls(self):
+        calls = []
+
+        def record(conn, provider, cfg, sources=None, dry_run=False):
+            calls.append(sources)
+            return {}
+
+        return calls, record
+
+    def test_first_tick_runs_every_collector_job(self):
+        calls, record = self._calls()
+        with mock.patch.object(scheduler, "run_once", side_effect=record), \
+             mock.patch.object(scheduler, "send_digest", return_value=0), \
+             mock.patch.object(scheduler, "_seconds_until_digest", return_value=10_000):
+            scheduler.run_forever(None, None, CFG, dry_run=True, cycles=1)
+        expected = [tuple(sources) for sources, _field in scheduler.JOBS.values()]
+        self.assertEqual(sorted(map(tuple, calls)), sorted(expected))
+
+    def test_digest_fires_only_once_its_due(self):
+        with mock.patch.object(scheduler, "run_once", return_value={}), \
+             mock.patch.object(scheduler, "send_digest", return_value=3) as send_digest, \
+             mock.patch.object(scheduler, "_seconds_until_digest", return_value=0):
+            scheduler.run_forever(None, None, CFG, dry_run=True, cycles=1)
+        send_digest.assert_called_once()
+
+    def test_a_job_not_yet_due_is_skipped_on_the_next_tick(self):
+        cfg = dataclasses.replace(
+            CFG, interval_stocks_seconds=10_000, interval_web_seconds=10_000,
+            interval_youtube_seconds=10_000,
+        )
+        calls, record = self._calls()
+        with mock.patch.object(scheduler, "run_once", side_effect=record), \
+             mock.patch.object(scheduler, "send_digest", return_value=0), \
+             mock.patch.object(scheduler, "_seconds_until_digest", return_value=10_000), \
+             mock.patch.object(scheduler, "TICK_SECONDS", 0):
+            scheduler.run_forever(None, None, cfg, dry_run=True, cycles=2)
+        # Every job ran on the first tick only -- the second tick found nothing due.
+        self.assertEqual(len(calls), len(scheduler.JOBS))
+
+
+class FeedbackListenerTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        db.upsert_interest(self.conn, an_interest())
+        (self.interest,) = db.active_interests(self.conn)
+        self.item = stored_item(self.conn)
+        self.score_id = db.save_score(self.conn, a_score(self.item.id, self.interest.id, 0.8))
+
+    def _callback(self, data):
+        return {"id": "cb1", "data": data, "message": {"chat": {"id": 123}}}
+
+    def test_a_recognized_button_records_feedback_and_acks_with_the_label(self):
+        with mock.patch.object(feedback_listener, "api_call") as api_call:
+            feedback_listener._handle_callback(self.conn, "tok", self._callback(f"fb:fire:{self.score_id}"))
+        row = self.conn.execute("SELECT * FROM feedback WHERE item_id = ?", (self.item.id,)).fetchone()
+        self.assertEqual(row["verdict"], "fire")
+        self.assertAlmostEqual(row["original_score"], 0.8)
+        self.assertEqual(row["interest_id"], self.interest.id)
+        api_call.assert_called_once_with(
+            "tok", "answerCallbackQuery",
+            {"callback_query_id": "cb1", "text": f"Recorded: {notify.FEEDBACK_VERDICTS['fire']}"},
+        )
+
+    def test_garbage_callback_data_is_acked_but_records_nothing(self):
+        with mock.patch.object(feedback_listener, "api_call") as api_call:
+            feedback_listener._handle_callback(self.conn, "tok", self._callback("not-a-real-payload"))
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 0)
+        api_call.assert_called_once_with("tok", "answerCallbackQuery", {"callback_query_id": "cb1"})
+
+    def test_a_score_id_that_no_longer_exists_is_acked_without_a_crash(self):
+        with mock.patch.object(feedback_listener, "api_call") as api_call:
+            feedback_listener._handle_callback(self.conn, "tok", self._callback("fb:up:999999"))
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 0)
+        api_call.assert_called_once()
+
+
+class FakeCDPConnection:
+    """Stands in for cdp.CDPConnection. `replies` feeds the completion calls in
+    order: a string/dict is returned as-is, an Exception is raised. Create and
+    delete calls always succeed and are recorded in `calls`."""
+
+    def __init__(self, replies):
+        self.replies = list(replies)
+        self.calls = []
+        self.closed = False
+
+    def evaluate(self, js, timeout=None, **_kw):
+        if "/completion" in js:
+            self.calls.append("completion")
+            reply = self.replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+        if "'DELETE'" in js:
+            self.calls.append("delete")
+            return True
+        self.calls.append("create")
+        return True
+
+    def close(self):
+        self.closed = True
+
+
+def completion_reply(text):
+    return json.dumps({"text": text})
+
+
+class ClaudeChatProviderTests(unittest.TestCase):
+    """The claude.ai-over-CDP provider, with the browser faked out entirely."""
+
+    SCHEMA = {
+        "type": "object",
+        "properties": {
+            "a": {"type": "number"},
+            "kind": {"type": "string", "enum": ["x", "y"]},
+        },
+        "required": ["a"],
+        "additionalProperties": False,
+    }
+
+    def _provider(self, *replies, connections=None):
+        conns = connections if connections is not None else [FakeCDPConnection(replies)]
+        remaining = list(conns)
+        self.connections = conns
+        return claude_chat.ClaudeChatProvider(
+            "claude-opus-5", org_id="org-123", port=9222,
+            connect=lambda: remaining.pop(0),
+        )
+
+    def test_registered_and_constructable_without_touching_chrome(self):
+        self.assertIn("claude_chat", PROVIDERS)
+        provider = claude_chat.ClaudeChatProvider("claude-opus-5", org_id="", port=9222)
+        self.assertEqual(provider.name, "claude_chat")  # lazy: no connection yet
+
+    def test_complete_json_parses_a_clean_reply_and_cleans_up(self):
+        provider = self._provider(completion_reply('{"a": 0.5, "kind": "x"}'))
+        data = provider.complete_json("sys", "prompt", self.SCHEMA)
+        self.assertEqual(data, {"a": 0.5, "kind": "x"})
+        (conn,) = self.connections
+        self.assertEqual(conn.calls, ["create", "completion", "delete"])
+        self.assertEqual(provider.usage["calls"], 1)
+        self.assertEqual(provider.usage["input_tokens"], 0)  # not reported, never guessed
+
+    def test_complete_json_survives_prose_and_fences_around_the_object(self):
+        provider = self._provider(
+            completion_reply('Sure! Here it is:\n```json\n{"a": 1.0}\n```\nHope that helps.')
+        )
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 1.0})
+
+    def test_a_malformed_reply_is_retried_once_then_succeeds(self):
+        provider = self._provider(
+            completion_reply("I cannot answer in JSON, sorry."),
+            completion_reply('{"a": 0.25}'),
+        )
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 0.25})
+        (conn,) = self.connections
+        self.assertEqual(conn.calls.count("completion"), 2)
+
+    def test_two_malformed_replies_fail_gracefully(self):
+        provider = self._provider(
+            completion_reply('{"wrong": true}'),   # missing required "a"
+            completion_reply('{"a": "not a number"}'),
+        )
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("attempt 2", str(ctx.exception))
+
+    def test_an_enum_violation_counts_as_malformed(self):
+        provider = self._provider(
+            completion_reply('{"a": 1, "kind": "zebra"}'),
+            completion_reply('{"a": 1, "kind": "zebra"}'),
+        )
+        with self.assertRaises(ProviderError):
+            provider.complete_json("s", "p", self.SCHEMA)
+
+    def test_search_json_returns_the_embedded_array_and_garbage_becomes_empty(self):
+        provider = self._provider(
+            completion_reply('I searched.\n[{"title": "T", "url": "https://e.com"}]\nDone.'),
+            completion_reply("no array here at all"),
+        )
+        self.assertEqual(
+            provider.search_json("find things"),
+            [{"title": "T", "url": "https://e.com"}],
+        )
+        self.assertEqual(provider.search_json("find things"), [])
+
+    def test_missing_org_id_is_a_clean_provider_error(self):
+        provider = claude_chat.ClaudeChatProvider("claude-opus-5", org_id="", port=9222)
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("CLAUDE_ORG_ID", str(ctx.exception))
+
+    def test_no_chrome_endpoint_is_a_clean_provider_error(self):
+        provider = claude_chat.ClaudeChatProvider("claude-opus-5", org_id="org", port=9222)
+        with mock.patch.object(
+            claude_chat.cdp, "find_claude_tab", side_effect=ConnectionRefusedError("refused")
+        ):
+            with self.assertRaises(ProviderError) as ctx:
+                provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("Chrome DevTools endpoint", str(ctx.exception))
+
+    def test_no_claude_tab_is_a_clean_provider_error(self):
+        provider = claude_chat.ClaudeChatProvider("claude-opus-5", org_id="org", port=9222)
+        with mock.patch.object(claude_chat.cdp, "find_claude_tab", return_value=None):
+            with self.assertRaises(ProviderError) as ctx:
+                provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("claude.ai tab", str(ctx.exception))
+
+    def test_a_js_exception_in_the_tab_is_a_provider_error_not_a_crash(self):
+        provider = self._provider(RuntimeError("JS exception: completion HTTP 429"))
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("HTTP 429", str(ctx.exception))
+
+    def test_a_dropped_connection_reconnects_once_and_recovers(self):
+        dead = FakeCDPConnection([ConnectionError("websocket closed")])
+        alive = FakeCDPConnection([completion_reply('{"a": 0.75}')])
+        provider = self._provider(connections=[dead, alive])
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 0.75})
+        self.assertTrue(dead.closed)   # reset closed the dead connection
+        self.assertFalse(alive.closed)
+
+    def test_a_connection_that_keeps_dropping_fails_gracefully(self):
+        dead1 = FakeCDPConnection([ConnectionError("closed")])
+        dead2 = FakeCDPConnection([ConnectionError("closed again")])
+        provider = self._provider(connections=[dead1, dead2])
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("twice", str(ctx.exception))
+
+    def test_a_null_completion_result_blames_the_tab(self):
+        # conn.evaluate hands back Python None when the tab's JS context was
+        # torn down mid-request (navigation/reload) -- no exception raised.
+        provider = self._provider(None)
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("no text", str(ctx.exception))
+
+    def test_a_dict_reply_from_cdp_is_accepted_as_is(self):
+        # Some Chrome/CDP combinations hand back the JS return value already
+        # deserialized (same quirk council_bot.parse_completion_result handles).
+        provider = self._provider({"text": '{"a": 2}'})
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 2})
+
+
+class SchemaContractTests(unittest.TestCase):
+    def test_every_structured_output_schema_forbids_extra_properties(self):
+        """The live structured-outputs API requires additionalProperties: false
+        on every object -- a schema without it 400s on the first real call."""
+        from discovery.collectors import stocks as stocks_module, web as web_module
+
+        for schema in (scoring.SCORE_SCHEMA, web_module.QUERY_SCHEMA,
+                       stocks_module.EXPLAIN_SCHEMA):
+            self.assertIs(schema.get("additionalProperties"), False, schema)
+
+
+class CLITests(unittest.TestCase):
+    """Config mistakes surface as clean exit codes, not tracebacks."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = os.path.join(self.tmp.name, "t.db")
+
+    def _main(self, *argv, env=None):
+        import contextlib
+        import io
+
+        from discovery.__main__ import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env or {}), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(["--db", self.db_path, *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def _interests_file(self, content):
+        path = os.path.join(self.tmp.name, "interests.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write(content)
+        return path
+
+    def test_init_with_a_malformed_interests_file_exits_cleanly(self):
+        path = self._interests_file("{ not json")
+        code, _out, err = self._main("init", env={"DISCOVERY_INTERESTS": path})
+        self.assertEqual(code, 2)
+        self.assertIn("malformed interests file", err)
+
+    def test_init_with_an_entry_missing_its_key_exits_cleanly(self):
+        path = self._interests_file('{"interests": [{"title": "no key"}]}')
+        code, _out, err = self._main("init", env={"DISCOVERY_INTERESTS": path})
+        self.assertEqual(code, 2)
+        self.assertIn("malformed interests file", err)
+
+    def test_init_with_a_missing_interests_file_exits_cleanly(self):
+        missing = os.path.join(self.tmp.name, "nope.json")
+        code, _out, err = self._main("init", env={"DISCOVERY_INTERESTS": missing})
+        self.assertEqual(code, 2)
+        self.assertIn("not found", err)
+
+    def test_feedback_on_an_unknown_item_exits_cleanly(self):
+        code, _out, err = self._main("feedback", "999", "up")
+        self.assertEqual(code, 2)
+        self.assertIn("no item with id 999", err)
+
+    def test_an_unknown_provider_is_a_config_error_not_a_traceback(self):
+        path = self._interests_file(
+            '{"interests": [{"key": "x", "title": "X", "sources": ["web_search"]}]}'
+        )
+        self._main("init", env={"DISCOVERY_INTERESTS": path})
+        code, _out, err = self._main(
+            "--provider", "bogus", "score", "--url", "https://e.com/a", "--title", "T",
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("unknown provider 'bogus'", err)
 
 
 if __name__ == "__main__":

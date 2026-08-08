@@ -23,7 +23,10 @@ from . import db, dedup, matching, normalize, notify, scoring
 from .collectors import COLLECTORS
 from .models import CandidateItem, ScoreResult
 
-STAGES = ("collected", "duplicate", "filtered", "already_scored", "scored", "errors", "notified")
+STAGES = (
+    "collected", "duplicate", "filtered", "already_scored",
+    "scored", "deferred", "errors", "notified",
+)
 
 
 @dataclass
@@ -58,36 +61,71 @@ class Outcome:
         }
 
 
-def run_once(conn, provider, cfg, dry_run=False):
-    """One full cycle over every active interest. Returns a counts summary."""
+def run_once(conn, provider, cfg, sources=None, dry_run=False):
+    """One full cycle over every active interest. `sources`, if given,
+    restricts collection to those collector names (scheduler.py's per-job
+    cadence, or `run-once --source`) -- an interest that doesn't list a given
+    source in its own `sources` still skips it. Returns a counts summary.
+
+    At most `cfg.max_scores_per_cycle` items are scored. Past that the cycle
+    keeps collecting and filtering but stops paying: the surplus is stored
+    unscored and picked up by _score_backlog() next cycle, so a collector that
+    suddenly returns hundreds of candidates costs one cycle's budget, not
+    hundreds of LLM calls.
+
+    Always ends by delivering ALERT-type notifications immediately; DISCOVERY
+    ones are left pending for send_digest() to batch."""
     interests = db.active_interests(conn)
     counts = Counter()
+    budget = Budget(cfg.max_scores_per_cycle)
 
     for interest in interests:
-        for item in _collect(interest, cfg, provider):
+        for item in _collect(conn, interest, cfg, provider, sources):
             counts["collected"] += 1
-            outcome = ingest(conn, provider, cfg, item, interests, origin_interest=interest.key)
+            outcome = ingest(
+                conn, provider, cfg, item, interests,
+                origin_interest=interest.key, budget=budget,
+            )
             counts[outcome.stage] += 1
 
     # Items stored on an earlier cycle that passed the filter but never got a
-    # score (the run died, the API was down): pick them up before spending on
-    # anything new.
-    counts["scored"] += _score_backlog(conn, provider, cfg, interests)
+    # score (the run died, the API was down, the budget ran out) -- scored with
+    # whatever budget this cycle's own candidates left over.
+    counts["scored"] += _score_backlog(conn, provider, interests, budget)
     counts["notified"] = deliver(conn, cfg, dry_run)
+    db.bump(conn, counts)
+    db.record_usage(conn, provider)   # per cycle, so `run` reports without exiting
     return {stage: counts[stage] for stage in STAGES}
+
+
+class Budget:
+    """How many more LLM scores this cycle may pay for. A plain counter rather
+    than a rate limiter -- the cap only has to be per-cycle, because anything
+    it defers is already durable and gets scored on the next one."""
+
+    def __init__(self, limit):
+        self.remaining = limit
+
+    def spend(self):
+        if self.remaining <= 0:
+            return False
+        self.remaining -= 1
+        return True
 
 
 # --- stage 1: collect --------------------------------------------------------
 
-def _collect(interest, cfg, provider):
+def _collect(conn, interest, cfg, provider, sources=None):
     items = []
     for source in interest.sources:
+        if sources is not None and source not in sources:
+            continue
         collect = COLLECTORS.get(source)
         if collect is None:
             print(f"{interest.key}: unknown source '{source}'", file=sys.stderr)
             continue
         try:
-            items.extend(collect(interest, cfg, provider))
+            items.extend(collect(interest, cfg, provider, conn))
         except Exception as e:  # noqa: BLE001
             print(f"{interest.key}/{source}: collect failed: {e}", file=sys.stderr)
     return items
@@ -95,7 +133,7 @@ def _collect(interest, cfg, provider):
 
 # --- stages 2-7: one candidate through the chain -----------------------------
 
-def ingest(conn, provider, cfg, item, interests, origin_interest=None, force=False):
+def ingest(conn, provider, cfg, item, interests, origin_interest=None, force=False, budget=None):
     """Normalize, dedup, persist, match, filter, score. Returns an Outcome."""
     normalize.normalize(item, origin_interest)
 
@@ -117,6 +155,9 @@ def ingest(conn, provider, cfg, item, interests, origin_interest=None, force=Fal
             return Outcome("already_scored", item, "scored on an earlier run", matches)
         db.delete_score(conn, item.id)
 
+    if budget is not None and not budget.spend():
+        return Outcome("deferred", item, "cycle score budget spent", matches)
+
     return _score(conn, provider, item, matches, reason)
 
 
@@ -126,19 +167,31 @@ def _score(conn, provider, item, matches, detail=""):
         score = scoring.score_candidate(provider, item, matches, feedback)
     except Exception as e:  # noqa: BLE001
         print(f"scoring item {item.id} failed: {e}", file=sys.stderr)
+        # Stamp the failure so _score_backlog() waits out a cool-off instead
+        # of re-failing this item on every cycle while the provider is down.
+        db.mark_score_attempt(conn, item.id)
         return Outcome("errors", item, str(e), matches)
     db.save_score(conn, score)
     return Outcome("scored", item, detail, matches, score)
 
 
-def _score_backlog(conn, provider, cfg, interests):
+def _score_backlog(conn, provider, interests, budget):
+    """Newest first and capped by whatever budget the cycle has left. Without
+    the cap a persistent scoring failure would re-attempt every unscored item
+    ever stored, on every cycle, forever. Items whose last scoring attempt
+    failed recently are skipped until the cool-off passes (never dropped) --
+    a provider outage otherwise re-fails the whole backlog every cycle."""
+    if budget.remaining <= 0:
+        return 0
     rows = conn.execute(
         """
         SELECT id FROM candidate_items
         WHERE prefilter_ok = 1
           AND NOT EXISTS (SELECT 1 FROM scores s WHERE s.item_id = candidate_items.id)
-        ORDER BY id
-        """
+          AND (score_attempted_at IS NULL OR score_attempted_at < ?)
+        ORDER BY id DESC LIMIT ?
+        """,
+        (db.ago(db.SCORE_RETRY_SECONDS), budget.remaining),
     ).fetchall()
     scored = 0
     for row in rows:
@@ -146,6 +199,8 @@ def _score_backlog(conn, provider, cfg, interests):
         matches = matching.match_interests(item, interests)
         if not matches:
             continue
+        if not budget.spend():
+            break
         if _score(conn, provider, item, matches).stage == "scored":
             scored += 1
     return scored
@@ -159,12 +214,11 @@ def notification_ready(conn):
     The threshold lives in SQL (`final_score >= interests.min_score`) so a
     lowered bar picks up items scored under the old one automatically.
     """
+    by_id = {i.id: i for i in db.active_interests(conn)}
     ready = []
     for row in db.pending_notifications(conn):
         item = db.get_item(conn, row["item_id"])
-        interest = next(
-            (i for i in db.active_interests(conn) if i.id == row["interest_id"]), None
-        )
+        interest = by_id.get(row["interest_id"])
         if item is None or interest is None:
             continue
         ready.append((row, item, interest))
@@ -172,19 +226,43 @@ def notification_ready(conn):
 
 
 def deliver(conn, cfg, dry_run=False):
+    """ALERT-type items only, sent the moment they clear the bar. DISCOVERY
+    items are left pending -- send_digest() is what clears those."""
     sent = 0
     for row, item, interest in notification_ready(conn):
-        text = notify.format_message(
-            interest,
-            item,
-            row["final_score"],
-            row["reason"],
-            row["why_better_than_generic"],
-            row["confidence"],
-        )
-        ok = notify.send(cfg, text, dry_run=dry_run)
-        # Recorded either way: a failed send stays recorded as not-ok rather
-        # than being retried forever on every cycle.
-        db.record_notification(conn, row["score_id"], "telegram", ok)
-        sent += 1
+        if not notify.is_alert(item):
+            continue
+        sent += _send_one(conn, cfg, row, item, interest, dry_run)
     return sent
+
+
+def send_digest(conn, cfg, dry_run=False):
+    """DISCOVERY items only, sorted by final_score (already
+    notification_ready()'s order), capped at cfg.digest_max_items. Anything
+    past the cap simply stays pending for tomorrow's digest -- it was never
+    marked notified. Alerts are never touched here; deliver() already sent
+    them."""
+    sent = 0
+    for row, item, interest in notification_ready(conn):
+        if notify.is_alert(item):
+            continue
+        if sent >= cfg.digest_max_items:
+            break
+        sent += _send_one(conn, cfg, row, item, interest, dry_run)
+    return sent
+
+
+def _send_one(conn, cfg, row, item, interest, dry_run):
+    text = notify.format_message(
+        interest,
+        item,
+        row["final_score"],
+        row["reason"],
+        row["why_better_than_generic"],
+        row["confidence"],
+    )
+    ok = notify.send(cfg, text, reply_markup=notify.feedback_keyboard(row["score_id"]), dry_run=dry_run)
+    # Recorded either way: a failed send stays recorded as not-ok rather
+    # than being retried forever on every cycle.
+    db.record_notification(conn, row["score_id"], "telegram", ok)
+    return 1

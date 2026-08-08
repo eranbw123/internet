@@ -17,7 +17,7 @@ class OpenAIProvider(LLMProvider):
             client = openai.OpenAI()
         self.client = client
 
-    def complete_json(self, system, prompt, schema, max_tokens=2000):
+    def complete_json(self, system, prompt, schema, max_tokens=8000):
         response = self.client.chat.completions.create(
             model=self.model,
             max_completion_tokens=max_tokens,
@@ -29,6 +29,11 @@ class OpenAIProvider(LLMProvider):
                 "type": "json_schema",
                 "json_schema": {"name": "result", "schema": schema, "strict": True},
             },
+        )
+        usage = getattr(response, "usage", None)
+        self.record_usage(
+            input_tokens=getattr(usage, "prompt_tokens", 0) if usage else 0,
+            output_tokens=getattr(usage, "completion_tokens", 0) if usage else 0,
         )
         return parse_json_object(response.choices[0].message.content)
 

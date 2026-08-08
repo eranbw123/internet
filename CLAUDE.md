@@ -22,17 +22,20 @@ CLAUDE.md + PROJECT_STATE.md are the authoritative starting context and are alre
 - Python 3.14; run from repo root — `discovery` imports `watch`.
 - `watch.py` stays stdlib-only.
 - SQLite (`discovery.db`) is the discovery engine's only store.
-- Vendor SDKs belong only in `discovery/providers/`; provider and model come from `DISCOVERY_PROVIDER` / `DISCOVERY_MODEL` (default `anthropic` + `claude-opus-5`).
+- Vendor SDKs belong only in `discovery/providers/`; provider and model come from `DISCOVERY_PROVIDER` / `DISCOVERY_MODEL` (default `claude_chat` + `claude-opus-5` — claude.ai via an authenticated Chrome tab over CDP, no API key; `anthropic` is the opt-in direct-API path).
 - Secrets come from environment / `.env`; never hardcode them.
 
 ## Discovery
 
 - Provider boundary is `LLMProvider` (`complete_json` / `search_json`); a missing capability raises `UnsupportedCapability` and is skipped.
-- Collector interface: `collect(interest, cfg, provider) -> list[CandidateItem]`, registered in `discovery/collectors/__init__.py`.
+- Collector interface: `collect(interest, cfg, provider, conn=None) -> list[CandidateItem]`, registered in `discovery/collectors/__init__.py`. `conn` is read-only, only for `db.seen_dedup_keys` skip checks.
 - Collectors fetch/shape only; normalization, dedup, relevance, scoring, and notification belong downstream.
 - Pipeline remains explicit and resumable; persist decisions so work is not repeated.
+- Never pay an LLM/API call for a candidate dedup will discard; check before spending, not after.
+- Every LLM call is bounded: per-cycle score budget, per-source item caps.
 - The model rates; code ranks.
 - Failures are isolated and skipped rather than killing the cycle.
+- Anything needed to judge whether the system is working goes through `stats.py`; counters are written as the pipeline runs.
 
 ## watch.py
 

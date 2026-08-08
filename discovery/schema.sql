@@ -35,6 +35,10 @@ CREATE TABLE IF NOT EXISTS candidate_items (
     -- sent to the LLM on a later cycle. NULL = not filtered yet.
     prefilter_ok     INTEGER,
     prefilter_reason TEXT,
+    -- Last time an LLM scoring attempt failed for this item. The backlog
+    -- rescorer skips items attempted within SCORE_RETRY_SECONDS (db.py) so a
+    -- provider outage doesn't re-fail the same items every cycle.
+    score_attempted_at TEXT,
     first_seen_at    TEXT NOT NULL,
     -- One row per distinct thing a collector saw. A stock move recurs daily,
     -- so the stocks collector puts the date in dedup_key; everything else
@@ -86,17 +90,48 @@ CREATE TABLE IF NOT EXISTS notifications (
     id        INTEGER PRIMARY KEY,
     score_id  INTEGER NOT NULL UNIQUE REFERENCES scores(id),
     channel   TEXT NOT NULL,
-    sent_at   TEXT NOT NULL,
-    ok        INTEGER NOT NULL
+    sent_at   TEXT NOT NULL,             -- time of the latest attempt
+    ok        INTEGER NOT NULL,
+    -- Send attempts so far. A failed send (ok=0) stays eligible for retry --
+    -- after a cool-off, up to MAX_SEND_ATTEMPTS (see db.py) -- instead of
+    -- being silently consumed; a success (ok=1) is final either way.
+    attempts  INTEGER NOT NULL DEFAULT 1
 );
 
 CREATE TABLE IF NOT EXISTS feedback (
-    id           INTEGER PRIMARY KEY,
-    item_id      INTEGER NOT NULL REFERENCES candidate_items(id),
-    interest_id  INTEGER REFERENCES interests(id),
-    verdict      TEXT NOT NULL,                     -- 'up' | 'down'
-    note         TEXT NOT NULL DEFAULT '',
-    created_at   TEXT NOT NULL
+    id              INTEGER PRIMARY KEY,
+    item_id         INTEGER NOT NULL REFERENCES candidate_items(id),
+    interest_id     INTEGER REFERENCES interests(id),
+    verdict         TEXT NOT NULL,                  -- 'fire' | 'up' | 'down' | 'trash'
+    note            TEXT NOT NULL DEFAULT '',
+    -- scores.final_score at the moment feedback was given, so a later
+    -- re-score (or a ranking-formula change) doesn't retroactively change
+    -- what the user was actually reacting to.
+    original_score  REAL,
+    created_at      TEXT NOT NULL
+);
+
+-- Funnel counters, one row per (day, stage). Stages that end an item's life
+-- (duplicate, filtered) leave no row in candidate_items, so the funnel cannot
+-- be reconstructed from the other tables -- hence counting it as it happens.
+CREATE TABLE IF NOT EXISTS metrics (
+    day    TEXT NOT NULL,
+    name   TEXT NOT NULL,
+    count  INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, name)
+);
+
+-- Token spend, per day and model, so `stats` can price a week's run. Written
+-- from the provider's in-process counters at the end of each command.
+CREATE TABLE IF NOT EXISTS llm_usage (
+    day            TEXT NOT NULL,
+    provider       TEXT NOT NULL,
+    model          TEXT NOT NULL,
+    calls          INTEGER NOT NULL DEFAULT 0,
+    input_tokens   INTEGER NOT NULL DEFAULT 0,
+    output_tokens  INTEGER NOT NULL DEFAULT 0,
+    web_searches   INTEGER NOT NULL DEFAULT 0,
+    PRIMARY KEY (day, provider, model)
 );
 
 CREATE INDEX IF NOT EXISTS idx_scores_interest ON scores(interest_id, final_score);

@@ -134,12 +134,20 @@ def _interest_block(interest, match_score):
     )
 
 
+_VERDICT_PHRASING = {
+    "fire": "loved",
+    "up": "liked",
+    "down": "disliked",
+    "trash": "rejected as a bad match",
+}
+
+
 def _feedback_block(feedback):
     """Past verdicts, as worked examples. Empty until the user rates something."""
     if not feedback:
         return ""
     lines = [
-        f"- {'liked' if row['verdict'] == 'up' else 'rejected'}: {row['title']}"
+        f"- {_VERDICT_PHRASING.get(row['verdict'], row['verdict'])}: {row['title']}"
         + (f" ({row['note']})" if row["note"] else "")
         for row in feedback
     ]

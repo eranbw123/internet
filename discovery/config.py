@@ -11,7 +11,7 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Per-provider default, so switching DISCOVERY_PROVIDER alone gives a sane model.
-DEFAULT_MODELS = {"anthropic": "claude-opus-5", "openai": "gpt-5"}
+DEFAULT_MODELS = {"claude_chat": "claude-opus-5", "anthropic": "claude-opus-5", "openai": "gpt-5"}
 
 
 @dataclass
@@ -21,11 +21,18 @@ class Config:
     provider: str
     model: str
     max_items_per_source: int
-    interval_seconds: int
     min_match_score: float      # pre-filter: weakest interest match worth scoring
     min_text_chars: int         # pre-filter: least text worth sending to an LLM
     telegram_bot_token: str
     telegram_chat_id: str
+    youtube_api_key: str = ""   # YouTube Data API v3 key; only the youtube collector needs it
+    max_scores_per_cycle: int = 25   # hard ceiling on LLM scoring calls per run_once()
+    # Per-job schedule (see scheduler.py).
+    interval_stocks_seconds: int = 3600
+    interval_web_seconds: int = 4 * 3600
+    interval_youtube_seconds: int = 4 * 3600
+    digest_time: str = "08:00"      # local HH:MM, once per day
+    digest_max_items: int = 10      # Discovery items per digest; Alerts are unbounded and immediate
 
 
 def load():
@@ -34,7 +41,7 @@ def load():
     from watch import load_dotenv
 
     load_dotenv(str(REPO_ROOT / ".env"))
-    provider = os.environ.get("DISCOVERY_PROVIDER", "anthropic")
+    provider = os.environ.get("DISCOVERY_PROVIDER", "claude_chat")
     return Config(
         db_path=os.environ.get("DISCOVERY_DB", str(REPO_ROOT / "discovery.db")),
         interests_path=os.environ.get(
@@ -43,9 +50,15 @@ def load():
         provider=provider,
         model=os.environ.get("DISCOVERY_MODEL", DEFAULT_MODELS.get(provider, "")),
         max_items_per_source=int(os.environ.get("DISCOVERY_MAX_ITEMS", "8")),
-        interval_seconds=int(os.environ.get("DISCOVERY_INTERVAL", "3600")),
         min_match_score=float(os.environ.get("DISCOVERY_MIN_MATCH", "0.25")),
         min_text_chars=int(os.environ.get("DISCOVERY_MIN_TEXT_CHARS", "120")),
         telegram_bot_token=os.environ.get("TELEGRAM_BOT_TOKEN", ""),
         telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
+        youtube_api_key=os.environ.get("YOUTUBE_API_KEY", ""),
+        max_scores_per_cycle=int(os.environ.get("DISCOVERY_MAX_SCORES", "25")),
+        interval_stocks_seconds=int(os.environ.get("DISCOVERY_INTERVAL_STOCKS", "3600")),
+        interval_web_seconds=int(os.environ.get("DISCOVERY_INTERVAL_WEB", str(4 * 3600))),
+        interval_youtube_seconds=int(os.environ.get("DISCOVERY_INTERVAL_YOUTUBE", str(4 * 3600))),
+        digest_time=os.environ.get("DISCOVERY_DIGEST_TIME", "08:00"),
+        digest_max_items=int(os.environ.get("DISCOVERY_DIGEST_MAX", "10")),
     )

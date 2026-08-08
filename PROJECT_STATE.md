@@ -1,87 +1,91 @@
 # PROJECT_STATE.md — `internet`
 
-Updated 2026-08-07. Imported by `CLAUDE.md`; maintained under its startup and
-token-efficiency rules. Current state only — not a log, not an architecture doc.
+Updated 2026-08-08 (claude_chat migration + live smoke). Imported by
+`CLAUDE.md`. Current state only — not a log.
+
+## claude_chat migration (2026-08-08)
+Default provider is now `claude_chat` (`discovery/providers/claude_chat.py`):
+claude.ai driven inside an authenticated Chrome tab over CDP — no
+`ANTHROPIC_API_KEY`. Pattern reused from `../ai`'s `council_bot.py` browser
+backend; `discovery/providers/cdp.py` is vendored verbatim from `../ai/cdp.py`
+(keep in sync). Needs Chrome `--remote-debugging-port=9222` (+ logged-in
+claude.ai tab) and `CLAUDE_ORG_ID` in `.env`. `anthropic` (direct API) and
+`openai` remain opt-in; `anthropic` SDK line commented out in requirements.
+- No structured outputs on claude.ai: `complete_json` prompts for strict JSON,
+  slices first `{`…last `}`, validates required/type/enum against the caller's
+  schema, retries once. `search_json` enables claude.ai's `web_search_v0` tool;
+  `max_searches` is a prompt instruction, not a hard cap.
+- One scratch conversation per call (create → completion SSE → delete);
+  dropped CDP connection reconnects once. Missing org id / Chrome / tab are
+  clean ProviderErrors.
+- No token metering on this transport: usage records calls only; `stats`
+  reports claude_chat as subscription-covered, never a dollar figure (mixed
+  API-billed rows still get totalled).
+
+## Fixed in this pass (former known issues)
+- Failed Telegram sends are no longer consumed: `notifications.attempts`
+  column; retry after 15-min cool-off, max 3 attempts (`db.MAX_SEND_ATTEMPTS`),
+  success final, no duplicates. `pending_notifications` encodes the policy.
+- Backlog rescore backoff: `candidate_items.score_attempted_at` stamped on
+  scoring failure; backlog skips items attempted within 30 min
+  (`db.SCORE_RETRY_SECONDS`). Never lost, just paced.
+- Both columns added via guarded `ALTER TABLE` in `db.init` (schema.sql stays
+  CREATE-IF-NOT-EXISTS-only).
+
+## Verification (2026-08-08)
+- 135 offline tests (`test_discovery.py`, +18: ClaudeChatProviderTests, retry/
+  backoff, stats), 20 (`test_watch.py`).
+- 41/41-check E2E simulation rerun with the REAL ClaudeChatProvider over a
+  scripted fake CDP connection: full funnel, alert + digest, Telegram-outage
+  retry, backlog cool-off, feedback, stats, idempotent cycles, dead-provider
+  isolation.
+- LIVE smoke via real claude.ai session: contrast scoring — narcolepsy strong
+  0.76 vs generic sleep-hygiene 0.03; NBIS material deal 0.85 vs generic AI
+  commentary 0.05; behavioral research 0.78 vs dating advice 0.03. Live
+  `discover web` cycle: query-gen → real web search → 2 current items scored
+  (0.65 FDA approval, 0.46 year-old recap). Scorer is directionally sane.
+- Note: over-specific generated queries + short recency windows legitimately
+  return `[]`; widen `recency_days`/`num_queries` per interest if a cycle
+  finds nothing.
 
 ## Implemented
-- **`watch.py`** — watchlist price alerter, complete and working. 20 tests pass.
-- **`discovery/`** — staged pipeline (collect → normalize → dedup → persist →
-  match → pre-filter → LLM score → threshold → notify), 0–1 dimension scoring,
-  provider abstraction. The rewrite is **finished**: the repo runs, and
-  `python test_discovery.py` passes 59 tests.
-- **`app/`** — thin alias package; `python -m app …` == `python -m discovery …`.
-- **`discovery/collectors/web.py`** — generic web discovery collector
-  (registered as `"web"`, distinct from `web_search`): one `complete_json`
-  call turns an interest's description/positive_signals into a few query
-  variations, then one `search_json` call per query, scoped by a
-  `source_config["web"]` recency window. `metadata["query"]` on each
-  `CandidateItem` records which query found it. `python -m app discover web`
-  runs it across every active interest and prints candidates + scores
-  (dedup/prefilter/scoring included) without ever calling `deliver()`.
+- `watch.py` — watchlist price alerter, complete; live Yahoo path verified.
+- `discovery/` — staged pipeline, 0–1 dimension scoring, provider abstraction
+  (`claude_chat`/`anthropic`/`openai`), score budget, backlog rescore w/
+  backoff, funnel + llm_usage metrics, `stats.py`.
+- Collectors: `web_search`, `web` (LLM query-gen), `stocks` (daily/weekly
+  thresholds, search+grade catalyst — confirmed/plausible/none), `youtube`.
+  Collectors take read-only `conn` for skip-before-spend.
+- Telegram: ALERT immediate vs DISCOVERY digest; feedback buttons →
+  `feedback_listener`; failed sends retried (see above).
+- Scheduler: 60s tick loop; per-job cadences + daily digest.
 
 ## Non-obvious decisions
-- `final_score` is computed in code from `models.WEIGHTS`, never returned by the
-  model; `specificity` is scored and stored but deliberately unweighted so
-  ranking can change without re-scoring.
-- One score row per item (`UNIQUE(item_id)`): the scorer picks the most relevant
-  interest itself from the shortlist `matching.py` supplies.
-- Dedup is three layers — canonical-URL hash, title hash, content hash (only for
-  bodies ≥ 200 chars) — checked *before* insert; `(source, dedup_key)` is the
-  in-collector backstop.
-- Pre-filter verdicts persist on `candidate_items.prefilter_ok/_reason`, so a
-  rejected item is never re-filtered or re-sent to an LLM.
-- `__main__.py` builds the provider **lazily** — `init`/`items`/`feedback` must
-  work without an API key.
-- `ingest(..., force=…)` bypasses dedup and an existing score, but *not* the
-  pre-filter. `score --item-id` reaches `already_scored` because an item that
-  carries its own id is excluded from its own dedup lookup.
-- `interests.load_file` divides any `min_score > 1` by 100 — the 0–100 scale is
-  gone, and a stale `75` would otherwise silently mean "never notify".
-- `discovery` imports `watch` (dotenv loader, Yahoo fetch) — **only resolves
-  when run from the repo root**.
-- `watch.py`'s `SCHEDULES` counts lookback in trading bars, not calendar time.
-- The threshold is applied in SQL, not Python: `db.py` selects
-  `WHERE s.final_score >= n.min_score`, both on the 0–1 scale.
-- `run-once --dry-run` runs the whole cycle — collect, score, persist — and
-  skips only the pushes. It still calls the live LLM provider, so it is not a
-  zero-cost rehearsal.
-
-## Adding a collector (the recurring task — no file reads needed)
-Three files: `discovery/collectors/<name>.py` with
-`collect(interest, cfg, provider) -> list[CandidateItem]`; one line in
-`discovery/collectors/__init__.py`'s `COLLECTORS` dict (`"web_search"`,
-`"youtube"`, `"stocks"` → each module's `collect`); a test in
-`test_discovery.py` with a fake provider. `CandidateItem` (`discovery/models.py`)
-is a dataclass: required `source, type, title, url`; optional `text, author,
-published_at, metadata, dedup_key, origin_interest`. `url_hash`/`title_hash`/
-`content_hash`/`id` are filled in later by `normalize.py` — a collector leaves
-them unset.
+- `final_score` computed in code from `models.WEIGHTS`; one score row per item.
+- Dedup: URL/title/content hashes + `(source, dedup_key)`; prefilter persists.
+- Threshold in SQL (`final_score >= interests.min_score`).
+- Provider built lazily; `init`/`items`/`feedback`/`stats` need no session/key.
+- Run from repo root — `discovery` imports `watch`. CLI global flags before
+  the subcommand.
 
 ## Known issues
-- **Nothing in `discovery/` has ever run against a live API** — every run so far
-  used a fake provider. First live run is the real smoke test.
-- `youtube` collector is a stub returning `[]`.
-- `web_search` needs the `anthropic` provider; the openai one raises
-  `UnsupportedCapability` and that collector is skipped.
-- No `watchlist-*` scheduled tasks registered on this machine.
-
-## Uncommitted (branch `main`, dirty)
-Modified: `.env.example`, `.gitignore`, `README.md`, `requirements.txt`.
-Untracked — i.e. the whole discovery engine has never been committed:
-`discovery/`, `app/`, `interests.json`, `test_discovery.py`, `CLAUDE.md`,
-`PROJECT_STATE.md`.
+- claude.ai endpoints are internal/undocumented — payload shapes can drift;
+  heavy automated use sits uneasily with claude.ai ToS (volume bounded by
+  `DISCOVERY_MAX_SCORES`). Live Telegram delivery and YouTube still unverified
+  (no creds in `.env`).
 
 ## Next task
-1. Branch off `main`, commit the discovery engine, open a PR. Nothing is
-   committed yet.
-2. First live run: `.env` with a real `ANTHROPIC_API_KEY`, then
-   `python -m app score --url … --title … --text …` on one known-good article
-   before letting `run-once` loose on the API.
+1. Branch, commit everything (nothing committed yet), open a PR.
+2. Add Telegram creds and let `run` cycle for a few days; then `stats --days 7`.
 
 ## Commands to continue
 ```bash
+# once per boot: chrome --remote-debugging-port=9222  (+ log into claude.ai)
 python test_discovery.py && python test_watch.py
 python -m app init
 python -m app score --url https://example.com/x --title "..." --text "..."
-python -m app run-once --dry-run
+python -m app --dry-run run-once
+python -m app run      # scheduler
+python -m app listen   # Telegram feedback buttons (separate process)
+python -m app stats --days 7
 ```

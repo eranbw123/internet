@@ -14,7 +14,7 @@ class AnthropicProvider(LLMProvider):
             client = anthropic.Anthropic()
         self.client = client
 
-    def complete_json(self, system, prompt, schema, max_tokens=2000):
+    def complete_json(self, system, prompt, schema, max_tokens=8000):
         response = self.client.messages.create(
             model=self.model,
             max_tokens=max_tokens,
@@ -25,9 +25,10 @@ class AnthropicProvider(LLMProvider):
             },
             messages=[{"role": "user", "content": prompt}],
         )
+        self._record(response)
         return parse_json_object(_text(_finished(response)))
 
-    def search_json(self, prompt, max_searches=5, max_tokens=8000):
+    def search_json(self, prompt, max_searches=5, max_tokens=16000):
         response = self.client.messages.create(
             model=self.model,
             max_tokens=max_tokens,
@@ -36,7 +37,21 @@ class AnthropicProvider(LLMProvider):
             ],
             messages=[{"role": "user", "content": prompt}],
         )
+        self._record(response)
         return parse_json_array(_text(response))
+
+    def _record(self, response):
+        """Server-side web searches are billed per request, separately from
+        tokens, so they are counted separately too (see stats.py)."""
+        usage = getattr(response, "usage", None)
+        if usage is None:
+            return
+        server_tools = getattr(usage, "server_tool_use", None)
+        self.record_usage(
+            input_tokens=getattr(usage, "input_tokens", 0),
+            output_tokens=getattr(usage, "output_tokens", 0),
+            web_searches=getattr(server_tools, "web_search_requests", 0) if server_tools else 0,
+        )
 
 
 def _finished(response):

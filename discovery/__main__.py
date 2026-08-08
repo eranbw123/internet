@@ -3,37 +3,50 @@
 `python -m app <command>` is the same CLI under a shorter name.
 
     init          create/upgrade discovery.db and load interests.json
-    run-once      one collect -> score -> notify cycle
-    run           the same, on a loop (--interval seconds)
+    run-once      one collect -> score -> notify cycle (--source to limit
+                  collection to one collector; Alerts still send immediately,
+                  Discovery items still just queue for `digest`)
+    run           the same, on a loop -- stocks/web/youtube each on their own
+                  cadence plus a daily digest (see scheduler.py)
     discover      run one collector across all active interests, print
                   candidates and scores, never sends (e.g. `discover web`)
     score         push one candidate through the pipeline and print the verdict
+    digest        send the pending Discovery digest now (Alerts are unaffected)
+    listen        long-poll Telegram for feedback-button presses (blocking)
     items         list recently scored items
-    feedback      record a thumbs up/down on an item, by item id
+    feedback      record feedback on an item, by item id
+    stats         funnel, feedback and cost over a trailing window
 """
 import argparse
 import json
 import sys
+from collections import Counter
 
-from . import config, db, interests, providers, scheduler
+from . import config, db, feedback_listener, interests, providers, scheduler, stats
 from .collectors import COLLECTORS
 from .models import CandidateItem
-from .pipeline import deliver, ingest, run_once
+from .notify import FEEDBACK_VERDICTS, print_safe
+from .pipeline import Budget, deliver, ingest, run_once, send_digest
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(prog="discovery", description=__doc__)
     parser.add_argument("--db", help="override DISCOVERY_DB")
-    parser.add_argument("--provider", help="override DISCOVERY_PROVIDER (anthropic|openai)")
+    parser.add_argument(
+        "--provider", help="override DISCOVERY_PROVIDER (claude_chat|anthropic|openai)"
+    )
     parser.add_argument("--model", help="override DISCOVERY_MODEL")
     parser.add_argument("--dry-run", action="store_true", help="print pushes instead of sending")
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="create the DB and load interests.json")
-    sub.add_parser("run-once", help="one cycle")
-    run = sub.add_parser("run", help="cycle on a loop")
-    run.add_argument("--interval", type=int, help="seconds between cycles")
-    run.add_argument("--cycles", type=int, help="stop after N cycles")
+    ro = sub.add_parser("run-once", help="one cycle")
+    ro.add_argument(
+        "--source", choices=sorted(COLLECTORS), help="collect only this collector's items"
+    )
+    run = sub.add_parser("run", help="scheduler loop: per-job cadence + daily digest")
+    run.add_argument("--cycles", type=int, help="stop after N scheduler ticks (tests)")
+    sub.add_parser("digest", help="send the pending Discovery digest now")
     disc = sub.add_parser(
         "discover", help="run a collector across all active interests; print, never send"
     )
@@ -50,11 +63,14 @@ def main(argv=None):
     listing = sub.add_parser("items", help="list recently scored items")
     listing.add_argument("--limit", type=int, default=20)
     listing.add_argument("--min-score", type=float, default=0.0, help="0-1 final score")
+    sub.add_parser("listen", help="long-poll Telegram for feedback-button presses (blocking)")
     fb = sub.add_parser("feedback", help="rate an item")
     fb.add_argument("item_id", type=int)
-    fb.add_argument("verdict", choices=["up", "down"])
+    fb.add_argument("verdict", choices=sorted(FEEDBACK_VERDICTS))
     fb.add_argument("--interest-id", type=int)
     fb.add_argument("--note", default="")
+    st = sub.add_parser("stats", help="funnel, feedback rates and estimated cost")
+    st.add_argument("--days", type=int, default=7, help="trailing window (default 7)")
 
     args = parser.parse_args(argv)
     cfg = config.load()
@@ -65,33 +81,73 @@ def main(argv=None):
         cfg.model = args.model or config.DEFAULT_MODELS.get(args.provider, cfg.model)
     if args.model:
         cfg.model = args.model
-    if getattr(args, "interval", None):
-        cfg.interval_seconds = args.interval
 
     conn = db.connect(cfg.db_path)
     db.init(conn)
 
-    # Built only for the commands that talk to a model -- constructing a
-    # provider needs an API key, and `init`/`items`/`feedback` don't need one.
-    def provider():
-        return providers.get_provider(cfg)
+    # Built once, and only for the commands that talk to a model -- constructing
+    # a provider needs an API key, and `init`/`items`/`feedback`/`stats` don't
+    # need one. The single instance is also what accumulates token usage, which
+    # is why it is cached rather than rebuilt per call.
+    built = {}
 
+    def provider():
+        if "provider" not in built:
+            built["provider"] = providers.get_provider(cfg)
+        return built["provider"]
+
+    try:
+        return _dispatch(conn, cfg, args, provider)
+    except providers.ProviderError as e:
+        # e.g. an unknown DISCOVERY_PROVIDER -- a config mistake, not a crash.
+        print(f"provider error: {e}", file=sys.stderr)
+        return 2
+    finally:
+        # Whatever the command spent, on the way out -- `run` flushes per cycle
+        # from run_once() instead, since it never gets here.
+        if "provider" in built:
+            db.record_usage(conn, built["provider"])
+        conn.close()   # Windows keeps the .db file locked otherwise
+
+
+def _dispatch(conn, cfg, args, provider):
     if args.command == "init":
-        count = interests.sync(conn, cfg.interests_path)
+        try:
+            count = interests.sync(conn, cfg.interests_path)
+        except FileNotFoundError:
+            print(f"interests file not found: {cfg.interests_path}", file=sys.stderr)
+            return 2
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            print(f"malformed interests file {cfg.interests_path}: {e}", file=sys.stderr)
+            return 2
         print(f"{cfg.db_path}: schema ready, {count} interests loaded")
     elif args.command == "run-once":
-        print(run_once(conn, provider(), cfg, dry_run=args.dry_run))
+        sources = [args.source] if args.source else None
+        print(run_once(conn, provider(), cfg, sources=sources, dry_run=args.dry_run))
     elif args.command == "run":
         scheduler.run_forever(conn, provider(), cfg, dry_run=args.dry_run, cycles=args.cycles)
     elif args.command == "discover":
         return _discover(conn, provider(), cfg, args)
     elif args.command == "score":
         return _score_one(conn, provider(), cfg, args)
+    elif args.command == "digest":
+        print(f"sent {send_digest(conn, cfg, dry_run=args.dry_run)} digest item(s)")
+    elif args.command == "listen":
+        feedback_listener.listen(conn, cfg)
     elif args.command == "items":
         _list_items(conn, args.limit, args.min_score)
     elif args.command == "feedback":
-        db.add_feedback(conn, args.item_id, args.interest_id, args.verdict, args.note)
+        if db.get_item(conn, args.item_id) is None:
+            print(f"no item with id {args.item_id}", file=sys.stderr)
+            return 2
+        row = conn.execute(
+            "SELECT final_score FROM scores WHERE item_id = ?", (args.item_id,)
+        ).fetchone()
+        original_score = row["final_score"] if row else None
+        db.add_feedback(conn, args.item_id, args.interest_id, args.verdict, args.note, original_score)
         print(f"recorded {args.verdict} on item {args.item_id}")
+    elif args.command == "stats":
+        print_safe(stats.report(conn, args.days))
     return 0
 
 
@@ -106,16 +162,24 @@ def _discover(conn, provider, cfg, args):
         return 2
 
     total = 0
+    counts = Counter()
+    budget = Budget(cfg.max_scores_per_cycle)
     for interest in active:
         try:
-            candidates = collect(interest, cfg, provider)
+            candidates = collect(interest, cfg, provider, conn)
         except Exception as e:  # noqa: BLE001
             print(f"{interest.key}/{args.source}: collect failed: {e}", file=sys.stderr)
             continue
         for item in candidates:
             total += 1
-            outcome = ingest(conn, provider, cfg, item, active, origin_interest=interest.key)
+            counts["collected"] += 1
+            outcome = ingest(
+                conn, provider, cfg, item, active,
+                origin_interest=interest.key, budget=budget,
+            )
+            counts[outcome.stage] += 1
             _print_discovered(interest, item, outcome)
+    db.bump(conn, counts)
     print(f"\n{total} candidate(s) from '{args.source}'", file=sys.stderr)
     return 0
 

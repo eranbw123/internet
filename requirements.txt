@@ -1,12 +1,21 @@
 # watch.py is stdlib only (urllib for both the Yahoo Finance fetch and the
 # ntfy push, argparse/json for the rest) and stays that way.
 #
-# The discovery engine needs one LLM SDK, imported only inside
-# discovery/providers/. Claude is the default and is the only provider with
-# web search, so the web_search collector needs this one.
-anthropic>=0.120.2
+# The default provider (claude_chat) is stdlib only: it drives claude.ai
+# through an authenticated Chrome tab over the DevTools Protocol
+# (discovery/providers/cdp.py), so no SDK and no API key are needed.
+
+# Optional: only for DISCOVERY_PROVIDER=anthropic (direct API, pay-per-token).
+# Imported lazily inside discovery/providers/anthropic_provider.py.
+# anthropic>=0.120.2
 
 # Optional: only for DISCOVERY_PROVIDER=openai. Install it yourself if you
 # want that provider -- it is imported lazily, so the default path works
 # without it.
 # openai>=2.9.0
+
+# Optional: only for the youtube collector's transcript fetch (video search
+# itself is a plain YOUTUBE_API_KEY REST call, no SDK needed). Imported
+# lazily inside discovery/collectors/youtube.py; without it, that collector
+# logs and skips every video instead of failing the cycle.
+# youtube-transcript-api>=1.2.4

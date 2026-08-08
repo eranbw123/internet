@@ -8,8 +8,14 @@ Two methods, because the pipeline needs exactly two things from an LLM:
 Anything a provider can't do raises UnsupportedCapability, which callers
 treat like any other collector/scorer failure: log it, skip, keep going.
 Nothing above this module imports a vendor SDK.
+
+Each provider also tallies what it spent in `self.usage`; `db.record_usage`
+drains it into `llm_usage` at the end of a command. Kept in the provider (and
+not, say, threaded through every call site) because it is the one object every
+paid call already passes through.
 """
 import json
+from collections import Counter
 
 
 class ProviderError(Exception):
@@ -25,11 +31,24 @@ class LLMProvider:
 
     def __init__(self, model):
         self.model = model
+        self.usage = Counter()
 
-    def complete_json(self, system, prompt, schema, max_tokens=2000):
+    def record_usage(self, input_tokens=0, output_tokens=0, web_searches=0):
+        self.usage.update(
+            calls=1,
+            input_tokens=int(input_tokens or 0),
+            output_tokens=int(output_tokens or 0),
+            web_searches=int(web_searches or 0),
+        )
+
+    # max_tokens caps thinking + response together on current Claude models
+    # (thinking is on by default), so both defaults carry headroom well past
+    # the size of the JSON we actually ask for -- a tight cap truncates the
+    # response mid-thought and turns every call into a ProviderError.
+    def complete_json(self, system, prompt, schema, max_tokens=8000):
         raise NotImplementedError
 
-    def search_json(self, prompt, max_searches=5, max_tokens=8000):
+    def search_json(self, prompt, max_searches=5, max_tokens=16000):
         raise UnsupportedCapability(f"{self.name} has no web search capability")
 
 

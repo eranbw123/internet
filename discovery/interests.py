@@ -6,7 +6,9 @@ from .models import Interest
 
 
 def load_file(path):
-    data = json.loads(open(path, encoding="utf-8").read())
+    # utf-8-sig: a Windows editor saving interests.json with a BOM must not
+    # break `init`.
+    data = json.loads(open(path, encoding="utf-8-sig").read())
     defaults = data.get("defaults", {})
     return [_to_interest(entry, defaults) for entry in data["interests"]]
 

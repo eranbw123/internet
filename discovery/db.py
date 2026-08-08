@@ -4,17 +4,39 @@ JSON-shaped columns (signals, metadata, source_config, matched_terms) are
 stored as text and decoded here so callers only ever see Python values.
 """
 import json
+import re
 import sqlite3
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from .models import DIMENSIONS, CandidateItem, Interest
 
 SCHEMA_PATH = Path(__file__).resolve().parent / "schema.sql"
 
+# Failed-send retry policy: a not-ok notification may be retried once its last
+# attempt is older than RESEND_FAILED_AFTER_SECONDS, at most MAX_SEND_ATTEMPTS
+# times in total. Small on purpose -- a persistent failure should give up, not
+# queue forever.
+MAX_SEND_ATTEMPTS = 3
+RESEND_FAILED_AFTER_SECONDS = 15 * 60
+
+# Backlog rescore cool-off: an item whose scoring attempt failed is left alone
+# for this long before the backlog pass tries it again.
+SCORE_RETRY_SECONDS = 30 * 60
+
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
+
+def ago(seconds):
+    return (
+        datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    ).isoformat(timespec="seconds")
+
+
+def today():
+    return datetime.now(timezone.utc).date().isoformat()
 
 
 def connect(db_path):
@@ -26,6 +48,16 @@ def connect(db_path):
 
 def init(conn):
     conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    # schema.sql is CREATE TABLE IF NOT EXISTS only, so columns added after a
+    # DB was created need their own additive ALTERs (no migration framework).
+    for table, column, decl in (
+        ("notifications", "attempts", "INTEGER NOT NULL DEFAULT 1"),
+        ("candidate_items", "score_attempted_at", "TEXT"),
+    ):
+        try:
+            conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
+        except sqlite3.OperationalError:
+            pass  # column already exists
     conn.commit()
 
 
@@ -120,6 +152,23 @@ def get_item(conn, item_id):
     return _row_to_item(row) if row else None
 
 
+def seen_dedup_keys(conn, source, prefix=""):
+    """Dedup keys this source has already stored, optionally restricted to a
+    prefix. Collectors use it to skip work *before* paying for it -- dedup.py
+    only rejects a duplicate after the collector has already fetched (and, for
+    stocks, explained) it."""
+    # LIKE treats _ and % as wildcards, and YouTube video ids routinely contain
+    # underscores -- unescaped, "abc_def:" would also match "abcXdef:..." and a
+    # never-processed video would be skipped forever.
+    escaped = re.sub(r"([\\%_])", r"\\\1", prefix)
+    rows = conn.execute(
+        "SELECT dedup_key FROM candidate_items"
+        " WHERE source = ? AND dedup_key LIKE ? ESCAPE '\\'",
+        (source, escaped + "%"),
+    ).fetchall()
+    return {row["dedup_key"] for row in rows}
+
+
 def find_item_by_hash(conn, column, value):
     """Look up an existing item by one of the dedup hashes."""
     if not value:
@@ -160,6 +209,15 @@ def set_prefilter(conn, item_id, ok, reason):
 def is_scored(conn, item_id):
     row = conn.execute("SELECT 1 FROM scores WHERE item_id = ?", (item_id,)).fetchone()
     return row is not None
+
+
+def mark_score_attempt(conn, item_id):
+    """Stamp a failed scoring attempt so the backlog pass can leave the item
+    alone for SCORE_RETRY_SECONDS instead of re-failing it every cycle."""
+    conn.execute(
+        "UPDATE candidate_items SET score_attempted_at = ? WHERE id = ?", (now(), item_id)
+    )
+    conn.commit()
 
 
 # --- interest matches --------------------------------------------------------
@@ -221,7 +279,9 @@ def delete_score(conn, item_id):
 
 
 def pending_notifications(conn):
-    """Scores at or above their interest's bar that were never sent."""
+    """Scores at or above their interest's bar that still need sending: never
+    attempted, or last attempt failed and is old enough to retry (and under
+    the attempt cap). A success is final; retries never duplicate it."""
     return conn.execute(
         """
         SELECT s.id AS score_id, s.item_id, s.interest_id, s.final_score,
@@ -230,26 +290,53 @@ def pending_notifications(conn):
         JOIN interests n ON n.id = s.interest_id
         WHERE s.final_score >= n.min_score
           AND n.active = 1
-          AND NOT EXISTS (SELECT 1 FROM notifications x WHERE x.score_id = s.id)
+          AND NOT EXISTS (
+              SELECT 1 FROM notifications x
+              WHERE x.score_id = s.id
+                AND (x.ok = 1 OR x.attempts >= ? OR x.sent_at > ?)
+          )
         ORDER BY s.final_score DESC
-        """
+        """,
+        (MAX_SEND_ATTEMPTS, ago(RESEND_FAILED_AFTER_SECONDS)),
     ).fetchall()
 
 
 def record_notification(conn, score_id, channel, ok):
+    """One row per score. A repeat attempt updates the row and bumps
+    `attempts`, so pending_notifications() can cap and pace retries."""
     conn.execute(
-        "INSERT OR REPLACE INTO notifications (score_id, channel, sent_at, ok) VALUES (?, ?, ?, ?)",
+        """
+        INSERT INTO notifications (score_id, channel, sent_at, ok, attempts)
+        VALUES (?, ?, ?, ?, 1)
+        ON CONFLICT(score_id) DO UPDATE SET
+            channel  = excluded.channel,
+            sent_at  = excluded.sent_at,
+            ok       = excluded.ok,
+            attempts = attempts + 1
+        """,
         (score_id, channel, now(), 1 if ok else 0),
     )
     conn.commit()
 
 
-def add_feedback(conn, item_id, interest_id, verdict, note=""):
+def add_feedback(conn, item_id, interest_id, verdict, note="", original_score=None):
     conn.execute(
-        "INSERT INTO feedback (item_id, interest_id, verdict, note, created_at) VALUES (?, ?, ?, ?, ?)",
-        (item_id, interest_id, verdict, note, now()),
+        """
+        INSERT INTO feedback (item_id, interest_id, verdict, note, original_score, created_at)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (item_id, interest_id, verdict, note, original_score, now()),
     )
     conn.commit()
+
+
+def score_by_id(conn, score_id):
+    """Looked up from a Telegram feedback button's callback_data, which only
+    carries the score id -- this is how the listener recovers item_id,
+    interest_id, and the score to attribute the feedback to."""
+    return conn.execute(
+        "SELECT id, item_id, interest_id, final_score FROM scores WHERE id = ?", (score_id,)
+    ).fetchone()
 
 
 def recent_feedback(conn, interest_id, limit=10):
@@ -264,3 +351,48 @@ def recent_feedback(conn, interest_id, limit=10):
         """,
         (interest_id, limit),
     ).fetchall()
+
+
+# --- metrics -----------------------------------------------------------------
+
+def bump(conn, counts):
+    """Add `counts` ({name: n}) to today's funnel counters. Called once per
+    cycle with an accumulated Counter, not once per item."""
+    rows = [(today(), name, n) for name, n in counts.items() if n]
+    if not rows:
+        return
+    conn.executemany(
+        """
+        INSERT INTO metrics (day, name, count) VALUES (?, ?, ?)
+        ON CONFLICT(day, name) DO UPDATE SET count = count + excluded.count
+        """,
+        rows,
+    )
+    conn.commit()
+
+
+def record_usage(conn, provider):
+    """Persist and reset a provider's in-process token counters (see
+    providers/base.py). Safe to call when nothing was spent."""
+    usage = getattr(provider, "usage", None)
+    if not usage:
+        return
+    conn.execute(
+        """
+        INSERT INTO llm_usage
+            (day, provider, model, calls, input_tokens, output_tokens, web_searches)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(day, provider, model) DO UPDATE SET
+            calls         = calls         + excluded.calls,
+            input_tokens  = input_tokens  + excluded.input_tokens,
+            output_tokens = output_tokens + excluded.output_tokens,
+            web_searches  = web_searches  + excluded.web_searches
+        """,
+        (
+            today(), provider.name, provider.model,
+            usage["calls"], usage["input_tokens"],
+            usage["output_tokens"], usage["web_searches"],
+        ),
+    )
+    conn.commit()
+    usage.clear()
