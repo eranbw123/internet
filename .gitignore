@@ -1,10 +1,18 @@
-# NTFY_TOPIC lives here -- an ntfy topic is effectively a shared secret and
-# this repo is public. Never commit it.
+# Secrets (CLAUDE_ORG_ID, TELEGRAM_BOT_TOKEN, etc). This repo is public,
+# never commit it.
 .env
 .env.local
 
-# Your personal watchlist; watchlist.example.json is the committed template.
+# Stale now that watch.py has no watchlist-file reader -- kept ignored
+# because it's still personal data (which tickers someone watches), not
+# because anything reads it.
 watchlist.json
+
+# The discovery engine's local store: a cache of collected items and their
+# scores, rebuildable by re-running. interests.json IS committed.
+discovery.db
+discovery.db-shm
+discovery.db-wal
 
 __pycache__/
 *.pyc

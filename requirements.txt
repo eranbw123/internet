@@ -1,4 +1,21 @@
-# No third-party dependencies -- watch.py is stdlib only (urllib for both the
-# Yahoo Finance fetch and the ntfy push, argparse/json for the rest). This
-# file exists so `pip install -r requirements.txt` is a no-op rather than an
-# error, and as the place to add a dep if one ever becomes necessary.
+# watch.py is stdlib only (urllib for the Yahoo Finance fetch) and stays
+# that way -- it's a shared library, not a standalone tool.
+#
+# The default provider (claude_chat) is stdlib only: it drives claude.ai
+# through an authenticated Chrome tab over the DevTools Protocol
+# (discovery/providers/cdp.py), so no SDK and no API key are needed.
+
+# Optional: only for DISCOVERY_PROVIDER=anthropic (direct API, pay-per-token).
+# Imported lazily inside discovery/providers/anthropic_provider.py.
+# anthropic>=0.120.2
+
+# Optional: only for DISCOVERY_PROVIDER=openai. Install it yourself if you
+# want that provider -- it is imported lazily, so the default path works
+# without it.
+# openai>=2.9.0
+
+# Optional: only for the youtube collector's transcript fetch (video search
+# itself is a plain YOUTUBE_API_KEY REST call, no SDK needed). Imported
+# lazily inside discovery/collectors/youtube.py; without it, that collector
+# logs and skips every video instead of failing the cycle.
+# youtube-transcript-api>=1.2.4
