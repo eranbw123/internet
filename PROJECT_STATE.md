@@ -75,8 +75,9 @@ claude.ai tab) and `CLAUDE_ORG_ID` in `.env`. `anthropic` (direct API) and
   (no creds in `.env`).
 
 ## Next task
-1. Branch, commit everything (nothing committed yet), open a PR.
-2. Add Telegram creds and let `run` cycle for a few days; then `stats --days 7`.
+PR #1 (branch `add-discovery-engine`, commit a7ea1a9) is open with full-scope
+title/body — awaiting merge. Then: add Telegram creds and let `run` cycle for
+a few days; then `stats --days 7`.
 
 ## Commands to continue
 ```bash
