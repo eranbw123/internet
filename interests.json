@@ -1,0 +1,80 @@
+{
+  "defaults": {
+    "min_score": 0.75,
+    "sources": ["web_search"]
+  },
+
+  "interests": [
+    {
+      "key": "narcolepsy-eds",
+      "title": "Narcolepsy / EDS research",
+      "description": "Clinical and mechanistic research on narcolepsy (type 1 and 2), idiopathic hypersomnia, and excessive daytime sleepiness. Orexin/hypocretin biology, orexin agonists in trials, autoimmune hypotheses, diagnostics beyond the MSLT, and how existing stimulants and oxybates actually compare in outcomes. Interested in what the evidence says, not in coping tips.",
+      "positive_signals": [
+        "orexin/hypocretin receptor agonist trial results",
+        "new mechanistic findings on hypocretin neuron loss",
+        "phase 2/3 readouts, FDA/EMA decisions",
+        "peer-reviewed papers with actual effect sizes",
+        "diagnostic advances (biomarkers, imaging, actigraphy)"
+      ],
+      "negative_signals": [
+        "generic sleep-hygiene advice",
+        "listicles and personal-blog symptom stories",
+        "supplement marketing",
+        "restating a press release with no new data"
+      ],
+      "min_score": 0.75,
+      "sources": ["web_search", "youtube"],
+      "source_config": {
+        "web_search": { "limit": 8, "max_searches": 5 }
+      }
+    },
+
+    {
+      "key": "nbis-nebius",
+      "title": "NBIS / Nebius",
+      "description": "Nebius Group (NASDAQ: NBIS) as a business: GPU capacity and datacenter buildout, cloud contracts and their economics, quarterly results and guidance, the Avride/Toloka/TripleTen segments, and how it is positioned against CoreWeave and the hyperscalers. Both the fundamentals and notable price action.",
+      "positive_signals": [
+        "earnings, guidance, ARR and capacity disclosures",
+        "signed customer contracts and their size",
+        "datacenter/GPU capacity announcements",
+        "analyst initiations or material target changes with reasoning",
+        "large or unexplained price moves"
+      ],
+      "negative_signals": [
+        "generic AI-stock roundups that merely list the ticker",
+        "price-target regurgitation with no argument",
+        "pump/hype newsletters"
+      ],
+      "min_score": 0.70,
+      "sources": ["web_search", "stocks"],
+      "source_config": {
+        "web_search": { "limit": 8, "max_searches": 5 },
+        "stocks": { "tickers": ["NBIS"], "schedule": "daily", "min_change_pct": 4 }
+      }
+    },
+
+    {
+      "key": "behavioral-psychology",
+      "title": "Technical behavioral psychology / interpersonal dynamics",
+      "description": "Rigorous work on human behavior and interaction: behavior analysis, social and relational dynamics, status and negotiation, group behavior, and the measurement problems behind all of it. Wants the technical version - mechanisms, methods, effect sizes, replication status - not self-help framing of the same ideas.",
+      "positive_signals": [
+        "well-powered studies with methods worth reading",
+        "replication results and failures",
+        "measurement or methodology critiques",
+        "practitioner writing grounded in specific evidence",
+        "cross-disciplinary work (econ, ethology, linguistics) on interaction"
+      ],
+      "negative_signals": [
+        "self-help and productivity framing",
+        "pop-psych repackaging of a single famous study",
+        "cited findings from the replication-crisis canon presented uncritically",
+        "personality-type content"
+      ],
+      "min_score": 0.78,
+      "sources": ["web_search"],
+      "source_config": {
+        "web_search": { "limit": 8, "max_searches": 5 }
+      }
+    }
+  ]
+}

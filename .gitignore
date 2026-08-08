@@ -6,6 +6,12 @@
 # Your personal watchlist; watchlist.example.json is the committed template.
 watchlist.json
 
+# The discovery engine's local store: a cache of collected items and their
+# scores, rebuildable by re-running. interests.json IS committed.
+discovery.db
+discovery.db-shm
+discovery.db-wal
+
 __pycache__/
 *.pyc
 .venv/

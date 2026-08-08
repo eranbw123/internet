@@ -1,4 +1,12 @@
-# No third-party dependencies -- watch.py is stdlib only (urllib for both the
-# Yahoo Finance fetch and the ntfy push, argparse/json for the rest). This
-# file exists so `pip install -r requirements.txt` is a no-op rather than an
-# error, and as the place to add a dep if one ever becomes necessary.
+# watch.py is stdlib only (urllib for both the Yahoo Finance fetch and the
+# ntfy push, argparse/json for the rest) and stays that way.
+#
+# The discovery engine needs one LLM SDK, imported only inside
+# discovery/providers/. Claude is the default and is the only provider with
+# web search, so the web_search collector needs this one.
+anthropic>=0.120.2
+
+# Optional: only for DISCOVERY_PROVIDER=openai. Install it yourself if you
+# want that provider -- it is imported lazily, so the default path works
+# without it.
+# openai>=2.9.0
