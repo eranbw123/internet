@@ -1,79 +1,308 @@
 {
   "defaults": {
-    "min_score": 0.75,
+    "min_score": 0.78,
     "sources": ["web_search"]
   },
-
   "interests": [
     {
       "key": "narcolepsy-eds",
-      "title": "Narcolepsy / EDS research",
-      "description": "Clinical and mechanistic research on narcolepsy (type 1 and 2), idiopathic hypersomnia, and excessive daytime sleepiness. Orexin/hypocretin biology, orexin agonists in trials, autoimmune hypotheses, diagnostics beyond the MSLT, and how existing stimulants and oxybates actually compare in outcomes. Interested in what the evidence says, not in coping tips.",
+      "title": "Narcolepsy / EDS / wakefulness",
+      "description": "Deep clinical and mechanistic work on narcolepsy type 1 and 2, idiopathic hypersomnia, excessive daytime sleepiness and pathological hypoarousal. Especially interested in treatments that meaningfully change wakefulness, cognitive activation or functional capacity: orexin/hypocretin agonists, histamine/H3 mechanisms, pitolisant, modafinil/armodafinil, oxybates, stimulants, selegiline and MAO mechanisms, clarithromycin/flumazenil and GABA-A modulation, and unusual or neglected pharmacological approaches. Strong interest in actual magnitude of benefit, objective outcomes such as MWT/MSLT/PVT and real functional outcomes, not just questionnaire significance. Old or obscure studies are interesting if the signal is unusually strong. Also interested in pharmacology, dose-response, safety, drug interactions, biomarkers, pathophysiology, diagnostics beyond the MSLT and reasons promising treatments succeed or fail.",
       "positive_signals": [
-        "orexin/hypocretin receptor agonist trial results",
-        "new mechanistic findings on hypocretin neuron loss",
-        "phase 2/3 readouts, FDA/EMA decisions",
-        "peer-reviewed papers with actual effect sizes",
-        "diagnostic advances (biomarkers, imaging, actigraphy)"
+        "orexin/hypocretin agonist phase 2 or phase 3 results with actual numbers",
+        "large objective improvement in wakefulness, vigilance or functional capacity",
+        "head-to-head or unusually informative treatment comparisons",
+        "mechanistic explanation connecting pharmacology to wakefulness or hypoactivity",
+        "selegiline, MAO-B or monoaminergic wakefulness evidence",
+        "clarithromycin, flumazenil or GABA-A modulation in hypersomnolence",
+        "pitolisant, armodafinil, oxybate or stimulant comparative evidence",
+        "unexpected or overlooked older study with unusually strong results",
+        "dose-response, interaction or safety data that changes the practical picture",
+        "biomarkers or diagnostic advances beyond conventional MSLT interpretation",
+        "orexin biology or mechanisms of hypocretin neuron loss"
       ],
       "negative_signals": [
-        "generic sleep-hygiene advice",
-        "listicles and personal-blog symptom stories",
+        "generic sleep hygiene advice",
+        "basic explanation of what narcolepsy is",
+        "generic symptom listicles",
+        "patient stories with no unusual clinical information",
         "supplement marketing",
-        "restating a press release with no new data"
+        "press releases that contain no useful numbers",
+        "small statistical effects presented as major clinical breakthroughs"
       ],
-      "min_score": 0.75,
+      "min_score": 0.74,
       "sources": ["web_search", "youtube"],
       "source_config": {
-        "web_search": { "limit": 8, "max_searches": 5 }
+        "web_search": {
+          "limit": 7,
+          "max_searches": 4
+        },
+        "youtube": {
+          "max_candidate_videos": 12,
+          "max_transcript_fetches": 5,
+          "recency_days": 30,
+          "languages": ["en", "he", "iw"],
+          "chunk_seconds": 360,
+          "chunk_overlap_seconds": 60
+        }
       }
     },
-
+    {
+      "key": "ai-agents-dev-tools",
+      "title": "AI agents / coding / personal automation",
+      "description": "High-leverage developments in AI coding agents, Claude Code, Codex and similar systems, agent harnesses, context engineering, memory, MCP/tool use, browser automation, autonomous or semi-autonomous software engineering and personal automation. Especially interested in techniques or tools that let one person build substantially more, reduce supervision, preserve context across sessions, operate computers remotely or turn AI into persistent infrastructure rather than a chat interface. Also interested in clever lightweight implementations, open-source projects and unusual workflows involving terminals, mobile access, notifications and personal agents. Ignore routine AI product news unless it changes what is technically possible.",
+      "positive_signals": [
+        "major Claude Code, Codex or coding-agent capability changes",
+        "agent architecture that materially improves reliability or autonomy",
+        "context compression, persistent memory or long-running agent techniques",
+        "novel MCP, tool-use, browser-control or computer-use implementations",
+        "strong coding-agent benchmarks with useful methodological details",
+        "small open-source project with disproportionately useful capabilities",
+        "personal AI infrastructure or automation that replaces substantial manual work",
+        "clever remote or mobile workflows for controlling development environments",
+        "evidence about what actually makes agents work better rather than prompt folklore"
+      ],
+      "negative_signals": [
+        "generic AI news roundups",
+        "minor model releases with no practical consequence",
+        "basic prompt-engineering tutorials",
+        "AI productivity listicles",
+        "thin wrapper products",
+        "benchmark announcements without enough information to interpret them"
+      ],
+      "min_score": 0.76,
+      "sources": ["web_search", "youtube"],
+      "source_config": {
+        "web_search": {
+          "limit": 7,
+          "max_searches": 4
+        },
+        "youtube": {
+          "max_candidate_videos": 10,
+          "max_transcript_fetches": 4,
+          "recency_days": 21,
+          "languages": ["en"],
+          "chunk_seconds": 360,
+          "chunk_overlap_seconds": 60
+        }
+      }
+    },
+    {
+      "key": "personal-knowledge-learning",
+      "title": "Learning / memory / personal knowledge systems",
+      "description": "Research and systems for learning large conceptual domains efficiently with minimal cognitive overhead. Especially interested in understanding-first learning, retrieval practice, durable memory, semantic organization, compressed representations, hierarchical or graph-like knowledge structures, AI tutoring and using LLMs to convert large amounts of material or conversation history into compact usable memory. Interested in whether very lean representations can preserve enough structure for associative reconstruction, and in empirical comparisons of different learning strategies. Also interested in technical systems for conversation archives, semantic graphs, retrieval, RAG and long-term AI memory when they help construct a usable external mind.",
+      "positive_signals": [
+        "controlled studies comparing learning or retrieval strategies",
+        "research on retrieval practice, spacing, memory consolidation or schema formation",
+        "minimal representations that produce surprisingly good recall",
+        "AI tutoring studies with measured learning outcomes",
+        "research on cognitive load and working-memory constraints",
+        "novel semantic memory, knowledge graph, RAG or long-term LLM memory architecture",
+        "conversation compression or personal knowledge systems that actually work at scale",
+        "evidence contradicting common study-method advice"
+      ],
+      "negative_signals": [
+        "generic study tips",
+        "visual mnemonic content without evidence",
+        "productivity influencer content",
+        "basic second-brain tutorials",
+        "generic note-taking app comparisons",
+        "claims about learning styles presented as established science"
+      ],
+      "min_score": 0.80,
+      "sources": ["web_search"],
+      "source_config": {
+        "web_search": {
+          "limit": 6,
+          "max_searches": 4
+        }
+      }
+    },
+    {
+      "key": "behavioral-psychology",
+      "title": "Human interaction / attraction / behavioral psychology",
+      "description": "Technical, bottom-up work on real interpersonal behavior: attraction, flirting, interpersonal synchrony, mimicry, gaze, voice and prosody, approach and avoidance, status, dominance, submission, reinforcement, expectation, suggestibility, emotional contagion, group behavior, negotiation and relationship dynamics. Especially interested in research where small behavioral changes can be linked to subsequent changes in another person's behavior and where competing mechanisms can actually be distinguished. Prefer multimodal behavioral data, temporal sequences, experiments, longitudinal patterns, effect sizes and methodological criticism over broad psychological theories or self-help.",
+      "positive_signals": [
+        "interpersonal synchrony or mimicry experiments",
+        "gaze, posture, distance, touch or vocal-prosody research",
+        "attraction or courtship studies with observable behavioral measures",
+        "temporal analysis showing one person's behavior predicting another's next response",
+        "status, dominance or submission studied behaviorally",
+        "suggestibility, reinforcement or conditioning inside social interaction",
+        "unexpected sex differences supported by strong data",
+        "high-resolution observational studies of real interaction",
+        "replications or failures that materially alter a familiar finding",
+        "cross-disciplinary work from ethology, linguistics, economics or neuroscience"
+      ],
+      "negative_signals": [
+        "dating advice",
+        "pickup content",
+        "generic self-help",
+        "body-language dictionaries",
+        "personality-type content",
+        "pop psychology built around one famous experiment",
+        "claims that infer internal states from a single isolated gesture"
+      ],
+      "min_score": 0.80,
+      "sources": ["web_search", "youtube"],
+      "source_config": {
+        "web_search": {
+          "limit": 7,
+          "max_searches": 4
+        },
+        "youtube": {
+          "max_candidate_videos": 10,
+          "max_transcript_fetches": 4,
+          "recency_days": 45,
+          "languages": ["en"],
+          "chunk_seconds": 360,
+          "chunk_overlap_seconds": 60
+        }
+      }
+    },
+    {
+      "key": "ai-infrastructure-physical-ai",
+      "title": "AI infrastructure / semis / Physical AI investing",
+      "description": "Investment-relevant developments where AI demand collides with physical bottlenecks: GPU infrastructure, datacenters, power, networking, optical interconnect and CPO, HBM and DRAM, foundry and packaging capacity, sensors, industrial automation, robotics and Physical AI. Particularly interested in underappreciated public companies or supply-chain nodes with asymmetric upside rather than already-consensus mega-cap AI exposure. Companies and themes of recurring interest include Nebius, VPG, COHR, LITE, TSEM, AAOI, IREN, APLD, CORZ, CIFR, Shunsin, memory/HBM and humanoid or industrial robotics. Focus on unit economics, capacity, contracts, bottlenecks, margins and evidence that expectations are materially wrong.",
+      "positive_signals": [
+        "previously unknown capacity, contract or customer disclosure",
+        "supply bottleneck with identifiable beneficiaries",
+        "major change in HBM, DRAM, optics, CPO or AI networking economics",
+        "small or mid-cap company gaining structurally important AI exposure",
+        "management commentary containing concrete numbers",
+        "expert supply-chain evidence that contradicts consensus estimates",
+        "margin or utilization inflection with a clear mechanism",
+        "robotics or Physical AI development with investable upstream implications",
+        "primary-source filings, earnings calls and technical supplier disclosures"
+      ],
+      "negative_signals": [
+        "generic AI stock lists",
+        "technical analysis",
+        "price targets without a model or argument",
+        "pump newsletters",
+        "articles that mention AI without quantifying business exposure",
+        "mega-cap AI news with no implications for the relevant supply chain"
+      ],
+      "min_score": 0.76,
+      "sources": ["web_search"],
+      "source_config": {
+        "web_search": {
+          "limit": 7,
+          "max_searches": 4
+        }
+      }
+    },
     {
       "key": "nbis-nebius",
       "title": "NBIS / Nebius",
-      "description": "Nebius Group (NASDAQ: NBIS) as a business: GPU capacity and datacenter buildout, cloud contracts and their economics, quarterly results and guidance, the Avride/Toloka/TripleTen segments, and how it is positioned against CoreWeave and the hyperscalers. Both the fundamentals and notable price action.",
+      "description": "Nebius Group as a business and investment: GPU capacity, datacenter construction, financing, utilization, cloud contracts, customer concentration, pricing and unit economics, ARR/revenue trajectory, margins and capital intensity, plus Avride, Toloka and TripleTen where material. Particularly interested in evidence that changes the long-term probability distribution rather than routine stock commentary, and in comparisons with CoreWeave, hyperscalers and other neoclouds. Large or unexplained stock moves are also relevant.",
       "positive_signals": [
         "earnings, guidance, ARR and capacity disclosures",
-        "signed customer contracts and their size",
-        "datacenter/GPU capacity announcements",
-        "analyst initiations or material target changes with reasoning",
-        "large or unexplained price moves"
+        "signed customer contracts and their economics",
+        "new datacenter or GPU capacity",
+        "financing or capex information that changes dilution or growth assumptions",
+        "utilization or margin evidence",
+        "major competitive development involving CoreWeave or hyperscalers",
+        "material Avride development",
+        "large or unexplained price movement",
+        "credible evidence that consensus expectations are substantially wrong"
       ],
       "negative_signals": [
-        "generic AI-stock roundups that merely list the ticker",
-        "price-target regurgitation with no argument",
-        "pump/hype newsletters"
+        "generic AI-stock roundups",
+        "price-target regurgitation",
+        "technical analysis",
+        "pump or hype newsletters",
+        "articles that repeat already-known company announcements"
       ],
       "min_score": 0.70,
       "sources": ["web_search", "stocks"],
       "source_config": {
-        "web_search": { "limit": 8, "max_searches": 5 },
-        "stocks": { "tickers": [{ "ticker": "NBIS", "daily_percent_move": 6, "weekly_percent_move": 12 }] }
+        "web_search": {
+          "limit": 7,
+          "max_searches": 4
+        },
+        "stocks": {
+          "tickers": [
+            {
+              "ticker": "NBIS",
+              "daily_percent_move": 6,
+              "weekly_percent_move": 12
+            }
+          ]
+        }
       }
     },
-
     {
-      "key": "behavioral-psychology",
-      "title": "Technical behavioral psychology / interpersonal dynamics",
-      "description": "Rigorous work on human behavior and interaction: behavior analysis, social and relational dynamics, status and negotiation, group behavior, and the measurement problems behind all of it. Wants the technical version - mechanisms, methods, effect sizes, replication status - not self-help framing of the same ideas.",
+      "key": "emdr-trauma-therapy",
+      "title": "EMDR / trauma processing mechanisms",
+      "description": "Deep mechanistic and clinical research on EMDR (Eye Movement Desensitization and Reprocessing) and related bilateral/dual-attention trauma therapies. Especially interested in the actual proposed mechanisms of action (working memory taxation, orienting response, REM-sleep/thalamic-limbic analogues, interhemispheric interaction, adaptive information processing model) and the evidence for or against each; well-controlled dismantling studies isolating whether eye movements themselves add anything beyond exposure/reprocessing components; neuroimaging (fMRI/EEG/PET) findings during or after EMDR sessions; comparisons of EMDR against prolonged exposure, CPT, ketamine, MDMA-assisted therapy and other trauma treatments with real effect sizes and remission rates; and applications beyond classic PTSD (complex trauma, phobias, chronic pain, grief, psychosis-comorbid trauma). Also interested in critiques, replication failures, meta-analytic controversies, dose/protocol variations (movement speed, bilateral tactile/audio alternatives), and biomarkers predicting response.",
       "positive_signals": [
-        "well-powered studies with methods worth reading",
-        "replication results and failures",
-        "measurement or methodology critiques",
-        "practitioner writing grounded in specific evidence",
-        "cross-disciplinary work (econ, ethology, linguistics) on interaction"
+        "dismantling or component-control studies isolating the eye-movement/bilateral-stimulation element",
+        "neuroimaging evidence of what EMDR changes in the brain during or after sessions",
+        "mechanistic theories tested against working-memory taxation or orienting-response accounts",
+        "head-to-head trials against prolonged exposure, CPT, MDMA- or ketamine-assisted therapy with real numbers",
+        "meta-analyses or replications that materially shift confidence in efficacy or mechanism",
+        "biomarkers or individual-difference predictors of EMDR response",
+        "protocol variation evidence: movement speed, bilateral audio/tactile alternatives, session dosing",
+        "applications to complex PTSD, phobias, chronic pain, grief or psychosis-comorbid trauma with objective outcomes",
+        "credible methodological critique or controversy in the EMDR efficacy literature",
+        "connections to sleep/REM physiology, memory reconsolidation or interhemispheric interaction research"
       ],
       "negative_signals": [
-        "self-help and productivity framing",
-        "pop-psych repackaging of a single famous study",
-        "cited findings from the replication-crisis canon presented uncritically",
-        "personality-type content"
+        "basic explainer of what EMDR is or how a session works",
+        "therapist marketing or practice-building content",
+        "patient testimonial with no clinical or mechanistic detail",
+        "generic trauma self-help content",
+        "listicles of trauma therapy options",
+        "advocacy pieces with no data",
+        "small statistical effects presented as major breakthroughs"
       ],
       "min_score": 0.78,
+      "sources": ["web_search", "youtube"],
+      "source_config": {
+        "web_search": {
+          "limit": 7,
+          "max_searches": 4
+        },
+        "youtube": {
+          "max_candidate_videos": 10,
+          "max_transcript_fetches": 4,
+          "recency_days": 45,
+          "languages": ["en"],
+          "chunk_seconds": 360,
+          "chunk_overlap_seconds": 60
+        }
+      }
+    },
+    {
+      "key": "adjacent-curiosity",
+      "title": "Unexpected high-signal ideas",
+      "description": "Serendipity bucket for unusually interesting findings outside the predefined interests. Look for concrete, surprising and intellectually rich work in neuroscience, cognitive science, psychology, economics, biology, AI, social science, philosophy of mind or complex systems. The ideal item reveals a mechanism, experiment, dataset or phenomenon that is strange enough to provoke a long investigation or connects two domains in a non-obvious way. This is explicitly NOT a general science-news feed: ordinary important news is less interesting than a weird result with explanatory depth.",
+      "positive_signals": [
+        "counterintuitive experimental result with strong evidence",
+        "weird behavioral or biological phenomenon with a plausible mechanism",
+        "cross-disciplinary result connecting previously separate ideas",
+        "new method that makes something previously difficult measurable",
+        "large replication that overturns conventional understanding",
+        "forgotten or obscure research that becomes newly relevant",
+        "specific phenomenon likely to generate several deeper questions",
+        "result where the details are substantially more interesting than the headline"
+      ],
+      "negative_signals": [
+        "general science news",
+        "space or technology trivia",
+        "generic futurism",
+        "popular-science explainers of established facts",
+        "viral studies with weak methods",
+        "interesting headline with no underlying mechanism or data"
+      ],
+      "min_score": 0.85,
       "sources": ["web_search"],
       "source_config": {
-        "web_search": { "limit": 8, "max_searches": 5 }
+        "web_search": {
+          "limit": 6,
+          "max_searches": 4
+        }
       }
     }
   ]

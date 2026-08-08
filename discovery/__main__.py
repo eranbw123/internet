@@ -178,8 +178,14 @@ def _discover(conn, provider, cfg, args):
                 origin_interest=interest.key, budget=budget,
             )
             counts[outcome.stage] += 1
+            # Flushed per item rather than once at the end (see pipeline.py's
+            # run_once() for the same fix and its rationale): _print_discovered
+            # below is exactly what killed a real run mid-loop once already
+            # (a narrow console codepage choking on a model-generated
+            # character) and silently lost every already-scored item's funnel
+            # counts with it, even though their DB rows were already committed.
+            db.bump(conn, {"collected": 1, outcome.stage: 1})
             _print_discovered(interest, item, outcome)
-    db.bump(conn, counts)
     print(f"\n{total} candidate(s) from '{args.source}'", file=sys.stderr)
     return 0
 
@@ -189,11 +195,11 @@ def _print_discovered(interest, item, outcome):
     header = f"[{interest.key}] {outcome.stage}"
     if query:
         header += f"  (query: {query!r})"
-    print(header)
-    print(f"      {item.title}")
-    print(f"      {item.url}")
+    print_safe(header)
+    print_safe(f"      {item.title}")
+    print_safe(f"      {item.url}")
     if outcome.score is not None:
-        print(f"      score={outcome.score.final_score:.2f}  {outcome.score.reason}")
+        print_safe(f"      score={outcome.score.final_score:.2f}  {outcome.score.reason}")
 
 
 def _score_one(conn, provider, cfg, args):
@@ -253,9 +259,9 @@ def _list_items(conn, limit, min_score):
     ).fetchall()
     for row in rows:
         # Shown 0-100 for the same reason notify.format_message does it.
-        print(f"[{row['final_score'] * 100:>3.0f}] #{row['id']} {row['interest']}: {row['title']}")
-        print(f"      {row['reason']}")
-        print(f"      {row['url']}")
+        print_safe(f"[{row['final_score'] * 100:>3.0f}] #{row['id']} {row['interest']}: {row['title']}")
+        print_safe(f"      {row['reason']}")
+        print_safe(f"      {row['url']}")
 
 
 if __name__ == "__main__":

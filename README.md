@@ -150,7 +150,7 @@ anything above 1 is treated as the old scale and divided by 100, so a stale
 | --- | --- | --- |
 | `web_search` | working | The provider's server-side web search returns candidate articles |
 | `stocks` | working | Notable price moves via `watch.py`'s Yahoo fetch |
-| `youtube` | working | Recent uploads/search results, transcript split into overlapping time windows, one candidate **per segment** |
+| `youtube` | working | Recent uploads/search results; transcript available → one candidate **per segment**, otherwise one **video-level** candidate (title + description) |
 
 A collector is one function — `collect(interest, cfg, provider, conn=None) -> list[CandidateItem]`
 — registered in `discovery/collectors/__init__.py`. Collectors fetch and shape
@@ -162,26 +162,38 @@ transcript fetch) only for dedup to discard it a moment later.
 
 ### `youtube`
 
-Needs `YOUTUBE_API_KEY` (video search/metadata) and, for transcripts,
+Needs `YOUTUBE_API_KEY` (video verification/metadata) and, for transcripts,
 `pip install youtube-transcript-api`. A video without an available transcript
 in the requested language is logged and skipped, not an error — captions are
-off for plenty of videos.
+off for plenty of videos, and the unofficial transcript endpoint also
+soft-blocks bursting IPs from time to time.
 
-Because a 90-minute video can hide one great 6-minute discussion, this
-collector doesn't score whole videos: it fetches the transcript, slides a
-fixed, overlapping time window across it, and emits one `CandidateItem` per
-window, each with its own start/end time and deep link
-(`...watch?v=ID&t=<seconds>`). The existing per-item scoring and threshold
-then decide which *segments* are worth a push — nothing extra to configure
-for that part.
+Videos are found by the LLM provider, not by keyword search: one web-search
+conversation per interest turns up candidate video URLs (with a relevance
+estimate each), then a single batched `videos.list` call verifies the ids
+actually exist and are recent — 1 quota unit instead of 100 per
+`search.list` query. Transcript fetches are the scarce resource, so only the
+top `max_transcript_fetches` videos by estimate are fetched each cycle,
+paced a couple of seconds apart.
+
+Because a 90-minute video can hide one great 6-minute discussion, a video
+with a fetched transcript isn't scored whole: the transcript is sliced into
+a fixed, overlapping time window, and one `CandidateItem` per window is
+emitted, each with its own start/end time and deep link
+(`...watch?v=ID&t=<seconds>`). A video whose transcript wasn't fetched this
+cycle — no captions, the endpoint blocked, or simply ranked below the fetch
+budget — degrades gracefully instead of being dropped: it's still emitted as
+one video-level candidate (title + description, no deep link), so the
+discovery + verification work already spent on it isn't wasted. Either way a
+video is processed exactly once — a video-level item is never later
+"upgraded" to segments if transcripts come back.
 
 ```json
 "sources": ["youtube"],
 "source_config": {
   "youtube": {
-    "channels": ["UCxxxxxxxxxxxxxxxxxxxxxx"],
-    "queries": ["orexin agonist podcast discussion"],
-    "max_videos": 5,
+    "max_candidate_videos": 10,
+    "max_transcript_fetches": 4,
     "recency_days": 14,
     "chunk_seconds": 360,
     "chunk_overlap_seconds": 60
@@ -189,8 +201,7 @@ for that part.
 }
 ```
 
-`channels` are channel ids, `queries` are search terms — either or both. All
-knobs above are optional and shown at their defaults.
+All knobs above are optional and shown at their defaults.
 
 ```bash
 python -m app discover youtube
