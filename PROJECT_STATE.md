@@ -33,8 +33,13 @@ claude.ai tab) and `CLAUDE_ORG_ID` in `.env`. `anthropic` (direct API) and
   CREATE-IF-NOT-EXISTS-only).
 
 ## Verification (2026-08-08)
-- 135 offline tests (`test_discovery.py`, +18: ClaudeChatProviderTests, retry/
-  backoff, stats), 20 (`test_watch.py`).
+- 145 offline tests (`test_discovery.py`, +10: AnthropicProviderTests,
+  OpenAIProviderTests -- the two opt-in providers had zero coverage; both take
+  an injectable `client=`, same seam as `ClaudeChatProvider`'s `connect=`, so
+  fake clients cover them with no SDK install), 20 (`test_watch.py`).
+- `.github/workflows/tests.yml` runs both suites on every PR/push to `main`
+  (ubuntu, Python 3.14, no pip install -- both suites are stdlib-only at
+  import time).
 - 41/41-check E2E simulation rerun with the REAL ClaudeChatProvider over a
   scripted fake CDP connection: full funnel, alert + digest, Telegram-outage
   retry, backlog cool-off, feedback, stats, idempotent cycles, dead-provider
