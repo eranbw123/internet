@@ -32,7 +32,7 @@ cp .env.example .env                 # set CLAUDE_ORG_ID (+ Telegram, optional)
 $EDITOR interests.json               # what you care about
 python -m app init                          # create discovery.db, load interests
 python -m app --dry-run run-once            # one cycle, prints pushes instead of sending
-python -m app run                           # scheduler: stocks/web/youtube on their own
+python -m app run                           # scheduler: stocks/web_search/youtube on their own
                                              # cadence, plus a daily digest (see below)
 python -m app listen                        # separate process: records feedback-button presses
 python -m app stats                         # is it finding anything you care about?
@@ -150,7 +150,6 @@ anything above 1 is treated as the old scale and divided by 100, so a stale
 | --- | --- | --- |
 | `web_search` | working | The provider's server-side web search returns candidate articles |
 | `stocks` | working | Notable price moves via `watch.py`'s Yahoo fetch |
-| `web` | working | LLM-generated queries, then the provider's web search, one candidate per URL |
 | `youtube` | working | Recent uploads/search results, transcript split into overlapping time windows, one candidate **per segment** |
 
 A collector is one function — `collect(interest, cfg, provider, conn=None) -> list[CandidateItem]`
@@ -336,7 +335,7 @@ day, so a window is just a date filter.
 | `DISCOVERY_MAX_ITEMS` | `8` | Items per source per cycle |
 | `DISCOVERY_MAX_SCORES` | `25` | Hard cap on LLM scoring calls per cycle. Anything over waits for the next cycle |
 | `DISCOVERY_INTERVAL_STOCKS` | `3600` | `run`'s stocks job cadence, seconds |
-| `DISCOVERY_INTERVAL_WEB` | `14400` | `run`'s web_search+web job cadence, seconds |
+| `DISCOVERY_INTERVAL_WEB` | `14400` | `run`'s web_search job cadence, seconds |
 | `DISCOVERY_INTERVAL_YOUTUBE` | `14400` | `run`'s youtube job cadence, seconds |
 | `DISCOVERY_DIGEST_TIME` | `08:00` | Local time-of-day `run` sends the Discovery digest |
 | `DISCOVERY_DIGEST_MAX` | `10` | Discovery items per digest, highest score first |

@@ -18,11 +18,10 @@ explanation, a transcript fetch) only for dedup.py to discard it downstream.
 It is not a licence to write, score, or filter -- that all still belongs to the
 pipeline.
 """
-from . import stocks, web, web_search, youtube
+from . import stocks, web_search, youtube
 
 COLLECTORS = {
     "web_search": web_search.collect,
-    "web": web.collect,
     "youtube": youtube.collect,
     "stocks": stocks.collect,
 }

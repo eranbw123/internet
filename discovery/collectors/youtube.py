@@ -13,7 +13,7 @@ Two stages, both best-effort and independently skippable:
   1. `_search_videos` -- YouTube Data API v3 (needs YOUTUBE_API_KEY), for
      `source_config["youtube"]["channels"]` (channel ids) and/or `["queries"]`
      (search terms). One bad channel/query is logged and skipped, like a bad
-     query in web.py.
+     query in web_search.py.
   2. `_fetch_transcript` -- youtube-transcript-api (`pip install
      youtube-transcript-api`, optional -- only this collector needs it).
      Most videos won't have a transcript in the requested language, or have

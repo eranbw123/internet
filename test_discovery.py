@@ -29,7 +29,7 @@ from discovery import (
     scoring,
     stats,
 )
-from discovery.collectors import COLLECTORS, stocks, web, web_search, youtube
+from discovery.collectors import COLLECTORS, stocks, web_search, youtube
 from discovery.models import CandidateItem, Interest, ScoreResult
 from discovery.providers import PROVIDERS, claude_chat
 from discovery.providers.anthropic_provider import AnthropicProvider
@@ -703,50 +703,6 @@ class WebSearchCollectorTests(unittest.TestCase):
     def test_a_provider_without_search_raises_unsupported(self):
         with self.assertRaises(UnsupportedCapability):
             web_search.collect(an_interest(), CFG, FakeProvider())
-
-
-class WebCollectorTests(unittest.TestCase):
-    @staticmethod
-    def _provider(queries, **kw):
-        """FakeProvider.complete_json is keyed by scoring prompts, so query
-        generation needs its own stub -- same override pattern as the
-        hallucinated-schema test above."""
-        provider = FakeProvider(**kw)
-        provider.complete_json = lambda *a, **kw: {"queries": queries}
-        return provider
-
-    def test_generates_queries_and_records_provenance(self):
-        provider = self._provider(
-            ["orexin agonist trial"],
-            search_results=[{"title": "T", "url": "https://e.com/x", "summary": "S"}],
-        )
-        (item,) = web.collect(an_interest(), CFG, provider)
-        self.assertEqual((item.source, item.type, item.url), ("web", "article", "https://e.com/x"))
-        self.assertEqual(item.metadata["query"], "orexin agonist trial")
-        self.assertIn("orexin agonist trial", provider.search_prompts[0])
-
-    def test_dedups_urls_across_queries_and_respects_the_limit(self):
-        provider = self._provider(
-            ["q1", "q2", "q3"],
-            search_results=[
-                {"title": "A", "url": "https://e.com/a"},
-                {"title": "A dup", "url": "https://e.com/a"},
-            ],
-        )
-        interest = an_interest(source_config={"web": {"limit": 1}})
-        items = web.collect(interest, CFG, provider)
-        self.assertEqual(len(items), 1)
-
-    def test_falls_back_to_the_interest_title_with_no_usable_queries(self):
-        provider = self._provider([], search_results=[])
-        items = web.collect(an_interest(title="Narcolepsy"), CFG, provider)
-        self.assertEqual(items, [])
-        self.assertIn("Narcolepsy", provider.search_prompts[0])
-
-    def test_a_provider_without_search_raises_unsupported(self):
-        provider = self._provider(["q1"])
-        with self.assertRaises(UnsupportedCapability):
-            web.collect(an_interest(), CFG, provider)
 
 
 class StocksCollectorTests(unittest.TestCase):
@@ -1851,10 +1807,9 @@ class SchemaContractTests(unittest.TestCase):
     def test_every_structured_output_schema_forbids_extra_properties(self):
         """The live structured-outputs API requires additionalProperties: false
         on every object -- a schema without it 400s on the first real call."""
-        from discovery.collectors import stocks as stocks_module, web as web_module
+        from discovery.collectors import stocks as stocks_module
 
-        for schema in (scoring.SCORE_SCHEMA, web_module.QUERY_SCHEMA,
-                       stocks_module.EXPLAIN_SCHEMA):
+        for schema in (scoring.SCORE_SCHEMA, stocks_module.EXPLAIN_SCHEMA):
             self.assertIs(schema.get("additionalProperties"), False, schema)
 
 

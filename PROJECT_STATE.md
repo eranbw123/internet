@@ -1,7 +1,26 @@
 # PROJECT_STATE.md — `internet`
 
-Updated 2026-08-08 (watch.py de-standalone'd). Imported by `CLAUDE.md`.
+Updated 2026-08-08 (`web` collector removed). Imported by `CLAUDE.md`.
 Current state only — not a log.
+
+## `web` collector removed (2026-08-08)
+Deleted `discovery/collectors/web.py` (LLM-generates all queries blind, then
+one `search_json` call per query) and its `COLLECTORS`/import entries. No
+interest configured it — all use `web_search` — and `web_search`'s freeform
+single-pass search (model sees each search's results before writing the next
+query) is strictly preferable on the claude_chat transport: adaptive, cheaper
+(1 scratch conversation vs 1 query-gen + N search conversations), and stopping
+early on a quiet week is correct. Its one edge, `metadata["query"]`
+provenance, solved a problem `stats.py`'s funnel already covers (a
+persistently-empty source shows up there). Removed: the module, its 4 tests in
+`test_discovery.py`, README's `web` row and `discover web` mentions,
+`_search.py`'s docstring reference, `youtube.py`'s stray comment pointer.
+Kept: `DISCOVERY_INTERVAL_WEB`/`interval_web_seconds` and the scheduler's
+`"web"` job name — that cadence bucket still drives `web_search` (renamed
+nothing, just fixed the comments/docstrings to say so). `_search.py` (shared
+`RESULT_SPEC`/`to_items`) stays — `web_search` and `stocks` still use it.
+`test_discovery.py`: 141 tests (was 145). Recoverable from git history
+(~100 lines) if ever needed again.
 
 ## watch.py is now library-only (2026-08-08)
 Removed its standalone CLI/alerter flow (`main`, `run`, `ntfy_notify`,

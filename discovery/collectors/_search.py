@@ -1,7 +1,7 @@
 """One shape for every provider web-search result.
 
-`web_search`, `web`, and `stocks` all ask the model for the same JSON array and
-all turned it into CandidateItems in their own near-identical loop. Both halves
+`web_search` and `stocks` both ask the model for the same JSON array and
+both turned it into CandidateItems in their own near-identical loop. Both halves
 live here now: RESULT_SPEC is the prompt fragment that defines the shape, and
 `to_items` is the parser that trusts nothing about it.
 """

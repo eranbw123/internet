@@ -6,10 +6,10 @@
     run-once      one collect -> score -> notify cycle (--source to limit
                   collection to one collector; Alerts still send immediately,
                   Discovery items still just queue for `digest`)
-    run           the same, on a loop -- stocks/web/youtube each on their own
-                  cadence plus a daily digest (see scheduler.py)
+    run           the same, on a loop -- stocks/web_search/youtube each on
+                  their own cadence plus a daily digest (see scheduler.py)
     discover      run one collector across all active interests, print
-                  candidates and scores, never sends (e.g. `discover web`)
+                  candidates and scores, never sends (e.g. `discover web_search`)
     score         push one candidate through the pipeline and print the verdict
     digest        send the pending Discovery digest now (Alerts are unaffected)
     listen        long-poll Telegram for feedback-button presses (blocking)

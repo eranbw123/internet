@@ -4,7 +4,7 @@ No cron, no APScheduler, no job table. One process, four jobs, each with its
 own cadence, tracked as plain "next due" timestamps:
 
     stocks    every cfg.interval_stocks_seconds   (default 1h)
-    web       every cfg.interval_web_seconds       (default 4h) -- web_search + web
+    web       every cfg.interval_web_seconds       (default 4h) -- web_search
     youtube   every cfg.interval_youtube_seconds   (default 4h)
     digest    once a day at cfg.digest_time (local HH:MM)
 
@@ -19,11 +19,11 @@ from datetime import datetime, timedelta
 from .pipeline import run_once, send_digest
 
 # Collector job name -> (collectors it runs, the Config field holding its
-# cadence). "web" is one cadence bucket for both web-ish collectors;
-# stocks/youtube stand alone.
+# cadence). "web" is named for the cadence, not a 1:1 collector -- it drives
+# web_search only, but keeps its own knob distinct from stocks/youtube.
 JOBS = {
     "stocks": (["stocks"], "interval_stocks_seconds"),
-    "web": (["web_search", "web"], "interval_web_seconds"),
+    "web": (["web_search"], "interval_web_seconds"),
     "youtube": (["youtube"], "interval_youtube_seconds"),
 }
 
