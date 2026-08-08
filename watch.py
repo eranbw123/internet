@@ -1,36 +1,24 @@
-#!/usr/bin/env python3
-"""Watchlist price alerter: Yahoo Finance -> ntfy push.
+"""Shared Yahoo Finance helper: fetch a ticker's chart and compute its price
+change over a trading-bar window.
 
-Reads a watchlist file of tickers, each tagged with a schedule (hourly /
-daily / weekly). Run it once per schedule bucket from Task Scheduler, cron,
-or a CI workflow:
-
-    python watch.py --schedule daily
-
-For every matching ticker it pulls Yahoo Finance's public chart endpoint,
-computes the price change over that period, and pushes one ntfy
-notification summarising the movers.
-
-ntfy config is read from the environment ONLY -- an ntfy topic is
-effectively a shared secret (anyone who knows the topic string can read
-your notifications and send to them), and this repo is public, so there is
-deliberately no default topic baked in here. Set NTFY_TOPIC in .env
-(gitignored) or in the process environment.
+Not a standalone tool -- this is a library used by the `stocks` collector
+(`discovery/collectors/stocks.py`, via `price_change`/`WatchError`) and by
+`discovery/config.py` (via `load_dotenv`). There is no CLI/notification flow
+here; alerting lives in the discovery pipeline (Telegram ALERT/DISCOVERY),
+not in this module.
 """
 
-import argparse
-import json
 import os
-import sys
 import urllib.error
 import urllib.parse
 import urllib.request
+import json
 from datetime import datetime, timedelta, timezone
 
 CHART_URL = "https://query1.finance.yahoo.com/v8/finance/chart/{ticker}"
 
 # Yahoo 403s the default urllib User-Agent, so send a browser-ish one.
-USER_AGENT = "Mozilla/5.0 (compatible; watchlist-alerter/1.0)"
+USER_AGENT = "Mozilla/5.0 (compatible; internet-discovery/1.0)"
 
 # Per-schedule fetch parameters and how far back to compare.
 #
@@ -45,66 +33,9 @@ SCHEDULES = {
     "weekly": {"range": "3mo", "interval": "1d", "lookback": 5, "label": "1w"},
 }
 
-DEFAULT_WATCHLIST = "watchlist.json"
-
 
 class WatchError(Exception):
-    """Anything that should abort one ticker without killing the whole run."""
-
-
-def load_watchlist(path):
-    """Parse the watchlist file into a list of normalised entries.
-
-    Accepts either the long form::
-
-        {"tickers": [{"ticker": "NBIS", "schedule": "weekly", "min_change_pct": 2}]}
-
-    or the shorthand, where a bare string inherits the file-level default::
-
-        {"default_schedule": "daily", "tickers": ["NBIS", "MSFT"]}
-    """
-    try:
-        with open(path, encoding="utf-8") as fh:
-            raw = json.load(fh)
-    except FileNotFoundError:
-        raise WatchError(
-            f"watchlist not found: {path}\n"
-            f"Copy watchlist.example.json to {path} and edit it."
-        )
-    except json.JSONDecodeError as e:
-        raise WatchError(f"watchlist {path} is not valid JSON: {e}")
-
-    default_schedule = raw.get("default_schedule", "daily")
-    default_threshold = float(raw.get("default_min_change_pct", 0.0))
-
-    entries = []
-    for item in raw.get("tickers", []):
-        if isinstance(item, str):
-            item = {"ticker": item}
-        if not isinstance(item, dict) or not item.get("ticker"):
-            raise WatchError(f"watchlist entry missing a ticker: {item!r}")
-
-        schedule = item.get("schedule", default_schedule)
-        if schedule not in SCHEDULES:
-            raise WatchError(
-                f"{item['ticker']}: unknown schedule {schedule!r} "
-                f"(expected one of {', '.join(SCHEDULES)})"
-            )
-        entries.append(
-            {
-                "ticker": item["ticker"].upper(),
-                "schedule": schedule,
-                # Suppress noise: only alert when the move is at least this
-                # big in either direction. 0 means always alert.
-                "min_change_pct": float(
-                    item.get("min_change_pct", default_threshold)
-                ),
-            }
-        )
-
-    if not entries:
-        raise WatchError(f"watchlist {path} has no tickers")
-    return entries
+    """Anything that should abort one ticker without killing the caller's run."""
 
 
 def fetch_chart(ticker, rng, interval, timeout=15):
@@ -176,46 +107,8 @@ def price_change(ticker, schedule):
     }
 
 
-def format_line(change):
-    """One-line summary of a single ticker's move.
-
-    Deliberately ASCII-only: this string is both printed to the console and
-    sent as the ntfy body, and Windows consoles on a non-UTF-8 codepage
-    (cp1255 here) raise UnicodeEncodeError on arrows like U+25B2. The ntfy
-    tag already renders a trend icon in the app, so the sign carries it.
-    """
-    sign = "+" if change["delta"] >= 0 else ""
-    return (
-        f"{change['ticker']:<6} {change['now_price']:>9.2f} {change['currency']}  "
-        f"{sign}{change['pct']:.2f}% ({sign}{change['delta']:.2f} / {change['label']})"
-    )
-
-
-def ntfy_notify(title, message, priority="default", tags=None):
-    """Best-effort push via ntfy. Never raises -- a failed push must not
-    fail the run, and there is no default topic (see module docstring)."""
-    topic = os.environ.get("NTFY_TOPIC", "")
-    if not topic:
-        print("NTFY_TOPIC not set -- skipping push", file=sys.stderr)
-        return False
-    base = os.environ.get("NTFY_BASE", "https://ntfy.sh")
-    headers = {"Title": title, "Priority": priority, "User-Agent": USER_AGENT}
-    if tags:
-        headers["Tags"] = tags
-    req = urllib.request.Request(
-        f"{base}/{topic}", data=message.encode("utf-8"), headers=headers, method="POST"
-    )
-    try:
-        with urllib.request.urlopen(req, timeout=10) as resp:
-            resp.read()
-        return True
-    except Exception as e:  # noqa: BLE001
-        print(f"ntfy notify failed: {e}", file=sys.stderr)
-        return False
-
-
 def load_dotenv(path=".env"):
-    """Minimal KEY=VALUE loader so NTFY_TOPIC can live in a gitignored file.
+    """Minimal KEY=VALUE loader so secrets can live in a gitignored file.
 
     Deliberately tiny (no python-dotenv dependency) -- existing environment
     variables always win, so CI secrets override the local file.
@@ -231,99 +124,3 @@ def load_dotenv(path=".env"):
             continue
         key, _, value = line.partition("=")
         os.environ.setdefault(key.strip(), value.strip().strip("'\""))
-
-
-def run(entries, dry_run=False):
-    """Fetch every entry, push one digest, return a process exit code."""
-    changes, failures = [], []
-    for entry in entries:
-        try:
-            changes.append(price_change(entry["ticker"], entry["schedule"]))
-            changes[-1]["min_change_pct"] = entry["min_change_pct"]
-        except WatchError as e:
-            print(f"WARN {e}", file=sys.stderr)
-            failures.append(str(e))
-
-    for change in changes:
-        print(format_line(change))
-
-    alerts = [c for c in changes if abs(c["pct"]) >= c["min_change_pct"]]
-    if not alerts:
-        print("nothing crossed its threshold -- no push")
-        return 1 if failures and not changes else 0
-
-    biggest = max(alerts, key=lambda c: abs(c["pct"]))
-    sign = "+" if biggest["delta"] >= 0 else ""
-    if len(alerts) == 1:
-        title = f"{biggest['ticker']} {sign}{biggest['pct']:.2f}% ({biggest['label']})"
-    else:
-        title = (
-            f"{len(alerts)} movers -- {biggest['ticker']} "
-            f"{sign}{biggest['pct']:.2f}% ({biggest['label']})"
-        )
-
-    body = "\n".join(format_line(c) for c in alerts)
-    if failures:
-        body += "\n\nFailed: " + "; ".join(failures)
-    tags = "chart_with_upwards_trend" if biggest["delta"] >= 0 else "chart_with_downwards_trend"
-
-    if dry_run:
-        print(f"\n--- dry run, would push ---\n{title}\n{body}")
-    else:
-        ntfy_notify(title, body, tags=tags)
-
-    return 1 if failures and not changes else 0
-
-
-def main(argv=None):
-    parser = argparse.ArgumentParser(description=__doc__.splitlines()[0])
-    parser.add_argument(
-        "--schedule",
-        choices=sorted(SCHEDULES),
-        help="Only process watchlist entries with this schedule. Omit for all.",
-    )
-    parser.add_argument(
-        "--watchlist", default=DEFAULT_WATCHLIST, help=f"Watchlist file (default: {DEFAULT_WATCHLIST})"
-    )
-    parser.add_argument(
-        "--ticker",
-        action="append",
-        help="Check this ticker instead of the watchlist. Repeatable.",
-    )
-    parser.add_argument(
-        "--min-change-pct",
-        type=float,
-        help="Override every entry's alert threshold.",
-    )
-    parser.add_argument("--dry-run", action="store_true", help="Print instead of pushing")
-    args = parser.parse_args(argv)
-
-    load_dotenv()
-
-    try:
-        if args.ticker:
-            schedule = args.schedule or "daily"
-            entries = [
-                {"ticker": t.upper(), "schedule": schedule, "min_change_pct": 0.0}
-                for t in args.ticker
-            ]
-        else:
-            entries = load_watchlist(args.watchlist)
-            if args.schedule:
-                entries = [e for e in entries if e["schedule"] == args.schedule]
-            if not entries:
-                print(f"no {args.schedule} entries in {args.watchlist} -- nothing to do")
-                return 0
-    except WatchError as e:
-        print(f"ERROR {e}", file=sys.stderr)
-        return 2
-
-    if args.min_change_pct is not None:
-        for e in entries:
-            e["min_change_pct"] = args.min_change_pct
-
-    return run(entries, dry_run=args.dry_run)
-
-
-if __name__ == "__main__":
-    sys.exit(main())

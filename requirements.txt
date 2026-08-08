@@ -1,5 +1,5 @@
-# watch.py is stdlib only (urllib for both the Yahoo Finance fetch and the
-# ntfy push, argparse/json for the rest) and stays that way.
+# watch.py is stdlib only (urllib for the Yahoo Finance fetch) and stays
+# that way -- it's a shared library, not a standalone tool.
 #
 # The default provider (claude_chat) is stdlib only: it drives claude.ai
 # through an authenticated Chrome tab over the DevTools Protocol

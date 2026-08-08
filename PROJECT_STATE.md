@@ -1,7 +1,21 @@
 # PROJECT_STATE.md — `internet`
 
-Updated 2026-08-08 (claude_chat migration + live smoke). Imported by
-`CLAUDE.md`. Current state only — not a log.
+Updated 2026-08-08 (watch.py de-standalone'd). Imported by `CLAUDE.md`.
+Current state only — not a log.
+
+## watch.py is now library-only (2026-08-08)
+Removed its standalone CLI/alerter flow (`main`, `run`, `ntfy_notify`,
+`load_watchlist`, `format_line`, `watchlist.json`/`.example.json`, the
+`NTFY_TOPIC`/`NTFY_BASE` env vars) — it was a second, redundant notification
+path (ntfy) alongside discovery's Telegram flow. `watch.py` now only exports
+`price_change`/`fetch_chart`/`WatchError`/`load_dotenv`, i.e. exactly what
+`discovery/collectors/stocks.py` and `discovery/config.py` already called.
+A ticker move surfaces the same way as everything else discovery finds: the
+`stocks` collector → normal pipeline → Telegram ALERT. `test_watch.py` trimmed
+to the surviving surface (10 tests, was 20). README/`.env.example`/`.gitignore`
+updated to match; `watchlist.example.json` deleted. The user's local
+`watchlist.json` (gitignored, untracked) was left untouched — it's just no
+longer read by anything.
 
 ## claude_chat migration (2026-08-08)
 Default provider is now `claude_chat` (`discovery/providers/claude_chat.py`):
@@ -36,7 +50,8 @@ claude.ai tab) and `CLAUDE_ORG_ID` in `.env`. `anthropic` (direct API) and
 - 145 offline tests (`test_discovery.py`, +10: AnthropicProviderTests,
   OpenAIProviderTests -- the two opt-in providers had zero coverage; both take
   an injectable `client=`, same seam as `ClaudeChatProvider`'s `connect=`, so
-  fake clients cover them with no SDK install), 20 (`test_watch.py`).
+  fake clients cover them with no SDK install), 10 (`test_watch.py`, trimmed
+  to library surface — see watch.py section above).
 - `.github/workflows/tests.yml` runs both suites on every PR/push to `main`
   (ubuntu, Python 3.14, no pip install -- both suites are stdlib-only at
   import time).
@@ -54,7 +69,8 @@ claude.ai tab) and `CLAUDE_ORG_ID` in `.env`. `anthropic` (direct API) and
   finds nothing.
 
 ## Implemented
-- `watch.py` — watchlist price alerter, complete; live Yahoo path verified.
+- `watch.py` — shared Yahoo Finance helper library (no CLI/notification of
+  its own); live Yahoo path verified.
 - `discovery/` — staged pipeline, 0–1 dimension scoring, provider abstraction
   (`claude_chat`/`anthropic`/`openai`), score budget, backlog rescore w/
   backoff, funnel + llm_usage metrics, `stats.py`.

@@ -1,6 +1,8 @@
 # CLAUDE.md — `internet`
 
-Repo contains `watch.py` (price alerts) and `discovery/` (personal internet discovery).
+Repo contains `discovery/` (personal internet discovery) and `watch.py`, a
+shared Yahoo Finance helper library the `stocks` collector calls into — not a
+standalone tool with its own flow.
 
 @PROJECT_STATE.md
 
@@ -20,7 +22,9 @@ CLAUDE.md + PROJECT_STATE.md are the authoritative starting context and are alre
 ## Core constraints
 
 - Python 3.14; run from repo root — `discovery` imports `watch`.
-- `watch.py` stays stdlib-only.
+- `watch.py` stays stdlib-only and library-only: no CLI, no notification
+  channel of its own. `stocks.py` and `discovery/config.py` are its only
+  callers; alerting goes out through the discovery pipeline's Telegram flow.
 - SQLite (`discovery.db`) is the discovery engine's only store.
 - Vendor SDKs belong only in `discovery/providers/`; provider and model come from `DISCOVERY_PROVIDER` / `DISCOVERY_MODEL` (default `claude_chat` + `claude-opus-5` — claude.ai via an authenticated Chrome tab over CDP, no API key; `anthropic` is the opt-in direct-API path).
 - Secrets come from environment / `.env`; never hardcode them.
@@ -40,7 +44,10 @@ CLAUDE.md + PROJECT_STATE.md are the authoritative starting context and are alre
 ## watch.py
 
 - Comparison windows use trading bars, not calendar time.
-- Send one digest per run, not one notification per ticker.
+- Library only: `price_change`/`WatchError`/`load_dotenv` are its public
+  surface. Don't add back a CLI, ntfy, or any other standalone flow — a
+  ticker move is just another discovery candidate, notified the same way as
+  everything else (see `stocks` collector, `internet/CLAUDE.md` Discovery section).
 
 ## Testing
 
