@@ -1,5 +1,5 @@
 Title: Pin and stamp the scorer, then re-score the stored corpus to decompose drift and read out band density
-Status: EXECUTED
+Status: REVERTED
 Created: 2026-08-09T11:04:45+00:00
 
 # 001 — Pin and stamp the scorer, then re-score the stored corpus to decompose drift and read out band density
@@ -26,4 +26,7 @@ A re-score under the identical prompt can look artificially low-drift through ca
 Revert the stamping/pinning instrumentation and its interpretation if within_version_drift mean > 0.040 (less than a 25% reduction against mean_drift 0.0535), or if cross_version_drift < within_version_drift ג€” either result means drift is not prompt/model-version attributable and the next probe must target input-side non-determinism (retrieval and context assembly) instead. Also revert if the re-score pass cannot cover >= 80% of the stored corpus within the remaining budget, since a partial pass supports neither the drift decomposition nor the corpus-wide notify_rate readout.
 
 Execution notes: approved under the owner's pre-authorized unattended window (2026-08-09, in chat). Deviations from the letter of the proposal, recorded before the validating run: claude_chat exposes no decoding params or retrieval snapshot and cannot assert cache-off, so those stamps are omitted rather than fabricated; every stored row predates prompt stamping, so the strict within-version stratum has n=0 and 'unstamped_model_match' (same model, prompt constancy checked via git history of scoring.py) is reported as its labeled proxy; re-score uses an empty feedback block for comparability with gen 1.
+
+
+Validation outcome (2026-08-09, gen-2 rescore, 122/122 coverage): PREDICTION FAILED -> REVERTED per own trigger. Same-prompt same-model drift mean 0.0569 (median 0.0345) vs predicted 0.020 and rollback bound 0.040; 14/122 notify flips; no cross-version stratum exists so the decomposition yielded nothing. Kept: the stamping mechanism, and both secondary routing readouts (notify_rate 0.197, band_density 0.148) which held exactly. Redirect: input-side non-determinism. Concrete mechanism suspect recorded at execution time: the lab replay scores against ONE interest with empty feedback, while production hands the scorer the full matched-interest shortlist plus a recent-feedback block -- reconstructing the exact production context is the first thing the next probe must pin.
 

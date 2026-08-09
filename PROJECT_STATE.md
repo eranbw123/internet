@@ -19,24 +19,32 @@ spacing between interest bars — the largest real effect**; separation
 unmeasurable at 4 verdicts. Judge guidance (in `artifacts/scoring/state.json`):
 band-proximate sampling next, ≥15+15 labels before trusting AUC, corpus-wide
 notify-rate check — bar calibration may be the binding constraint, not
-scorer noise. Golden-set batch of 25 items sampled, awaiting user rating:
-`python experiments/lab/rate_batch.py`.
+scorer noise.
 
 Meta-loop `design_council.py` (the powerhouse): reads all experiments'
 state, emits ONE pre-registered proposal per cycle into
 `experiments/lab/proposals/` (evidence → predicted metric move → validation
-on untouched data → rollback trigger), notifies owner via ntfy (.env
-NTFY_TOPIC), `validate` checks predictions post-run. Ledger PROPOSED→
-APPROVED→EXECUTED→VALIDATED|REVERTED; guardrails in LAB.md. Proposal 001
-EXECUTED 2026-08-09: `scores.prompt_hash` stamping live
-(`scoring.prompt_fingerprint()`); corpus distribution measured —
-notify_rate .197, band_density .148 (18 near-bar items), dimensions
-discriminating (22–34 distinct values, dim_std=0 was quantization) →
-**pre-registered routing rule fired: bar calibration is next, prompt tuning
-deferred** (behavioral/knowledge/emdr bars 0.78–0.80 notify ≈0). Corpus
-rescore (drift decomposition; whole corpus is git-verified same-prompt
-same-model) + council validation of 001 running as Scheduled Task
-`engine-lab-rescore`, chained ntfy on finish.
+on untouched data → rollback trigger), ntfy to owner (.env NTFY_TOPIC),
+`validate` checks predictions post-run. Ledger PROPOSED→APPROVED→EXECUTED→
+VALIDATED|REVERTED; guardrails in LAB.md.
+
+Proposal 001 EXECUTED then **REVERTED by its own trigger** (2026-08-09):
+`scores.prompt_hash` stamping kept (`scoring.prompt_fingerprint()`), but the
+drift-is-version-attributable interpretation is falsified — full-corpus
+rescore (122/122, same git-verified prompt + model) measured mean drift
+0.0569 / median 0.0345 with **14/122 notify flips**: same-version
+non-determinism. Prime suspect (recorded in 001): lab replay scores one
+interest + empty feedback vs production's full shortlist + feedback block.
+Routing readouts held: corpus notify_rate .197, band_density .148 (18
+near-bar items); behavioral/knowledge/emdr (bars 0.78–0.80) notify ≈0;
+dimensions discriminating (22–34 distinct values).
+
+Proposal 002 PROPOSED, **awaiting owner approval**: blind stratified
+owner-verdict batch (~65–70 items, binary verdicts, duplicates for
+intra-rater agreement, frozen as test split) to clear the 15+15 separation
+gate; pre-registered AUC ≥ 0.70 (CI lower > 0.55) routes to bar fitting,
+else scorer redesign. **Supersedes the earlier `rate_batch.py` 25-item pass
+— that flow shows scores (anchoring) and must not be run as-is.**
 
 ## youtube: graceful degradation to video-level items
 Stages 1–2 unchanged (LLM-first `search_json` discovery, 0 quota; one batched
