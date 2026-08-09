@@ -1,6 +1,26 @@
 # PROJECT_STATE.md — `internet`
 
-Updated 2026-08-08. Imported by `CLAUDE.md`. Current state only — not a log.
+Updated 2026-08-09. Imported by `CLAUDE.md`. Current state only — not a log.
+
+## engine lab (`experiments/lab/`, branch `engine-lab`)
+Reusable prompt-optimization loop for the whole engine, generalized from the
+x prompt lab: `lab_common.py` (budget cap, runs.jsonl full-prompt log,
+state.json generations, council judge), `db_replay.py` (mode=ro sampling),
+`prod_scorer.py` (production scoring incl. prompt variants), `rate_batch.py`
+(golden-set feedback writer — the lab's ONLY DB write), `exp_scoring.py`
+(E1), `exp_weights.py` (E4, free). Catalog/triggers/promotion path:
+`experiments/lab/LAB.md`. Long-running lab jobs must run as a one-shot
+Scheduled Task, not a session child — SSH-session children get reaped.
+
+E1 baseline (2026-08-09, 31 calls, 10 items × 3 repeats): jitter fine
+(mean_std .011, max .022, 0 notify flips) but sampled items sat far from
+bars, so flips were never stressed; **drift vs stored scores .054 ≈ the
+spacing between interest bars — the largest real effect**; separation
+unmeasurable at 4 verdicts. Judge guidance (in `artifacts/scoring/state.json`):
+band-proximate sampling next, ≥15+15 labels before trusting AUC, corpus-wide
+notify-rate check — bar calibration may be the binding constraint, not
+scorer noise. Golden-set batch of 25 items sampled, awaiting user rating:
+`python experiments/lab/rate_batch.py`.
 
 ## youtube: graceful degradation to video-level items
 Stages 1–2 unchanged (LLM-first `search_json` discovery, 0 quota; one batched
@@ -35,6 +55,18 @@ higher once the block clears — unverified. Spend: 4 `videos.list` units, 6
 Verdict: MOSTLY fixed — silent discard resolved; items stored, scored, would
 notify past the bar; none cleared it here, expected from description-only
 evidence.
+
+## x collector: prompt-lab verdict (2026-08-08, live spend, no code yet)
+Search-prompts-only X discovery (via `search_json`, no scraping/API) is
+VIABLE: 2 interests × 3 generations, 91/91 items valid status URLs, 0
+hallucinated (15 ids independently re-found = realness proof), judge-ranked
+main news. Freshness floor: D-1 broad topics, D-2 single ticker → digest
+source, NOT ALERT. Winning angles: article-embed harvesting + aggregator
+backtrace; IR/capex/funding tweet hunts always empty. Production shape:
+cached strategist prompt + 2–4 angle searches, dedup_key=status id, add
+`"x"` to SHORT_FORM_SOURCES. Full data + harness + conclusions.md:
+`experiments/x_prompt_lab/` (untracked). Fallback transports if ever needed:
+twitterapi.io ($0.15/1k) or t.me/s/walter_bloomberg scrape.
 
 ## Open decision
 `recency_days` is both prompt bias and HARD verify drop. Proposal (not
