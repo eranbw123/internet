@@ -22,6 +22,22 @@ notify-rate check — bar calibration may be the binding constraint, not
 scorer noise. Golden-set batch of 25 items sampled, awaiting user rating:
 `python experiments/lab/rate_batch.py`.
 
+Meta-loop `design_council.py` (the powerhouse): reads all experiments'
+state, emits ONE pre-registered proposal per cycle into
+`experiments/lab/proposals/` (evidence → predicted metric move → validation
+on untouched data → rollback trigger), notifies owner via ntfy (.env
+NTFY_TOPIC), `validate` checks predictions post-run. Ledger PROPOSED→
+APPROVED→EXECUTED→VALIDATED|REVERTED; guardrails in LAB.md. Proposal 001
+EXECUTED 2026-08-09: `scores.prompt_hash` stamping live
+(`scoring.prompt_fingerprint()`); corpus distribution measured —
+notify_rate .197, band_density .148 (18 near-bar items), dimensions
+discriminating (22–34 distinct values, dim_std=0 was quantization) →
+**pre-registered routing rule fired: bar calibration is next, prompt tuning
+deferred** (behavioral/knowledge/emdr bars 0.78–0.80 notify ≈0). Corpus
+rescore (drift decomposition; whole corpus is git-verified same-prompt
+same-model) + council validation of 001 running as Scheduled Task
+`engine-lab-rescore`, chained ntfy on finish.
+
 ## youtube: graceful degradation to video-level items
 Stages 1–2 unchanged (LLM-first `search_json` discovery, 0 quota; one batched
 `videos.list` verify, 1 unit/≤50 ids, drops hallucinated/dead/stale ids).
