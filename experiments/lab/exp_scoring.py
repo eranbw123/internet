@@ -1,30 +1,24 @@
-"""E1 -- scorer stability at the notify band (see LAB.md, proposal 003).
+"""E1 -- scorer stability, reduced to the one open question (proposal 004).
 
-The notify decision lives in a 0.70-0.85 threshold band. This experiment
-measures whether the production scorer is reproducible enough for that band
-to mean anything, on the items where it matters: those near their bars.
+History, all retired with results persisted in state.json: gen-1 far-from-bar
+jitter baseline; gen-2 full-corpus rescore (drift 0.0569 vs stored, 14/122
+flips, unattributable); gen-3 band/control 3-repeat (jitter small: band
+mean_std 0.0137, mapd 0.0223; flips track bar proximity, not variance;
+REVERTED on a 0.0003 conjunctive miss). Proposal 004 deleted the repeat
+apparatus and the conjunctive all_hold gate, leaving a single question:
+is drift within-version? One more pinned corpus pass answers it against the
+gen-2 stamped scores, decided on the 75 items gen-3 never sampled.
 
-    python experiments/lab/exp_scoring.py band-repeat [--repeats 3] [--budget 300]
+    python experiments/lab/exp_scoring.py pinned-pass [--budget 450]
     python experiments/lab/exp_scoring.py distribution   # free corpus readout
     python experiments/lab/exp_scoring.py report
 
-History (retired per proposal 003's complexity budget; results persist in
-state.json): gen-1 far-from-bar baseline jitter, gen-2 full-corpus rescore
-(mean drift 0.0569, 14/122 flips, unattributable at strict_within_version_n
-0), verdict-separation reporting (label-gated; owner deferred labels).
-
-band-repeat scores each item K times with the pinned production prompt
-(hash asserted) and an empty feedback block, then reports per stratum --
-band (|gen2 score - bar| <= 0.05) vs control (>= 0.15 away) -- mean_std,
-max_std, mean absolute pairwise delta, flip rate (notify decision not
-unanimous), per-dimension noise, and 1000-resample bootstrap CIs. The
-control stratum doubles as a cache/session leak detector. Pre-registered
-pass/fail intervals from proposal 003 are checked in code.
+No jitter, std, dimension-noise, separation, or AUC claim is made here:
+mean_abs_pairwise_delta over two passes is the only variance-adjacent
+statistic, and the label-gated metrics stay gated (owner deferred labels).
 """
 import argparse
-import itertools
 import json
-import random
 import statistics
 import sys
 
@@ -37,181 +31,34 @@ from discovery import scoring  # noqa: E402
 from discovery.config import load as load_cfg  # noqa: E402
 from discovery.models import DIMENSIONS  # noqa: E402
 
-PINNED_HASH = "92954b87de02"     # proposal 003: the run is void on any other prompt
+PINNED_HASH = "92954b87de02"     # run void on any other prompt or model
 PINNED_MODEL = "claude-opus-5"
 BAND = 0.05
-CONTROL_MIN_DIST = 0.15
-N_CONTROLS = 22
-BOOTSTRAP_N = 1000
-SEED = 20260810
 
 BRIEF = """\
-Experiment E1 (proposal 003) of a personal discovery engine's lab. The LLM
-scorer rates items 0-1 on six dimensions; a weighted final_score decides
-notification against per-interest bars of 0.70-0.85. This generation
-measures within-version reproducibility on band-proximate items (first
-sample clearing the 15-item band gate) vs far-from-bar controls, under a
-pinned prompt and model. Pre-registered intervals: overall
-mean_abs_pairwise_delta <= 0.025 AND band mean_std <= 0.020; control
-mean_std <= 0.015 AND control flip_rate <= 0.05; band flip_rate strictly
-inside (0.10, 0.45) AND band mean_std <= 1.5x control mean_std. Run invalid
-(not failed) if control mean_std < 0.003 (cache/session leak). Rollback:
-band mean_std >= 0.045, band flip_rate >= 0.50, or overall
-mean_abs_pairwise_delta >= 0.045."""
+Experiment E1 (proposal 004) of a personal discovery engine's lab. The LLM
+scorer rates items 0-1; a weighted final_score decides notification against
+per-interest bars of 0.70-0.85. This generation runs a second pinned pass
+over the stored 122-item corpus and compares it to the gen-2 stamped pass
+(same prompt hash, same model). Pre-registered, decided on the 75 held-out
+items never in gen-3's band/control sample: held-out
+mean_abs_pairwise_delta in [0.010, 0.035] and < 0.0341 (0.6x the 0.0569
+cross-condition figure); corpus-wide notify disagreements <= 10 of 122; >=
+60% of disagreeing items within 0.05 of their bar. Rollback: held-out mapd
+>= 0.0341, corpus mapd >= 0.045, disagreements > 18, or < 50% of
+disagreements near-bar. Invalid (not passing) if >= 90% of held-out deltas
+are exactly 0.0 (caching/shared-context suspect). If the prediction holds,
+drift closes and the next question is bar calibration."""
 
 
-# --- item set (from the gen-2 rescore, per proposal 003) ---------------------
-
-def band_and_controls(lab, cfg):
-    """(rows, stratum_by_item_id) -- band = |gen2 score - bar| <= 0.05, all of
-    them; controls = >= 0.15 away, N_CONTROLS sampled proportionally across
-    interests. Frozen into state on first build so re-runs use the same set."""
-    if "band_repeat_items" in lab.state:
-        frozen = lab.state["band_repeat_items"]
-    else:
-        rescore = lab.state.get("rescore")
-        if not rescore:
-            sys.exit("gen-2 rescore state missing; band membership is defined on it")
-        band, far_by_interest = [], {}
-        conn = db_replay.open_ro(cfg.db_path)
-        rows = {r["item_id"]: r for r in db_replay.scored_items(conn)}
-        for key, entry in rescore.items():
-            item_id = int(key)
-            row = rows.get(item_id)
-            if row is None:
-                continue
-            dist = abs(entry["new"] - entry["bar"])
-            if dist <= BAND:
-                band.append(item_id)
-            elif dist >= CONTROL_MIN_DIST:
-                far_by_interest.setdefault(row["interest_key"], []).append(item_id)
-
-        total_far = sum(len(v) for v in far_by_interest.values())
-        controls = []
-        for key in sorted(far_by_interest):
-            ids = sorted(far_by_interest[key])
-            quota = max(1, round(N_CONTROLS * len(ids) / total_far))
-            controls.extend(
-                r for r in db_replay.spread_sample(
-                    [{"item_id": i, "final_score": rescore[str(i)]["new"]} for i in ids],
-                    quota)
-            )
-        controls = [c["item_id"] for c in controls][:N_CONTROLS]
-        frozen = {"band": sorted(band), "control": sorted(controls)}
-        lab.state["band_repeat_items"] = frozen
-        lab.save()
-
-    stratum = {i: "band" for i in frozen["band"]}
-    stratum.update({i: "control" for i in frozen["control"]})
-    return frozen, stratum
+def gen3_sample_ids(lab):
+    frozen = lab.state.get("band_repeat_items")
+    if not frozen:
+        sys.exit("gen-3 band/control sample missing from state; held-out arm undefined")
+    return set(frozen["band"]) | set(frozen["control"])
 
 
-# --- measurement -------------------------------------------------------------
-
-def pairwise_delta(finals):
-    return round(statistics.mean(
-        abs(a - b) for a, b in itertools.combinations(finals, 2)), 4)
-
-
-def measure(lab, prov, rows, interests, repeats):
-    results = []
-    done = {r["item_id"] for g in lab.state["generations"]
-            if g.get("kind") == "band_repeat" for r in g.get("items", [])}
-    partial = lab.state.setdefault("band_repeat_partial", {})
-    for row in rows:
-        key = str(row["item_id"])
-        if row["item_id"] in done:
-            continue
-        if key in partial:
-            results.append(partial[key])
-            continue
-        item = db_replay.to_candidate(row)
-        interest = interests[row["item_id"]]
-        runs = []
-        for k in range(repeats):
-            result = lab.call(
-                "score",
-                lambda: prod_scorer.score_item(prov, item, interest,
-                                               match_score=row["match_score"]),
-                kind="band_repeat", item_id=row["item_id"], repeat=k)
-            if result is None:
-                continue
-            if result.prompt_hash != PINNED_HASH:
-                sys.exit(f"prompt hash {result.prompt_hash} != pinned {PINNED_HASH}; "
-                         "run void per proposal 003")
-            lab.log(call="score", kind="band_repeat", item_id=row["item_id"],
-                    repeat=k, final=result.final_score, dims=result.dimensions)
-            runs.append(result)
-        if len(runs) < 2:
-            continue
-        finals = [r.final_score for r in runs]
-        bar = row["min_score"]
-        rec = {
-            "item_id": row["item_id"],
-            "interest_key": row["interest_key"],
-            "bar": bar,
-            "finals": finals,
-            "mean": round(statistics.mean(finals), 4),
-            "std": round(statistics.pstdev(finals), 4),
-            "pairwise_delta": pairwise_delta(finals),
-            "flip": len({f >= bar for f in finals}) > 1,
-            "dim_std": {d: round(statistics.pstdev([r.dimensions[d] for r in runs]), 4)
-                        for d in DIMENSIONS},
-        }
-        partial[key] = rec
-        lab.save()
-        results.append(rec)
-    return results
-
-
-def bootstrap_ci(values, statistic, rng):
-    if not values:
-        return None
-    samples = sorted(
-        statistic([rng.choice(values) for _ in values]) for _ in range(BOOTSTRAP_N)
-    )
-    return [round(samples[int(0.025 * BOOTSTRAP_N)], 4),
-            round(samples[int(0.975 * BOOTSTRAP_N) - 1], 4)]
-
-
-def stratum_metrics(items, rng):
-    stds = [r["std"] for r in items]
-    deltas = [r["pairwise_delta"] for r in items]
-    flips = [r["flip"] for r in items]
-    return {
-        "n": len(items),
-        "mean_std": round(statistics.mean(stds), 4),
-        "max_std": round(max(stds), 4),
-        "mean_std_ci95": bootstrap_ci(stds, statistics.mean, rng),
-        "mean_abs_pairwise_delta": round(statistics.mean(deltas), 4),
-        "mapd_ci95": bootstrap_ci(deltas, statistics.mean, rng),
-        "flip_rate": round(sum(flips) / len(flips), 3),
-        "flip_rate_ci95": bootstrap_ci(flips, lambda v: sum(v) / len(v), rng),
-        "dim_noise": {d: round(statistics.mean(r["dim_std"][d] for r in items), 4)
-                      for d in DIMENSIONS},
-    }
-
-
-def preregistered_checks(band, control, overall_mapd):
-    checks = {
-        "primary_mapd<=0.025": overall_mapd <= 0.025,
-        "primary_band_mean_std<=0.020": band["mean_std"] <= 0.020,
-        "secondary_control_mean_std<=0.015": control["mean_std"] <= 0.015,
-        "secondary_control_flip_rate<=0.05": control["flip_rate"] <= 0.05,
-        "third_band_flip_in_(0.10,0.45)": 0.10 < band["flip_rate"] < 0.45,
-        "third_band_std<=1.5x_control": band["mean_std"] <= 1.5 * control["mean_std"],
-    }
-    verdicts = {
-        "all_hold": all(checks.values()),
-        "invalid_leak_detector": control["mean_std"] < 0.003,
-        "rollback_band_mean_std>=0.045": band["mean_std"] >= 0.045,
-        "rollback_band_flip_rate>=0.50": band["flip_rate"] >= 0.50,
-        "rollback_mapd>=0.045": overall_mapd >= 0.045,
-    }
-    return checks, verdicts
-
-
-def run_band_repeat(lab, args):
+def run_pinned_pass(lab, args):
     cfg = load_cfg()
     prov = prod_scorer.provider()
     if prov.model != PINNED_MODEL:
@@ -219,54 +66,115 @@ def run_band_repeat(lab, args):
     if scoring.prompt_fingerprint() != PINNED_HASH:
         sys.exit("production prompt changed since gen-2; re-pin before running")
 
-    frozen, stratum = band_and_controls(lab, cfg)
+    gen2 = lab.state.get("rescore")
+    if not gen2:
+        sys.exit("gen-2 rescore state missing; nothing to compare a pinned pass against")
+    gen3_ids = gen3_sample_ids(lab)
+
     conn = db_replay.open_ro(cfg.db_path)
-    wanted = set(stratum)
-    rows = [r for r in db_replay.scored_items(conn) if r["item_id"] in wanted]
+    rows = [r for r in db_replay.scored_items(conn) if str(r["item_id"]) in gen2]
     by_id = {i.id: i for i in ddb.active_interests(conn)}
-    interests = {r["item_id"]: by_id[r["interest_id"]] for r in rows}
 
-    results = measure(lab, prov, rows, interests, args.repeats)
-    band_items = [r for r in results if stratum.get(r["item_id"]) == "band"]
-    control_items = [r for r in results if stratum.get(r["item_id"]) == "control"]
-    if not band_items or not control_items:
-        sys.exit("a stratum came back empty; nothing to report")
+    partial = lab.state.setdefault("pinned_pass_partial", {})
+    for row in rows:
+        key = str(row["item_id"])
+        if key in partial:
+            continue
+        item = db_replay.to_candidate(row)
+        interest = by_id[row["interest_id"]]
+        result = lab.call(
+            "score",
+            lambda: prod_scorer.score_item(prov, item, interest,
+                                           match_score=row["match_score"]),
+            kind="pinned_pass", item_id=row["item_id"])
+        if result is None:
+            continue
+        if result.prompt_hash != PINNED_HASH:
+            sys.exit(f"prompt hash {result.prompt_hash} != pinned {PINNED_HASH}; run void")
+        g2 = gen2[key]
+        bar = g2["bar"]
+        rec = {
+            "item_id": row["item_id"],
+            "interest_key": row["interest_key"],
+            "bar": bar,
+            "pass1": g2["new"],
+            "pass2": result.final_score,
+            "delta": round(result.final_score - g2["new"], 4),
+            "disagree": (result.final_score >= bar) != (g2["new"] >= bar),
+            "dist_to_bar": round(abs(g2["new"] - bar), 4),
+            "held_out": row["item_id"] not in gen3_ids,
+        }
+        partial[key] = rec
+        lab.save()
+        lab.log(call="score", kind="pinned_pass", **rec)
 
-    rng = random.Random(SEED)
-    band_m = stratum_metrics(band_items, rng)
-    control_m = stratum_metrics(control_items, rng)
-    overall_mapd = round(statistics.mean(r["pairwise_delta"] for r in results), 4)
-    checks, verdicts = preregistered_checks(band_m, control_m, overall_mapd)
+    recs = list(partial.values())
+    if not recs:
+        sys.exit("no comparisons produced")
 
+    def mapd(subset):
+        return round(statistics.mean(abs(r["delta"]) for r in subset), 4) if subset else None
+
+    held = [r for r in recs if r["held_out"]]
+    gen3 = [r for r in recs if not r["held_out"]]
+    disagree = [r for r in recs if r["disagree"]]
+    near = [r for r in disagree if r["dist_to_bar"] <= BAND]
+    zero_frac = round(sum(r["delta"] == 0 for r in held) / len(held), 3) if held else None
+
+    def notify_rates(pass_key):
+        per = {}
+        for r in recs:
+            b = per.setdefault(r["interest_key"], [0, 0])
+            b[1] += 1
+            b[0] += r[pass_key] >= r["bar"]
+        return {k: f"{v[0]}/{v[1]}" for k, v in sorted(per.items())}
+
+    held_mapd, corpus_mapd = mapd(held), mapd(recs)
+    near_share = round(len(near) / len(disagree), 3) if disagree else None
     agg = {
         "pinned": {"prompt_hash": PINNED_HASH, "model": PINNED_MODEL},
-        "repeats": args.repeats,
-        "band": band_m,
-        "control": control_m,
-        "overall_mean_abs_pairwise_delta": overall_mapd,
-        "preregistered_checks": checks,
-        "trigger_verdicts": verdicts,
+        "n": {"corpus": len(recs), "held_out": len(held), "gen3_arm": len(gen3)},
+        "mapd": {"held_out": held_mapd, "corpus": corpus_mapd, "gen3_arm": mapd(gen3)},
+        "notify_disagreements": len(disagree),
+        "disagreement_near_bar_share": near_share,
+        "disagreeing_items": [
+            {k: r[k] for k in ("item_id", "interest_key", "pass1", "pass2", "dist_to_bar")}
+            for r in sorted(disagree, key=lambda r: r["dist_to_bar"])
+        ],
+        "held_out_zero_delta_fraction": zero_frac,
+        "notify_rate_pass1": notify_rates("pass1"),
+        "notify_rate_pass2": notify_rates("pass2"),
+        "preregistered_checks": {
+            "held_out_mapd_in_[0.010,0.035]": held_mapd is not None and 0.010 <= held_mapd <= 0.035,
+            "held_out_mapd<0.0341": held_mapd is not None and held_mapd < 0.0341,
+            "disagreements<=10": len(disagree) <= 10,
+            "near_bar_share>=0.60": near_share is not None and near_share >= 0.60,
+        },
+        "rollback_triggers": {
+            "held_out_mapd>=0.0341": held_mapd is not None and held_mapd >= 0.0341,
+            "corpus_mapd>=0.045": corpus_mapd is not None and corpus_mapd >= 0.045,
+            "disagreements>18": len(disagree) > 18,
+            "near_bar_share<0.50": near_share is not None and near_share < 0.50,
+            "invalid_zero_delta>=0.90": zero_frac is not None and zero_frac >= 0.90,
+        },
     }
-    record = {"kind": "band_repeat", "aggregate": agg, "items": results,
-              "delta_vs_baseline": None}
+    record = {"kind": "pinned_pass", "aggregate": agg, "delta_vs_baseline": None}
 
     judged = council_judge(
-        prov, lab, BRIEF,
-        {"aggregate": agg,
-         "band_gate": {"band_n": len(band_items), "gate": 15,
-                       "admissible": len(band_items) >= 15}},
-        "Question: which pre-registered intervals held, is the run valid per "
-        "the leak detector, and per proposal 003's triggers should the change "
-        "stand or revert? State the next open question.",
-        kind="band_repeat")
+        prov, lab, BRIEF, {"aggregate": agg},
+        "Question: did the pre-registered prediction hold on the held-out arm, "
+        "is the run valid per the zero-delta guard, and per proposal 004's "
+        "triggers does the change stand or revert? If drift is closed, state "
+        "what the bar-calibration generation should measure first.",
+        kind="pinned_pass")
     if judged:
         record["verdict"] = judged["verdict"]
         record["guidance"] = judged["guidance"]
 
-    lab.state.pop("band_repeat_partial", None)
+    lab.state.pop("pinned_pass_partial", None)
+    lab.state["pinned_pass_results"] = recs
     lab.add_generation(record)
-    print(json.dumps({k: record[k] for k in
-                      ("gen", "kind", "aggregate", "verdict", "guidance")
+    print(json.dumps({k: record[k] for k in ("gen", "kind", "aggregate", "verdict", "guidance")
                       if k in record}, ensure_ascii=False, indent=1))
     print(f"budget used: {lab.state['budget_used']}/{lab.budget_cap}")
 
@@ -302,9 +210,8 @@ def distribution(conn):
 def main():
     utf8_streams()
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["band-repeat", "distribution", "report"])
-    ap.add_argument("--repeats", type=int, default=3)
-    ap.add_argument("--budget", type=int, default=300)
+    ap.add_argument("mode", choices=["pinned-pass", "distribution", "report"])
+    ap.add_argument("--budget", type=int, default=450)
     args = ap.parse_args()
 
     lab = Lab("scoring", budget_cap=args.budget)
@@ -318,7 +225,7 @@ def main():
                              ensure_ascii=False, indent=1))
         print(f"budget used: {lab.state['budget_used']}/{lab.budget_cap}")
     else:
-        run_band_repeat(lab, args)
+        run_pinned_pass(lab, args)
 
 
 if __name__ == "__main__":

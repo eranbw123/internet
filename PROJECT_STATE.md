@@ -45,16 +45,25 @@ available (`artifacts/blind_batch_002/`), every label-gated metric stays
 gated. Owner directive: proceed label-free, trust the council (standing
 approval for council proposals; `propose --context` passes directives in).
 
-Proposal 003 EXECUTED (auto-approved under that directive), **running
-detached** as Scheduled Task `engine-lab-003`: pinned within-version
-3-repeat on band items + far controls (band by gen2 scores = 25 items, not
-the 18 estimated — drift moved items in; +22 controls = 141 calls, cap 320),
-pre-registered intervals + cache-leak detector coded into
-`exp_scoring.py band-repeat`; validate + ntfy chained. Complexity budget
-delivered: exp_scoring rewritten — baseline/variant/rescore/separation
-modes DELETED (results persist in state.json), band-repeat/distribution/
-report remain. Lab rules in CLAUDE.md: iterations run detached; every
-iteration must shrink the lab (also enforced in the design-council brief).
+Proposal 003 EXECUTED then **REVERTED on a 0.0003 conjunctive miss**
+(control mean_std 0.0153 vs ≤0.015, CI straddling): measurements stand —
+jitter small (band mean_std .0137, mapd .0223), band flip_rate .12, flips
+track bar proximity not variance; anomalies logged (control noisier than
+band; band personal_relevance dim_noise .0063 vs control .0198).
+
+Proposal 004 EXECUTED (auto-approved), **running detached** as Scheduled
+Task `engine-lab-004`: council overruled its own 7-repeat replication
+guidance — deleted the whole band/control repeat apparatus AND the
+conjunctive all_hold gate (it contradicted the rollback triggers and caused
+003's revert; sole revert rule is now the trigger block). Single addition:
+`exp_scoring.py pinned-pass` — second pinned corpus pass (122 calls) vs the
+gen-2 stamped scores, decided on the 75 held-out items gen-3 never sampled.
+Pre-registered: held-out mapd ∈ [0.010, 0.035] and < 0.0341; ≤10 notify
+disagreements; ≥60% of disagreements within 0.05 of bar; ≥90% zero-delta =
+INVALID (caching guard). Prediction holds → drift closed, next generation
+is bar calibration (behavioral/knowledge/emdr at 0.80/0.80/0.78 notify
+≈0). Validate + ntfy chained. Lab rules in CLAUDE.md: iterations run
+detached; every iteration must shrink the lab (also in the council brief).
 
 ## youtube: graceful degradation to video-level items
 Stages 1–2 unchanged (LLM-first `search_json` discovery, 0 quota; one batched
