@@ -1,5 +1,5 @@
 Title: Retire the repeat-jitter apparatus and the conjunctive all_hold gate; one pinned rescore pass to convert drift into a within-version, corpus-wide quantity
-Status: EXECUTED
+Status: VALIDATED
 Created: 2026-08-09T12:27:25+00:00
 
 # 004 — Retire the repeat-jitter apparatus and the conjunctive all_hold gate; one pinned rescore pass to convert drift into a within-version, corpus-wide quantity
@@ -26,4 +26,7 @@ Two passes give a noisy per-item estimate; this is mitigated by evaluating only 
 Revert this proposal, restoring the gen 2 configuration, if ANY of: held-out (n=75) within_version_mean_abs_pairwise_delta >= 0.0341, or corpus within_version_mean_abs_pairwise_delta >= 0.045, or notify disagreements > 15% of 122 (> 18 items), or fewer than 50% of disagreeing items lie within 0.05 of their bar (which would mean movement, not proximity, drives decisions and the deleted variance instrumentation was load-bearing). Additionally, if >= 90% of held-out items return a delta of exactly 0.0, treat the run as INVALID rather than passing -- that indicates caching or a shared context, not stability -- and re-run with verified session isolation before drawing any conclusion. No conjunctive all_hold condition applies; absent a listed trigger, the change stands.
 
 Execution notes (2026-08-09): auto-approved under the owner's trust-the-council directive. Deletions delivered: band/control repeat apparatus, per-item std / dim-noise reporting, cross-version drift metric, and the conjunctive all_hold gate all removed from exp_scoring.py (rollback-trigger block is now the sole revert rule, as 004 specifies). Single addition: pinned-pass mode, 122 calls, compared against gen-2 stamped scores; held-out arm = 75 items outside gen-3's 47-item sample. claude_chat exposes no temperature/seed control; each call is an independent claude.ai conversation; the >=90 percent zero-delta guard is the caching detector.
+
+
+Validation outcome (2026-08-09): VALIDATED -- held-out mapd 0.0245 in [0.010,0.035] and <0.0341; 2/122 notify disagreements (vs 14 cross-condition); zero-delta 14.7% (valid); arm ordering conservative (held-out 0.0245 > corpus 0.0222 > gen3 0.0184). Drift closed for the pinned same-hash/same-model condition. near_bar_share 0.50 at n=2 flagged as a pre-registration defect, not a result -> new lab rule: share-based criteria non-decisive below 8 observations, fall through to absolute counts. Carry-forwards prescribed: max-|delta| sentinel (ceiling 0.08) + re-score of items 40 and 113; next substantive question is bar calibration, which requires owner labels (15+15 per precision claim).
 

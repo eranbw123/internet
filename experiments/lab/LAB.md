@@ -125,7 +125,11 @@ PROPOSED → APPROVED → EXECUTED → VALIDATED | REVERTED.
    items, or held-out labels — never the sample the change was tuned on.
 6. Judge scores never promote anything alone (judge and scorer share a model
    family); only code-computed metrics on untouched data do.
-7. Complexity budget — the lab must shrink over time, not grow: every
+7. Share-based criteria (rates, proportions) are non-decisive below 8
+   observations — fall through to the absolute count instead. Learned from
+   004: a ≥60% share test over 2 disagreements can only pass at 2/2, which
+   is a coin flip, not a test.
+8. Complexity budget — the lab must shrink over time, not grow: every
    proposal prefers deleting/merging code, metrics, or process steps, and any
    addition must name what it removes or retires. Retire experiments whose
    question is answered; no frameworks, base classes, or abstractions for

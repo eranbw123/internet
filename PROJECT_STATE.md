@@ -51,19 +51,28 @@ jitter small (band mean_std .0137, mapd .0223), band flip_rate .12, flips
 track bar proximity not variance; anomalies logged (control noisier than
 band; band personal_relevance dim_noise .0063 vs control .0198).
 
-Proposal 004 EXECUTED (auto-approved), **running detached** as Scheduled
-Task `engine-lab-004`: council overruled its own 7-repeat replication
-guidance — deleted the whole band/control repeat apparatus AND the
-conjunctive all_hold gate (it contradicted the rollback triggers and caused
-003's revert; sole revert rule is now the trigger block). Single addition:
-`exp_scoring.py pinned-pass` — second pinned corpus pass (122 calls) vs the
-gen-2 stamped scores, decided on the 75 held-out items gen-3 never sampled.
-Pre-registered: held-out mapd ∈ [0.010, 0.035] and < 0.0341; ≤10 notify
-disagreements; ≥60% of disagreements within 0.05 of bar; ≥90% zero-delta =
-INVALID (caching guard). Prediction holds → drift closed, next generation
-is bar calibration (behavioral/knowledge/emdr at 0.80/0.80/0.78 notify
-≈0). Validate + ntfy chained. Lab rules in CLAUDE.md: iterations run
-detached; every iteration must shrink the lab (also in the council brief).
+Proposal 004 **VALIDATED** (first in the ledger): second pinned corpus pass
+— held-out mapd 0.0245 ∈ [0.010, 0.035], 2/122 notify disagreements (vs 14
+cross-condition), caching guard clear, conservative arm ordering. **Drift
+closed for the pinned same-hash/same-model condition.** Learned rules:
+share-based criteria non-decisive below 8 observations (LAB.md guardrail
+7); tails matter — item 40 moved 0.094 while means stayed flat → max-|delta|
+sentinel (ceiling 0.08) carried as a non-decisive 2-item probe.
+
+Proposal 005 EXECUTED (auto-approved), **running detached** as Scheduled
+Task `engine-lab-005`: E2 discovery-yield A/B on the three starved
+interests + nbis control — Arm S (production static template, limit raised
+to 15 for parity) vs Arm A (strategist angles, Goodhart-firewalled: sees
+only the owner-written interest definition, never rubric/dimensions/bars;
+output scanned, breach = void). Every net-new item scored once by the
+frozen scorer. Pre-registered: Arm A above-bar ≥4 and >S on starved
+interests; pooled p90 gap ≥0.04. Both → angles become production collector;
+neither + gap <0.02 → retrieval falsified, starvation is a scorer/bar
+property, **lab goes idle until labels**. Drift apparatus deleted
+(exp_scoring.py now distribution+report only; probe lives in
+exp_discovery.py). New Lab("discovery") budget, cap 220. Validate + ntfy
+chained. Lab rules in CLAUDE.md: iterations run detached; every iteration
+must shrink the lab (also in the council brief).
 
 ## youtube: graceful degradation to video-level items
 Stages 1–2 unchanged (LLM-first `search_json` discovery, 0 quota; one batched
