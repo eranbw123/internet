@@ -1,27 +1,30 @@
-"""E1 -- scorer stability & calibration (see LAB.md).
+"""E1 -- scorer stability at the notify band (see LAB.md, proposal 003).
 
 The notify decision lives in a 0.70-0.85 threshold band. This experiment
-measures whether the production scorer is precise enough for that band to
-mean anything, and whether its scores agree with recorded human verdicts.
+measures whether the production scorer is reproducible enough for that band
+to mean anything, on the items where it matters: those near their bars.
 
-    python experiments/lab/exp_scoring.py baseline [--items 10] [--repeats 3]
-    python experiments/lab/exp_scoring.py variant anchored [--repeats 3]
-    python experiments/lab/exp_scoring.py separation      # free, no LLM calls
+    python experiments/lab/exp_scoring.py band-repeat [--repeats 3] [--budget 300]
+    python experiments/lab/exp_scoring.py distribution   # free corpus readout
     python experiments/lab/exp_scoring.py report
 
-baseline: score a spread of stored items K times each with the production
-prompt -> per-item std of final_score (jitter), flip rate of the notify
-decision, drift vs the stored score, per-dimension noise. The sampled item
-ids persist in state.json so later variants re-score the same items.
+History (retired per proposal 003's complexity budget; results persist in
+state.json): gen-1 far-from-bar baseline jitter, gen-2 full-corpus rescore
+(mean drift 0.0569, 14/122 flips, unattributable at strict_within_version_n
+0), verdict-separation reporting (label-gated; owner deferred labels).
 
-variant: same items, same metrics, under a named prompt variant; deltas vs
-the baseline generation are the result.
-
-Jitter runs score with an empty feedback block: production feedback context
-varies over time and would confound repeat-to-repeat variance.
+band-repeat scores each item K times with the pinned production prompt
+(hash asserted) and an empty feedback block, then reports per stratum --
+band (|gen2 score - bar| <= 0.05) vs control (>= 0.15 away) -- mean_std,
+max_std, mean absolute pairwise delta, flip rate (notify decision not
+unanimous), per-dimension noise, and 1000-resample bootstrap CIs. The
+control stratum doubles as a cache/session leak detector. Pre-registered
+pass/fail intervals from proposal 003 are checked in code.
 """
 import argparse
+import itertools
 import json
+import random
 import statistics
 import sys
 
@@ -29,115 +32,250 @@ import db_replay
 import prod_scorer
 from lab_common import Lab, council_judge, utf8_streams
 
+from discovery import db as ddb  # noqa: E402
 from discovery import scoring  # noqa: E402
 from discovery.config import load as load_cfg  # noqa: E402
 from discovery.models import DIMENSIONS  # noqa: E402
 
-POSITIVE = ("fire", "up")
-NEGATIVE = ("down", "trash")
+PINNED_HASH = "92954b87de02"     # proposal 003: the run is void on any other prompt
+PINNED_MODEL = "claude-opus-5"
+BAND = 0.05
+CONTROL_MIN_DIST = 0.15
+N_CONTROLS = 22
+BOOTSTRAP_N = 1000
+SEED = 20260810
 
 BRIEF = """\
-Experiment E1 of a personal discovery engine's lab. The engine's LLM scorer
-rates candidate items 0-1 on six dimensions; a weighted final_score decides
-notification against per-interest bars of 0.70-0.85. We measure: jitter (std
-of final_score when the SAME item is scored repeatedly -- above ~0.05 the
-band decisions are noise), notify-decision flip rate, drift vs the stored
-production score, per-dimension noise, and separation between items the owner
-rated positively vs negatively."""
-
-# Calibration anchors inserted into the production prompt. The hypothesis:
-# absolute anchors reduce repeat-to-repeat variance without changing ranking.
-ANCHORS = """\
-Calibration anchors for every dimension: 0.1 = clearly absent; 0.3 = weak or
-incidental; 0.5 = genuinely middling; 0.7 = strong, would hold up under
-scrutiny; 0.9 = exceptional, top few percent for this interest. Anchor each
-rating to these absolute definitions, not to other items you have seen, and
-rate in steps of 0.05.
-
-"""
+Experiment E1 (proposal 003) of a personal discovery engine's lab. The LLM
+scorer rates items 0-1 on six dimensions; a weighted final_score decides
+notification against per-interest bars of 0.70-0.85. This generation
+measures within-version reproducibility on band-proximate items (first
+sample clearing the 15-item band gate) vs far-from-bar controls, under a
+pinned prompt and model. Pre-registered intervals: overall
+mean_abs_pairwise_delta <= 0.025 AND band mean_std <= 0.020; control
+mean_std <= 0.015 AND control flip_rate <= 0.05; band flip_rate strictly
+inside (0.10, 0.45) AND band mean_std <= 1.5x control mean_std. Run invalid
+(not failed) if control mean_std < 0.003 (cache/session leak). Rollback:
+band mean_std >= 0.045, band flip_rate >= 0.50, or overall
+mean_abs_pairwise_delta >= 0.045."""
 
 
-def _anchored_prompt():
-    marker = "Also return:"
-    assert marker in scoring.PROMPT, "production prompt changed; re-derive variant"
-    return scoring.PROMPT.replace(marker, ANCHORS + marker)
+# --- item set (from the gen-2 rescore, per proposal 003) ---------------------
 
+def band_and_controls(lab, cfg):
+    """(rows, stratum_by_item_id) -- band = |gen2 score - bar| <= 0.05, all of
+    them; controls = >= 0.15 away, N_CONTROLS sampled proportionally across
+    interests. Frozen into state on first build so re-runs use the same set."""
+    if "band_repeat_items" in lab.state:
+        frozen = lab.state["band_repeat_items"]
+    else:
+        rescore = lab.state.get("rescore")
+        if not rescore:
+            sys.exit("gen-2 rescore state missing; band membership is defined on it")
+        band, far_by_interest = [], {}
+        conn = db_replay.open_ro(cfg.db_path)
+        rows = {r["item_id"]: r for r in db_replay.scored_items(conn)}
+        for key, entry in rescore.items():
+            item_id = int(key)
+            row = rows.get(item_id)
+            if row is None:
+                continue
+            dist = abs(entry["new"] - entry["bar"])
+            if dist <= BAND:
+                band.append(item_id)
+            elif dist >= CONTROL_MIN_DIST:
+                far_by_interest.setdefault(row["interest_key"], []).append(item_id)
 
-VARIANTS = {
-    "anchored": lambda: {"prompt": _anchored_prompt()},
-}
+        total_far = sum(len(v) for v in far_by_interest.values())
+        controls = []
+        for key in sorted(far_by_interest):
+            ids = sorted(far_by_interest[key])
+            quota = max(1, round(N_CONTROLS * len(ids) / total_far))
+            controls.extend(
+                r for r in db_replay.spread_sample(
+                    [{"item_id": i, "final_score": rescore[str(i)]["new"]} for i in ids],
+                    quota)
+            )
+        controls = [c["item_id"] for c in controls][:N_CONTROLS]
+        frozen = {"band": sorted(band), "control": sorted(controls)}
+        lab.state["band_repeat_items"] = frozen
+        lab.save()
+
+    stratum = {i: "band" for i in frozen["band"]}
+    stratum.update({i: "control" for i in frozen["control"]})
+    return frozen, stratum
 
 
 # --- measurement -------------------------------------------------------------
 
-def score_repeats(lab, prov, rows, interests, repeats, variant=None, kind="baseline"):
-    """Score each sampled row `repeats` times; returns per-item records.
-    `interests` maps item_id -> full Interest definition (the re-score must
-    show the scorer exactly what production shows it)."""
-    overrides = VARIANTS[variant]() if variant else {}
+def pairwise_delta(finals):
+    return round(statistics.mean(
+        abs(a - b) for a, b in itertools.combinations(finals, 2)), 4)
+
+
+def measure(lab, prov, rows, interests, repeats):
     results = []
+    done = {r["item_id"] for g in lab.state["generations"]
+            if g.get("kind") == "band_repeat" for r in g.get("items", [])}
+    partial = lab.state.setdefault("band_repeat_partial", {})
     for row in rows:
+        key = str(row["item_id"])
+        if row["item_id"] in done:
+            continue
+        if key in partial:
+            results.append(partial[key])
+            continue
         item = db_replay.to_candidate(row)
         interest = interests[row["item_id"]]
         runs = []
         for k in range(repeats):
-            def one():
-                with prod_scorer.prompt_variant(**overrides):
-                    return prod_scorer.score_item(
-                        prov, item, interest, match_score=row["match_score"]
-                    )
-            result = lab.call("score", one, kind=kind, item_id=row["item_id"], repeat=k)
+            result = lab.call(
+                "score",
+                lambda: prod_scorer.score_item(prov, item, interest,
+                                               match_score=row["match_score"]),
+                kind="band_repeat", item_id=row["item_id"], repeat=k)
             if result is None:
                 continue
-            lab.log(call="score", kind=kind, item_id=row["item_id"], repeat=k,
-                    final=result.final_score, dims=result.dimensions,
-                    reason=result.reason)
+            if result.prompt_hash != PINNED_HASH:
+                sys.exit(f"prompt hash {result.prompt_hash} != pinned {PINNED_HASH}; "
+                         "run void per proposal 003")
+            lab.log(call="score", kind="band_repeat", item_id=row["item_id"],
+                    repeat=k, final=result.final_score, dims=result.dimensions)
             runs.append(result)
-        if not runs:
+        if len(runs) < 2:
             continue
         finals = [r.final_score for r in runs]
         bar = row["min_score"]
-        results.append({
+        rec = {
             "item_id": row["item_id"],
             "interest_key": row["interest_key"],
-            "title": row["title"][:80],
             "bar": bar,
-            "stored": row["final_score"],
             "finals": finals,
             "mean": round(statistics.mean(finals), 4),
             "std": round(statistics.pstdev(finals), 4),
-            "spread": round(max(finals) - min(finals), 4),
-            "notify_flip": len({f >= bar for f in finals}) > 1,
-            "drift": round(abs(statistics.mean(finals) - row["final_score"]), 4),
-            "dim_std": {
-                d: round(statistics.pstdev([r.dimensions[d] for r in runs]), 4)
-                for d in DIMENSIONS
-            },
-        })
+            "pairwise_delta": pairwise_delta(finals),
+            "flip": len({f >= bar for f in finals}) > 1,
+            "dim_std": {d: round(statistics.pstdev([r.dimensions[d] for r in runs]), 4)
+                        for d in DIMENSIONS},
+        }
+        partial[key] = rec
+        lab.save()
+        results.append(rec)
     return results
 
 
-def aggregate(results):
-    if not results:
-        return {}
-    stds = [r["std"] for r in results]
+def bootstrap_ci(values, statistic, rng):
+    if not values:
+        return None
+    samples = sorted(
+        statistic([rng.choice(values) for _ in values]) for _ in range(BOOTSTRAP_N)
+    )
+    return [round(samples[int(0.025 * BOOTSTRAP_N)], 4),
+            round(samples[int(0.975 * BOOTSTRAP_N) - 1], 4)]
+
+
+def stratum_metrics(items, rng):
+    stds = [r["std"] for r in items]
+    deltas = [r["pairwise_delta"] for r in items]
+    flips = [r["flip"] for r in items]
     return {
-        "items": len(results),
+        "n": len(items),
         "mean_std": round(statistics.mean(stds), 4),
         "max_std": round(max(stds), 4),
-        "flip_rate": round(sum(r["notify_flip"] for r in results) / len(results), 2),
-        "mean_drift": round(statistics.mean(r["drift"] for r in results), 4),
-        "dim_noise": {
-            d: round(statistics.mean(r["dim_std"][d] for r in results), 4)
-            for d in DIMENSIONS
-        },
+        "mean_std_ci95": bootstrap_ci(stds, statistics.mean, rng),
+        "mean_abs_pairwise_delta": round(statistics.mean(deltas), 4),
+        "mapd_ci95": bootstrap_ci(deltas, statistics.mean, rng),
+        "flip_rate": round(sum(flips) / len(flips), 3),
+        "flip_rate_ci95": bootstrap_ci(flips, lambda v: sum(v) / len(v), rng),
+        "dim_noise": {d: round(statistics.mean(r["dim_std"][d] for r in items), 4)
+                      for d in DIMENSIONS},
     }
 
 
+def preregistered_checks(band, control, overall_mapd):
+    checks = {
+        "primary_mapd<=0.025": overall_mapd <= 0.025,
+        "primary_band_mean_std<=0.020": band["mean_std"] <= 0.020,
+        "secondary_control_mean_std<=0.015": control["mean_std"] <= 0.015,
+        "secondary_control_flip_rate<=0.05": control["flip_rate"] <= 0.05,
+        "third_band_flip_in_(0.10,0.45)": 0.10 < band["flip_rate"] < 0.45,
+        "third_band_std<=1.5x_control": band["mean_std"] <= 1.5 * control["mean_std"],
+    }
+    verdicts = {
+        "all_hold": all(checks.values()),
+        "invalid_leak_detector": control["mean_std"] < 0.003,
+        "rollback_band_mean_std>=0.045": band["mean_std"] >= 0.045,
+        "rollback_band_flip_rate>=0.50": band["flip_rate"] >= 0.50,
+        "rollback_mapd>=0.045": overall_mapd >= 0.045,
+    }
+    return checks, verdicts
+
+
+def run_band_repeat(lab, args):
+    cfg = load_cfg()
+    prov = prod_scorer.provider()
+    if prov.model != PINNED_MODEL:
+        sys.exit(f"model {prov.model} != pinned {PINNED_MODEL}; run void")
+    if scoring.prompt_fingerprint() != PINNED_HASH:
+        sys.exit("production prompt changed since gen-2; re-pin before running")
+
+    frozen, stratum = band_and_controls(lab, cfg)
+    conn = db_replay.open_ro(cfg.db_path)
+    wanted = set(stratum)
+    rows = [r for r in db_replay.scored_items(conn) if r["item_id"] in wanted]
+    by_id = {i.id: i for i in ddb.active_interests(conn)}
+    interests = {r["item_id"]: by_id[r["interest_id"]] for r in rows}
+
+    results = measure(lab, prov, rows, interests, args.repeats)
+    band_items = [r for r in results if stratum.get(r["item_id"]) == "band"]
+    control_items = [r for r in results if stratum.get(r["item_id"]) == "control"]
+    if not band_items or not control_items:
+        sys.exit("a stratum came back empty; nothing to report")
+
+    rng = random.Random(SEED)
+    band_m = stratum_metrics(band_items, rng)
+    control_m = stratum_metrics(control_items, rng)
+    overall_mapd = round(statistics.mean(r["pairwise_delta"] for r in results), 4)
+    checks, verdicts = preregistered_checks(band_m, control_m, overall_mapd)
+
+    agg = {
+        "pinned": {"prompt_hash": PINNED_HASH, "model": PINNED_MODEL},
+        "repeats": args.repeats,
+        "band": band_m,
+        "control": control_m,
+        "overall_mean_abs_pairwise_delta": overall_mapd,
+        "preregistered_checks": checks,
+        "trigger_verdicts": verdicts,
+    }
+    record = {"kind": "band_repeat", "aggregate": agg, "items": results,
+              "delta_vs_baseline": None}
+
+    judged = council_judge(
+        prov, lab, BRIEF,
+        {"aggregate": agg,
+         "band_gate": {"band_n": len(band_items), "gate": 15,
+                       "admissible": len(band_items) >= 15}},
+        "Question: which pre-registered intervals held, is the run valid per "
+        "the leak detector, and per proposal 003's triggers should the change "
+        "stand or revert? State the next open question.",
+        kind="band_repeat")
+    if judged:
+        record["verdict"] = judged["verdict"]
+        record["guidance"] = judged["guidance"]
+
+    lab.state.pop("band_repeat_partial", None)
+    lab.add_generation(record)
+    print(json.dumps({k: record[k] for k in
+                      ("gen", "kind", "aggregate", "verdict", "guidance")
+                      if k in record}, ensure_ascii=False, indent=1))
+    print(f"budget used: {lab.state['budget_used']}/{lab.budget_cap}")
+
+
+# --- distribution (free) -----------------------------------------------------
+
 def distribution(conn):
-    """Corpus score-vs-bar readout (free): per-interest notify_rate, band
-    density, and per-dimension distinct-value counts (proposal 001's routing
-    readout -- decides bar fitting vs band-proximate prompt testing)."""
+    """Corpus score-vs-bar readout: per-interest notify_rate, band density,
+    per-dimension distinct-value counts."""
     rows = db_replay.scored_items(conn)
     per_interest = {}
     for r in rows:
@@ -146,7 +284,7 @@ def distribution(conn):
         )
         b["n"] += 1
         b["notify"] += r["final_score"] >= r["min_score"]
-        b["band"] += abs(r["final_score"] - r["min_score"]) <= 0.05
+        b["band"] += abs(r["final_score"] - r["min_score"]) <= BAND
     for b in per_interest.values():
         b["notify_rate"] = round(b["notify"] / b["n"], 3)
         b["band_density"] = round(b["band"] / b["n"], 3)
@@ -155,219 +293,32 @@ def distribution(conn):
         "corpus_n": total,
         "notify_rate": round(sum(r["final_score"] >= r["min_score"] for r in rows) / total, 3),
         "band_density": round(
-            sum(abs(r["final_score"] - r["min_score"]) <= 0.05 for r in rows) / total, 3),
-        "band_count": sum(abs(r["final_score"] - r["min_score"]) <= 0.05 for r in rows),
+            sum(abs(r["final_score"] - r["min_score"]) <= BAND for r in rows) / total, 3),
         "per_interest": per_interest,
-        "dim_distinct_values": {
-            d: len({round(r[d], 2) for r in rows}) for d in DIMENSIONS
-        },
+        "dim_distinct_values": {d: len({round(r[d], 2) for r in rows}) for d in DIMENSIONS},
     }
-
-
-def run_rescore(lab, args):
-    """Proposal 001's validating run: one fresh production-scored pass over
-    the whole stored corpus. Drift strata are honest about what exists: every
-    stored row predates prompt stamping, so `unstamped_model_match` is the
-    closest available proxy for within-version and is labeled as such, never
-    presented as the strict stratum. Partial runs resume from state."""
-    cfg = load_cfg()
-    prov = prod_scorer.provider()
-    current_model = prov.model
-    current_hash = scoring.prompt_fingerprint()
-
-    conn, rows = full_rows(cfg)
-    pairs = _attach_interests(cfg, rows)
-    done = lab.state.setdefault("rescore", {})
-
-    for row, interest in pairs:
-        key = str(row["item_id"])
-        if key in done:
-            continue
-        item = db_replay.to_candidate(row)
-
-        def one():
-            return prod_scorer.score_item(prov, item, interest, match_score=row["match_score"])
-
-        result = lab.call("score", one, kind="rescore", item_id=row["item_id"])
-        if result is None:
-            continue
-        stratum = ("unstamped_model_match" if row["score_model"] == current_model
-                   else "unstamped_model_mismatch")
-        done[key] = {
-            "stored": row["final_score"], "new": result.final_score,
-            "drift": round(abs(result.final_score - row["final_score"]), 4),
-            "bar": row["min_score"], "stratum": stratum,
-            "flip": (result.final_score >= row["min_score"]) != (row["final_score"] >= row["min_score"]),
-            "dims": result.dimensions,
-        }
-        lab.save()
-        lab.log(call="score", kind="rescore", item_id=row["item_id"],
-                stored=row["final_score"], new=result.final_score, stratum=stratum)
-
-    by_stratum = {}
-    for d in done.values():
-        by_stratum.setdefault(d["stratum"], []).append(d["drift"])
-    agg = {
-        "coverage": round(len(done) / len(pairs), 3) if pairs else 0,
-        "corpus_n": len(pairs),
-        "rescored": len(done),
-        "current_model": current_model,
-        "current_prompt_hash": current_hash,
-        "strict_within_version_n": 0,  # no stored row carries a prompt stamp
-        "drift_by_stratum": {
-            s: {"n": len(v), "mean": round(statistics.mean(v), 4),
-                "median": round(statistics.median(v), 4)}
-            for s, v in by_stratum.items()
-        },
-        "mean_drift_overall": round(
-            statistics.mean(d["drift"] for d in done.values()), 4) if done else None,
-        "notify_flips": sum(d["flip"] for d in done.values()),
-        "distribution": distribution(conn),
-    }
-    record = lab.add_generation({"kind": "rescore", "aggregate": agg})
-    print(json.dumps({k: record[k] for k in ("gen", "kind", "aggregate")},
-                     ensure_ascii=False, indent=1))
-    print(f"budget used: {lab.state['budget_used']}/{lab.budget_cap}")
-
-
-def separation(conn):
-    """Stored-score separation between positive and negative verdicts. Free:
-    uses scores already in the DB."""
-    rows = db_replay.feedback_rows(conn)
-    pos = [r for r in rows if r["verdict"] in POSITIVE]
-    neg = [r for r in rows if r["verdict"] in NEGATIVE]
-
-    def score_of(r):
-        return r["final_score"] if r["final_score"] is not None else r["original_score"]
-
-    pos_scores = [score_of(r) for r in pos if score_of(r) is not None]
-    neg_scores = [score_of(r) for r in neg if score_of(r) is not None]
-    out = {"n_positive": len(pos_scores), "n_negative": len(neg_scores)}
-    if pos_scores and neg_scores:
-        out.update({
-            "mean_positive": round(statistics.mean(pos_scores), 4),
-            "mean_negative": round(statistics.mean(neg_scores), 4),
-            "gap": round(statistics.mean(pos_scores) - statistics.mean(neg_scores), 4),
-            # Fraction of pos/neg pairs ranked correctly (AUC); 0.5 = chance.
-            "auc": round(
-                statistics.mean(
-                    (p > q) + 0.5 * (p == q) for p in pos_scores for q in neg_scores
-                ), 3),
-        })
-    return out
-
-
-# --- interest resolution needs full definitions for a fair re-score ----------
-
-def full_rows(cfg, sample_ids=None):
-    """Sampled rows, but with the FULL interest definition attached (the jitter
-    re-score must show the scorer exactly what production shows it)."""
-    conn = db_replay.open_ro(cfg.db_path)
-    rows = db_replay.scored_items(conn)
-    if sample_ids is not None:
-        rows = [r for r in rows if r["item_id"] in sample_ids]
-    return conn, rows
-
-
-def _attach_interests(cfg, rows):
-    from discovery import db as ddb
-    conn = db_replay.open_ro(cfg.db_path)
-    by_id = {i.id: i for i in ddb.active_interests(conn)}
-    out = []
-    for row in rows:
-        interest = by_id.get(row["interest_id"])
-        if interest is not None:
-            out.append((row, interest))
-    return out
-
-
-def run_measurement(lab, args, variant=None):
-    cfg = load_cfg()
-    prov = prod_scorer.provider()
-    kind = f"variant:{variant}" if variant else "baseline"
-
-    sample_ids = lab.state.get("sample_ids")
-    conn, rows = full_rows(cfg, set(sample_ids) if sample_ids else None)
-    if sample_ids is None:
-        rows = db_replay.spread_sample(rows, args.items)
-        lab.state["sample_ids"] = [r["item_id"] for r in rows]
-        lab.save()
-
-    pairs = _attach_interests(cfg, rows)
-    interests = {row["item_id"]: interest for row, interest in pairs}
-    results = score_repeats(
-        lab, prov, [row for row, _ in pairs], interests, args.repeats, variant, kind
-    )
-
-    agg = aggregate(results)
-    sep = separation(conn)
-    record = {"kind": kind, "repeats": args.repeats, "aggregate": agg,
-              "separation": sep, "items": results}
-
-    baseline = next((g for g in lab.state["generations"] if g["kind"] == "baseline"), None)
-    if variant and baseline:
-        record["delta_vs_baseline"] = {
-            k: round(agg[k] - baseline["aggregate"][k], 4)
-            for k in ("mean_std", "flip_rate", "mean_drift")
-            if k in agg and k in baseline.get("aggregate", {})
-        }
-
-    judged = council_judge(
-        prov, lab, BRIEF,
-        {"aggregate": agg, "separation": sep, "delta_vs_baseline": record.get("delta_vs_baseline"),
-         "noisiest_items": sorted(results, key=lambda r: -r["std"])[:3]},
-        "Question: is the scorer stable enough for its threshold band, does it "
-        "separate the owner's verdicts, and what should the next generation of "
-        "this experiment change (prompt variant to try, or a different "
-        "experiment if scoring is not the bottleneck)?",
-        kind=kind,
-    )
-    if judged:
-        record["verdict"] = judged["verdict"]
-        record["guidance"] = judged["guidance"]
-
-    lab.add_generation(record)
-    print(json.dumps({k: record[k] for k in
-                      ("kind", "aggregate", "separation", "delta_vs_baseline",
-                       "verdict", "guidance") if k in record},
-                     ensure_ascii=False, indent=1))
-    print(f"budget used: {lab.state['budget_used']}/{lab.budget_cap}")
 
 
 def main():
     utf8_streams()
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["baseline", "variant", "separation", "report",
-                                     "distribution", "rescore"])
-    ap.add_argument("name", nargs="?", help="variant name (for mode=variant)")
-    ap.add_argument("--items", type=int, default=10)
+    ap.add_argument("mode", choices=["band-repeat", "distribution", "report"])
     ap.add_argument("--repeats", type=int, default=3)
-    ap.add_argument("--budget", type=int, default=40)
+    ap.add_argument("--budget", type=int, default=300)
     args = ap.parse_args()
 
     lab = Lab("scoring", budget_cap=args.budget)
-
-    if args.mode == "separation":
-        cfg = load_cfg()
-        print(json.dumps(separation(db_replay.open_ro(cfg.db_path)), indent=1))
-    elif args.mode == "distribution":
+    if args.mode == "distribution":
         cfg = load_cfg()
         print(json.dumps(distribution(db_replay.open_ro(cfg.db_path)), indent=1))
-    elif args.mode == "rescore":
-        run_rescore(lab, args)
     elif args.mode == "report":
         for g in lab.state["generations"]:
             print(json.dumps({k: g.get(k) for k in
-                              ("gen", "ts", "kind", "aggregate", "separation",
-                               "delta_vs_baseline", "verdict", "guidance")},
+                              ("gen", "ts", "kind", "aggregate", "verdict", "guidance")},
                              ensure_ascii=False, indent=1))
         print(f"budget used: {lab.state['budget_used']}/{lab.budget_cap}")
-    elif args.mode == "variant":
-        if args.name not in VARIANTS:
-            sys.exit(f"unknown variant {args.name!r}; have: {sorted(VARIANTS)}")
-        run_measurement(lab, args, variant=args.name)
     else:
-        run_measurement(lab, args)
+        run_band_repeat(lab, args)
 
 
 if __name__ == "__main__":

@@ -39,18 +39,22 @@ Routing readouts held: corpus notify_rate .197, band_density .148 (18
 near-bar items); behavioral/knowledge/emdr (bars 0.78–0.80) notify ≈0;
 dimensions discriminating (22–34 distinct values).
 
-Proposal 002 APPROVED (owner, in chat) + EXECUTED: `blind_rate.py` built —
-blind stratified verdict batch frozen (67 unique: band 18 / above 13 /
-below 36, 8 duplicate re-shows, 75 presentations, seed 20260809; manifest in
-`artifacts/blind_batch_002/`). **Owner rating pending:
-`python experiments/lab/blind_rate.py`** (y/n/s/q, resumable). `--metrics`
-computes bootstrap AUC + per-interest positive rate + flip-item verdicts +
-intra-rater agreement, all gated (15+15 labels, agreement ≥ 0.80);
-pre-registered rule: AUC CI lower > 0.55 → bar fitting, else scorer
-redesign. Supersedes `rate_batch.py` (shows scores — never run as-is).
-Lab rules now in CLAUDE.md: iterations run detached (Scheduled Task, ntfy
-chained) and must shrink the lab, not grow it (complexity budget, also
-enforced in the design-council brief).
+Proposal 002 EXECUTED then **mothballed by owner decision**: rating pass
+deferred indefinitely — `blind_rate.py` + frozen 67-item blind batch remain
+available (`artifacts/blind_batch_002/`), every label-gated metric stays
+gated. Owner directive: proceed label-free, trust the council (standing
+approval for council proposals; `propose --context` passes directives in).
+
+Proposal 003 EXECUTED (auto-approved under that directive), **running
+detached** as Scheduled Task `engine-lab-003`: pinned within-version
+3-repeat on band items + far controls (band by gen2 scores = 25 items, not
+the 18 estimated — drift moved items in; +22 controls = 141 calls, cap 320),
+pre-registered intervals + cache-leak detector coded into
+`exp_scoring.py band-repeat`; validate + ntfy chained. Complexity budget
+delivered: exp_scoring rewritten — baseline/variant/rescore/separation
+modes DELETED (results persist in state.json), band-repeat/distribution/
+report remain. Lab rules in CLAUDE.md: iterations run detached; every
+iteration must shrink the lab (also enforced in the design-council brief).
 
 ## youtube: graceful degradation to video-level items
 Stages 1–2 unchanged (LLM-first `search_json` discovery, 0 quota; one batched

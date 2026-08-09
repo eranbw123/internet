@@ -27,3 +27,6 @@ Revert this design change (and treat its output as unusable) if intra-rater agre
 
 Execution notes (2026-08-09): approved by owner in chat; blind_rate.py built (blind y/n/s/q rater + gated --metrics). Batch frozen from the gen-2 rescore corpus, seed 20260809: 67 unique items - band 18, above-bar 13, below-bar 36 (7 each from behavioral-psychology / personal-knowledge-learning / emdr-trauma-therapy, 3 each from the other five interests, spread across each interest's score range) - 8 duplicate re-shows, 75 presentations. Verdicts persist via db.add_feedback (up/down, note blind-batch-002); duplicates recorded in the responses log only. Deviation: band-subset AUC gate (15+15 within 18 band items) is arithmetically unreachable, so that readout will always be the descriptive count the proposal allows. Metrics + council validation pending owner rating.
 
+
+Owner decision (2026-08-09): rating pass deferred indefinitely -- proceed without owner labels. The frozen batch and blind_rate.py remain available; every label-gated metric stays gated (no AUC, no separation claim) until verdicts exist.
+

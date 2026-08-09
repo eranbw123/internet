@@ -115,7 +115,7 @@ def _field(text, name):
 
 # --- propose -----------------------------------------------------------------
 
-def propose(notify):
+def propose(notify, context=""):
     cfg = load_cfg()
     provider = get_provider(cfg)
     lab = Lab("design_council", budget_cap=10)
@@ -127,6 +127,10 @@ def propose(notify):
             {"id": n, "slug": s, "status": st, "title": t} for n, s, st, t, _ in entries
         ],
     }
+    if context:
+        # Owner directives for this cycle (e.g. "labels deferred, propose
+        # label-free work") -- constraints, not evidence.
+        data["owner_directive"] = context
     result = council_judge(
         provider, lab, BRIEF, data,
         "Question: what single design change should the lab make next? "
@@ -285,10 +289,11 @@ def main():
     ap.add_argument("mode", choices=["propose", "status", "mark", "validate", "notify"])
     ap.add_argument("rest", nargs="*")
     ap.add_argument("--notify", action="store_true")
+    ap.add_argument("--context", default="", help="owner directive passed to the council")
     args = ap.parse_args()
 
     if args.mode == "propose":
-        propose(args.notify)
+        propose(args.notify, args.context)
     elif args.mode == "status":
         show_status()
     elif args.mode == "mark":
