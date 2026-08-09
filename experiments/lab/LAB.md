@@ -12,6 +12,11 @@ generation starts from the scorecard.
 - Run from the repo root. Default provider is `claude_chat` (Chrome on :9222,
   logged into claude.ai) — zero marginal cost, but never run the lab while
   `python -m app run` is running (shared browser tab).
+- Iterations run detached, always: anything that spends provider calls or
+  outlives a few minutes goes in a one-shot Scheduled Task with validate +
+  ntfy chained into its `.cmd` (see `artifacts/scoring/rescore_task.cmd` for
+  the shape), never as an SSH-session child — those get reaped on disconnect.
+  Results stream to `artifacts/` as produced so any session can resume.
 - Every run has a hard budget cap (default 40 provider calls, `--budget`).
 - The lab reads `discovery.db` strictly `mode=ro`. The single exception is
   `rate_batch.py`, which writes feedback rows through `db.add_feedback` —
@@ -120,6 +125,12 @@ PROPOSED → APPROVED → EXECUTED → VALIDATED | REVERTED.
    items, or held-out labels — never the sample the change was tuned on.
 6. Judge scores never promote anything alone (judge and scorer share a model
    family); only code-computed metrics on untouched data do.
+7. Complexity budget — the lab must shrink over time, not grow: every
+   proposal prefers deleting/merging code, metrics, or process steps, and any
+   addition must name what it removes or retires. Retire experiments whose
+   question is answered; no frameworks, base classes, or abstractions for
+   single call sites (repo ethos applies to the lab too). A lab too complex
+   to hold in one head stops being trustworthy — treat that as a defect.
 
 ## Promotion path
 

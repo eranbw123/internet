@@ -39,12 +39,18 @@ Routing readouts held: corpus notify_rate .197, band_density .148 (18
 near-bar items); behavioral/knowledge/emdr (bars 0.78–0.80) notify ≈0;
 dimensions discriminating (22–34 distinct values).
 
-Proposal 002 PROPOSED, **awaiting owner approval**: blind stratified
-owner-verdict batch (~65–70 items, binary verdicts, duplicates for
-intra-rater agreement, frozen as test split) to clear the 15+15 separation
-gate; pre-registered AUC ≥ 0.70 (CI lower > 0.55) routes to bar fitting,
-else scorer redesign. **Supersedes the earlier `rate_batch.py` 25-item pass
-— that flow shows scores (anchoring) and must not be run as-is.**
+Proposal 002 APPROVED (owner, in chat) + EXECUTED: `blind_rate.py` built —
+blind stratified verdict batch frozen (67 unique: band 18 / above 13 /
+below 36, 8 duplicate re-shows, 75 presentations, seed 20260809; manifest in
+`artifacts/blind_batch_002/`). **Owner rating pending:
+`python experiments/lab/blind_rate.py`** (y/n/s/q, resumable). `--metrics`
+computes bootstrap AUC + per-interest positive rate + flip-item verdicts +
+intra-rater agreement, all gated (15+15 labels, agreement ≥ 0.80);
+pre-registered rule: AUC CI lower > 0.55 → bar fitting, else scorer
+redesign. Supersedes `rate_batch.py` (shows scores — never run as-is).
+Lab rules now in CLAUDE.md: iterations run detached (Scheduled Task, ntfy
+chained) and must shrink the lab, not grow it (complexity budget, also
+enforced in the design-council brief).
 
 ## youtube: graceful degradation to video-level items
 Stages 1–2 unchanged (LLM-first `search_json` discovery, 0 quota; one batched

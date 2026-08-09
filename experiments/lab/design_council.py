@@ -54,7 +54,12 @@ Hard rules for any proposal you make:
   positive + 15 negative labels; no jitter claims from repeats < 3; no
   threshold-band claims from items far from their bars.
 - Do not re-propose anything in the existing ledger below unless its status
-  is REVERTED and you have new evidence."""
+  is REVERTED and you have new evidence.
+- Complexity budget: prefer proposals that DELETE or merge code, metrics,
+  process steps, or whole experiments whose question is answered. Any
+  proposal that adds something must name what it removes or retires in
+  exchange; growth of the lab with no offsetting reduction is itself a
+  defect, and "add nothing, delete X" is a perfectly good proposal."""
 
 PROPOSAL_SCHEMA = {
     "type": "object",
