@@ -91,6 +91,36 @@ python experiments/lab/rate_batch.py --apply "101=f 105=t"
 | About to edit an `interests.json` entry | E3 first |
 | Scores cluster oddly / notify decisions feel random | E1 baseline (or re-baseline after a scoring.py change) |
 
+## Design evolution — the meta-loop (`design_council.py`)
+
+The lab improves its own design from accumulated council decisions:
+
+```bash
+python experiments/lab/design_council.py propose --notify  # 1 call -> proposals/NNN-*.md + ntfy
+python experiments/lab/design_council.py status            # ledger
+python experiments/lab/design_council.py mark 1 APPROVED   # owner decision recorded
+python experiments/lab/design_council.py validate 1        # did the prediction hold?
+```
+
+Each proposal is the *smallest* change that tests the highest-value idea,
+pre-registered in `proposals/NNN-<slug>.md` with: cited measured evidence, a
+predicted metric move, a validation plan on data the change was not designed
+against, overfitting risks, and a rollback trigger. Ledger:
+PROPOSED → APPROVED → EXECUTED → VALIDATED | REVERTED.
+
+**Overfitting guardrails** (non-negotiable):
+1. Owner approval gates execution — the council proposes, code metrics
+   decide, the owner approves (may be pre-authorized for a stated window).
+2. Pre-registration: the prediction is written before the validating run; a
+   change that misses it is REVERTED, not re-argued.
+3. One change at a time; no compound proposals.
+4. Minimum-n gates: no separation/AUC claims under 15+15 labels; no jitter
+   claims under 3 repeats; no band claims from items far from their bars.
+5. Validation data must be untouched by design: later generations, new
+   items, or held-out labels — never the sample the change was tuned on.
+6. Judge scores never promote anything alone (judge and scorer share a model
+   family); only code-computed metrics on untouched data do.
+
 ## Promotion path
 
 Lab finding → normal edit to `discovery/` or `interests.json` → offline tests

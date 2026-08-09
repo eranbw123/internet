@@ -134,6 +134,102 @@ def aggregate(results):
     }
 
 
+def distribution(conn):
+    """Corpus score-vs-bar readout (free): per-interest notify_rate, band
+    density, and per-dimension distinct-value counts (proposal 001's routing
+    readout -- decides bar fitting vs band-proximate prompt testing)."""
+    rows = db_replay.scored_items(conn)
+    per_interest = {}
+    for r in rows:
+        b = per_interest.setdefault(
+            r["interest_key"], {"n": 0, "notify": 0, "band": 0, "bar": r["min_score"]}
+        )
+        b["n"] += 1
+        b["notify"] += r["final_score"] >= r["min_score"]
+        b["band"] += abs(r["final_score"] - r["min_score"]) <= 0.05
+    for b in per_interest.values():
+        b["notify_rate"] = round(b["notify"] / b["n"], 3)
+        b["band_density"] = round(b["band"] / b["n"], 3)
+    total = len(rows)
+    return {
+        "corpus_n": total,
+        "notify_rate": round(sum(r["final_score"] >= r["min_score"] for r in rows) / total, 3),
+        "band_density": round(
+            sum(abs(r["final_score"] - r["min_score"]) <= 0.05 for r in rows) / total, 3),
+        "band_count": sum(abs(r["final_score"] - r["min_score"]) <= 0.05 for r in rows),
+        "per_interest": per_interest,
+        "dim_distinct_values": {
+            d: len({round(r[d], 2) for r in rows}) for d in DIMENSIONS
+        },
+    }
+
+
+def run_rescore(lab, args):
+    """Proposal 001's validating run: one fresh production-scored pass over
+    the whole stored corpus. Drift strata are honest about what exists: every
+    stored row predates prompt stamping, so `unstamped_model_match` is the
+    closest available proxy for within-version and is labeled as such, never
+    presented as the strict stratum. Partial runs resume from state."""
+    cfg = load_cfg()
+    prov = prod_scorer.provider()
+    current_model = prov.model
+    current_hash = scoring.prompt_fingerprint()
+
+    conn, rows = full_rows(cfg)
+    pairs = _attach_interests(cfg, rows)
+    done = lab.state.setdefault("rescore", {})
+
+    for row, interest in pairs:
+        key = str(row["item_id"])
+        if key in done:
+            continue
+        item = db_replay.to_candidate(row)
+
+        def one():
+            return prod_scorer.score_item(prov, item, interest, match_score=row["match_score"])
+
+        result = lab.call("score", one, kind="rescore", item_id=row["item_id"])
+        if result is None:
+            continue
+        stratum = ("unstamped_model_match" if row["score_model"] == current_model
+                   else "unstamped_model_mismatch")
+        done[key] = {
+            "stored": row["final_score"], "new": result.final_score,
+            "drift": round(abs(result.final_score - row["final_score"]), 4),
+            "bar": row["min_score"], "stratum": stratum,
+            "flip": (result.final_score >= row["min_score"]) != (row["final_score"] >= row["min_score"]),
+            "dims": result.dimensions,
+        }
+        lab.save()
+        lab.log(call="score", kind="rescore", item_id=row["item_id"],
+                stored=row["final_score"], new=result.final_score, stratum=stratum)
+
+    by_stratum = {}
+    for d in done.values():
+        by_stratum.setdefault(d["stratum"], []).append(d["drift"])
+    agg = {
+        "coverage": round(len(done) / len(pairs), 3) if pairs else 0,
+        "corpus_n": len(pairs),
+        "rescored": len(done),
+        "current_model": current_model,
+        "current_prompt_hash": current_hash,
+        "strict_within_version_n": 0,  # no stored row carries a prompt stamp
+        "drift_by_stratum": {
+            s: {"n": len(v), "mean": round(statistics.mean(v), 4),
+                "median": round(statistics.median(v), 4)}
+            for s, v in by_stratum.items()
+        },
+        "mean_drift_overall": round(
+            statistics.mean(d["drift"] for d in done.values()), 4) if done else None,
+        "notify_flips": sum(d["flip"] for d in done.values()),
+        "distribution": distribution(conn),
+    }
+    record = lab.add_generation({"kind": "rescore", "aggregate": agg})
+    print(json.dumps({k: record[k] for k in ("gen", "kind", "aggregate")},
+                     ensure_ascii=False, indent=1))
+    print(f"budget used: {lab.state['budget_used']}/{lab.budget_cap}")
+
+
 def separation(conn):
     """Stored-score separation between positive and negative verdicts. Free:
     uses scores already in the DB."""
@@ -241,7 +337,8 @@ def run_measurement(lab, args, variant=None):
 def main():
     utf8_streams()
     ap = argparse.ArgumentParser()
-    ap.add_argument("mode", choices=["baseline", "variant", "separation", "report"])
+    ap.add_argument("mode", choices=["baseline", "variant", "separation", "report",
+                                     "distribution", "rescore"])
     ap.add_argument("name", nargs="?", help="variant name (for mode=variant)")
     ap.add_argument("--items", type=int, default=10)
     ap.add_argument("--repeats", type=int, default=3)
@@ -253,6 +350,11 @@ def main():
     if args.mode == "separation":
         cfg = load_cfg()
         print(json.dumps(separation(db_replay.open_ro(cfg.db_path)), indent=1))
+    elif args.mode == "distribution":
+        cfg = load_cfg()
+        print(json.dumps(distribution(db_replay.open_ro(cfg.db_path)), indent=1))
+    elif args.mode == "rescore":
+        run_rescore(lab, args)
     elif args.mode == "report":
         for g in lab.state["generations"]:
             print(json.dumps({k: g.get(k) for k in

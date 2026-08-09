@@ -78,4 +78,5 @@ class ScoreResult:
     why_better_than_generic: str
     provider: str
     model: str
+    prompt_hash: str = ""         # scoring.prompt_fingerprint(); "" on legacy rows
     id: int = None

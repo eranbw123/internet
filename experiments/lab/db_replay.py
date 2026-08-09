@@ -27,6 +27,7 @@ def scored_items(conn):
                i.author, i.published_at, i.metadata, i.dedup_key,
                s.final_score, s.personal_relevance, s.novelty, s.depth,
                s.specificity, s.importance, s.surprise, s.confidence, s.reason,
+               s.model AS score_model, s.provider AS score_provider,
                n.key AS interest_key, n.id AS interest_id, n.min_score,
                COALESCE(m.match_score, 0.5) AS match_score
         FROM candidate_items i

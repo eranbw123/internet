@@ -53,6 +53,7 @@ def init(conn):
     for table, column, decl in (
         ("notifications", "attempts", "INTEGER NOT NULL DEFAULT 1"),
         ("candidate_items", "score_attempted_at", "TEXT"),
+        ("scores", "prompt_hash", "TEXT"),
     ):
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
@@ -254,12 +255,13 @@ def save_score(conn, score):
         f"""
         INSERT OR REPLACE INTO scores
             (item_id, interest_id, {', '.join(DIMENSIONS)}, final_score, confidence,
-             reason, why_better_than_generic, provider, model, created_at)
-        VALUES (?, ?, {', '.join('?' * len(DIMENSIONS))}, ?, ?, ?, ?, ?, ?, ?)
+             reason, why_better_than_generic, provider, model, prompt_hash, created_at)
+        VALUES (?, ?, {', '.join('?' * len(DIMENSIONS))}, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             score.item_id, score.interest_id, *dims, score.final_score, score.confidence,
-            score.reason, score.why_better_than_generic, score.provider, score.model, now(),
+            score.reason, score.why_better_than_generic, score.provider, score.model,
+            score.prompt_hash, now(),
         ),
     )
     conn.commit()
