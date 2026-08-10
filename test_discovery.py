@@ -10,6 +10,7 @@ import dataclasses
 import io
 import json
 import os
+import sqlite3
 import sys
 import tempfile
 import types
@@ -48,6 +49,12 @@ from discovery.providers.openai_provider import OpenAIProvider
 # invocation would resolve it: `ops/` on sys.path, then a bare import.
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ops"))
 import install_tasks  # noqa: E402
+
+# Same pattern for the engine-lab's flat scripts.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "experiments", "lab"))
+import db_replay  # noqa: E402
+import exp_connectors  # noqa: E402
 
 CFG = config.Config(
     db_path=":memory:",
@@ -3294,6 +3301,290 @@ class InstallTasksTests(unittest.TestCase):
         with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
             install_tasks.status(runner=lambda args: (0, output_with_soak, ""))
         self.assertIn(f"{install_tasks.SOAK_TASK}:", out.getvalue())
+
+
+class _FakeHTTPResponse:
+    def __init__(self, body=b'{"hits": []}', status=200, headers=None):
+        self.status = status
+        self._body = body
+        self.headers = headers or {}
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class ConnectorReconTests(unittest.TestCase):
+    """exp_connectors.py (step-09a): offline, no network, no provider, no
+    real DB -- every test injects a fake fetcher into _http_get or exercises
+    the pure analysis/rule functions directly."""
+
+    def setUp(self):
+        exp_connectors._reset_http_state()
+
+    def tearDown(self):
+        exp_connectors._reset_http_state()
+
+    # (a) canonicalization + overlap/marginal-unique-rate math ------------
+
+    def test_canon_url_and_title(self):
+        self.assertEqual(exp_connectors.canon_url("HTTPS://Example.com/Path?x=1#frag"),
+                         "https://example.com/path")
+        self.assertEqual(exp_connectors.canon_url("https://example.com/path/"),
+                         "https://example.com/path")
+        self.assertEqual(exp_connectors.canon_title("Some, Title! 2026"), "sometitle2026")
+
+    def test_jaccard_overlap_exact_tie(self):
+        a = {"https://e.com/1", "https://e.com/2"}
+        self.assertEqual(exp_connectors.jaccard_overlap(a, set(a)), 1.0)
+
+    def test_jaccard_overlap_empty_sets(self):
+        self.assertEqual(exp_connectors.jaccard_overlap(set(), set()), 0.0)
+
+    def test_marginal_unique_rate_hand_computed(self):
+        sample = {"a", "b", "c", "d"}
+        baseline = {"a", "b"}
+        self.assertAlmostEqual(exp_connectors.marginal_unique_rate(sample, baseline), 0.5)
+
+    def test_marginal_unique_rate_empty_sample_is_void(self):
+        self.assertIsNone(exp_connectors.marginal_unique_rate(set(), {"a"}))
+
+    # (b) falsification rule ------------------------------------------------
+
+    def test_falsification_no_baseline_is_void(self):
+        metrics = {"hackernews": {"marginal_unique_rate": 0.9, "jaccard_overlap": 0.1}}
+        self.assertEqual(exp_connectors.apply_falsification_rule(metrics, False), "VOID_NO_BASELINE")
+
+    def test_falsification_no_measurable_connectors(self):
+        metrics = {"hackernews": {"marginal_unique_rate": None, "jaccard_overlap": None},
+                  "reddit": {"marginal_unique_rate": None, "jaccard_overlap": 0.2}}
+        self.assertEqual(exp_connectors.apply_falsification_rule(metrics, True),
+                         "VOID_NO_MEASURABLE_CONNECTORS")
+
+    def test_falsification_all_below_threshold_yields_falsified_not_void(self):
+        metrics = {
+            "hackernews": {"marginal_unique_rate": 0.10, "jaccard_overlap": 0.50},
+            "reddit": {"marginal_unique_rate": 0.39, "jaccard_overlap": 0.10},   # rate just under 0.40
+            "arxiv": {"marginal_unique_rate": 0.90, "jaccard_overlap": 0.31},    # overlap just over 0.30
+        }
+        self.assertEqual(exp_connectors.apply_falsification_rule(metrics, True), "H1_FALSIFIED")
+
+    def test_falsification_supported_when_one_connector_clears_bar(self):
+        metrics = {
+            "hackernews": {"marginal_unique_rate": 0.10, "jaccard_overlap": 0.50},
+            "pubmed": {"marginal_unique_rate": 0.45, "jaccard_overlap": 0.20},
+        }
+        self.assertEqual(exp_connectors.apply_falsification_rule(metrics, True), "H1_SUPPORTED")
+
+    # (c) request counter + per-host spacing --------------------------------
+
+    def test_request_cap_refuses_41st(self):
+        with mock.patch("exp_connectors.time.sleep"), \
+             mock.patch("exp_connectors.urllib.request.urlopen",
+                        return_value=_FakeHTTPResponse()) as m_urlopen:
+            for i in range(exp_connectors.MAX_REQUESTS):
+                exp_connectors._http_get(f"https://host{i}.example/path")
+            self.assertEqual(m_urlopen.call_count, exp_connectors.MAX_REQUESTS)
+            with self.assertRaises(RuntimeError):
+                exp_connectors._http_get("https://host-over.example/path")
+            self.assertEqual(m_urlopen.call_count, exp_connectors.MAX_REQUESTS)
+
+    def test_per_host_spacing_honored(self):
+        fake_times = iter([0.0, 0.5, 1.5])
+        with mock.patch("exp_connectors.time.monotonic", side_effect=lambda: next(fake_times)), \
+             mock.patch("exp_connectors.time.sleep") as m_sleep, \
+             mock.patch("exp_connectors.urllib.request.urlopen", return_value=_FakeHTTPResponse()):
+            exp_connectors._http_get("https://hn.algolia.com/api/v1/search_by_date?query=a")
+            exp_connectors._http_get("https://hn.algolia.com/api/v1/search_by_date?query=b")
+        m_sleep.assert_called_once()
+        self.assertAlmostEqual(m_sleep.call_args[0][0], 0.5, places=3)
+
+    def test_arxiv_has_its_own_wider_spacing(self):
+        self.assertEqual(exp_connectors.HOST_MIN_GAP_SECONDS["export.arxiv.org"], 3.0)
+        self.assertEqual(exp_connectors.DEFAULT_MIN_GAP_SECONDS, 1.0)
+
+    def test_per_connector_cap_refuses_11th(self):
+        with mock.patch("exp_connectors.time.sleep"), \
+             mock.patch("exp_connectors.urllib.request.urlopen",
+                        return_value=_FakeHTTPResponse()) as m_urlopen:
+            for i in range(exp_connectors.PER_CONNECTOR_CAP):
+                exp_connectors._http_get(f"https://hn.algolia.com/api/v1/search_by_date?query={i}",
+                                         connector="hackernews")
+            self.assertEqual(m_urlopen.call_count, exp_connectors.PER_CONNECTOR_CAP)
+            with self.assertRaises(RuntimeError):
+                exp_connectors._http_get("https://hn.algolia.com/api/v1/search_by_date?query=over",
+                                         connector="hackernews")
+            self.assertEqual(m_urlopen.call_count, exp_connectors.PER_CONNECTOR_CAP)
+            # a different connector's own cap is untouched by hackernews's
+            exp_connectors._http_get("https://export.arxiv.org/api/query?search_query=x",
+                                     connector="arxiv")
+            self.assertEqual(m_urlopen.call_count, exp_connectors.PER_CONNECTOR_CAP + 1)
+
+    # (d) missing corpus / missing network / failed preflight -> VOID/PENDING
+
+    def test_load_corpus_urls_missing_file_is_void(self):
+        with tempfile.TemporaryDirectory() as d:
+            missing = os.path.join(d, "discovery.db")
+            urls, status = exp_connectors.load_corpus_urls(missing)
+        self.assertIsNone(urls)
+        self.assertFalse(status["available"])
+        self.assertIn(missing, status["reason"])
+
+    def test_build_x_entry_not_implemented_regardless_of_provider_ok(self):
+        # x has no sampler at all in this harness version -- the status must
+        # say so plainly and identically whether or not a live provider is
+        # reachable (repair: it used to say PENDING unconditionally, implying
+        # a live session alone would resolve it).
+        for provider_ok, provider_why in ((False, "CLAUDE_ORG_ID is not set"), (True, "")):
+            with self.subTest(provider_ok=provider_ok):
+                entry = exp_connectors.build_x_entry(["ai-agents-dev-tools"], provider_ok, provider_why)
+                self.assertEqual(entry["availability"]["status"], "NOT_IMPLEMENTED")
+                self.assertEqual(entry["sample"]["status"], "NOT_IMPLEMENTED")
+                self.assertIsNone(entry["metrics"]["marginal_unique_rate"])
+                self.assertEqual(entry["metrics"]["marginal_unique_rate_status"], "NOT_IMPLEMENTED")
+                self.assertIsNone(entry["command_to_complete"])
+                self.assertTrue(entry["follow_up"])
+
+    def test_http_connector_entry_void_when_endpoint_unreachable(self):
+        def boom(url, timeout=15, connector=None):
+            raise exp_connectors.ConnectorUnreachable("host.example: connection refused")
+
+        interests_by_key = {"ai-agents-dev-tools": an_interest(
+            key="ai-agents-dev-tools", title="T", positive_signals=["s1", "s2", "s3"])}
+        with mock.patch("exp_connectors._http_get", side_effect=boom):
+            entry = exp_connectors.build_http_connector_entry(
+                "hackernews", ["ai-agents-dev-tools"], interests_by_key, set(), False,
+                datetime.now(timezone.utc), "deadbeef", provider=None, provider_ok=False, lab=None)
+        self.assertEqual(entry["sample"]["status"], "VOID_UNREACHABLE")
+        self.assertIn("connection refused", entry["failure_behavior"])
+        self.assertIn("connection refused", entry["availability"]["detail"])
+        self.assertEqual(entry["metrics"]["n_sampled"], 0)
+        self.assertIsNone(entry["metrics"]["marginal_unique_rate"])
+        self.assertEqual(entry["metrics"]["marginal_unique_rate_status"], "VOID_UNREACHABLE")
+
+    def test_http_connector_entry_void_on_low_n(self):
+        def empty_hits(url, timeout=15, connector=None):
+            return 200, b'{"hits": []}', {}
+
+        interests_by_key = {"ai-agents-dev-tools": an_interest(
+            key="ai-agents-dev-tools", title="T", positive_signals=["s1", "s2", "s3"])}
+        with mock.patch("exp_connectors._http_get", side_effect=empty_hits):
+            entry = exp_connectors.build_http_connector_entry(
+                "hackernews", ["ai-agents-dev-tools"], interests_by_key, set(), False,
+                datetime.now(timezone.utc), "deadbeef", provider=None, provider_ok=False, lab=None)
+        self.assertEqual(entry["sample"]["status"], "VOID_LOW_N")
+        # availability is about reachability (http 200), not sample size --
+        # repair: these two used to be conflated into one 'detail' field.
+        self.assertIn("reachable", entry["availability"]["detail"])
+        self.assertNotIn("< 5", entry["availability"]["detail"])
+        self.assertIn("< 5", entry["sample"]["detail"])
+
+    def test_http_connector_entry_computes_offline_baseline_when_corpus_available(self):
+        # repair: baseline_available used to be hardcoded False with no code
+        # path that could ever set it True. The offline lane's substitute
+        # baseline is the corpus alone (pre-registration) when reachable.
+        def five_hits(url, timeout=15, connector=None):
+            hits = [{"title": f"T{i}", "url": f"https://e.com/{i}",
+                    "created_at": "2026-08-01T00:00:00.000Z", "objectID": str(i)}
+                   for i in range(1, 6)]
+            return 200, json.dumps({"hits": hits}).encode(), {}
+
+        interests_by_key = {"ai-agents-dev-tools": an_interest(
+            key="ai-agents-dev-tools", title="T", positive_signals=["s1", "s2", "s3"])}
+        corpus_urls = {"https://e.com/1", "https://e.com/2"}   # 2 of the 5 sampled urls known
+        with mock.patch("exp_connectors._http_get", side_effect=five_hits):
+            entry = exp_connectors.build_http_connector_entry(
+                "hackernews", ["ai-agents-dev-tools"], interests_by_key, corpus_urls, True,
+                datetime.now(timezone.utc), "deadbeef", provider=None, provider_ok=False, lab=None)
+        self.assertEqual(entry["sample"]["status"], "OK")
+        self.assertAlmostEqual(entry["metrics"]["marginal_unique_rate"], 0.6)
+        self.assertEqual(entry["metrics"]["marginal_unique_rate_status"],
+                         "OK_OFFLINE_LANE_CORPUS_ONLY_BASELINE")
+
+    def test_http_connector_entry_void_no_baseline_when_corpus_unavailable(self):
+        def five_hits(url, timeout=15, connector=None):
+            hits = [{"title": f"T{i}", "url": f"https://e.com/{i}",
+                    "created_at": "2026-08-01T00:00:00.000Z", "objectID": str(i)}
+                   for i in range(1, 6)]
+            return 200, json.dumps({"hits": hits}).encode(), {}
+
+        interests_by_key = {"ai-agents-dev-tools": an_interest(
+            key="ai-agents-dev-tools", title="T", positive_signals=["s1", "s2", "s3"])}
+        with mock.patch("exp_connectors._http_get", side_effect=five_hits):
+            entry = exp_connectors.build_http_connector_entry(
+                "hackernews", ["ai-agents-dev-tools"], interests_by_key, set(), False,
+                datetime.now(timezone.utc), "deadbeef", provider=None, provider_ok=False, lab=None)
+        self.assertEqual(entry["sample"]["status"], "OK")
+        self.assertIsNone(entry["metrics"]["marginal_unique_rate"])
+        self.assertEqual(entry["metrics"]["marginal_unique_rate_status"], "VOID_NO_BASELINE")
+
+    def test_above_bar_not_spent_when_baseline_unavailable(self):
+        # repair: above-bar sub-metric used to fire on provider_ok alone,
+        # spending provider budget even when the connector's own primary
+        # metric was structurally void this pass.
+        def five_hits(url, timeout=15, connector=None):
+            hits = [{"title": f"T{i}", "url": f"https://e.com/{i}",
+                    "created_at": "2026-08-01T00:00:00.000Z", "objectID": str(i)}
+                   for i in range(1, 6)]
+            return 200, json.dumps({"hits": hits}).encode(), {}
+
+        interests_by_key = {"ai-agents-dev-tools": an_interest(
+            key="ai-agents-dev-tools", title="T", positive_signals=["s1", "s2", "s3"])}
+        with mock.patch("exp_connectors._http_get", side_effect=five_hits):
+            entry = exp_connectors.build_http_connector_entry(
+                "hackernews", ["ai-agents-dev-tools"], interests_by_key, set(), False,
+                datetime.now(timezone.utc), "deadbeef", provider=object(), provider_ok=True, lab=None)
+        self.assertIsNone(entry["metrics"]["above_bar_count"])
+        self.assertEqual(entry["metrics"]["above_bar_status"], "VOID_NO_BASELINE")
+
+    # (e) provenance on every dossier record --------------------------------
+
+    def test_per_interest_records_carry_provenance(self):
+        def one_hit(url, timeout=15, connector=None):
+            body = json.dumps({"hits": [{"title": "T1", "url": "https://e.com/1",
+                                        "created_at": "2026-08-01T00:00:00.000Z",
+                                        "objectID": "1"}]}).encode()
+            return 200, body, {}
+
+        interests_by_key = {"ai-agents-dev-tools": an_interest(
+            key="ai-agents-dev-tools", title="T", positive_signals=["s1", "s2", "s3"])}
+        with mock.patch("exp_connectors._http_get", side_effect=one_hit):
+            entry = exp_connectors.build_http_connector_entry(
+                "hackernews", ["ai-agents-dev-tools"], interests_by_key, set(), False,
+                datetime.now(timezone.utc), "deadbeef", provider=None, provider_ok=False, lab=None)
+        pi = entry["sample"]["per_interest"][0]
+        self.assertEqual(pi["lane"], "zero_spend")
+        self.assertEqual(pi["git_commit"], "deadbeef")
+        self.assertTrue(pi["collected_at"])
+        self.assertEqual(entry["metrics"]["sample_validity_rate"], 1.0)
+
+    # (f) discovery.db is opened mode=ro only --------------------------------
+
+    def test_load_corpus_urls_opens_mode_ro(self):
+        captured = {}
+        real_connect = sqlite3.connect
+
+        def spy_connect(*args, **kwargs):
+            captured["uri"] = args[0]
+            return real_connect(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as d:
+            db_path = os.path.join(d, "discovery.db")
+            conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE candidate_items (id INTEGER PRIMARY KEY, url TEXT)")
+            conn.execute("INSERT INTO candidate_items (url) VALUES ('https://e.com/x')")
+            conn.commit()
+            conn.close()
+            with mock.patch("db_replay.sqlite3.connect", side_effect=spy_connect):
+                urls, status = exp_connectors.load_corpus_urls(db_path)
+        self.assertTrue(status["available"])
+        self.assertIn("https://e.com/x", urls)
+        self.assertIn("mode=ro", captured["uri"])
 
 
 if __name__ == "__main__":

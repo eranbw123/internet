@@ -134,10 +134,12 @@ near-bar items); behavioral/knowledge/emdr (bars 0.78–0.80) notify ≈0;
 dimensions discriminating (22–34 distinct values).
 
 Proposal 002 EXECUTED then **mothballed by owner decision**: rating pass
-deferred indefinitely — `blind_rate.py` + frozen 67-item blind batch remain
-available (`artifacts/blind_batch_002/`), every label-gated metric stays
-gated. Owner directive: proceed label-free, trust the council (standing
-approval for council proposals; `propose --context` passes directives in).
+deferred indefinitely — every label-gated metric stays gated. Owner
+directive: proceed label-free, trust the council (standing approval for
+council proposals; `propose --context` passes directives in). Its runner
+`blind_rate.py` is DELETED (step-09a, LAB.md guardrail 8): the frozen
+67-item batch under gitignored `artifacts/blind_batch_002/` is untouched
+and git history retains the file if the pass is ever revived.
 
 Proposal 003 EXECUTED then **REVERTED on a 0.0003 conjunctive miss**
 (control mean_std 0.0153 vs ≤0.015, CI straddling): measurements stand —
@@ -167,6 +169,35 @@ property, **lab goes idle until labels**. Drift apparatus deleted
 exp_discovery.py). New Lab("discovery") budget, cap 220. Validate + ntfy
 chained. Lab rules in CLAUDE.md: iterations run detached; every iteration
 must shrink the lab (also in the council brief).
+
+**E5 — connector evidence (step-09a, `exp_connectors.py`)**: read-only recon
+for step-09's connector decision (x, hackernews, reddit, arxiv, pubmed vs
+the 5 probed interests). Zero-spend lane RAN for real (14 free HTTP
+requests, 0 provider calls): hackernews 0 hits (the mechanical
+title+3-signals query is over-constrained for Algolia's AND-match, an
+honest low-recall result, not a bug), reddit blocked (403, likely
+datacenter-IP anti-bot), arxiv and pubmed reachable with real records
+(counts vary run to run with live network conditions). `marginal_unique_rate`
+now genuinely computes against `discovery.db` alone when it's reachable (the
+pre-registered offline-lane substitute baseline; repair fixed a bug where
+this was hardcoded unreachable with no code path to fix it) — still VOID
+here because this worktree has no `discovery.db`. Verdict
+**`VOID_NO_BASELINE`**. **The live lane is NOT YET IMPLEMENTED in the
+harness**, not just session-gated: no code calls `provider.search_json` for
+`x`, and there is no `web_search` baseline sampler, so
+`jaccard_overlap_with_web_search_sample` (needed for a decisive H1
+either way) stays void regardless of who runs `sample` or from where.
+Before re-running for real evidence: (1) implement an `x` sampler
+(`provider.search_json` + the same mechanical query rule) and a
+`web_search`-baseline sampler in `exp_connectors.py`, (2) then run
+`python experiments/lab/exp_connectors.py sample` from a live operator
+session (Chrome `--remote-debugging-port=9222`, logged into claude.ai) with
+`discovery.db` reachable. Spend: 14/40 HTTP requests, $0, 0 provider calls,
+0 YouTube quota. Follow-up: `exp_connectors.py` keeps its own local
+canonicalization/percentile helpers (never touched `exp_discovery.py`'s, to
+avoid disturbing `engine-lab-005` in flight) — collapse the two copies onto
+one shared module once 005 completes. Dossier:
+`experiments/lab/connector_evidence.json` (tracked).
 
 ## youtube: graceful degradation to video-level items
 Stages 1–2 unchanged (LLM-first `search_json` discovery, 0 quota; one batched
