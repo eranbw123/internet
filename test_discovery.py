@@ -4904,21 +4904,6 @@ class ConnectorReconTests(unittest.TestCase):
         self.assertFalse(status["available"])
         self.assertIn(missing, status["reason"])
 
-    def test_build_x_entry_not_implemented_regardless_of_provider_ok(self):
-        # x has no sampler at all in this harness version -- the status must
-        # say so plainly and identically whether or not a live provider is
-        # reachable (repair: it used to say PENDING unconditionally, implying
-        # a live session alone would resolve it).
-        for provider_ok, provider_why in ((False, "CLAUDE_ORG_ID is not set"), (True, "")):
-            with self.subTest(provider_ok=provider_ok):
-                entry = exp_connectors.build_x_entry(["ai-agents-dev-tools"], provider_ok, provider_why)
-                self.assertEqual(entry["availability"]["status"], "NOT_IMPLEMENTED")
-                self.assertEqual(entry["sample"]["status"], "NOT_IMPLEMENTED")
-                self.assertIsNone(entry["metrics"]["marginal_unique_rate"])
-                self.assertEqual(entry["metrics"]["marginal_unique_rate_status"], "NOT_IMPLEMENTED")
-                self.assertIsNone(entry["command_to_complete"])
-                self.assertTrue(entry["follow_up"])
-
     def test_http_connector_entry_void_when_endpoint_unreachable(self):
         def boom(url, timeout=15, connector=None):
             raise exp_connectors.ConnectorUnreachable("host.example: connection refused")
@@ -5054,6 +5039,230 @@ class ConnectorReconTests(unittest.TestCase):
         self.assertTrue(status["available"])
         self.assertIn("https://e.com/x", urls)
         self.assertIn("mode=ro", captured["uri"])
+
+    # (g) E5b / H2 (step-09): revised query rule, USABLE definition, gate ---
+
+    def test_build_query_v2_first_four_distinctive_tokens_in_title_order(self):
+        interest = an_interest(title="Zebra Quantum Coding Wizard Extra Words Here")
+        self.assertEqual(exp_connectors.build_query_v2(interest), "zebra quantum coding wizard")
+
+    def test_build_query_v2_dedupes_within_title(self):
+        interest = an_interest(title="Coding Coding Quantum Wizard")
+        self.assertEqual(exp_connectors.build_query_v2(interest), "coding quantum wizard")
+
+    def test_build_query_v2_extends_from_positive_signals_until_two(self):
+        interest = an_interest(title="AI", positive_signals=["Great Learning Systems Here"])
+        self.assertEqual(exp_connectors.build_query_v2(interest), "great learning")
+
+    def test_build_query_v2_extend_stops_at_two_not_four(self):
+        interest = an_interest(title="Zebra", positive_signals=["Wizard Coding Extra"])
+        self.assertEqual(exp_connectors.build_query_v2(interest), "zebra wizard")
+
+    def test_usable_records_rejects_missing_url_or_title(self):
+        interest = an_interest(key="k", title="Zebra Quantum Coding")
+        per_interest = [{"interest": "k", "records": [
+            {"title": "Zebra quantum coding release", "url": None},
+            {"title": None, "url": "https://e.com/1"},
+        ]}]
+        self.assertEqual(exp_connectors.usable_records(per_interest, {"k": interest}, CFG), [])
+
+    def test_usable_records_rejects_weak_match_and_grants_no_origin_floor(self):
+        # If origin_interest were mistakenly set, matching.ORIGIN_MATCH_FLOOR
+        # (0.5) would pass this record despite zero shared tokens -- proves
+        # the metric isn't made vacuous.
+        interest = an_interest(key="k", title="Alpha Beta Gamma", positive_signals=[])
+        per_interest = [{"interest": "k", "records": [
+            {"title": "Totally unrelated words nothing shared", "url": "https://e.com/3"},
+        ]}]
+        self.assertEqual(exp_connectors.usable_records(per_interest, {"k": interest}, CFG), [])
+
+    def test_usable_records_accepts_strong_match(self):
+        interest = an_interest(key="k", title="Zebra Quantum Coding")
+        per_interest = [{"interest": "k", "records": [
+            {"title": "Zebra quantum coding release", "url": "https://e.com/1"},
+        ]}]
+        usable = exp_connectors.usable_records(per_interest, {"k": interest}, CFG)
+        self.assertEqual(len(usable), 1)
+        self.assertGreaterEqual(usable[0]["match_score"], CFG.min_match_score)
+
+    def test_usable_records_dedups_pooled_across_interests_by_url_and_title(self):
+        interest = an_interest(key="k", title="Zebra Quantum Coding")
+        per_interest = [
+            {"interest": "k", "records": [
+                {"title": "Zebra quantum coding launch", "url": "https://e.com/x?ref=1"}]},
+            {"interest": "k", "records": [
+                {"title": "ZEBRA QUANTUM CODING LAUNCH", "url": "https://e.com/x?ref=2"}]},
+        ]
+        usable = exp_connectors.usable_records(per_interest, {"k": interest}, CFG)
+        self.assertEqual(len(usable), 1)
+
+    def test_apply_h2_falsification_rule(self):
+        self.assertEqual(exp_connectors.apply_h2_falsification_rule({"a": 3, "b": 7}), "H2_FALSIFIED")
+        self.assertEqual(exp_connectors.apply_h2_falsification_rule({"a": 9, "b": 2}), "H2_SUPPORTED")
+
+    def test_gate_promote_when_all_three_clear(self):
+        metrics = {"a": {"usable_yield": 10, "marginal_unique_rate": 0.5},
+                  "b": {"usable_yield": 3, "marginal_unique_rate": 0.9}}
+        result = exp_connectors.apply_promotion_gate(metrics, True)
+        self.assertEqual(result["result"], "PROMOTE")
+        self.assertEqual(result["winner"], "a")
+        self.assertIsNone(result["failing_gate"])
+
+    def test_gate_no_promotion_g1_tie(self):
+        metrics = {"a": {"usable_yield": 8, "marginal_unique_rate": 0.9},
+                  "b": {"usable_yield": 8, "marginal_unique_rate": 0.9}}
+        result = exp_connectors.apply_promotion_gate(metrics, True)
+        self.assertEqual(result["result"], "NO_PROMOTION")
+        self.assertEqual(result["failing_gate"], "G1")
+
+    def test_gate_no_promotion_g1_below_eight(self):
+        metrics = {"a": {"usable_yield": 7, "marginal_unique_rate": 0.9}}
+        result = exp_connectors.apply_promotion_gate(metrics, True)
+        self.assertEqual(result["failing_gate"], "G1")
+
+    def test_gate_no_promotion_g2_not_clear_winner(self):
+        metrics = {"a": {"usable_yield": 10, "marginal_unique_rate": 0.9},
+                  "b": {"usable_yield": 6, "marginal_unique_rate": 0.1}}
+        result = exp_connectors.apply_promotion_gate(metrics, True)
+        self.assertEqual(result["failing_gate"], "G2")
+
+    def test_gate_no_promotion_g3_void_baseline(self):
+        metrics = {"a": {"usable_yield": 10, "marginal_unique_rate": 0.9}}
+        result = exp_connectors.apply_promotion_gate(metrics, False)
+        self.assertEqual(result["result"], "NO_PROMOTION")
+        self.assertEqual(result["failing_gate"], "G3")
+
+    def test_gate_no_promotion_g3_below_threshold(self):
+        metrics = {"a": {"usable_yield": 10, "marginal_unique_rate": 0.1}}
+        result = exp_connectors.apply_promotion_gate(metrics, True)
+        self.assertEqual(result["failing_gate"], "G3")
+
+    def test_x_deferred_entry_shape(self):
+        entry = exp_connectors.x_deferred_entry()
+        self.assertEqual(entry["status"], "DEFERRED_NEEDS_PROVIDER")
+        self.assertTrue(entry["detail"])
+
+    def test_uniqueness_among_candidates(self):
+        by_connector = {"a": {"u1", "u2"}, "b": {"u2", "u3"}}
+        self.assertAlmostEqual(exp_connectors.uniqueness_among_candidates("a", by_connector), 0.5)
+        self.assertIsNone(exp_connectors.uniqueness_among_candidates("c", by_connector))
+
+    def test_sample_reddit_pass2_stops_after_failed_recheck(self):
+        interests_by_key = {f"i{n}": an_interest(key=f"i{n}", title=f"Topic Number {n} Words")
+                            for n in range(3)}
+
+        def always_403(url, timeout=15, connector=None):
+            return 403, b"blocked", {"Retry-After": "0"}
+
+        with mock.patch("exp_connectors._http_get", side_effect=always_403):
+            per_interest, availability = exp_connectors.sample_reddit_pass2(
+                list(interests_by_key), interests_by_key)
+        self.assertEqual(len(per_interest), 1)
+        self.assertFalse(availability["reachable"])
+
+    def test_sample_reddit_pass2_continues_after_successful_recheck(self):
+        interests_by_key = {f"i{n}": an_interest(key=f"i{n}", title=f"Topic Number {n} Words")
+                            for n in range(3)}
+
+        def empty_hits(url, timeout=15, connector=None):
+            return 200, json.dumps({"data": {"children": []}}).encode(), {}
+
+        with mock.patch("exp_connectors._http_get", side_effect=empty_hits):
+            per_interest, availability = exp_connectors.sample_reddit_pass2(
+                list(interests_by_key), interests_by_key)
+        self.assertEqual(len(per_interest), len(interests_by_key))
+        self.assertTrue(availability["reachable"])
+
+    def test_build_connector_pass2_entry_computes_both_arms(self):
+        interest = an_interest(key="k", title="Zebra Quantum Coding")
+        old_per_interest = [{"interest": "k", "records": [
+            {"title": "Zebra old quantum coding record", "url": "https://e.com/old1"},
+            {"title": "unrelated old record entirely", "url": "https://e.com/old2"},
+        ]}]
+
+        def two_hits(url, timeout=15, connector=None):
+            hits = [
+                {"title": "Zebra quantum coding new release", "url": "https://e.com/new1",
+                 "created_at": "2026-08-01T00:00:00.000Z", "objectID": "1"},
+                {"title": "unrelated new item entirely", "url": "https://e.com/new2",
+                 "created_at": "2026-08-01T00:00:00.000Z", "objectID": "2"},
+            ]
+            return 200, json.dumps({"hits": hits}).encode(), {}
+
+        with mock.patch("exp_connectors._http_get", side_effect=two_hits):
+            entry, usable_urls = exp_connectors.build_connector_pass2_entry(
+                "hackernews", ["k"], {"k": interest}, CFG, old_per_interest,
+                set(), False, datetime.now(timezone.utc), 0)
+
+        self.assertEqual(entry["arm_new_rule"]["usable_yield"], 1)
+        self.assertEqual(entry["arm_old_rule_recomputed"]["usable_yield"], 1)
+        self.assertIsNone(entry["arm_new_rule"]["marginal_unique_rate"])
+        self.assertEqual(entry["arm_new_rule"]["marginal_unique_rate_status"], "VOID_NO_BASELINE")
+        self.assertEqual(usable_urls, {"https://e.com/new1"})
+
+    def test_run_pass2_e5b_end_to_end_offline_no_promotion_on_void_baseline(self):
+        # Fully offline: patches _http_get for every host the real pass would
+        # hit, reads the real tracked dossier (read-only, for old-rule
+        # baseline records) and a real interests.json, but never touches the
+        # network or writes the dossier file.
+        hn_bodies = iter([
+            json.dumps({"hits": [{"title": "New AI coding agents automation research",
+                                  "url": "https://e.com/hn1", "created_at": "2026-08-01T00:00:00.000Z",
+                                  "objectID": "1"}]}).encode(),
+            json.dumps({"hits": [{"title": "Personal knowledge memory learning system launch",
+                                  "url": "https://e.com/hn2", "created_at": "2026-08-01T00:00:00.000Z",
+                                  "objectID": "2"}]}).encode(),
+        ])
+
+        def atom(url_, title_):
+            return (
+                '<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">'
+                f"<entry><id>{url_}</id><title>{title_}</title>"
+                "<published>2026-01-01T00:00:00Z</published></entry></feed>"
+            ).encode()
+
+        arxiv_bodies = iter([
+            atom("https://arxiv.org/abs/1", "Human interaction attraction behavioral study"),
+            atom("https://arxiv.org/abs/2", "Personal knowledge memory learning systems"),
+            atom("https://arxiv.org/abs/3", "Agents coding automation for personal tools"),
+        ])
+        pubmed_bodies = iter([
+            json.dumps({"esearchresult": {"idlist": ["101"]}}).encode(),
+            json.dumps({"result": {"uids": ["101"], "101": {
+                "title": "Narcolepsy wakefulness orexin trial", "pubdate": "2026 Jan"}}}).encode(),
+            json.dumps({"esearchresult": {"idlist": ["201"]}}).encode(),
+            json.dumps({"result": {"uids": ["201"], "201": {
+                "title": "EMDR trauma processing mechanisms study", "pubdate": "2026 Feb"}}}).encode(),
+        ])
+
+        def fake_http_get(url, timeout=15, connector=None):
+            host = urllib.parse.urlparse(url).netloc
+            if host == "hn.algolia.com":
+                return 200, next(hn_bodies), {}
+            if host == "export.arxiv.org":
+                return 200, next(arxiv_bodies), {}
+            if host == "eutils.ncbi.nlm.nih.gov":
+                return 200, next(pubmed_bodies), {}
+            if host == "www.reddit.com":
+                return 403, b"blocked", {"Retry-After": "0"}
+            raise AssertionError(f"unexpected host {host}")
+
+        with tempfile.TemporaryDirectory() as d:
+            missing_db = os.path.join(d, "discovery.db")
+            cfg = dataclasses.replace(CFG, db_path=missing_db, interests_path="interests.json")
+            dossier = json.loads(exp_connectors.DOSSIER_PATH.read_text(encoding="utf-8"))
+            with mock.patch("exp_connectors._http_get", side_effect=fake_http_get), \
+                 mock.patch("exp_connectors.time.sleep"):
+                pass2 = exp_connectors.run_pass2_e5b(dossier, cfg)
+
+        self.assertEqual(pass2["x"]["status"], "DEFERRED_NEEDS_PROVIDER")
+        self.assertEqual(pass2["aborted_attempts"], [])
+        self.assertFalse(pass2["corpus"]["available"])
+        self.assertEqual(pass2["dispositions"]["reddit"], "RETIRED_UNREACHABLE")
+        for name in ("hackernews", "arxiv", "pubmed"):
+            self.assertEqual(pass2["dispositions"][name], "NOT_PROMOTED_VOID_BASELINE")
+        self.assertEqual(pass2["gate"]["result"], "NO_PROMOTION")
+        self.assertIn(pass2["verdict"], ("H2_SUPPORTED", "H2_FALSIFIED"))
 
 
 if __name__ == "__main__":
