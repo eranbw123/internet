@@ -798,8 +798,8 @@ class InterestsFileTests(unittest.TestCase):
         self.assertIn("stocks", nbis.sources)
         self.assertEqual(nbis.source_config["stocks"]["tickers"][0]["ticker"], "NBIS")
         youtube_cfg = loaded[keys.index("narcolepsy-eds")].source_config["youtube"]
-        self.assertIn("max_candidate_videos", youtube_cfg)
         self.assertIn("max_transcript_fetches", youtube_cfg)
+        self.assertTrue(youtube_cfg.get("queries"))  # owner hints the collector feeds the prompt
 
     def test_sample_file_thresholds_are_on_the_0_1_scale(self):
         for interest in interests.load_file("interests.json"):
@@ -1363,6 +1363,22 @@ class YoutubeCollectorTests(unittest.TestCase):
             # FakeProvider with search_results=None raises UnsupportedCapability.
             self.assertEqual(youtube.collect(self.interest(), self.cfg, FakeProvider()), [])
             lv.assert_not_called()
+
+    def test_owner_queries_ride_into_the_discovery_prompt(self):
+        """`source_config.youtube.queries` are starting-point hints for the
+        model's iterative search -- blank entries dropped, absent key means
+        the prompt stays byte-identical to the hintless form."""
+        interest = self.interest(
+            source_config={"youtube": {"queries": ["orexin agonist trial MWT", "  ", ""]}}
+        )
+        provider = FakeProvider(search_results=[])
+        self.assertEqual(youtube.collect(interest, self.cfg, provider), [])
+        self.assertIn("orexin agonist trial MWT", provider.search_prompts[0])
+        self.assertIn("Starting-point searches", provider.search_prompts[0])
+
+        bare = FakeProvider(search_results=[])
+        youtube.collect(self.interest(), self.cfg, bare)
+        self.assertNotIn("Starting-point searches", bare.search_prompts[0])
 
     def test_collect_shapes_one_candidate_per_segment(self):
         interest = self.interest(

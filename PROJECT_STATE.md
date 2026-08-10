@@ -199,6 +199,14 @@ avoid disturbing `engine-lab-005` in flight) — collapse the two copies onto
 one shared module once 005 completes. Dossier:
 `experiments/lab/connector_evidence.json` (tracked).
 
+## interests.json rewrite (2026-08-10, owner-supplied)
+Full owner rewrite: 40 interests, defaults `min_score` 0.8 / `sources` []
+(interests with explicit `sources: []` collect nothing but remain scoring
+targets). Owner's `max_videos: 1` translated to `max_transcript_fetches: 1`;
+unsupported empty `channels` dropped. New youtube knob added for it:
+`source_config.youtube.queries` — owner starting-point searches injected
+into the stage-1 discovery prompt as hints (absent key = prompt unchanged).
+
 ## youtube: graceful degradation to video-level items
 Stages 1–2 unchanged (LLM-first `search_json` discovery, 0 quota; one batched
 `videos.list` verify, 1 unit/≤50 ids, drops hallucinated/dead/stale ids).
