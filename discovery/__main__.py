@@ -291,11 +291,11 @@ def _personal_state(cfg, args):
     except (AttributeError, TypeError, ValueError):
         age = "age unknown"
 
-    print(f"{path}: contract_version={state.contract_version}")
-    print(f"generated_at={state.generated_at} ({age})")
-    print(f"{len(state.topics)} topic(s)")
+    print_safe(f"{path}: contract_version={state.contract_version}")
+    print_safe(f"generated_at={state.generated_at} ({age})")
+    print_safe(f"{len(state.topics)} topic(s)")
     for topic in state.topics[:10]:
-        print(f"  {topic.get('key')!r}  weight={topic.get('weight')}")
+        print_safe(f"  {topic.get('key')!r}  weight={topic.get('weight')}")
     return 0
 
 

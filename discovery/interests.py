@@ -16,7 +16,7 @@ def load_file(path, state=None):
 def _to_interest(entry, defaults, state=None):
     positive_signals = entry.get("positive_signals", [])
     top_n = entry.get("personal_state_top_terms")
-    if top_n and state is not None:
+    if top_n and state is not None and int(top_n) > 0:
         # De-duplicated, existing signals first, order stable -- an opt-in
         # augmentation that must stay byte-identical to today when the key
         # is absent or the artifact didn't load (see discovery/personal_state.py).

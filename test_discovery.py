@@ -2516,6 +2516,27 @@ class CLITests(unittest.TestCase):
             self.assertEqual(code, 0)
             self.assertIn("age unknown", out)
 
+    def test_personal_state_probe_prints_a_full_readout(self):
+        # Valid v1 artifact, proper Z-suffixed timestamp, >10 topics -- the
+        # normal-path shape, as opposed to the degenerate/error shape above.
+        topics = [{"key": f"t{i}", "weight": round(1.0 - i * 0.05, 2)} for i in range(12)]
+        path = os.path.join(self.tmp.name, "ps.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"contract_version": 1, "generated_at": "2026-08-01T00:00:00Z", "topics": topics},
+                fh,
+            )
+        code, out, _err = self._main("personal-state", "--path", path)
+        self.assertEqual(code, 0)
+        self.assertIn("contract_version=1", out)
+        self.assertIn("12 topic(s)", out)
+        self.assertIn("d old", out)
+        self.assertNotIn("age unknown", out)
+        listed_keys = [
+            line.split("'")[1] for line in out.splitlines() if line.strip().startswith("'t")
+        ]
+        self.assertEqual(listed_keys, [f"t{i}" for i in range(10)])
+
 
 class CLIPrintSafetyTests(unittest.TestCase):
     """Regression: __main__.py's own output helpers must survive a narrow
@@ -2558,6 +2579,25 @@ class CLIPrintSafetyTests(unittest.TestCase):
 
         with mock.patch("sys.stdout", self._narrow_stdout()):
             _list_items(conn, limit=10, min_score=0.0)  # must not raise
+
+    def test_personal_state_probe_survives_a_narrow_codepage(self):
+        from discovery.__main__ import _personal_state
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "ps.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "contract_version": 1,
+                    "generated_at": "2026-08-01T00:00:00Z",
+                    "topics": [{"key": "topic ≥ threshold", "weight": 0.9}],
+                },
+                fh,
+            )
+        args = SimpleNamespace(path=path)
+        with mock.patch("sys.stdout", self._narrow_stdout()):
+            _personal_state(None, args)  # must not raise
 
 
 if __name__ == "__main__":

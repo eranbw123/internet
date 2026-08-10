@@ -72,6 +72,12 @@ def load(path):
             f"in discovery/personal_state.py to add support for it."
         )
 
+    # Deliberately stricter than the "ignore unknown keys" forward-compat
+    # posture above: top_terms() indexes topic["key"] outside load_optional's
+    # fail-soft boundary (called straight from interests.py/__main__.py), so
+    # every topic having a string key is an invariant this reader must
+    # guarantee up front rather than let a bad entry surface as a KeyError
+    # deep in a caller. One malformed topic voids the whole artifact.
     topics = data["topics"]
     if not isinstance(topics, list) or any(
         not isinstance(t, dict) or not isinstance(t.get("key"), str) for t in topics
