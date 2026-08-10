@@ -90,8 +90,22 @@ def _iso8601_duration(seconds):
 
 
 def _current_user():
-    domain = os.environ.get("USERDOMAIN", "")
+    """The account SID, not a name: on workgroup machines USERDOMAIN can be
+    the literal 'WORKGROUP', which schtasks cannot map to a SID ('No mapping
+    between account names and security IDs', observed on first live install).
+    A SID is always mappable and locale-proof. Fallback builds
+    COMPUTERNAME\\USERNAME — the real authority for local accounts."""
+    try:
+        out = subprocess.run(["whoami", "/user", "/fo", "csv"],
+                             capture_output=True, text=True, errors="replace",
+                             timeout=15).stdout or ""
+        sid = out.strip().splitlines()[-1].split(",")[-1].strip('" ')
+        if sid.upper().startswith("S-1-"):
+            return sid
+    except (OSError, IndexError, subprocess.TimeoutExpired):
+        pass
     name = os.environ.get("USERNAME", "")
+    domain = os.environ.get("COMPUTERNAME", "")
     return f"{domain}\\{name}" if domain else name
 
 
@@ -208,7 +222,11 @@ def render_xml(task):
 
 
 def _default_runner(args):
-    proc = subprocess.run(args, capture_output=True, text=True)
+    # errors="replace": the machine-wide `schtasks /query /fo LIST /v` dump
+    # contains bytes the ANSI codepage (cp1255 here) cannot decode; bare
+    # text=True crashed the reader thread and handed back stdout=None
+    # (observed on first live --status). The fields we parse are ASCII.
+    proc = subprocess.run(args, capture_output=True, text=True, errors="replace")
     return proc.returncode, proc.stdout, proc.stderr
 
 
@@ -323,7 +341,7 @@ def _parse_query_blocks(output):
     under our prefix."""
     blocks = {}
     current = {}
-    for raw_line in output.splitlines() + [""]:
+    for raw_line in (output or "").splitlines() + [""]:
         line = raw_line.rstrip()
         if not line.strip():
             name = current.get("TaskName", "").lstrip("\\")
