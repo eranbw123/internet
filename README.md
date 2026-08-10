@@ -432,12 +432,31 @@ propagating the exit code. `python -m app health` (or
 fastest way to check the appliance is actually alive without digging through
 logs.
 
+## Experiments lab
+
+`experiments/lab/` is how the engine's prompts and parameters get improved:
+bounded, budget-capped, logged experiments whose findings are promoted into
+production only through normal edits + offline tests + PR — see
+`experiments/lab/LAB.md` for the ground rules and the experiment catalog
+(scorer stability/calibration, discovery yield, weights fitting, and more).
+The lab reads `discovery.db` strictly read-only (single documented exception:
+`rate_batch.py` writing feedback rows), and every provider call's prompt and
+raw response is logged to gitignored artifacts.
+
+`experiments/lab/exp_connectors.py` is a read-only recon harness for five
+candidate future connectors (x, hackernews, reddit, arxiv, pubmed): it
+probes reachability and samples yield against the frozen probed interests
+under a pre-registered plan with a hard request cap and zero provider spend
+by default; its persisted evidence lives in
+`experiments/lab/connector_evidence.json`. It never registers a collector,
+never edits `interests.json`, and never writes `discovery.db`.
+
 ## Tests
 
 ```bash
 python test_discovery.py
 ```
 
-215 tests, network fully stubbed — they never hit an LLM API, Telegram, or
+252 tests, network fully stubbed — they never hit an LLM API, Telegram, or
 Yahoo. The provider seam is the whole stub: a fake object with `complete_json`
 and `search_json`.
