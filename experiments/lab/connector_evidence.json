@@ -1,0 +1,527 @@
+{
+ "schema_version": 1,
+ "evidence_cutoff": "2026-08-10T17:15:55+00:00",
+ "git_commit": "b4d4175aec4965825e21ab851ede17dce3d335f8",
+ "tool_version": "1.0",
+ "preregistration": {
+  "hypothesis_h1": "At least one candidate connector supplies items the engine cannot already reach: pooled over the probed interests, marginal_unique_rate >= 0.40 AND jaccard_overlap_with_web_search_sample < 0.30.",
+  "baseline": "The existing web_search collector's sample over the same interests, same window, same per-interest item cap. For the zero-spend lane the baseline is the stored production corpus; if neither corpus nor a web_search sample is reachable, the metric is recorded as VOID, never as 0.",
+  "primary_metric": "marginal_unique_rate = |sample_urls \\ (corpus_urls UNION web_search_sample_urls)| / |sample_urls|, per connector, pooled across probed interests, canonicalized URLs/titles.",
+  "secondary_metrics_non_decisive": [
+   "count of sampled items at/above the interest's own min_score under the frozen production scorer (absolute count, never a share, below 8 observations -- LAB.md guardrail 7)",
+   "median item age in days",
+   "sample validity rate (fraction of records with both a URL and a title)"
+  ],
+  "stopping_condition": "Exactly one pass per (connector, interest) pair at the caps below. Queries frozen in code before the run, derived mechanically from the committed interest definition. No query tuning, no re-runs, no connector added after seeing results.",
+  "falsification_condition": "If every candidate connector has marginal_unique_rate < 0.40 or overlap >= 0.30, H1 is FALSIFIED: no candidate connector adds retrieval surface, step-09 should not add a connector on retrieval grounds. A falsified H1 is a successful outcome of this step.",
+  "validity_voids": [
+   "network unavailable",
+   "connector endpoint unreachable or shape-changed",
+   "production corpus (discovery.db) unavailable",
+   "sample n < 5 for a connector",
+   "provider unavailable for the scoring sub-metric"
+  ],
+  "spend_bound": {
+   "paid_usd": 0.0,
+   "youtube_quota_units": 0,
+   "http_requests_max_total": 40,
+   "http_requests_max_per_connector": 10,
+   "http_records_max_per_query": 50,
+   "http_timeout_seconds": 15,
+   "http_min_gap_seconds": 1.0,
+   "http_min_gap_seconds_arxiv": 3.0,
+   "provider_calls_zero_spend_lane": 0,
+   "provider_calls_live_lane_max": 40,
+   "deliberate_rate_limit_stress_testing": false
+  },
+  "candidate_connectors": [
+   "x",
+   "hackernews",
+   "reddit",
+   "arxiv",
+   "pubmed"
+  ],
+  "probed_interests": [
+   "behavioral-psychology",
+   "personal-knowledge-learning",
+   "emdr-trauma-therapy",
+   "narcolepsy-eds",
+   "ai-agents-dev-tools"
+  ],
+  "applicability_map": {
+   "x": [
+    "behavioral-psychology",
+    "personal-knowledge-learning",
+    "emdr-trauma-therapy",
+    "narcolepsy-eds",
+    "ai-agents-dev-tools"
+   ],
+   "hackernews": [
+    "ai-agents-dev-tools",
+    "personal-knowledge-learning"
+   ],
+   "reddit": [
+    "behavioral-psychology",
+    "personal-knowledge-learning",
+    "emdr-trauma-therapy",
+    "narcolepsy-eds",
+    "ai-agents-dev-tools"
+   ],
+   "arxiv": [
+    "behavioral-psychology",
+    "personal-knowledge-learning",
+    "ai-agents-dev-tools"
+   ],
+   "pubmed": [
+    "narcolepsy-eds",
+    "emdr-trauma-therapy"
+   ]
+  }
+ },
+ "spend_actual": {
+  "http_requests": 14,
+  "provider_calls": 0,
+  "paid_usd": 0.0,
+  "youtube_quota_units": 0
+ },
+ "lanes": {
+  "zero_spend": {
+   "status": "RAN",
+   "detail": "hackernews/reddit/arxiv/pubmed sampled via bounded free HTTP, one pass per connector-interest pair; 0 provider calls spent."
+  },
+  "live": {
+   "status": "PENDING",
+   "reason": "provider.preflight() = False (CLAUDE_ORG_ID is not set); x's search_json sample, the web_search baseline sample, and the above-bar sub-metric all require a live claude.ai Chrome/CDP session, which an isolated worktree implementer session cannot provide (see PROJECT_STATE.md step-01 precedent).",
+   "command_to_complete": "python experiments/lab/exp_connectors.py sample"
+  }
+ },
+ "corpus": {
+  "available": false,
+  "reason": "discovery.db not reachable at C:\\projects\\engine-control\\artifacts\\wt\\step-09a-c0-t0\\discovery.db: unable to open database file",
+  "path": "C:\\projects\\engine-control\\artifacts\\wt\\step-09a-c0-t0\\discovery.db"
+ },
+ "connectors": [
+  {
+   "name": "x",
+   "applicable_interests": [
+    "behavioral-psychology",
+    "personal-knowledge-learning",
+    "emdr-trauma-therapy",
+    "narcolepsy-eds",
+    "ai-agents-dev-tools"
+   ],
+   "availability": {
+    "reachable": null,
+    "status": "PENDING",
+    "detail": "provider.search_json requires a live claude.ai Chrome/CDP session; provider.preflight() here: False (CLAUDE_ORG_ID is not set)",
+    "checked_at": "2026-08-10T17:14:51+00:00"
+   },
+   "sample": {
+    "status": "PENDING",
+    "detail": "provider.search_json requires a live claude.ai Chrome/CDP session; provider.preflight() here: False (CLAUDE_ORG_ID is not set)",
+    "per_interest": []
+   },
+   "metrics": {
+    "marginal_unique_rate": null,
+    "marginal_unique_rate_status": "PENDING_LIVE_LANE",
+    "jaccard_overlap_with_web_search_sample": null,
+    "jaccard_overlap_status": "PENDING_LIVE_LANE",
+    "sample_validity_rate": null,
+    "median_age_days": null,
+    "above_bar_count": null,
+    "above_bar_status": "PENDING_LIVE_LANE",
+    "n_sampled": 0,
+    "n_unique_urls": 0
+   },
+   "failure_behavior": null,
+   "command_to_complete": "python experiments/lab/exp_connectors.py sample  # from a live operator session: Chrome --remote-debugging-port=9222, logged into claude.ai"
+  },
+  {
+   "name": "hackernews",
+   "applicable_interests": [
+    "ai-agents-dev-tools",
+    "personal-knowledge-learning"
+   ],
+   "availability": {
+    "reachable": true,
+    "http_status": 200,
+    "endpoint": "https://hn.algolia.com/api/v1/search_by_date?query=AI+agents+%2F+coding+%2F+personal+automation+major+Claude+Code%2C+Codex+or+coding-agent+capability+changes+agent+architecture+that+materially+improves+reliability+or+autonomy+context+compression%2C+persistent+memory+or+long-running+agent+techniques&tags=story&hitsPerPage=10",
+    "checked_at": "2026-08-10T17:14:51+00:00",
+    "detail": "n=0 < 5 across 2 probed interests"
+   },
+   "sample": {
+    "status": "VOID_LOW_N",
+    "detail": "n=0 < 5 across 2 probed interests",
+    "per_interest": [
+     {
+      "interest": "ai-agents-dev-tools",
+      "query": "AI agents / coding / personal automation major Claude Code, Codex or coding-agent capability changes agent architecture that materially improves reliability or autonomy context compression, persistent memory or long-running agent techniques",
+      "endpoint": "https://hn.algolia.com/api/v1/search_by_date?query=AI+agents+%2F+coding+%2F+personal+automation+major+Claude+Code%2C+Codex+or+coding-agent+capability+changes+agent+architecture+that+materially+improves+reliability+or+autonomy+context+compression%2C+persistent+memory+or+long-running+agent+techniques&tags=story&hitsPerPage=10",
+      "http_status": 200,
+      "error": null,
+      "records": [],
+      "n_records": 0,
+      "rate_limit_headers": {},
+      "collected_at": "2026-08-10T17:14:51+00:00",
+      "lane": "zero_spend",
+      "git_commit": "b4d4175aec4965825e21ab851ede17dce3d335f8"
+     },
+     {
+      "interest": "personal-knowledge-learning",
+      "query": "Learning / memory / personal knowledge systems controlled studies comparing learning or retrieval strategies research on retrieval practice, spacing, memory consolidation or schema formation minimal representations that produce surprisingly good recall",
+      "endpoint": "https://hn.algolia.com/api/v1/search_by_date?query=Learning+%2F+memory+%2F+personal+knowledge+systems+controlled+studies+comparing+learning+or+retrieval+strategies+research+on+retrieval+practice%2C+spacing%2C+memory+consolidation+or+schema+formation+minimal+representations+that+produce+surprisingly+good+recall&tags=story&hitsPerPage=10",
+      "http_status": 200,
+      "error": null,
+      "records": [],
+      "n_records": 0,
+      "rate_limit_headers": {},
+      "collected_at": "2026-08-10T17:14:53+00:00",
+      "lane": "zero_spend",
+      "git_commit": "b4d4175aec4965825e21ab851ede17dce3d335f8"
+     }
+    ]
+   },
+   "metrics": {
+    "marginal_unique_rate": null,
+    "marginal_unique_rate_status": "VOID_NO_BASELINE",
+    "jaccard_overlap_with_web_search_sample": null,
+    "jaccard_overlap_status": "VOID_NO_WEB_SEARCH_SAMPLE",
+    "sample_validity_rate": null,
+    "median_age_days": null,
+    "above_bar_count": null,
+    "above_bar_n_scored": null,
+    "above_bar_status": "VOID_NO_PROVIDER",
+    "n_sampled": 0,
+    "n_unique_urls": 0
+   },
+   "failure_behavior": "no failures observed in this pass"
+  },
+  {
+   "name": "reddit",
+   "applicable_interests": [
+    "behavioral-psychology",
+    "personal-knowledge-learning",
+    "emdr-trauma-therapy",
+    "narcolepsy-eds",
+    "ai-agents-dev-tools"
+   ],
+   "availability": {
+    "reachable": false,
+    "http_status": 403,
+    "endpoint": "https://www.reddit.com/search.json?q=Human+interaction+%2F+attraction+%2F+behavioral+psychology+interpersonal+synchrony+or+mimicry+experiments+gaze%2C+posture%2C+distance%2C+touch+or+vocal-prosody+research+attraction+or+courtship+studies+with+observable+behavioral+measures&sort=new&limit=10&t=year",
+    "checked_at": "2026-08-10T17:14:53+00:00",
+    "detail": "behavioral-psychology: http 403; personal-knowledge-learning: http 403; emdr-trauma-therapy: http 403; narcolepsy-eds: http 403; ai-agents-dev-tools: http 403"
+   },
+   "sample": {
+    "status": "VOID_UNREACHABLE",
+    "detail": "behavioral-psychology: http 403; personal-knowledge-learning: http 403; emdr-trauma-therapy: http 403; narcolepsy-eds: http 403; ai-agents-dev-tools: http 403",
+    "per_interest": [
+     {
+      "interest": "behavioral-psychology",
+      "query": "Human interaction / attraction / behavioral psychology interpersonal synchrony or mimicry experiments gaze, posture, distance, touch or vocal-prosody research attraction or courtship studies with observable behavioral measures",
+      "endpoint": "https://www.reddit.com/search.json?q=Human+interaction+%2F+attraction+%2F+behavioral+psychology+interpersonal+synchrony+or+mimicry+experiments+gaze%2C+posture%2C+distance%2C+touch+or+vocal-prosody+research+attraction+or+courtship+studies+with+observable+behavioral+measures&sort=new&limit=10&t=year",
+      "http_status": 403,
+      "error": "http 403",
+      "records": [],
+      "n_records": 0,
+      "rate_limit_headers": {
+       "Retry-After": "0"
+      },
+      "collected_at": "2026-08-10T17:14:53+00:00",
+      "lane": "zero_spend",
+      "git_commit": "b4d4175aec4965825e21ab851ede17dce3d335f8"
+     },
+     {
+      "interest": "personal-knowledge-learning",
+      "query": "Learning / memory / personal knowledge systems controlled studies comparing learning or retrieval strategies research on retrieval practice, spacing, memory consolidation or schema formation minimal representations that produce surprisingly good recall",
+      "endpoint": "https://www.reddit.com/search.json?q=Learning+%2F+memory+%2F+personal+knowledge+systems+controlled+studies+comparing+learning+or+retrieval+strategies+research+on+retrieval+practice%2C+spacing%2C+memory+consolidation+or+schema+formation+minimal+representations+that+produce+surprisingly+good+recall&sort=new&limit=10&t=year",
+      "http_status": 403,
+      "error": "http 403",
+      "records": [],
+      "n_records": 0,
+      "rate_limit_headers": {
+       "Retry-After": "0"
+      },
+      "collected_at": "2026-08-10T17:14:54+00:00",
+      "lane": "zero_spend",
+      "git_commit": "b4d4175aec4965825e21ab851ede17dce3d335f8"
+     },
+     {
+      "interest": "emdr-trauma-therapy",
+      "query": "EMDR / trauma processing mechanisms dismantling or component-control studies isolating the eye-movement/bilateral-stimulation element neuroimaging evidence of what EMDR changes in the brain during or after sessions mechanistic theories tested against working-memory taxation or orienting-response acc",
+      "endpoint": "https://www.reddit.com/search.json?q=EMDR+%2F+trauma+processing+mechanisms+dismantling+or+component-control+studies+isolating+the+eye-movement%2Fbilateral-stimulation+element+neuroimaging+evidence+of+what+EMDR+changes+in+the+brain+during+or+after+sessions+mechanistic+theories+tested+against+working-memory+taxation+or+orienting-response+acc&sort=new&limit=10&t=year",
+      "http_status": 403,
+      "error": "http 403",
+      "records": [],
+      "n_records": 0,
+      "rate_limit_headers": {
+       "Retry-After": "0"
+      },
+      "collected_at": "2026-08-10T17:14:56+00:00",
+      "lane": "zero_spend",
+      "git_commit": "b4d4175aec4965825e21ab851ede17dce3d335f8"
+     },
+     {
+      "interest": "narcolepsy-eds",
+      "query": "Narcolepsy / EDS / wakefulness orexin/hypocretin agonist phase 2 or phase 3 results with actual numbers large objective improvement in wakefulness, vigilance or functional capacity head-to-head or unusually informative treatment comparisons",
+      "endpoint": "https://www.reddit.com/search.json?q=Narcolepsy+%2F+EDS+%2F+wakefulness+orexin%2Fhypocretin+agonist+phase+2+or+phase+3+results+with+actual+numbers+large+objective+improvement+in+wakefulness%2C+vigilance+or+functional+capacity+head-to-head+or+unusually+informative+treatment+comparisons&sort=new&limit=10&t=year",
+      "http_status": 403,
+      "error": "http 403",
+      "records": [],
+      "n_records": 0,
+      "rate_limit_headers": {
+       "Retry-After": "0"
+      },
+      "collected_at": "2026-08-10T17:14:57+00:00",
+      "lane": "zero_spend",
+      "git_commit": "b4d4175aec4965825e21ab851ede17dce3d335f8"
+     },
+     {
+      "interest": "ai-agents-dev-tools",
+      "query": "AI agents / coding / personal automation major Claude Code, Codex or coding-agent capability changes agent architecture that materially improves reliability or autonomy context compression, persistent memory or long-running agent techniques",
+      "endpoint": "https://www.reddit.com/search.json?q=AI+agents+%2F+coding+%2F+personal+automation+major+Claude+Code%2C+Codex+or+coding-agent+capability+changes+agent+architecture+that+materially+improves+reliability+or+autonomy+context+compression%2C+persistent+memory+or+long-running+agent+techniques&sort=new&limit=10&t=year",
+      "http_status": 403,
+      "error": "http 403",
+      "records": [],
+      "n_records": 0,
+      "rate_limit_headers": {
+       "Retry-After": "0"
+      },
+      "collected_at": "2026-08-10T17:14:58+00:00",
+      "lane": "zero_spend",
+      "git_commit": "b4d4175aec4965825e21ab851ede17dce3d335f8"
+     }
+    ]
+   },
+   "metrics": {
+    "marginal_unique_rate": null,
+    "marginal_unique_rate_status": "VOID_NO_BASELINE",
+    "jaccard_overlap_with_web_search_sample": null,
+    "jaccard_overlap_status": "VOID_NO_WEB_SEARCH_SAMPLE",
+    "sample_validity_rate": null,
+    "median_age_days": null,
+    "above_bar_count": null,
+    "above_bar_n_scored": null,
+    "above_bar_status": "VOID_NO_PROVIDER",
+    "n_sampled": 0,
+    "n_unique_urls": 0
+   },
+   "failure_behavior": "behavioral-psychology: http 403; personal-knowledge-learning: http 403; emdr-trauma-therapy: http 403; narcolepsy-eds: http 403; ai-agents-dev-tools: http 403 | rate-limit headers observed: {'behavioral-psychology': {'Retry-After': '0'}, 'personal-knowledge-learning': {'Retry-After': '0'}, 'emdr-trauma-therapy': {'Retry-After': '0'}, 'narcolepsy-eds': {'Retry-After': '0'}, 'ai-agents-dev-tools': {'Retry-After': '0'}}"
+  },
+  {
+   "name": "arxiv",
+   "applicable_interests": [
+    "behavioral-psychology",
+    "personal-knowledge-learning",
+    "ai-agents-dev-tools"
+   ],
+   "availability": {
+    "reachable": false,
+    "http_status": null,
+    "endpoint": "https://export.arxiv.org/api/query?search_query=all%3AHuman+interaction+%2F+attraction+%2F+behavioral+psychology+interpersonal+synchrony+or+mimicry+experiments+gaze%2C+posture%2C+distance%2C+touch+or+vocal-prosody+research+attraction+or+courtship+studies+with+observable+behavioral+measures&start=0&max_results=10",
+    "checked_at": "2026-08-10T17:15:14+00:00",
+    "detail": "behavioral-psychology: export.arxiv.org: The read operation timed out; personal-knowledge-learning: export.arxiv.org: The read operation timed out; ai-agents-dev-tools: export.arxiv.org: The read operation timed out"
+   },
+   "sample": {
+    "status": "VOID_UNREACHABLE",
+    "detail": "behavioral-psychology: export.arxiv.org: The read operation timed out; personal-knowledge-learning: export.arxiv.org: The read operation timed out; ai-agents-dev-tools: export.arxiv.org: The read operation timed out",
+    "per_interest": [
+     {
+      "interest": "behavioral-psychology",
+      "query": "Human interaction / attraction / behavioral psychology interpersonal synchrony or mimicry experiments gaze, posture, distance, touch or vocal-prosody research attraction or courtship studies with observable behavioral measures",
+      "endpoint": "https://export.arxiv.org/api/query?search_query=all%3AHuman+interaction+%2F+attraction+%2F+behavioral+psychology+interpersonal+synchrony+or+mimicry+experiments+gaze%2C+posture%2C+distance%2C+touch+or+vocal-prosody+research+attraction+or+courtship+studies+with+observable+behavioral+measures&start=0&max_results=10",
+      "http_status": null,
+      "error": "export.arxiv.org: The read operation timed out",
+      "records": [],
+      "n_records": 0,
+      "rate_limit_headers": {},
+      "collected_at": "2026-08-10T17:15:14+00:00",
+      "lane": "zero_spend",
+      "git_commit": "b4d4175aec4965825e21ab851ede17dce3d335f8"
+     },
+     {
+      "interest": "personal-knowledge-learning",
+      "query": "Learning / memory / personal knowledge systems controlled studies comparing learning or retrieval strategies research on retrieval practice, spacing, memory consolidation or schema formation minimal representations that produce surprisingly good recall",
+      "endpoint": "https://export.arxiv.org/api/query?search_query=all%3ALearning+%2F+memory+%2F+personal+knowledge+systems+controlled+studies+comparing+learning+or+retrieval+strategies+research+on+retrieval+practice%2C+spacing%2C+memory+consolidation+or+schema+formation+minimal+representations+that+produce+surprisingly+good+recall&start=0&max_results=10",
+      "http_status": null,
+      "error": "export.arxiv.org: The read operation timed out",
+      "records": [],
+      "n_records": 0,
+      "rate_limit_headers": {},
+      "collected_at": "2026-08-10T17:15:32+00:00",
+      "lane": "zero_spend",
+      "git_commit": "b4d4175aec4965825e21ab851ede17dce3d335f8"
+     },
+     {
+      "interest": "ai-agents-dev-tools",
+      "query": "AI agents / coding / personal automation major Claude Code, Codex or coding-agent capability changes agent architecture that materially improves reliability or autonomy context compression, persistent memory or long-running agent techniques",
+      "endpoint": "https://export.arxiv.org/api/query?search_query=all%3AAI+agents+%2F+coding+%2F+personal+automation+major+Claude+Code%2C+Codex+or+coding-agent+capability+changes+agent+architecture+that+materially+improves+reliability+or+autonomy+context+compression%2C+persistent+memory+or+long-running+agent+techniques&start=0&max_results=10",
+      "http_status": null,
+      "error": "export.arxiv.org: The read operation timed out",
+      "records": [],
+      "n_records": 0,
+      "rate_limit_headers": {},
+      "collected_at": "2026-08-10T17:15:50+00:00",
+      "lane": "zero_spend",
+      "git_commit": "b4d4175aec4965825e21ab851ede17dce3d335f8"
+     }
+    ]
+   },
+   "metrics": {
+    "marginal_unique_rate": null,
+    "marginal_unique_rate_status": "VOID_NO_BASELINE",
+    "jaccard_overlap_with_web_search_sample": null,
+    "jaccard_overlap_status": "VOID_NO_WEB_SEARCH_SAMPLE",
+    "sample_validity_rate": null,
+    "median_age_days": null,
+    "above_bar_count": null,
+    "above_bar_n_scored": null,
+    "above_bar_status": "VOID_NO_PROVIDER",
+    "n_sampled": 0,
+    "n_unique_urls": 0
+   },
+   "failure_behavior": "behavioral-psychology: export.arxiv.org: The read operation timed out; personal-knowledge-learning: export.arxiv.org: The read operation timed out; ai-agents-dev-tools: export.arxiv.org: The read operation timed out"
+  },
+  {
+   "name": "pubmed",
+   "applicable_interests": [
+    "narcolepsy-eds",
+    "emdr-trauma-therapy"
+   ],
+   "availability": {
+    "reachable": true,
+    "http_status": 200,
+    "endpoint": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=Narcolepsy+%2F+EDS+%2F+wakefulness+orexin%2Fhypocretin+agonist+phase+2+or+phase+3+results+with+actual+numbers+large+objective+improvement+in+wakefulness%2C+vigilance+or+functional+capacity+head-to-head+or+unusually+informative+treatment+comparisons&retmode=json&retmax=10 -> https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id=42542404%2C42530884%2C42530577%2C42463031%2C42421086%2C42367338%2C42191840%2C42115887%2C42057717%2C42041227&retmode=json",
+    "checked_at": "2026-08-10T17:15:52+00:00",
+    "detail": "reachable"
+   },
+   "sample": {
+    "status": "OK",
+    "detail": null,
+    "per_interest": [
+     {
+      "interest": "narcolepsy-eds",
+      "query": "Narcolepsy / EDS / wakefulness orexin/hypocretin agonist phase 2 or phase 3 results with actual numbers large objective improvement in wakefulness, vigilance or functional capacity head-to-head or unusually informative treatment comparisons",
+      "endpoint": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=Narcolepsy+%2F+EDS+%2F+wakefulness+orexin%2Fhypocretin+agonist+phase+2+or+phase+3+results+with+actual+numbers+large+objective+improvement+in+wakefulness%2C+vigilance+or+functional+capacity+head-to-head+or+unusually+informative+treatment+comparisons&retmode=json&retmax=10 -> https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id=42542404%2C42530884%2C42530577%2C42463031%2C42421086%2C42367338%2C42191840%2C42115887%2C42057717%2C42041227&retmode=json",
+      "http_status": 200,
+      "error": null,
+      "records": [
+       {
+        "url": "https://pubmed.ncbi.nlm.nih.gov/42542404/",
+        "title": "Particle engineering, aerosol physics, and pulmonary deposition of single-inhaler triple ICS/LABA/LAMA therapies in obstructive airway diseases.",
+        "published_at": "2026 Aug 1"
+       },
+       {
+        "url": "https://pubmed.ncbi.nlm.nih.gov/42530884/",
+        "title": "Efficacy and Safety of Therapies for Systemic Sclerosis-Associated Interstitial Lung Disease: A Bayesian Network Meta-Analysis.",
+        "published_at": "2026 Jul 30"
+       },
+       {
+        "url": "https://pubmed.ncbi.nlm.nih.gov/42530577/",
+        "title": "[(18)F]FAPI-42 PET/CT for prognostic assessment in idiopathic pulmonary fibrosis: a prospective head-to-head comparison with [(18)F]FDG PET/CT.",
+        "published_at": "2026 Jul 30"
+       },
+       {
+        "url": "https://pubmed.ncbi.nlm.nih.gov/42463031/",
+        "title": "Physics-informed LSTM neural network for personalized pharmacokinetic modeling of polymyxin B in critically Ill patients.",
+        "published_at": "2026 Jul 16"
+       },
+       {
+        "url": "https://pubmed.ncbi.nlm.nih.gov/42421086/",
+        "title": "Primary nasopharyngeal Kaposi's sarcoma without cutaneous manifestations: a case report.",
+        "published_at": "2026 Jul 8"
+       },
+       {
+        "url": "https://pubmed.ncbi.nlm.nih.gov/42367338/",
+        "title": "Optimal exercise prescription for patients with coronary heart disease across cardiac rehabilitation phases: a systematic review and network meta-analysis.",
+        "published_at": "2026"
+       },
+       {
+        "url": "https://pubmed.ncbi.nlm.nih.gov/42191840/",
+        "title": "Comparative efficacy of intermittent hypoxic training modalities on athletes' performance: a systematic review with pairwise and network meta-analyses.",
+        "published_at": "2026 May 26"
+       },
+       {
+        "url": "https://pubmed.ncbi.nlm.nih.gov/42115887/",
+        "title": "Comparative efficacy and safety of monotherapy and combination pharmacotherapies for idiopathic pulmonary fibrosis: a network meta-analysis of randomized controlled trials.",
+        "published_at": "2026 May 11"
+       },
+       {
+        "url": "https://pubmed.ncbi.nlm.nih.gov/42057717/",
+        "title": "Translational bacterial biomarkers and pharmacodynamic models in the treatment of tuberculosis.",
+        "published_at": "2026 Apr 30"
+       },
+       {
+        "url": "https://pubmed.ncbi.nlm.nih.gov/42041227/",
+        "title": "The SCALE Guidelines: A Framework for Standardized Case Reports in Architecture and the Built Environment.",
+        "published_at": "2026 Jul"
+       }
+      ],
+      "n_records": 10,
+      "rate_limit_headers": {
+       "X-Ratelimit-Limit": "3",
+       "X-Ratelimit-Remaining": "2"
+      },
+      "collected_at": "2026-08-10T17:15:52+00:00",
+      "lane": "zero_spend",
+      "git_commit": "b4d4175aec4965825e21ab851ede17dce3d335f8"
+     },
+     {
+      "interest": "emdr-trauma-therapy",
+      "query": "EMDR / trauma processing mechanisms dismantling or component-control studies isolating the eye-movement/bilateral-stimulation element neuroimaging evidence of what EMDR changes in the brain during or after sessions mechanistic theories tested against working-memory taxation or orienting-response acc",
+      "endpoint": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=EMDR+%2F+trauma+processing+mechanisms+dismantling+or+component-control+studies+isolating+the+eye-movement%2Fbilateral-stimulation+element+neuroimaging+evidence+of+what+EMDR+changes+in+the+brain+during+or+after+sessions+mechanistic+theories+tested+against+working-memory+taxation+or+orienting-response+acc&retmode=json&retmax=10 -> https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id=35567304&retmode=json",
+      "http_status": 200,
+      "error": null,
+      "records": [
+       {
+        "url": "https://pubmed.ncbi.nlm.nih.gov/35567304/",
+        "title": "Theta oscillatory dynamics of inhibitory control, error processing, and post-error adjustments: Neural underpinnings and alcohol-induced dysregulation in social drinkers.",
+        "published_at": "2022 Jul"
+       }
+      ],
+      "n_records": 1,
+      "rate_limit_headers": {
+       "X-Ratelimit-Limit": "3",
+       "X-Ratelimit-Remaining": "2"
+      },
+      "collected_at": "2026-08-10T17:15:55+00:00",
+      "lane": "zero_spend",
+      "git_commit": "b4d4175aec4965825e21ab851ede17dce3d335f8"
+     }
+    ]
+   },
+   "metrics": {
+    "marginal_unique_rate": null,
+    "marginal_unique_rate_status": "VOID_NO_BASELINE",
+    "jaccard_overlap_with_web_search_sample": null,
+    "jaccard_overlap_status": "VOID_NO_WEB_SEARCH_SAMPLE",
+    "sample_validity_rate": 1.0,
+    "median_age_days": 40.72,
+    "above_bar_count": null,
+    "above_bar_n_scored": null,
+    "above_bar_status": "VOID_NO_PROVIDER",
+    "n_sampled": 11,
+    "n_unique_urls": 11
+   },
+   "failure_behavior": "no failures observed in this pass | rate-limit headers observed: {'narcolepsy-eds': {'X-Ratelimit-Limit': '3', 'X-Ratelimit-Remaining': '2'}, 'emdr-trauma-therapy': {'X-Ratelimit-Limit': '3', 'X-Ratelimit-Remaining': '2'}}"
+  }
+ ],
+ "prior_evidence": [
+  {
+   "source": "experiments/x_prompt_lab/conclusions.md (untracked; not re-verifiable from this clone)",
+   "as_of": "2026-08-08",
+   "status": "prior, unreplicated in this step",
+   "summary": "Search-prompts-only X discovery via search_json (no scraping/API) judged VIABLE: 2 interests x 3 generations, 91/91 items valid status URLs, 0 hallucinated (15 ids independently re-found as a realness proof), judge-ranked main news. Freshness floor: D-1 broad topics, D-2 single ticker -> digest source, NOT alert.",
+   "bearing_on_h1": "Suggestive that the x connector could clear the marginal-unique-rate bar on retrieval grounds, but this step could not re-test it -- the zero-spend lane makes 0 provider calls, and x's search_json needs one. Cited as evidence, not counted as a measurement made here."
+  },
+  {
+   "source": "experiments/lab/design_council.py proposal ledger (PROJECT_STATE.md, engine lab section)",
+   "as_of": "2026-08-10",
+   "status": "prior, unreplicated in this step",
+   "summary": "001 EXECUTED then REVERTED by its own trigger (same-version scorer non-determinism, not prompt-version drift). 002 EXECUTED then mothballed indefinitely by owner decision (\"proceed label-free\"). 003 EXECUTED then REVERTED on a 0.0003 conjunctive miss. 004 VALIDATED (drift closed for the pinned same-hash/same-model condition). 005 EXECUTED, running detached as Scheduled Task engine-lab-005 (E2 discovery-yield A/B on the three starved interests + nbis control, retrieval vs scoring failure).",
+   "bearing_on_h1": "005 asks whether the three starved interests are collection-limited or scorer-limited using the *existing* web_search collector under strategist angles -- a sibling question, not a substitute for this step's connector-level marginal-retrieval-surface question. Its result (still in flight) will bear on how to read a H1_FALSIFIED outcome here: if 005 shows the starved interests are scorer-limited, that further weakens the case for adding a new connector on retrieval grounds alone."
+  }
+ ],
+ "verdict": "VOID_NO_BASELINE",
+ "verdict_detail": "The pre-registered primary metric needs corpus UNION web_search_sample as its baseline. web_search_sample requires a provider.search_json call, which the zero-spend lane never makes by design -- so marginal_unique_rate and jaccard_overlap_with_web_search_sample are VOID for every connector this pass, regardless of corpus availability (corpus at C:\\projects\\engine-control\\artifacts\\wt\\step-09a-c0-t0\\discovery.db: not available -- discovery.db not reachable at C:\\projects\\engine-control\\artifacts\\wt\\step-09a-c0-t0\\discovery.db: unable to open database file). H1 is UNDECIDED, not falsified, until a live-lane pass supplies the web_search sample. Reproduce with: python experiments/lab/exp_connectors.py sample (from a live operator session: Chrome --remote-debugging-port=9222, logged into claude.ai)."
+}

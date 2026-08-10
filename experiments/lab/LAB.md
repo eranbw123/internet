@@ -73,6 +73,27 @@ maximizing AUC. Prints a proposal; below 30 labels it is directional only.
 python experiments/lab/exp_weights.py
 ```
 
+### E5 — connector evidence, read-only (`exp_connectors.py`)
+Step-09a: does any of the 5 candidate connectors (x, hackernews, reddit,
+arxiv, pubmed) reach items the engine can't already reach? Bounded free-HTTP
+probes (<=40 requests, <=10/connector) against the frozen probed-interest
+set; never registers a collector, edits `interests.json`, or writes
+`discovery.db`. `probe` = availability only; `sample` = bounded retrieval +
+analysis, persists the tracked `experiments/lab/connector_evidence.json`
+dossier; `report` = render the persisted dossier, zero spend.
+
+```bash
+python experiments/lab/exp_connectors.py probe
+python experiments/lab/exp_connectors.py sample
+python experiments/lab/exp_connectors.py report
+```
+
+Retires `blind_rate.py` (guardrail 8): proposal 002 was mothballed
+indefinitely by owner decision ("proceed label-free"), every label-gated
+metric is already gated elsewhere, and the frozen 67-item batch under the
+gitignored `artifacts/blind_batch_002/` is untouched — git history retains
+the file if the rating pass is ever revived.
+
 ## Golden set
 
 `rate_batch.py` samples ~25 scored-but-unrated items (spread across interests
