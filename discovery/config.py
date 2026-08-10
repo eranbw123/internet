@@ -11,7 +11,14 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Per-provider default, so switching DISCOVERY_PROVIDER alone gives a sane model.
-DEFAULT_MODELS = {"claude_chat": "claude-opus-5", "anthropic": "claude-opus-5", "openai": "gpt-5"}
+# chatgpt_browser uses chatgpt.com's model slugs; "auto" is the web router that
+# always exists and needs no special access.
+DEFAULT_MODELS = {
+    "claude_chat": "claude-opus-5",
+    "chatgpt_browser": "auto",
+    "anthropic": "claude-opus-5",
+    "openai": "gpt-5",
+}
 
 
 @dataclass
