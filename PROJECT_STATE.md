@@ -4,10 +4,23 @@ Updated 2026-08-10. Imported by `CLAUDE.md`. Current state only — not a log.
 
 ## service hardening (step-01): no more in-process scheduler
 `discovery/scheduler.py` and the `run` subcommand are DELETED — the
-SSH-session-child tick loop is gone; an OS scheduler must call `run-once
---source <name>` / `digest` / `listen --drain` / `health --notify` on their
-own cadence instead (installer not yet landed in this worktree). Every
-invocation is short-lived, idempotent and now overlap-safe:
+SSH-session-child tick loop is gone; `ops/install_tasks.py` IS the scheduler
+now: six Windows Scheduled Tasks (`internet-discovery-collect-stocks/-web
+/-youtube`, `-digest`, `-feedback`, `-health`) call `run-once --source
+<name>` / `digest` / `listen --drain` / `health --notify` on their own
+cadence, every trigger interval read from `config.load()` so a `.env` change
++ `--install` reschedules. Registers via generated Task Scheduler XML
+(UTF-16LE+BOM) + `schtasks /create /XML` — `StartWhenAvailable`,
+`MultipleInstancesPolicy=IgnoreNew`, `RestartOnFailure`, and an
+`InteractiveToken` principal (Chrome/CDP only exists in that session).
+`--dry-run`/`--install`/`--uninstall` (prefix-scoped, only ever touches its
+own six names)/`--status`. Each task runs `ops/run.cmd`
+(`PYTHONIOENCODING=utf-8`, `cd` to repo root, `python -m app %*`, appends to
+`logs\<first-arg>-<YYYYMMDD>.log`, propagates exit code); `logs/` is
+gitignored, inbound-only. Live install + fault-injection drills + the 24h
+soak are a separate, not-yet-done step (offline tests only stub
+`schtasks`/`subprocess` via an injected fake runner). Every invocation is
+short-lived, idempotent and overlap-safe:
 `db.connect` sets `PRAGMA busy_timeout=5000`, and a new `service_state`
 key/value table (`db.state_get`/`state_set`) persists job heartbeats
 (`job:<name>:last_ok`/`last_fail`), the Telegram `getUpdates` offset, and
@@ -191,7 +204,7 @@ All timestamps UTC via `db.now()`/`db.ago()`. No token metering on
 claude_chat (calls only).
 
 ## Tests
-`python test_discovery.py` (160) + `python test_watch.py` (10), offline, both
+`python test_discovery.py` (215) + `python test_watch.py` (10), offline, both
 green; CI on push/PR.
 
 ## Known issues

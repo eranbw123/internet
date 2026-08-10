@@ -43,6 +43,12 @@ from discovery.providers.anthropic_provider import AnthropicProvider
 from discovery.providers.base import LLMProvider, ProviderError, UnsupportedCapability
 from discovery.providers.openai_provider import OpenAIProvider
 
+# ops/install_tasks.py is a flat script (like app/, not a package) run as
+# `python ops/install_tasks.py`, so it's imported here the same way that
+# invocation would resolve it: `ops/` on sys.path, then a bare import.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ops"))
+import install_tasks  # noqa: E402
+
 CFG = config.Config(
     db_path=":memory:",
     interests_path="interests.json",
@@ -2970,6 +2976,116 @@ class MainJobTests(unittest.TestCase):
             code = _digest_cmd(self.conn, CFG, True)
         self.assertEqual(code, 0)
         self.assertIn("sent 5", out.getvalue())
+
+
+class InstallTasksTests(unittest.TestCase):
+    """ops/install_tasks.py, entirely offline: a FakeRunner stands in for
+    subprocess so no test here ever registers, deletes or queries a real
+    Scheduled Task."""
+
+    def test_triggers_are_derived_from_config_not_hardcoded(self):
+        cfg = dataclasses.replace(
+            CFG, interval_stocks_seconds=111, interval_web_seconds=222,
+            interval_youtube_seconds=333, digest_time="13:45",
+        )
+        by_name = {t.name: t for t in install_tasks.build_tasks(cfg)}
+        self.assertEqual(
+            by_name["internet-discovery-collect-stocks"].trigger_value, 111
+        )
+        self.assertEqual(
+            by_name["internet-discovery-collect-web"].trigger_value, 222
+        )
+        self.assertEqual(
+            by_name["internet-discovery-collect-youtube"].trigger_value, 333
+        )
+        self.assertEqual(by_name["internet-discovery-digest"].trigger_value, "13:45")
+        # Not derived from Config by design (see the plan): fixed cadences.
+        self.assertEqual(by_name["internet-discovery-feedback"].trigger_value, 5 * 60)
+        self.assertEqual(by_name["internet-discovery-health"].trigger_value, 3 * 3600)
+
+    def test_six_tasks_share_the_prefix_and_carry_the_right_app_args(self):
+        names = [t.name for t in install_tasks.build_tasks(CFG)]
+        self.assertEqual(len(names), 6)
+        self.assertTrue(all(n.startswith("internet-discovery-") for n in names))
+        by_name = {t.name: t for t in install_tasks.build_tasks(CFG)}
+        self.assertEqual(
+            by_name["internet-discovery-collect-stocks"].app_args,
+            ["run-once", "--source", "stocks"],
+        )
+        self.assertEqual(by_name["internet-discovery-digest"].app_args, ["digest"])
+        self.assertEqual(
+            by_name["internet-discovery-feedback"].app_args, ["listen", "--drain"]
+        )
+        self.assertEqual(
+            by_name["internet-discovery-health"].app_args, ["health", "--notify"]
+        )
+
+    def test_rendered_xml_uses_the_d_flag_and_run_cmd(self):
+        task = install_tasks.build_tasks(CFG)[0]
+        xml = install_tasks.render_xml(task)
+        self.assertIn("/d /c", xml)
+        self.assertIn("run.cmd", xml)
+        self.assertIn("StartWhenAvailable>true<", xml)
+        self.assertIn("InteractiveToken", xml)
+        self.assertIn("IgnoreNew", xml)
+
+    def test_dry_run_install_spawns_no_process(self):
+        calls = []
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = install_tasks.install(CFG, runner=lambda args: calls.append(args), dry_run=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [])
+
+    def test_install_calls_schtasks_create_per_task(self):
+        calls = []
+
+        def fake_runner(args):
+            calls.append(args)
+            return 0, "SUCCESS", ""
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = install_tasks.install(CFG, runner=fake_runner, dry_run=False)
+        self.assertEqual(code, 0)
+        self.assertEqual(len(calls), 6)
+        for args in calls:
+            self.assertEqual(args[0], "schtasks")
+            self.assertIn("/create", args)
+            self.assertIn("/xml", args)
+
+    def test_install_reports_failure_without_raising(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO), \
+             mock.patch("sys.stderr", new_callable=io.StringIO):
+            code = install_tasks.install(CFG, runner=lambda args: (1, "", "denied"), dry_run=False)
+        self.assertEqual(code, 1)
+
+    def test_uninstall_is_scoped_to_the_six_task_names_only(self):
+        calls = []
+        install_tasks.uninstall(runner=lambda args: calls.append(args) or (0, "", ""))
+        deleted = [args[args.index("/tn") + 1] for args in calls]
+        self.assertEqual(sorted(deleted), sorted(install_tasks.TASK_NAMES))
+        self.assertTrue(all(name.startswith("internet-discovery-") for name in deleted))
+        self.assertTrue(all(not name.startswith("ec-") for name in deleted))
+
+    def test_status_parses_schtasks_query_output_for_our_prefix(self):
+        output = (
+            "HostName:                             HOST\r\n"
+            "TaskName:                             \\internet-discovery-health\r\n"
+            "Next Run Time:                        8/10/2026 11:00:00 PM\r\n"
+            "Status:                               Ready\r\n"
+            "Last Run Time:                        8/10/2026 8:00:00 PM\r\n"
+            "Last Result:                          0\r\n"
+            "\r\n"
+            "TaskName:                             \\some-other-task\r\n"
+            "Status:                               Ready\r\n"
+        )
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = install_tasks.status(runner=lambda args: (0, output, ""))
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        self.assertIn("internet-discovery-health:", text)
+        self.assertIn("Ready", text)
+        self.assertIn("internet-discovery-collect-stocks: not installed", text)
+        self.assertNotIn("some-other-task", text)
 
 
 if __name__ == "__main__":

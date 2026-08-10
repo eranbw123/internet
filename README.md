@@ -391,12 +391,45 @@ day, so a window is just a date filter.
 
 `--provider`, `--model` and `--db` override the environment for one run.
 
+## Running it as an appliance
+
+There is no in-process scheduler (see [How a cycle works](#how-a-cycle-works))
+-- an OS scheduler has to call the commands above on their own cadence.
+`ops/install_tasks.py` registers six one-purpose Windows Scheduled Tasks
+(`internet-discovery-collect-stocks/-web/-youtube`, `-digest`, `-feedback`,
+`-health`), one XML task per job, trigger intervals read straight from
+`config.load()` so a `.env` change and a re-`--install` is all it takes to
+reschedule.
+
+**One manual prerequisite:** Chrome has to be running, in the same
+interactive Windows session the tasks run in, launched with
+`--remote-debugging-port=9222` and logged into claude.ai -- that's the
+default provider's only way in, and it doesn't exist under a service
+principal. `run-once` won't even try a collector without it (see the
+provider preflight in [Commands](#commands)); `DISCOVERY_CHROME_LAUNCH_CMD`
+can relaunch it once automatically, see [Configuration](#configuration).
+
+```bash
+python ops/install_tasks.py --dry-run      # print every task's XML + schtasks command, register nothing
+python ops/install_tasks.py --install      # create/update all six tasks
+python ops/install_tasks.py --status       # state, last run, last result, next run
+python ops/install_tasks.py --uninstall    # delete only the six tasks this script created
+```
+
+Each task runs `ops/run.cmd`, which sets `PYTHONIOENCODING=utf-8`, `cd`s to
+the repo root and runs `python -m app <args>`, appending stdout+stderr to
+`logs\<first-arg>-<YYYYMMDD>.log` (gitignored, inbound-only -- never
+committed) and propagating the exit code. `python -m app health` (or
+`python -m app stats`, which includes the same HEALTH section) is the
+fastest way to check the appliance is actually alive without digging through
+logs.
+
 ## Tests
 
 ```bash
 python test_discovery.py
 ```
 
-172 tests, network fully stubbed — they never hit an LLM API, Telegram, or
+215 tests, network fully stubbed — they never hit an LLM API, Telegram, or
 Yahoo. The provider seam is the whole stub: a fake object with `complete_json`
 and `search_json`.
