@@ -17,3 +17,9 @@ discovery.db-wal
 __pycache__/
 *.pyc
 .venv/
+
+# Engine-lab run artifacts: full prompt/response logs and per-experiment state.
+# The lab code and LAB.md ARE committed; what a run produced stays local.
+experiments/**/runs.jsonl
+experiments/**/state.json
+experiments/lab/artifacts/

@@ -1,6 +1,78 @@
 # PROJECT_STATE.md — `internet`
 
-Updated 2026-08-08. Imported by `CLAUDE.md`. Current state only — not a log.
+Updated 2026-08-09. Imported by `CLAUDE.md`. Current state only — not a log.
+
+## engine lab (`experiments/lab/`, branch `engine-lab`)
+Reusable prompt-optimization loop for the whole engine, generalized from the
+x prompt lab: `lab_common.py` (budget cap, runs.jsonl full-prompt log,
+state.json generations, council judge), `db_replay.py` (mode=ro sampling),
+`prod_scorer.py` (production scoring incl. prompt variants), `rate_batch.py`
+(golden-set feedback writer — the lab's ONLY DB write), `exp_scoring.py`
+(E1), `exp_weights.py` (E4, free). Catalog/triggers/promotion path:
+`experiments/lab/LAB.md`. Long-running lab jobs must run as a one-shot
+Scheduled Task, not a session child — SSH-session children get reaped.
+
+E1 baseline (2026-08-09, 31 calls, 10 items × 3 repeats): jitter fine
+(mean_std .011, max .022, 0 notify flips) but sampled items sat far from
+bars, so flips were never stressed; **drift vs stored scores .054 ≈ the
+spacing between interest bars — the largest real effect**; separation
+unmeasurable at 4 verdicts. Judge guidance (in `artifacts/scoring/state.json`):
+band-proximate sampling next, ≥15+15 labels before trusting AUC, corpus-wide
+notify-rate check — bar calibration may be the binding constraint, not
+scorer noise.
+
+Meta-loop `design_council.py` (the powerhouse): reads all experiments'
+state, emits ONE pre-registered proposal per cycle into
+`experiments/lab/proposals/` (evidence → predicted metric move → validation
+on untouched data → rollback trigger), ntfy to owner (.env NTFY_TOPIC),
+`validate` checks predictions post-run. Ledger PROPOSED→APPROVED→EXECUTED→
+VALIDATED|REVERTED; guardrails in LAB.md.
+
+Proposal 001 EXECUTED then **REVERTED by its own trigger** (2026-08-09):
+`scores.prompt_hash` stamping kept (`scoring.prompt_fingerprint()`), but the
+drift-is-version-attributable interpretation is falsified — full-corpus
+rescore (122/122, same git-verified prompt + model) measured mean drift
+0.0569 / median 0.0345 with **14/122 notify flips**: same-version
+non-determinism. Prime suspect (recorded in 001): lab replay scores one
+interest + empty feedback vs production's full shortlist + feedback block.
+Routing readouts held: corpus notify_rate .197, band_density .148 (18
+near-bar items); behavioral/knowledge/emdr (bars 0.78–0.80) notify ≈0;
+dimensions discriminating (22–34 distinct values).
+
+Proposal 002 EXECUTED then **mothballed by owner decision**: rating pass
+deferred indefinitely — `blind_rate.py` + frozen 67-item blind batch remain
+available (`artifacts/blind_batch_002/`), every label-gated metric stays
+gated. Owner directive: proceed label-free, trust the council (standing
+approval for council proposals; `propose --context` passes directives in).
+
+Proposal 003 EXECUTED then **REVERTED on a 0.0003 conjunctive miss**
+(control mean_std 0.0153 vs ≤0.015, CI straddling): measurements stand —
+jitter small (band mean_std .0137, mapd .0223), band flip_rate .12, flips
+track bar proximity not variance; anomalies logged (control noisier than
+band; band personal_relevance dim_noise .0063 vs control .0198).
+
+Proposal 004 **VALIDATED** (first in the ledger): second pinned corpus pass
+— held-out mapd 0.0245 ∈ [0.010, 0.035], 2/122 notify disagreements (vs 14
+cross-condition), caching guard clear, conservative arm ordering. **Drift
+closed for the pinned same-hash/same-model condition.** Learned rules:
+share-based criteria non-decisive below 8 observations (LAB.md guardrail
+7); tails matter — item 40 moved 0.094 while means stayed flat → max-|delta|
+sentinel (ceiling 0.08) carried as a non-decisive 2-item probe.
+
+Proposal 005 EXECUTED (auto-approved), **running detached** as Scheduled
+Task `engine-lab-005`: E2 discovery-yield A/B on the three starved
+interests + nbis control — Arm S (production static template, limit raised
+to 15 for parity) vs Arm A (strategist angles, Goodhart-firewalled: sees
+only the owner-written interest definition, never rubric/dimensions/bars;
+output scanned, breach = void). Every net-new item scored once by the
+frozen scorer. Pre-registered: Arm A above-bar ≥4 and >S on starved
+interests; pooled p90 gap ≥0.04. Both → angles become production collector;
+neither + gap <0.02 → retrieval falsified, starvation is a scorer/bar
+property, **lab goes idle until labels**. Drift apparatus deleted
+(exp_scoring.py now distribution+report only; probe lives in
+exp_discovery.py). New Lab("discovery") budget, cap 220. Validate + ntfy
+chained. Lab rules in CLAUDE.md: iterations run detached; every iteration
+must shrink the lab (also in the council brief).
 
 ## youtube: graceful degradation to video-level items
 Stages 1–2 unchanged (LLM-first `search_json` discovery, 0 quota; one batched
@@ -35,6 +107,18 @@ higher once the block clears — unverified. Spend: 4 `videos.list` units, 6
 Verdict: MOSTLY fixed — silent discard resolved; items stored, scored, would
 notify past the bar; none cleared it here, expected from description-only
 evidence.
+
+## x collector: prompt-lab verdict (2026-08-08, live spend, no code yet)
+Search-prompts-only X discovery (via `search_json`, no scraping/API) is
+VIABLE: 2 interests × 3 generations, 91/91 items valid status URLs, 0
+hallucinated (15 ids independently re-found = realness proof), judge-ranked
+main news. Freshness floor: D-1 broad topics, D-2 single ticker → digest
+source, NOT ALERT. Winning angles: article-embed harvesting + aggregator
+backtrace; IR/capex/funding tweet hunts always empty. Production shape:
+cached strategist prompt + 2–4 angle searches, dedup_key=status id, add
+`"x"` to SHORT_FORM_SOURCES. Full data + harness + conclusions.md:
+`experiments/x_prompt_lab/` (untracked). Fallback transports if ever needed:
+twitterapi.io ($0.15/1k) or t.me/s/walter_bloomberg scrape.
 
 ## Open decision
 `recency_days` is both prompt bias and HARD verify drop. Proposal (not

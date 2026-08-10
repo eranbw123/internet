@@ -10,6 +10,8 @@ weights for the same reason.
 The model also picks which interest the item is most relevant to, from the
 shortlist matching.py handed it.
 """
+import hashlib
+
 from .models import DIMENSIONS, ScoreResult, clamp01, final_score
 
 SYSTEM = """\
@@ -76,6 +78,14 @@ class ScoringError(Exception):
     pass
 
 
+def prompt_fingerprint():
+    """12-hex stamp of the exact scoring prompt text, stored on every score.
+    Reads the module globals at call time so a swapped-in variant stamps its
+    own hash. Exists so score drift can be split into prompt-change vs
+    same-prompt components (lab proposal 001)."""
+    return hashlib.sha256((SYSTEM + PROMPT).encode("utf-8")).hexdigest()[:12]
+
+
 def score_candidate(provider, item, matches, feedback=()):
     """Score `item` against its matched interests. `matches` is the output of
     matching.match_interests(): [(interest, match_score, terms)]."""
@@ -97,6 +107,7 @@ def score_candidate(provider, item, matches, feedback=()):
         why_better_than_generic=str(data.get("why_better_than_generic") or "").strip(),
         provider=provider.name,
         model=provider.model,
+        prompt_hash=prompt_fingerprint(),
     )
 
 

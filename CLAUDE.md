@@ -41,6 +41,22 @@ CLAUDE.md + PROJECT_STATE.md are the authoritative starting context and are alre
 - Failures are isolated and skipped rather than killing the cycle.
 - Anything needed to judge whether the system is working goes through `stats.py`; counters are written as the pipeline runs.
 
+## Engine lab (`experiments/lab/`)
+
+- **Experiment iterations and refinement always run detached**: any lab run
+  that spends provider calls or outlives a few minutes goes in a one-shot
+  Windows Scheduled Task (`schtasks /sc once`), never as a session child —
+  SSH-session children get reaped on disconnect. Chain the follow-up steps
+  (validate, ntfy via `design_council.py notify`) into the task's `.cmd`, and
+  persist every result to `experiments/lab/artifacts/` as it is produced, so
+  any later session resumes from state without rework.
+- Follow `experiments/lab/LAB.md` (catalog, triggers, budget caps, guardrails);
+  design changes go through the `design_council.py` proposal ledger.
+- **Every iteration tries to shrink the lab, not grow it**: prefer deleting or
+  merging code, metrics, and process over adding; a change that adds anything
+  must name what it removes or retires. The lab staying small IS a guardrail —
+  complexity with no scaling limit is treated as a defect, not progress.
+
 ## watch.py
 
 - Comparison windows use trading bars, not calendar time.
