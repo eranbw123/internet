@@ -262,10 +262,13 @@ can drift), and heavy automated use of claude.ai sits uneasily with its terms
 -- the per-cycle score budget keeps volume modest.
 
 No vendor SDK is imported outside `discovery/providers/`. A capability a
-provider lacks — OpenAI has no equivalent of Claude's server-side web search —
-raises `UnsupportedCapability` and that collector is skipped like any other
-failure, so `web_search` needs a Claude provider (`claude_chat` uses
-claude.ai's own web_search tool; `anthropic` uses the API's).
+provider lacks raises `UnsupportedCapability` and that collector is skipped
+like any other failure. All three providers run the web search server-side,
+so search-driven collectors (`web_search`, `youtube` discovery) work through
+ChatGPT and Claude alike: `claude_chat` uses claude.ai's own web_search tool,
+`anthropic` the Messages API's, and `openai` the Responses API's — the one
+difference is that OpenAI's tool has no hard cap on searches per call, so
+`max_searches` is a prompt-level bound there rather than an enforced one.
 
 ## Telegram
 

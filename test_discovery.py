@@ -2650,17 +2650,20 @@ class AnthropicProviderTests(unittest.TestCase):
 
 
 class FakeOpenAIClient:
-    """Stands in for openai.OpenAI() -- only .chat.completions.create is used."""
+    """Stands in for openai.OpenAI() -- .chat.completions.create (scoring) and
+    .responses.create (web search) are the only surfaces used. One pop-in-order
+    queue serves both."""
 
-    def __init__(self, *responses):
-        self.responses = list(responses)
+    def __init__(self, *canned):
+        self.canned = list(canned)
         self.calls = []
         self.chat = self
         self.completions = self
+        self.responses = self
 
     def create(self, **kwargs):
         self.calls.append(kwargs)
-        return self.responses.pop(0)
+        return self.canned.pop(0)
 
 
 def openai_response(content, prompt_tokens=0, completion_tokens=0):
@@ -2670,9 +2673,24 @@ def openai_response(content, prompt_tokens=0, completion_tokens=0):
     )
 
 
+def openai_search_response(text, input_tokens=0, output_tokens=0,
+                           web_search_calls=0, status="completed", usage=True):
+    """A Responses-API reply: web_search_call items, then the message text."""
+    output = [SimpleNamespace(type="web_search_call") for _ in range(web_search_calls)]
+    output.append(SimpleNamespace(type="message"))
+    return SimpleNamespace(
+        status=status,
+        output=output,
+        output_text=text,
+        usage=SimpleNamespace(input_tokens=input_tokens, output_tokens=output_tokens)
+        if usage else None,
+    )
+
+
 class OpenAIProviderTests(unittest.TestCase):
-    """No search capability, so the pipeline's UnsupportedCapability skip path
-    is what makes this provider usable at all for the web_search collector."""
+    """Scoring via chat.completions structured outputs, web search via the
+    Responses API's server-side web_search tool -- so DISCOVERY_PROVIDER=openai
+    can drive every collector, not just the scorer."""
 
     SCHEMA = {
         "type": "object",
@@ -2703,10 +2721,42 @@ class OpenAIProviderTests(unittest.TestCase):
         self.assertEqual(provider.usage["calls"], 1)  # record_usage still called, with zeros
         self.assertEqual(provider.usage["input_tokens"], 0)
 
-    def test_search_json_always_raises_unsupported(self):
-        provider = OpenAIProvider("gpt-5", client=FakeOpenAIClient())
-        with self.assertRaises(UnsupportedCapability):
+    def test_search_json_parses_the_array_and_counts_searches(self):
+        client = FakeOpenAIClient(openai_search_response(
+            'Found these:\n[{"url": "https://e.com/a", "title": "t"}]',
+            input_tokens=70, output_tokens=9, web_search_calls=2,
+        ))
+        provider = OpenAIProvider("gpt-5", client=client)
+        result = provider.search_json("find things", max_searches=4)
+        self.assertEqual(result, [{"url": "https://e.com/a", "title": "t"}])
+        self.assertEqual(provider.usage["web_searches"], 2)
+        self.assertEqual(provider.usage["input_tokens"], 70)
+        self.assertEqual(provider.usage["output_tokens"], 9)
+        kwargs = client.calls[0]
+        self.assertEqual(kwargs["model"], "gpt-5")
+        self.assertEqual(kwargs["tools"], [{"type": "web_search"}])
+        self.assertEqual(kwargs["input"], "find things")
+
+    def test_search_json_garbage_becomes_an_empty_list(self):
+        client = FakeOpenAIClient(openai_search_response("no array here"))
+        provider = OpenAIProvider("gpt-5", client=client)
+        self.assertEqual(provider.search_json("prompt"), [])
+
+    def test_search_json_incomplete_response_raises_before_parsing(self):
+        client = FakeOpenAIClient(openai_search_response(
+            '[{"url": "https://e.com/a"}', status="incomplete"))
+        provider = OpenAIProvider("gpt-5", client=client)
+        with self.assertRaises(ProviderError) as ctx:
             provider.search_json("prompt")
+        self.assertIn("incomplete", str(ctx.exception))
+
+    def test_search_json_missing_usage_still_counts_the_call(self):
+        client = FakeOpenAIClient(openai_search_response("[]", usage=False,
+                                                         web_search_calls=1))
+        provider = OpenAIProvider("gpt-5", client=client)
+        self.assertEqual(provider.search_json("prompt"), [])
+        self.assertEqual(provider.usage["calls"], 1)
+        self.assertEqual(provider.usage["web_searches"], 1)
 
     def test_preflight_is_a_key_presence_check_only(self):
         provider = OpenAIProvider("gpt-5", client=FakeOpenAIClient())
@@ -2716,6 +2766,28 @@ class OpenAIProviderTests(unittest.TestCase):
         self.assertIn("OPENAI_API_KEY", detail)
         with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "sk-x"}):
             self.assertEqual(provider.preflight(), (True, ""))
+
+
+class OpenAISearchCoversAllInterestsTests(unittest.TestCase):
+    """Every interest in the shipped interests.json can run its web_search
+    collection through the OpenAI (ChatGPT) provider -- the capability gap
+    that used to skip this collector for the second vendor is closed."""
+
+    def test_web_search_collect_yields_items_for_every_shipped_interest(self):
+        loaded = interests.load_file("interests.json")
+        self.assertGreater(len(loaded), 0, "interests.json went empty?")
+        cfg = SimpleNamespace(max_items_per_source=8)
+        for interest in loaded:
+            with self.subTest(interest=interest.key):
+                client = FakeOpenAIClient(openai_search_response(
+                    '[{"url": "https://e.com/x", "title": "t", "summary": "s"}]',
+                    web_search_calls=1,
+                ))
+                items = web_search.collect(
+                    interest, cfg, OpenAIProvider("gpt-5", client=client))
+                self.assertEqual([i.url for i in items], ["https://e.com/x"])
+                prompt = client.calls[0]["input"]
+                self.assertIn(interest.title, prompt)
 
 
 class SchemaContractTests(unittest.TestCase):

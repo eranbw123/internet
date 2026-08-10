@@ -259,6 +259,17 @@ implemented): per-interest `strict_recency` (default true); false = keep old
 videos (narcolepsy/behavioral want old gems per their definitions), rank +
 novelty judge instead. Awaiting user approval.
 
+## openai provider: web search implemented (2026-08-10)
+`OpenAIProvider.search_json` uses the Responses API server-side `web_search`
+tool (`client.responses.create`, tools=[{"type": "web_search"}]): status !=
+completed → ProviderError; `web_search_call` output items counted into
+usage.web_searches; array parsed from `output_text` via `parse_json_array`.
+No max_uses knob exists on OpenAI's tool — `max_searches` binds via the
+prompt only. `web_search`/`youtube` discovery now work under
+DISCOVERY_PROVIDER=openai (needs OPENAI_API_KEY + `pip install openai`);
+test_discovery covers parse/usage/incomplete + a collect-across-every-
+shipped-interest sweep.
+
 ## Implemented
 `watch.py` Yahoo helper (library-only, no CLI/ntfy). `discovery/`:
 staged pipeline, 0–1 scoring, providers `claude_chat` (default; claude.ai via

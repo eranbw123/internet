@@ -1,11 +1,12 @@
-"""OpenAI provider: JSON-schema structured outputs. No search capability.
+"""OpenAI provider: JSON-schema structured outputs; server-side web search
+via the Responses API's web_search tool.
 
 Here so the pipeline can be pointed at a second vendor by changing
 DISCOVERY_PROVIDER, with no pipeline code aware of either.
 """
 import os
 
-from .base import LLMProvider, UnsupportedCapability, parse_json_object
+from .base import LLMProvider, ProviderError, parse_json_array, parse_json_object
 
 
 class OpenAIProvider(LLMProvider):
@@ -44,7 +45,28 @@ class OpenAIProvider(LLMProvider):
         )
         return parse_json_object(response.choices[0].message.content)
 
-    def search_json(self, prompt, max_searches=5, max_tokens=8000):
-        # The web_search collector is skipped rather than half-working: this
-        # provider has no equivalent of Claude's server-side search tool.
-        raise UnsupportedCapability("openai provider has no web search capability")
+    def search_json(self, prompt, max_searches=5, max_tokens=16000):
+        # OpenAI's web_search tool has no max_uses knob, so max_searches only
+        # reaches the model through the prompt (the collectors already write it
+        # in); the searches actually run are still counted for stats.py.
+        response = self.client.responses.create(
+            model=self.model,
+            input=prompt,
+            tools=[{"type": "web_search"}],
+            max_output_tokens=max_tokens,
+        )
+        status = getattr(response, "status", "completed")
+        if status != "completed":
+            raise ProviderError(f"unusable response: status={status}")
+        searches = sum(
+            1
+            for item in getattr(response, "output", None) or []
+            if getattr(item, "type", "") == "web_search_call"
+        )
+        usage = getattr(response, "usage", None)
+        self.record_usage(
+            input_tokens=getattr(usage, "input_tokens", 0) if usage else 0,
+            output_tokens=getattr(usage, "output_tokens", 0) if usage else 0,
+            web_searches=searches,
+        )
+        return parse_json_array(getattr(response, "output_text", "") or "")
