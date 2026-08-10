@@ -1,7 +1,7 @@
 {
  "schema_version": 1,
- "evidence_cutoff": "2026-08-10T17:36:04+00:00",
- "git_commit": "e3df6fb5f655db0c94a7ba12c94e90f5bcaefdae",
+ "evidence_cutoff": "2026-08-10T17:37:20+00:00",
+ "git_commit": "bcc4351083e9b706c89510754d3df706f955989a",
  "tool_version": "1.0",
  "preregistration": {
   "hypothesis_h1": "At least one candidate connector supplies items the engine cannot already reach: pooled over the probed interests, marginal_unique_rate >= 0.40 AND jaccard_overlap_with_web_search_sample < 0.30.",
@@ -118,7 +118,7 @@
     "reachable": null,
     "status": "NOT_IMPLEMENTED",
     "detail": "x sampling via provider.search_json is NOT IMPLEMENTED in this harness version -- no code path calls search_json for x, independent of provider reachability (provider.preflight() here: False, CLAUDE_ORG_ID is not set). Re-running `sample`, live or not, will not change this entry until that sampler is written.",
-    "checked_at": "2026-08-10T17:35:39+00:00"
+    "checked_at": "2026-08-10T17:37:00+00:00"
    },
    "sample": {
     "status": "NOT_IMPLEMENTED",
@@ -151,7 +151,7 @@
     "reachable": true,
     "http_status": 200,
     "endpoint": "https://hn.algolia.com/api/v1/search_by_date?query=AI+agents+%2F+coding+%2F+personal+automation+major+Claude+Code%2C+Codex+or+coding-agent+capability+changes+agent+architecture+that+materially+improves+reliability+or+autonomy+context+compression%2C+persistent+memory+or+long-running+agent+techniques&tags=story&hitsPerPage=10",
-    "checked_at": "2026-08-10T17:35:40+00:00",
+    "checked_at": "2026-08-10T17:37:00+00:00",
     "detail": "reachable (http 200)"
    },
    "sample": {
@@ -167,9 +167,9 @@
       "records": [],
       "n_records": 0,
       "rate_limit_headers": {},
-      "collected_at": "2026-08-10T17:35:40+00:00",
+      "collected_at": "2026-08-10T17:37:00+00:00",
       "lane": "zero_spend",
-      "git_commit": "e3df6fb5f655db0c94a7ba12c94e90f5bcaefdae"
+      "git_commit": "bcc4351083e9b706c89510754d3df706f955989a"
      },
      {
       "interest": "personal-knowledge-learning",
@@ -180,9 +180,9 @@
       "records": [],
       "n_records": 0,
       "rate_limit_headers": {},
-      "collected_at": "2026-08-10T17:35:41+00:00",
+      "collected_at": "2026-08-10T17:37:02+00:00",
       "lane": "zero_spend",
-      "git_commit": "e3df6fb5f655db0c94a7ba12c94e90f5bcaefdae"
+      "git_commit": "bcc4351083e9b706c89510754d3df706f955989a"
      }
     ]
    },
@@ -214,7 +214,7 @@
     "reachable": false,
     "http_status": 403,
     "endpoint": "https://www.reddit.com/search.json?q=Human+interaction+%2F+attraction+%2F+behavioral+psychology+interpersonal+synchrony+or+mimicry+experiments+gaze%2C+posture%2C+distance%2C+touch+or+vocal-prosody+research+attraction+or+courtship+studies+with+observable+behavioral+measures&sort=new&limit=10&t=year",
-    "checked_at": "2026-08-10T17:35:42+00:00",
+    "checked_at": "2026-08-10T17:37:02+00:00",
     "detail": "behavioral-psychology: http 403; personal-knowledge-learning: http 403; emdr-trauma-therapy: http 403; narcolepsy-eds: http 403; ai-agents-dev-tools: http 403"
    },
    "sample": {
@@ -232,9 +232,9 @@
       "rate_limit_headers": {
        "Retry-After": "0"
       },
-      "collected_at": "2026-08-10T17:35:42+00:00",
+      "collected_at": "2026-08-10T17:37:02+00:00",
       "lane": "zero_spend",
-      "git_commit": "e3df6fb5f655db0c94a7ba12c94e90f5bcaefdae"
+      "git_commit": "bcc4351083e9b706c89510754d3df706f955989a"
      },
      {
       "interest": "personal-knowledge-learning",
@@ -247,9 +247,9 @@
       "rate_limit_headers": {
        "Retry-After": "0"
       },
-      "collected_at": "2026-08-10T17:35:43+00:00",
+      "collected_at": "2026-08-10T17:37:03+00:00",
       "lane": "zero_spend",
-      "git_commit": "e3df6fb5f655db0c94a7ba12c94e90f5bcaefdae"
+      "git_commit": "bcc4351083e9b706c89510754d3df706f955989a"
      },
      {
       "interest": "emdr-trauma-therapy",
@@ -262,9 +262,9 @@
       "rate_limit_headers": {
        "Retry-After": "0"
       },
-      "collected_at": "2026-08-10T17:35:44+00:00",
+      "collected_at": "2026-08-10T17:37:05+00:00",
       "lane": "zero_spend",
-      "git_commit": "e3df6fb5f655db0c94a7ba12c94e90f5bcaefdae"
+      "git_commit": "bcc4351083e9b706c89510754d3df706f955989a"
      },
      {
       "interest": "narcolepsy-eds",
@@ -277,9 +277,9 @@
       "rate_limit_headers": {
        "Retry-After": "0"
       },
-      "collected_at": "2026-08-10T17:35:46+00:00",
+      "collected_at": "2026-08-10T17:37:06+00:00",
       "lane": "zero_spend",
-      "git_commit": "e3df6fb5f655db0c94a7ba12c94e90f5bcaefdae"
+      "git_commit": "bcc4351083e9b706c89510754d3df706f955989a"
      },
      {
       "interest": "ai-agents-dev-tools",
@@ -292,9 +292,9 @@
       "rate_limit_headers": {
        "Retry-After": "0"
       },
-      "collected_at": "2026-08-10T17:35:47+00:00",
+      "collected_at": "2026-08-10T17:37:08+00:00",
       "lane": "zero_spend",
-      "git_commit": "e3df6fb5f655db0c94a7ba12c94e90f5bcaefdae"
+      "git_commit": "bcc4351083e9b706c89510754d3df706f955989a"
      }
     ]
    },
@@ -324,7 +324,7 @@
     "reachable": true,
     "http_status": 200,
     "endpoint": "https://export.arxiv.org/api/query?search_query=all%3AHuman+interaction+%2F+attraction+%2F+behavioral+psychology+interpersonal+synchrony+or+mimicry+experiments+gaze%2C+posture%2C+distance%2C+touch+or+vocal-prosody+research+attraction+or+courtship+studies+with+observable+behavioral+measures&start=0&max_results=10",
-    "checked_at": "2026-08-10T17:35:49+00:00",
+    "checked_at": "2026-08-10T17:37:08+00:00",
     "detail": "reachable (http 200)"
    },
    "sample": {
@@ -391,9 +391,9 @@
       ],
       "n_records": 10,
       "rate_limit_headers": {},
-      "collected_at": "2026-08-10T17:35:49+00:00",
+      "collected_at": "2026-08-10T17:37:08+00:00",
       "lane": "zero_spend",
-      "git_commit": "e3df6fb5f655db0c94a7ba12c94e90f5bcaefdae"
+      "git_commit": "bcc4351083e9b706c89510754d3df706f955989a"
      },
      {
       "interest": "personal-knowledge-learning",
@@ -455,9 +455,9 @@
       ],
       "n_records": 10,
       "rate_limit_headers": {},
-      "collected_at": "2026-08-10T17:35:54+00:00",
+      "collected_at": "2026-08-10T17:37:11+00:00",
       "lane": "zero_spend",
-      "git_commit": "e3df6fb5f655db0c94a7ba12c94e90f5bcaefdae"
+      "git_commit": "bcc4351083e9b706c89510754d3df706f955989a"
      },
      {
       "interest": "ai-agents-dev-tools",
@@ -519,9 +519,9 @@
       ],
       "n_records": 10,
       "rate_limit_headers": {},
-      "collected_at": "2026-08-10T17:36:00+00:00",
+      "collected_at": "2026-08-10T17:37:14+00:00",
       "lane": "zero_spend",
-      "git_commit": "e3df6fb5f655db0c94a7ba12c94e90f5bcaefdae"
+      "git_commit": "bcc4351083e9b706c89510754d3df706f955989a"
      }
     ]
    },
@@ -550,7 +550,7 @@
     "reachable": true,
     "http_status": 200,
     "endpoint": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=Narcolepsy+%2F+EDS+%2F+wakefulness+orexin%2Fhypocretin+agonist+phase+2+or+phase+3+results+with+actual+numbers+large+objective+improvement+in+wakefulness%2C+vigilance+or+functional+capacity+head-to-head+or+unusually+informative+treatment+comparisons&retmode=json&retmax=10 -> https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id=42542404%2C42530884%2C42530577%2C42463031%2C42421086%2C42367338%2C42191840%2C42115887%2C42057717%2C42041227&retmode=json",
-    "checked_at": "2026-08-10T17:36:02+00:00",
+    "checked_at": "2026-08-10T17:37:17+00:00",
     "detail": "reachable (http 200)"
    },
    "sample": {
@@ -620,9 +620,9 @@
        "X-Ratelimit-Limit": "3",
        "X-Ratelimit-Remaining": "2"
       },
-      "collected_at": "2026-08-10T17:36:02+00:00",
+      "collected_at": "2026-08-10T17:37:17+00:00",
       "lane": "zero_spend",
-      "git_commit": "e3df6fb5f655db0c94a7ba12c94e90f5bcaefdae"
+      "git_commit": "bcc4351083e9b706c89510754d3df706f955989a"
      },
      {
       "interest": "emdr-trauma-therapy",
@@ -642,9 +642,9 @@
        "X-Ratelimit-Limit": "3",
        "X-Ratelimit-Remaining": "2"
       },
-      "collected_at": "2026-08-10T17:36:04+00:00",
+      "collected_at": "2026-08-10T17:37:20+00:00",
       "lane": "zero_spend",
-      "git_commit": "e3df6fb5f655db0c94a7ba12c94e90f5bcaefdae"
+      "git_commit": "bcc4351083e9b706c89510754d3df706f955989a"
      }
     ]
    },
