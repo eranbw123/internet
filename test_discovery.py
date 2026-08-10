@@ -7,10 +7,16 @@ the pipeline holds an LLMProvider, so a fake object with `complete_json` /
 `search_json` is the whole seam.
 """
 import dataclasses
+import io
 import json
 import os
+import sqlite3
+import sys
 import tempfile
+import types
 import unittest
+import urllib.parse
+from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 from unittest import mock
 
@@ -19,22 +25,36 @@ from discovery import (
     db,
     dedup,
     feedback_listener,
+    health,
     interests,
     matching,
     models,
     normalize,
     notify,
+    personal_state,
     pipeline,
-    scheduler,
     scoring,
     stats,
 )
+from discovery.personal_state import PersonalState, PersonalStateError
 from discovery.collectors import COLLECTORS, stocks, web_search, youtube
 from discovery.models import CandidateItem, Interest, ScoreResult
 from discovery.providers import PROVIDERS, claude_chat
 from discovery.providers.anthropic_provider import AnthropicProvider
 from discovery.providers.base import LLMProvider, ProviderError, UnsupportedCapability
 from discovery.providers.openai_provider import OpenAIProvider
+
+# ops/install_tasks.py is a flat script (like app/, not a package) run as
+# `python ops/install_tasks.py`, so it's imported here the same way that
+# invocation would resolve it: `ops/` on sys.path, then a bare import.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ops"))
+import install_tasks  # noqa: E402
+
+# Same pattern for the engine-lab's flat scripts.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                "experiments", "lab"))
+import db_replay  # noqa: E402
+import exp_connectors  # noqa: E402
 
 CFG = config.Config(
     db_path=":memory:",
@@ -46,6 +66,11 @@ CFG = config.Config(
     min_text_chars=40,
     telegram_bot_token="",
     telegram_chat_id="",
+    # Pinned to the db.py module constants (rather than Config's own raised
+    # defaults) so the retry-policy tests below stay exact regardless of
+    # what config.load()'s production defaults are.
+    send_max_attempts=db.MAX_SEND_ATTEMPTS,
+    send_retry_seconds=db.RESEND_FAILED_AFTER_SECONDS,
 )
 
 BODY = (
@@ -479,6 +504,51 @@ class DBTests(unittest.TestCase):
             ("m1", 2, 150, 15, 2),
         )
 
+    def test_state_get_defaults_and_set_round_trips(self):
+        self.assertIsNone(db.state_get(self.conn, "job:stocks:last_ok"))
+        self.assertEqual(db.state_get(self.conn, "job:stocks:last_ok", "none yet"), "none yet")
+        db.state_set(self.conn, "job:stocks:last_ok", db.now())
+        stamp = db.state_get(self.conn, "job:stocks:last_ok")
+        self.assertIsNotNone(stamp)
+        db.state_set(self.conn, "job:stocks:last_ok", "later")
+        self.assertEqual(db.state_get(self.conn, "job:stocks:last_ok"), "later")
+        # One row per key, not one per write.
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) c FROM service_state WHERE key = 'job:stocks:last_ok'"
+            ).fetchone()["c"],
+            1,
+        )
+
+    def test_today_counts_reads_back_metrics(self):
+        db.bump(self.conn, {"run_ok": 2, "send_failed": 1})
+        self.assertEqual(db.today_counts(self.conn), {"run_ok": 2, "send_failed": 1})
+
+    def test_pending_notification_stats_and_abandoned_notifications(self):
+        db.upsert_interest(self.conn, an_interest())
+        (interest,) = db.active_interests(self.conn)
+        older = stored_item(self.conn, url="https://e.com/older").id
+        newer = stored_item(self.conn, url="https://e.com/newer").id
+        db.save_score(self.conn, a_score(older, interest.id, 0.9))
+        db.save_score(self.conn, a_score(newer, interest.id, 0.9))
+
+        count, oldest = db.pending_notification_stats(self.conn)
+        self.assertEqual(count, 2)
+        older_created = self.conn.execute(
+            "SELECT created_at FROM scores WHERE item_id = ?", (older,)
+        ).fetchone()["created_at"]
+        self.assertEqual(oldest, older_created)
+        self.assertEqual(db.abandoned_notifications(self.conn, max_attempts=3), 0)
+
+        score_id = self.conn.execute(
+            "SELECT id FROM scores WHERE item_id = ?", (older,)
+        ).fetchone()["id"]
+        for _ in range(3):
+            db.record_notification(self.conn, score_id, "telegram", False)
+        self.assertEqual(db.abandoned_notifications(self.conn, max_attempts=3), 1)
+        # A live retry candidate (under the cap) is not "abandoned".
+        self.assertEqual(db.abandoned_notifications(self.conn, max_attempts=10), 0)
+
 
 class StatsTests(unittest.TestCase):
     def setUp(self):
@@ -574,15 +644,162 @@ class StatsTests(unittest.TestCase):
         self.assertIn("TOTAL $10.00", text)
         self.assertIn("3 calls via the claude.ai session", text)
 
+    def test_report_without_cfg_omits_the_health_section(self):
+        self.assertNotIn("HEALTH", stats.report(self.conn, days=7))
+
+    def test_report_with_cfg_adds_a_health_section_without_checking_the_provider(self):
+        text = stats.report(self.conn, days=7, cfg=CFG)
+        self.assertIn("HEALTH", text)
+        self.assertIn("provider: not checked", text)
+        self.assertIn("overall: OK", text)
+
+
+class HealthTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def test_job_name_for_source_maps_collector_names_onto_config_fields(self):
+        self.assertEqual(health.job_name_for_source("web_search"), "web")
+        self.assertEqual(health.job_name_for_source("stocks"), "stocks")
+        self.assertEqual(health.job_name_for_source("youtube"), "youtube")
+        self.assertEqual(health.job_name_for_source(None), "run-once")
+        self.assertEqual(health.job_name_for_source("manual"), "manual")
+
+    def test_check_is_not_degraded_before_any_job_has_ever_run(self):
+        # A job never run is "unknown", not "stale" -- a fresh `init` must
+        # not read as degraded just because nothing has fired yet.
+        result = health.check(self.conn, CFG)
+        self.assertFalse(result["degraded"])
+        self.assertIsNone(result["provider_ok"])
+        self.assertTrue(all(not j["stale"] for j in result["jobs"]))
+
+    def test_check_flags_a_job_whose_last_ok_is_older_than_the_stale_threshold(self):
+        cfg = dataclasses.replace(CFG, interval_stocks_seconds=100, health_stale_factor=3)
+        db.state_set(self.conn, "job:stocks:last_ok", db.ago(301))
+        result = health.check(self.conn, cfg)
+        stocks = next(j for j in result["jobs"] if j["name"] == "stocks")
+        self.assertTrue(stocks["stale"])
+        self.assertTrue(result["degraded"])
+
+    def test_check_reflects_a_down_provider(self):
+        provider = FakeProvider()
+        provider.preflight = lambda: (False, "no CDP endpoint")
+        result = health.check(self.conn, CFG, provider)
+        self.assertEqual(result["provider_ok"], False)
+        self.assertEqual(result["provider_detail"], "no CDP endpoint")
+        self.assertTrue(result["degraded"])
+
+    def test_check_reports_abandoned_notifications_without_gating_degraded(self):
+        # Abandoned sends are an expected artifact of an outage that already
+        # passed (the retry policy is designed to eventually give up), and
+        # there is no ack/clear path for them -- gating `degraded` on an
+        # unbounded, all-time count would latch it forever the first time an
+        # outage outlasts the retry window, so it must be reported but not
+        # count towards degraded.
+        db.upsert_interest(self.conn, an_interest())
+        (interest,) = db.active_interests(self.conn)
+        item = stored_item(self.conn)
+        score_id = db.save_score(self.conn, a_score(item.id, interest.id, 0.9))
+        for _ in range(CFG.send_max_attempts):
+            db.record_notification(self.conn, score_id, "telegram", False)
+        result = health.check(self.conn, CFG)
+        self.assertEqual(result["abandoned"], 1)
+        self.assertFalse(result["degraded"])
+
+    def test_format_report_is_plain_text_and_mentions_every_job(self):
+        text = health.format_report(health.check(self.conn, CFG))
+        self.assertIn("HEALTH", text)
+        for name in ("stocks", "web", "youtube", "digest", "feedback"):
+            self.assertIn(name, text)
+
+    def test_preflight_gate_passes_through_a_healthy_provider_without_side_effects(self):
+        provider = FakeProvider()
+        self.assertTrue(health.preflight_gate(self.conn, provider, CFG, "stocks"))
+        self.assertEqual(db.today_counts(self.conn), {})
+        self.assertIsNone(db.state_get(self.conn, "job:stocks:last_fail"))
+
+    def test_preflight_gate_records_the_failure_and_returns_false(self):
+        provider = FakeProvider()
+        provider.preflight = lambda: (False, "no claude.ai tab")
+        self.assertFalse(health.preflight_gate(self.conn, provider, CFG, "stocks"))
+        self.assertEqual(db.today_counts(self.conn), {"provider_down": 1})
+        self.assertIsNotNone(db.state_get(self.conn, "job:stocks:last_fail"))
+
+    def test_preflight_gate_launches_chrome_once_and_rechecks(self):
+        provider = FakeProvider()
+        calls = [(False, "down"), (True, "")]
+        provider.preflight = lambda: calls.pop(0)
+        cfg = dataclasses.replace(
+            CFG, chrome_launch_cmd="chrome.cmd", chrome_launch_wait_seconds=0
+        )
+        with mock.patch("discovery.health.subprocess.run") as run, \
+             mock.patch("discovery.health.time.sleep") as sleep:
+            self.assertTrue(health.preflight_gate(self.conn, provider, cfg, "stocks"))
+        run.assert_called_once_with(["cmd", "/d", "/c", "chrome.cmd"], check=False, timeout=0)
+        sleep.assert_called_once_with(0)
+        self.assertEqual(db.today_counts(self.conn), {})  # recovered -- no provider_down
+
+    def test_preflight_gate_survives_a_launch_command_that_never_returns(self):
+        # A non-detached chrome_launch_cmd (still running Chrome itself when
+        # the timeout hits) must not hang run-once forever.
+        import subprocess
+
+        provider = FakeProvider()
+        provider.preflight = lambda: (False, "down")
+        cfg = dataclasses.replace(
+            CFG, chrome_launch_cmd="chrome.cmd", chrome_launch_wait_seconds=0
+        )
+        with mock.patch(
+            "discovery.health.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="chrome.cmd", timeout=0),
+        ), mock.patch("discovery.health.time.sleep"):
+            self.assertFalse(health.preflight_gate(self.conn, provider, cfg, "stocks"))
+        self.assertEqual(db.today_counts(self.conn), {"provider_down": 1})
+
+    def test_notify_if_needed_sends_once_while_degraded_then_respects_cooldown(self):
+        cfg = dataclasses.replace(CFG, health_alert_cooldown_seconds=3600)
+        result = {"degraded": True, "jobs": [], "provider_ok": False, "provider_detail": "down",
+                  "pending_count": 0, "pending_oldest": None, "abandoned": 0, "counters": {}}
+        with mock.patch.object(notify, "send", return_value=True) as send:
+            health.notify_if_needed(self.conn, cfg, result)
+        send.assert_called_once()
+        self.assertEqual(db.state_get(self.conn, "health:last_status"), "degraded")
+
+        with mock.patch.object(notify, "send", return_value=True) as send:
+            health.notify_if_needed(self.conn, cfg, result)
+        send.assert_not_called()  # still within the cooldown
+
+    def test_notify_if_needed_sends_exactly_one_recovery_message_on_transition(self):
+        db.state_set(self.conn, "health:last_status", "degraded")
+        ok_result = {"degraded": False, "jobs": [], "provider_ok": True, "provider_detail": "",
+                     "pending_count": 0, "pending_oldest": None, "abandoned": 0, "counters": {}}
+        with mock.patch.object(notify, "send", return_value=True) as send:
+            health.notify_if_needed(self.conn, CFG, ok_result)
+        send.assert_called_once()
+        self.assertIn("recovered", send.call_args.args[1])
+        self.assertEqual(db.state_get(self.conn, "health:last_status"), "ok")
+
+        with mock.patch.object(notify, "send", return_value=True) as send:
+            health.notify_if_needed(self.conn, CFG, ok_result)
+        send.assert_not_called()  # already ok -- no repeat recovery message
+
 
 class InterestsFileTests(unittest.TestCase):
     def test_sample_file_loads_with_defaults_applied(self):
         loaded = interests.load_file("interests.json")
         keys = [i.key for i in loaded]
-        self.assertEqual(keys, ["narcolepsy-eds", "nbis-nebius", "behavioral-psychology"])
-        nbis = loaded[1]
+        # Anchor on the two interests other tests and collectors lean on rather
+        # than the full list -- interests.json is real user config and changes.
+        self.assertIn("narcolepsy-eds", keys)
+        self.assertIn("nbis-nebius", keys)
+        nbis = loaded[keys.index("nbis-nebius")]
         self.assertIn("stocks", nbis.sources)
         self.assertEqual(nbis.source_config["stocks"]["tickers"][0]["ticker"], "NBIS")
+        youtube_cfg = loaded[keys.index("narcolepsy-eds")].source_config["youtube"]
+        self.assertIn("max_candidate_videos", youtube_cfg)
+        self.assertIn("max_transcript_fetches", youtube_cfg)
 
     def test_sample_file_thresholds_are_on_the_0_1_scale(self):
         for interest in interests.load_file("interests.json"):
@@ -623,6 +840,142 @@ class InterestsFileTests(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump(data, fh)
             return interests.load_file(path)
+
+    def test_personal_state_top_terms_are_appended_when_opted_in(self):
+        state = PersonalState(
+            contract_version=1,
+            generated_at="2026-08-10T00:00:00Z",
+            topics=[
+                {"key": "orexin", "weight": 1.0},
+                {"key": "wakefulness", "weight": 0.5},
+                {"key": "narcolepsy", "weight": 0.3},
+            ],
+        )
+        data = {
+            "interests": [{
+                "key": "x", "title": "X",
+                "positive_signals": ["orexin", "existing"],
+                "personal_state_top_terms": 2,
+            }]
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "i.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            (with_state,) = interests.load_file(path, state=state)
+            (without_key,) = interests.load_file(path, state=None)
+        # Existing signals first, order stable, de-duplicated against "orexin".
+        self.assertEqual(with_state.positive_signals, ["orexin", "existing", "wakefulness"])
+        # No state loaded -> the key is inert, byte-identical to no state at all.
+        self.assertEqual(without_key.positive_signals, ["orexin", "existing"])
+
+    def test_without_the_opt_in_key_behavior_is_unchanged_by_state(self):
+        state = PersonalState(
+            contract_version=1, generated_at="2026-08-10T00:00:00Z",
+            topics=[{"key": "orexin", "weight": 1.0}],
+        )
+        data = {"interests": [{"key": "x", "title": "X", "positive_signals": ["a"]}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "i.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            with_state = interests.load_file(path, state=state)
+            no_state = interests.load_file(path, state=None)
+            plain = interests.load_file(path)
+        self.assertEqual(with_state, no_state)
+        self.assertEqual(with_state, plain)
+
+
+class PersonalStateTests(unittest.TestCase):
+    def _write(self, data):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "personal_state.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        return path
+
+    def _artifact(self, **overrides):
+        base = {
+            "contract_version": 1,
+            "generated_at": "2026-08-10T00:00:00Z",
+            "window_days": 180,
+            "conversation_count": 12,
+            "sources": {"claude": 8, "chatgpt": 4},
+            "topics": [
+                {"key": "orexin", "weight": 1.0, "conversations": 5, "last_seen": "2026-08-09T00:00:00Z"},
+                {"key": "wakefulness", "weight": 0.6, "conversations": 3, "last_seen": "2026-08-08T00:00:00Z"},
+                {"key": "narcolepsy", "weight": 0.4, "conversations": 2, "last_seen": "2026-08-01T00:00:00Z"},
+            ],
+        }
+        base.update(overrides)
+        return base
+
+    def test_valid_v1_artifact_loads_and_top_terms_are_in_order(self):
+        path = self._write(self._artifact())
+        state = personal_state.load(path)
+        self.assertEqual(state.contract_version, 1)
+        self.assertEqual(state.top_terms(2), ["orexin", "wakefulness"])
+        self.assertEqual(state.top_terms(10), ["orexin", "wakefulness", "narcolepsy"])
+
+    def test_an_unsupported_version_names_found_and_supported_in_the_message(self):
+        path = self._write(self._artifact(contract_version=2))
+        with self.assertRaises(PersonalStateError) as ctx:
+            personal_state.load(path)
+        message = str(ctx.exception)
+        self.assertIn("2", message)
+        self.assertIn(str(sorted(personal_state.SUPPORTED_VERSIONS)), message)
+        # load_optional never raises -- the fail-soft wrapper the pipeline uses.
+        self.assertIsNone(personal_state.load_optional(path))
+
+    def test_forward_compat_ignores_unknown_top_level_and_per_topic_keys(self):
+        data = self._artifact(some_future_field="ignored")
+        data["topics"][0]["some_future_topic_field"] = "ignored"
+        path = self._write(data)
+        state = personal_state.load(path)
+        self.assertEqual(state.top_terms(1), ["orexin"])
+
+    def test_malformed_json_raises_and_load_optional_returns_none(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "bad.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        with self.assertRaises(PersonalStateError):
+            personal_state.load(path)
+        self.assertIsNone(personal_state.load_optional(path))
+
+    def test_missing_file_raises_and_load_optional_returns_none(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "does-not-exist.json")
+        with self.assertRaises(PersonalStateError):
+            personal_state.load(path)
+        self.assertIsNone(personal_state.load_optional(path))
+
+    def test_a_non_dict_artifact_raises_and_load_optional_returns_none(self):
+        # A truncated/zeroed producer write (`null`, a bare number, ...) must
+        # not escape as a raw TypeError -- `"contract_version" not in data`
+        # only makes sense once `data` is known to be a mapping.
+        for bad in (None, 5, [1, 2]):
+            path = self._write(bad)
+            with self.assertRaises(PersonalStateError):
+                personal_state.load(path)
+            self.assertIsNone(personal_state.load_optional(path))
+
+    def test_malformed_topics_raise_instead_of_failing_later_at_top_terms(self):
+        # `topics` not a list, and a topic missing its `key`, must be caught
+        # in load() itself -- interests.load_file calls top_terms() after
+        # load_optional() has already returned, outside any fail-soft guard.
+        not_a_list = self._write(self._artifact(topics={"a": 1}))
+        with self.assertRaises(PersonalStateError):
+            personal_state.load(not_a_list)
+        self.assertIsNone(personal_state.load_optional(not_a_list))
+
+        missing_key = self._write(self._artifact(topics=[{"weight": 1}]))
+        with self.assertRaises(PersonalStateError):
+            personal_state.load(missing_key)
+        self.assertIsNone(personal_state.load_optional(missing_key))
 
 
 class ScoringTests(unittest.TestCase):
@@ -751,6 +1104,34 @@ class StocksCollectorTests(unittest.TestCase):
         self.assertAlmostEqual(item.metadata["weekly_pct"], -2.0)
         self.assertIn("NBIS -8.40% today", item.title)
         self.assertIn("no provider", item.text)
+
+    def test_market_events_on_different_days_are_not_url_deduped(self):
+        # Regression: the market_event URL used to be ticker-only
+        # (finance.yahoo.com/quote/NBIS), constant across every day the
+        # ticker crossed its threshold. dedup.find_duplicate() checks
+        # url_hash before dedup_key is ever consulted, so a second day's
+        # genuinely distinct event was silently swallowed as "duplicate:
+        # same url" and never scored or alerted -- forever, for that ticker.
+        interest = an_interest(
+            sources=["stocks"],
+            source_config={"stocks": {"tickers": ["NBIS"]}},
+        )
+        with mock.patch.object(
+            stocks.watch, "price_change", side_effect=self._prices(daily_pct=8.4, weekly_pct=8.4)
+        ):
+            (day1,) = stocks.collect(interest, CFG, None)
+        day1 = normalize.normalize(day1)
+
+        later = self._change("daily", -9.5, "1d")
+        later["now_at"] = later["now_at"].replace(day=later["now_at"].day + 7)
+        with mock.patch.object(
+            stocks.watch, "price_change",
+            side_effect=lambda ticker, schedule: later if schedule == "daily" else later,
+        ):
+            (day2,) = stocks.collect(interest, CFG, None)
+
+        self.assertNotEqual(day1.url, day2.url)
+        self.assertNotEqual(day1.url_hash, normalize.normalize(day2).url_hash)
 
     def test_weekly_threshold_alone_still_triggers(self):
         interest = an_interest(
@@ -913,19 +1294,52 @@ class FakeSnippet:
         self.duration = duration
 
 
+# Real video ids are 11 chars of [A-Za-z0-9_-]; _video_id_from_url enforces
+# that, so test ids must look real.
+VID1, VID2, VID3 = "vid00000001", "vid00000002", "vid00000003"
+
+
+def recent_ts(days=1):
+    return (datetime.now(timezone.utc) - timedelta(days=days)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
 def a_video(**kw):
+    """An enriched video dict as _list_videos returns it (verification passed)."""
     base = dict(
-        video_id="vid1",
+        video_id=VID1,
         video_title="Some Podcast",
         channel="A Channel",
-        published_at="2026-08-01T00:00:00Z",
-        video_url="https://www.youtube.com/watch?v=vid1",
+        description="",
+        published_at=recent_ts(),
+        duration_seconds=3600,
     )
     base.update(kw)
+    base.setdefault("video_url", f"https://www.youtube.com/watch?v={base['video_id']}")
     return base
 
 
+def a_discovery_entry(video_id=VID1, estimate=0.8, why="looks on-topic"):
+    """One entry of the Stage-1 search_json reply."""
+    return {"url": f"https://www.youtube.com/watch?v={video_id}", "estimate": estimate, "why": why}
+
+
+def listed(*videos):
+    return {v["video_id"]: v for v in videos}
+
+
 class YoutubeCollectorTests(unittest.TestCase):
+    def setUp(self):
+        # Fetch pacing exists for the live endpoint, not for tests.
+        patcher = mock.patch.object(youtube, "FETCH_SLEEP_SECONDS", 0)
+        patcher.start()
+        self.addCleanup(patcher.stop)
+        self.cfg = dataclasses.replace(CFG, youtube_api_key="key")
+
+    def interest(self, **kw):
+        kw.setdefault("sources", ["youtube"])
+        kw.setdefault("source_config", {"youtube": {}})
+        return an_interest(**kw)
+
     def test_chunk_transcript_slides_with_overlap(self):
         snippets = [FakeSnippet(f"word{i}", i * 10, 10) for i in range(10)]  # 0..100s
         chunks = youtube._chunk_transcript(snippets, window_seconds=30, overlap_seconds=10)
@@ -937,43 +1351,41 @@ class YoutubeCollectorTests(unittest.TestCase):
         self.assertEqual(youtube._chunk_transcript([], 30, 10), [])
         self.assertEqual(youtube._chunk_transcript([FakeSnippet("  ", 0, 5)], 30, 10), [])
 
-    def test_no_channels_or_queries_returns_empty_without_needing_a_key(self):
-        interest = an_interest(sources=["youtube"], source_config={"youtube": {}})
-        self.assertEqual(youtube.collect(interest, CFG, None), [])
-
     def test_missing_api_key_raises(self):
-        interest = an_interest(
-            sources=["youtube"], source_config={"youtube": {"channels": ["UC1"]}}
-        )
         with self.assertRaises(youtube.YoutubeCollectorError):
-            youtube.collect(interest, CFG, None)
+            youtube.collect(self.interest(), CFG, None)
+
+    def test_no_provider_or_no_search_capability_is_a_clean_skip(self):
+        """Discovery has no fallback path: without a searching provider the
+        cycle skips youtube entirely -- and spends nothing."""
+        with mock.patch.object(youtube, "_list_videos") as lv:
+            self.assertEqual(youtube.collect(self.interest(), self.cfg, None), [])
+            # FakeProvider with search_results=None raises UnsupportedCapability.
+            self.assertEqual(youtube.collect(self.interest(), self.cfg, FakeProvider()), [])
+            lv.assert_not_called()
 
     def test_collect_shapes_one_candidate_per_segment(self):
-        cfg = dataclasses.replace(CFG, youtube_api_key="key")
-        interest = an_interest(
-            sources=["youtube"],
-            source_config={
-                "youtube": {
-                    "channels": ["UC1"],
-                    "chunk_seconds": 30,
-                    "chunk_overlap_seconds": 10,
-                }
-            },
+        interest = self.interest(
+            source_config={"youtube": {"chunk_seconds": 30, "chunk_overlap_seconds": 10}}
         )
+        provider = FakeProvider(search_results=[a_discovery_entry(estimate=0.9)])
         snippets = [FakeSnippet(f"segment about {i} orexin", i * 10, 10) for i in range(6)]
-        with mock.patch.object(youtube, "_search_videos", return_value=[a_video()]), \
+        with mock.patch.object(youtube, "_list_videos", return_value=listed(a_video())), \
              mock.patch.object(youtube, "_fetch_transcript", return_value=snippets):
-            items = youtube.collect(interest, cfg, None)
+            items = youtube.collect(interest, self.cfg, provider)
 
         self.assertGreaterEqual(len(items), 2)
         first, second = items[0], items[1]
         self.assertEqual(first.source, "youtube")
         self.assertEqual(first.type, "video_segment")
-        self.assertEqual(first.metadata["video_id"], "vid1")
+        self.assertEqual(first.metadata["video_id"], VID1)
         self.assertEqual(first.metadata["channel"], "A Channel")
         self.assertEqual(first.metadata["start_time"], 0)
         self.assertIn("orexin", first.metadata["transcript"])
-        self.assertTrue(first.url.startswith("https://www.youtube.com/watch?v=vid1&t="))
+        # Stage-1 provenance rides along for discovery-vs-score calibration.
+        self.assertEqual(first.metadata["discovery_estimate"], 0.9)
+        self.assertEqual(first.metadata["discovery_why"], "looks on-topic")
+        self.assertTrue(first.url.startswith(f"https://www.youtube.com/watch?v={VID1}&t="))
 
         # Two segments of the same video must not collide on any dedup layer:
         # distinct urls (survives fragment-stripping normalize.canonical_url),
@@ -982,58 +1394,281 @@ class YoutubeCollectorTests(unittest.TestCase):
         self.assertNotEqual(first.title, second.title)
         self.assertNotEqual(first.dedup_key, second.dedup_key)
 
-    def test_an_already_chunked_video_is_not_re_fetched(self):
-        """A search job re-lists the same uploads every few hours. Without the
-        check, each run re-fetches and re-chunks a transcript whose segments
-        dedup.py is only going to reject again."""
+    def test_transcript_success_yields_only_segments_no_video_level_item(self):
+        """A clean fetch never produces a video-level fallback alongside the
+        segments -- a video is one or the other, never both."""
+        provider = FakeProvider(search_results=[a_discovery_entry(estimate=0.9)])
+        snippets = [FakeSnippet("orexin content", 0, 10)]
+        with mock.patch.object(youtube, "_list_videos", return_value=listed(a_video())), \
+             mock.patch.object(youtube, "_fetch_transcript", return_value=snippets):
+            items = youtube.collect(self.interest(), self.cfg, provider)
+
+        self.assertTrue(items)
+        self.assertTrue(all(i.type == "video_segment" for i in items))
+        self.assertFalse(any(i.type == "video" for i in items))
+        self.assertFalse(any(i.dedup_key.endswith(":video") for i in items))
+
+    def test_a_stored_video_level_row_blocks_re_listing_and_re_fetching(self):
+        """A video-level fallback is a full seen row: the video is done for
+        good, exactly like a segmented one -- no re-list, no re-fetch."""
         conn = db.connect(":memory:")
         db.init(conn)
         self.addCleanup(conn.close)
-        cfg = dataclasses.replace(CFG, youtube_api_key="key")
-        interest = an_interest(
-            sources=["youtube"], source_config={"youtube": {"channels": ["UC1"]}}
-        )
+        provider = FakeProvider(search_results=[a_discovery_entry()])
+
+        with mock.patch.object(youtube, "_list_videos", return_value=listed(a_video())) as lv, \
+             mock.patch.object(youtube, "_fetch_transcript", return_value=None) as fetch:
+            items = youtube.collect(self.interest(), self.cfg, provider, conn)
+            self.assertEqual(len(items), 1)
+            self.assertEqual(items[0].type, "video")
+            normalize.normalize(items[0])
+            db.insert_item(conn, items[0])
+            self.assertEqual(lv.call_count, 1)
+            self.assertEqual(fetch.call_count, 1)
+
+            self.assertEqual(youtube.collect(self.interest(), self.cfg, provider, conn), [])
+            self.assertEqual(lv.call_count, 1)      # zero quota spent on a seen video
+            self.assertEqual(fetch.call_count, 1)   # zero transcript requests either
+
+    def test_an_already_chunked_video_is_not_re_listed_or_fetched(self):
+        """Discovery legitimately re-finds the same video next cycle. The
+        seen-prefix check must drop it BEFORE the videos.list spend, not just
+        before the transcript fetch."""
+        conn = db.connect(":memory:")
+        db.init(conn)
+        self.addCleanup(conn.close)
+        provider = FakeProvider(search_results=[a_discovery_entry()])
         snippets = [FakeSnippet("real content about orexin agonists", 0, 10)]
 
-        with mock.patch.object(youtube, "_search_videos", return_value=[a_video()]), \
+        with mock.patch.object(youtube, "_list_videos", return_value=listed(a_video())) as lv, \
              mock.patch.object(youtube, "_fetch_transcript", return_value=snippets) as fetch:
-            items = youtube.collect(interest, cfg, None, conn)
+            items = youtube.collect(self.interest(), self.cfg, provider, conn)
             for item in items:
                 normalize.normalize(item)
                 db.insert_item(conn, item)
+            self.assertEqual(lv.call_count, 1)
             self.assertEqual(fetch.call_count, 1)
 
-            self.assertEqual(youtube.collect(interest, cfg, None, conn), [])
-            self.assertEqual(fetch.call_count, 1)
+            self.assertEqual(youtube.collect(self.interest(), self.cfg, provider, conn), [])
+            self.assertEqual(lv.call_count, 1)      # zero quota spent on a seen video
+            self.assertEqual(fetch.call_count, 1)   # zero transcript requests either
 
-    def test_a_video_with_no_transcript_is_skipped_not_fatal(self):
-        interest = an_interest(
-            sources=["youtube"], source_config={"youtube": {"channels": ["UC1"]}}
+    def test_hallucinated_and_stale_ids_are_dropped_by_verify(self):
+        """videos.list is authoritative: ids it doesn't return don't exist
+        (hallucinated/deleted), and its publishedAt overrules the model's
+        recency claim."""
+        provider = FakeProvider(search_results=[
+            a_discovery_entry(VID1, estimate=0.9),
+            a_discovery_entry(VID2, estimate=0.8),   # hallucinated: absent from videos.list
+            a_discovery_entry(VID3, estimate=0.7),   # real but a year old
+        ])
+        returned = listed(a_video(video_id=VID1),
+                          a_video(video_id=VID3, published_at=recent_ts(days=365)))
+        snippets = [FakeSnippet("real content here today", 0, 10)]
+
+        with mock.patch.object(youtube, "_list_videos", return_value=returned), \
+             mock.patch.object(youtube, "_fetch_transcript", return_value=snippets) as fetch:
+            items = youtube.collect(self.interest(), self.cfg, provider)
+
+        fetch.assert_called_once_with(VID1, ["en"])
+        self.assertTrue(items)
+        self.assertTrue(all(i.metadata["video_id"] == VID1 for i in items))
+
+    def test_verify_is_one_batched_call_with_every_unseen_id(self):
+        provider = FakeProvider(search_results=[
+            a_discovery_entry(VID1), a_discovery_entry(VID2), a_discovery_entry(VID3),
+        ])
+        with mock.patch.object(youtube, "_list_videos", return_value={}) as lv:
+            self.assertEqual(youtube.collect(self.interest(), self.cfg, provider), [])
+        lv.assert_called_once_with("key", [VID1, VID2, VID3])
+
+    def test_list_videos_batches_50_per_request_and_unescapes(self):
+        """1 quota unit per ≤50 ids; entities in API strings must not reach
+        Telegram verbatim."""
+        ids = [f"vid{i:08d}" for i in range(60)]
+        calls = []
+
+        class FakeResponse(io.BytesIO):
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *exc):
+                return False
+
+        def fake_urlopen(request, timeout=0):
+            query = urllib.parse.parse_qs(urllib.parse.urlparse(request.full_url).query)
+            batch = query["id"][0].split(",")
+            calls.append(batch)
+            payload = {"items": [
+                {
+                    "id": vid,
+                    "snippet": {
+                        "title": "Let&#39;s Test Claude &amp; Friends",
+                        "channelTitle": "A &amp; B",
+                        "description": "details &amp; data",
+                        "publishedAt": "2026-08-01T00:00:00Z",
+                    },
+                    "contentDetails": {"duration": "PT1H2M3S"},
+                }
+                for vid in batch
+            ]}
+            return FakeResponse(json.dumps(payload).encode("utf-8"))
+
+        with mock.patch.object(youtube.urllib.request, "urlopen", side_effect=fake_urlopen):
+            found = youtube._list_videos("key", ids)
+
+        self.assertEqual([len(batch) for batch in calls], [50, 10])
+        self.assertEqual(len(found), 60)
+        video = found[ids[0]]
+        self.assertEqual(video["video_title"], "Let's Test Claude & Friends")
+        self.assertEqual(video["channel"], "A & B")
+        self.assertEqual(video["duration_seconds"], 3723)
+
+    def test_rank_is_estimate_first_keyword_match_tiebreak(self):
+        """The model rates, code ranks: fetch order is discovery-estimate
+        descending, _match_one on title+description breaking ties."""
+        interest = self.interest(
+            title="Orexin research", positive_signals=["orexin agonist trial"]
         )
-        cfg = dataclasses.replace(CFG, youtube_api_key="key")
-        videos = [a_video(video_id="no-transcript"), a_video(video_id="has-transcript")]
+        provider = FakeProvider(search_results=[
+            a_discovery_entry(VID1, estimate=0.5),   # tie, no keyword overlap
+            a_discovery_entry(VID2, estimate=0.9),   # top estimate wins outright
+            a_discovery_entry(VID3, estimate=0.5),   # tie, strong keyword match
+        ])
+        returned = listed(
+            a_video(video_id=VID1, video_title="Unrelated chat", description="nothing much"),
+            a_video(video_id=VID2, video_title="Also unrelated", description="nothing much"),
+            a_video(video_id=VID3, video_title="Orexin agonist trial results",
+                    description="deep dive on the orexin agonist trial data"),
+        )
+        order = []
+
+        def fake_fetch(video_id, languages):
+            order.append(video_id)
+            return None
+
+        with mock.patch.object(youtube, "_list_videos", return_value=returned), \
+             mock.patch.object(youtube, "_fetch_transcript", side_effect=fake_fetch):
+            youtube.collect(interest, self.cfg, provider)
+
+        self.assertEqual(order, [VID2, VID3, VID1])
+
+    def test_videos_over_the_fetch_budget_fall_back_to_video_level_same_cycle(self):
+        """A video ranked below `max_transcript_fetches` is never fetched, but
+        it isn't dropped either -- it lands as a video-level item this same
+        cycle, and its seen row then blocks any future re-listing."""
+        conn = db.connect(":memory:")
+        db.init(conn)
+        self.addCleanup(conn.close)
+        interest = self.interest(source_config={"youtube": {"max_transcript_fetches": 1}})
+        provider = FakeProvider(search_results=[
+            a_discovery_entry(VID1, estimate=0.9), a_discovery_entry(VID2, estimate=0.5),
+        ])
+        returned = listed(a_video(video_id=VID1), a_video(video_id=VID2))
+        snippets = [FakeSnippet("real content about orexin", 0, 10)]
+        fetched = []
+
+        def fake_fetch(video_id, languages):
+            fetched.append(video_id)
+            return snippets
+
+        with mock.patch.object(
+            youtube, "_list_videos",
+            side_effect=lambda key, ids: {v: returned[v] for v in ids},
+        ) as lv, mock.patch.object(youtube, "_fetch_transcript", side_effect=fake_fetch):
+            items = youtube.collect(interest, self.cfg, provider, conn)
+            self.assertEqual(fetched, [VID1])   # VID2 ranked below the budget: never fetched
+            by_video = {i.metadata["video_id"]: i for i in items}
+            self.assertEqual(by_video[VID1].type, "video_segment")
+            self.assertEqual(by_video[VID2].type, "video")
+            self.assertEqual(by_video[VID2].dedup_key, f"{VID2}:video")
+            for item in items:
+                normalize.normalize(item)
+                db.insert_item(conn, item)
+
+            second = youtube.collect(interest, self.cfg, provider, conn)
+
+        self.assertEqual(fetched, [VID1])  # no further fetch attempt for VID2
+        # Both videos are already seen (video-level counts too): nothing to
+        # re-list, let alone re-fetch, next cycle.
+        self.assertEqual(second, [])
+        lv.assert_called_once()
+
+    def test_circuit_breaker_stops_fetching_but_keeps_emitting_video_level_items(self):
+        """One RequestBlocked/IpBlocked means every further fetch this cycle
+        would fail and prolong the block: stop *fetching*, but the remaining
+        ranked videos still cost nothing to emit as video-level items."""
+        provider = FakeProvider(search_results=[
+            a_discovery_entry(VID1, estimate=0.9),
+            a_discovery_entry(VID2, estimate=0.8),
+            a_discovery_entry(VID3, estimate=0.7),
+        ])
+        returned = listed(a_video(video_id=VID1), a_video(video_id=VID2),
+                          a_video(video_id=VID3))
+        calls = []
+
+        def fake_fetch(video_id, languages):
+            calls.append(video_id)
+            if video_id == VID1:
+                return [FakeSnippet("good content before the block", 0, 10)]
+            raise youtube.TranscriptBlocked("ip blocked")
+
+        with mock.patch.object(youtube, "_list_videos", return_value=returned), \
+             mock.patch.object(youtube, "_fetch_transcript", side_effect=fake_fetch):
+            items = youtube.collect(self.interest(), self.cfg, provider)
+
+        self.assertEqual(calls, [VID1, VID2])   # the block trips on VID2; VID3 never attempted
+        by_video = {i.metadata["video_id"]: i for i in items}
+        self.assertEqual(len(items), 3)
+        self.assertEqual(by_video[VID1].type, "video_segment")
+        self.assertEqual(by_video[VID2].type, "video")   # blocked -> video-level fallback
+        self.assertEqual(by_video[VID3].type, "video")   # never even attempted -> video-level
+
+    def test_a_video_with_no_transcript_falls_back_to_a_video_level_item(self):
+        """A transcript miss is not fatal: the video's title+description is
+        emitted as a single video-level item instead of being discarded."""
+        provider = FakeProvider(search_results=[
+            a_discovery_entry(VID1, estimate=0.9), a_discovery_entry(VID2, estimate=0.5),
+        ])
+        returned = listed(
+            a_video(video_id=VID1, video_title="Video One", description="all about orexin"),
+            a_video(video_id=VID2),
+        )
         snippets = [FakeSnippet("some real content here", 0, 10)]
 
         def fake_fetch(video_id, languages):
-            return snippets if video_id == "has-transcript" else None
+            return snippets if video_id == VID2 else None
 
-        with mock.patch.object(youtube, "_search_videos", return_value=videos), \
+        with mock.patch.object(youtube, "_list_videos", return_value=returned), \
              mock.patch.object(youtube, "_fetch_transcript", side_effect=fake_fetch):
-            items = youtube.collect(interest, cfg, None)
+            items = youtube.collect(self.interest(), self.cfg, provider)
 
-        self.assertTrue(items)
-        self.assertTrue(all(i.metadata["video_id"] == "has-transcript" for i in items))
+        by_video = {i.metadata["video_id"]: i for i in items}
+        self.assertEqual(len(items), 2)  # VID2's one segment + VID1's video-level fallback
+
+        video_item = by_video[VID1]
+        self.assertEqual(video_item.type, "video")
+        self.assertEqual(video_item.dedup_key, f"{VID1}:video")
+        self.assertEqual(video_item.url, f"https://www.youtube.com/watch?v={VID1}")
+        self.assertEqual(video_item.title, "Video One")
+        self.assertIn("Video One", video_item.text)
+        self.assertIn("all about orexin", video_item.text)
+        self.assertEqual(video_item.metadata["discovery_estimate"], 0.9)
+
+        segment_item = by_video[VID2]
+        self.assertEqual(segment_item.type, "video_segment")
 
     def test_limit_stops_at_video_boundaries_never_mid_video(self):
         """A video is chunked in full or not at all: the seen-prefix skip means
         a half-chunked video would permanently lose its later segments."""
-        interest = an_interest(
-            sources=["youtube"],
-            source_config={"youtube": {"channels": ["UC1"], "limit": 1,
-                                       "chunk_seconds": 30, "chunk_overlap_seconds": 10}},
+        interest = self.interest(
+            source_config={"youtube": {"limit": 1, "chunk_seconds": 30,
+                                       "chunk_overlap_seconds": 10}},
         )
-        cfg = dataclasses.replace(CFG, youtube_api_key="key")
-        videos = [a_video(video_id="first"), a_video(video_id="second")]
+        provider = FakeProvider(search_results=[
+            a_discovery_entry(VID1, estimate=0.9), a_discovery_entry(VID2, estimate=0.5),
+        ])
+        returned = listed(a_video(video_id=VID1), a_video(video_id=VID2))
         snippets = [FakeSnippet(f"word{i}", i * 10, 10) for i in range(10)]  # 5 chunks
         fetched = []
 
@@ -1041,15 +1676,149 @@ class YoutubeCollectorTests(unittest.TestCase):
             fetched.append(video_id)
             return snippets
 
-        with mock.patch.object(youtube, "_search_videos", return_value=videos), \
+        with mock.patch.object(youtube, "_list_videos", return_value=returned), \
              mock.patch.object(youtube, "_fetch_transcript", side_effect=fake_fetch):
-            items = youtube.collect(interest, cfg, None)
+            items = youtube.collect(interest, self.cfg, provider)
 
         # The first video overshoots the limit but is emitted whole; the
         # second is never even fetched.
         self.assertEqual(len(items), 5)
-        self.assertEqual(fetched, ["first"])
-        self.assertTrue(all(i.metadata["video_id"] == "first" for i in items))
+        self.assertEqual(fetched, [VID1])
+        self.assertTrue(all(i.metadata["video_id"] == VID1 for i in items))
+
+    def test_video_id_from_url_handles_watch_youtu_be_and_shorts(self):
+        for url in (
+            f"https://www.youtube.com/watch?v={VID1}",
+            f"https://m.youtube.com/watch?v={VID1}&list=PL123&index=2",
+            f"https://youtu.be/{VID1}?t=30",
+            f"https://www.youtube.com/shorts/{VID1}",
+            f"https://www.youtube.com/live/{VID1}",
+            f"https://www.youtube.com/embed/{VID1}",
+        ):
+            self.assertEqual(youtube._video_id_from_url(url), VID1, url)
+        for url in (
+            f"https://example.com/watch?v={VID1}",       # not YouTube
+            "https://www.youtube.com/watch?v=short",     # not an 11-char id
+            "https://www.youtube.com/@somechannel",      # channel, not a video
+            "https://www.youtube.com/playlist?list=PL1",
+            "not a url at all",
+            "",
+        ):
+            self.assertIsNone(youtube._video_id_from_url(url), url)
+
+    def test_video_level_item_survives_prefilter_on_a_real_description(self):
+        """The video-level fallback's text must actually clear the same
+        cheap pre-filter every other item goes through (cfg.min_text_chars)."""
+        video = a_video(
+            video_title="Deep dive on orexin agonists",
+            description="A " * 40,  # well past min_text_chars=40
+        )
+        item = youtube._to_video_item(video)
+        matches = [(self.interest(), 0.5, ["orexin"])]
+        ok, reason = matching.prefilter(item, matches, self.cfg)
+        self.assertTrue(ok, reason)
+
+    def test_video_level_item_dies_on_prefilter_with_an_empty_description(self):
+        video = a_video(video_title="X", description="")
+        item = youtube._to_video_item(video)
+        matches = [(self.interest(), 0.5, ["orexin"])]
+        ok, reason = matching.prefilter(item, matches, self.cfg)
+        self.assertFalse(ok)
+        self.assertIn("chars", reason)
+
+    def _fake_transcript_api_modules(self, api_cls):
+        """sys.modules stand-ins for youtube-transcript-api, which CI does not
+        install -- _fetch_transcript imports it lazily, so patching sys.modules
+        is the whole seam."""
+        mod = types.ModuleType("youtube_transcript_api")
+        errors = types.ModuleType("youtube_transcript_api._errors")
+
+        class YouTubeTranscriptApiException(Exception):
+            pass
+
+        class NoTranscriptFound(YouTubeTranscriptApiException):
+            pass
+
+        errors.YouTubeTranscriptApiException = YouTubeTranscriptApiException
+        errors.NoTranscriptFound = NoTranscriptFound
+        mod.YouTubeTranscriptApi = api_cls
+        mod._errors = errors
+        return mod, errors
+
+    def test_fetch_transcript_falls_back_to_regional_variant(self):
+        """languages=["en"] must still fetch a video whose only English track
+        is "en-US" -- the library alone matches codes exactly and misses it."""
+        snippets = [FakeSnippet("real words", 0, 5)]
+
+        class FakeTrack:
+            language_code = "en-US"
+
+            def fetch(self):
+                return snippets
+
+        holder = {}
+
+        class FakeApi:
+            def fetch(self, video_id, languages=None):
+                raise holder["NoTranscriptFound"]()
+
+            def list(self, video_id):
+                return [FakeTrack()]
+
+        mod, errors = self._fake_transcript_api_modules(FakeApi)
+        holder["NoTranscriptFound"] = errors.NoTranscriptFound
+        with mock.patch.dict(
+            sys.modules,
+            {"youtube_transcript_api": mod, "youtube_transcript_api._errors": errors},
+        ):
+            result = youtube._fetch_transcript("vid1", ["en"])
+        self.assertEqual(result, snippets)
+
+    def test_fetch_transcript_no_variant_matches_returns_none(self):
+        class FakeTrack:
+            language_code = "ko"
+
+            def fetch(self):  # pragma: no cover -- must not be called
+                raise AssertionError("fetched a non-matching language")
+
+        holder = {}
+
+        class FakeApi:
+            def fetch(self, video_id, languages=None):
+                raise holder["NoTranscriptFound"]()
+
+            def list(self, video_id):
+                return [FakeTrack()]
+
+        mod, errors = self._fake_transcript_api_modules(FakeApi)
+        holder["NoTranscriptFound"] = errors.NoTranscriptFound
+        with mock.patch.dict(
+            sys.modules,
+            {"youtube_transcript_api": mod, "youtube_transcript_api._errors": errors},
+        ):
+            self.assertIsNone(youtube._fetch_transcript("vid1", ["en"]))
+
+    def test_fetch_transcript_raises_transcript_blocked_on_ip_block(self):
+        """RequestBlocked/IpBlocked must escape as TranscriptBlocked (for the
+        circuit breaker), not be swallowed like an ordinary per-video miss."""
+        holder = {}
+
+        class FakeApi:
+            def fetch(self, video_id, languages=None):
+                raise holder["IpBlocked"]("YouTube is blocking requests from your IP")
+
+        mod, errors = self._fake_transcript_api_modules(FakeApi)
+
+        class IpBlocked(errors.YouTubeTranscriptApiException):
+            pass
+
+        holder["IpBlocked"] = IpBlocked
+        with mock.patch.dict(
+            sys.modules,
+            {"youtube_transcript_api": mod, "youtube_transcript_api._errors": errors},
+        ):
+            with self.assertRaises(youtube.TranscriptBlocked):
+                youtube._fetch_transcript("vid1", ["en"])
 
 
 class NotifyTests(unittest.TestCase):
@@ -1186,6 +1955,24 @@ class PipelineTests(unittest.TestCase):
         )
         summary = self._run(FakeProvider({"Good": 0.9, "Meh": 0.1}))
         self.assertEqual((summary["duplicate"], summary["scored"], summary["notified"]), (2, 1, 0))
+
+    def test_scoring_sets_the_outcomes_score_id_to_the_saved_row(self):
+        # Regression: _score() used to call db.save_score() and discard the
+        # returned id, so outcome.score.id stayed None forever -- unlike
+        # item.id, which ingest() already assigns from db.insert_item()'s
+        # return value one line above it. Nothing in the production pipeline
+        # happened to read it back this way (deliver()/send_digest() always
+        # re-query score_id fresh from the DB), but any caller reasonably
+        # expecting the same contract item.id already carries would get a
+        # silent None instead of the real row id.
+        provider = FakeProvider({"A title": 0.9})
+        outcome = pipeline.ingest(self.conn, provider, CFG, an_item(), self.interests, "k")
+        self.assertEqual(outcome.stage, "scored")
+        self.assertIsNotNone(outcome.score.id)
+        row = self.conn.execute(
+            "SELECT id FROM scores WHERE item_id = ?", (outcome.item.id,)
+        ).fetchone()
+        self.assertEqual(outcome.score.id, row["id"])
 
     def test_a_duplicate_reports_the_item_it_collided_with(self):
         provider = FakeProvider({"A title": 0.9})
@@ -1335,6 +2122,52 @@ class PipelineTests(unittest.TestCase):
         usage = self.conn.execute("SELECT * FROM llm_usage").fetchone()
         self.assertEqual((usage["model"], usage["input_tokens"]), ("fake-1", 40))
 
+    def test_a_crash_after_the_first_item_still_leaves_its_metrics_recorded(self):
+        # Regression: counts used to accumulate in a local Counter() and flush
+        # via one db.bump() call at the very end of run_once() -- so an
+        # exception anywhere after the first item (a real one already hit
+        # this: notify.print_safe missing in __main__.py's own discover loop,
+        # see the sibling fix there) silently discarded every already-scored
+        # item's funnel counters, even though their DB rows were already
+        # durably committed by ingest(). Metrics must now survive that.
+        provider = FakeProvider({"Good": 0.9, "Meh": 0.5})
+
+        def collector(interest, cfg, provider, conn=None):
+            return [
+                an_item(source="fake", url="https://e.com/good", title="Good"),
+                an_item(source="fake", url="https://e.com/meh", title="Meh"),
+            ]
+
+        # Neither item needs to fail scoring itself -- ingest() already
+        # handles that internally (an "errors" outcome, still bumped). What
+        # this simulates is any *other* exception landing between items
+        # (a print crash, a bad future change, an OS hiccup): patch db.bump
+        # itself to blow up on its second call, i.e. right as "Meh"'s metrics
+        # would be flushed -- after "Good"'s have already landed for real.
+        calls = []
+        real_bump = db.bump
+
+        def flaky_bump(conn, counts):
+            calls.append(counts)
+            if len(calls) == 2:
+                raise RuntimeError("simulated crash mid-cycle")
+            real_bump(conn, counts)
+
+        with mock.patch.dict(COLLECTORS, {"fake": collector}), \
+             mock.patch.object(db, "bump", flaky_bump):
+            with self.assertRaises(RuntimeError):
+                pipeline.run_once(self.conn, provider, CFG, dry_run=True)
+
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        # "Good"'s own collected/scored counts made it in before the crash --
+        # they are not held hostage by whatever happens to "Meh" right after.
+        self.assertEqual(metrics.get("collected"), 1)
+        self.assertEqual(metrics.get("scored"), 1)
+        score_row = self.conn.execute(
+            "SELECT 1 FROM candidate_items WHERE title = 'Good'"
+        ).fetchone()
+        self.assertIsNotNone(score_row)  # and its DB row is there regardless
+
     def test_collectors_are_handed_the_connection_for_skip_checks(self):
         seen = []
         with mock.patch.dict(
@@ -1408,47 +2241,6 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(self._pending_titles(), [])
 
 
-class SchedulerTests(unittest.TestCase):
-    def _calls(self):
-        calls = []
-
-        def record(conn, provider, cfg, sources=None, dry_run=False):
-            calls.append(sources)
-            return {}
-
-        return calls, record
-
-    def test_first_tick_runs_every_collector_job(self):
-        calls, record = self._calls()
-        with mock.patch.object(scheduler, "run_once", side_effect=record), \
-             mock.patch.object(scheduler, "send_digest", return_value=0), \
-             mock.patch.object(scheduler, "_seconds_until_digest", return_value=10_000):
-            scheduler.run_forever(None, None, CFG, dry_run=True, cycles=1)
-        expected = [tuple(sources) for sources, _field in scheduler.JOBS.values()]
-        self.assertEqual(sorted(map(tuple, calls)), sorted(expected))
-
-    def test_digest_fires_only_once_its_due(self):
-        with mock.patch.object(scheduler, "run_once", return_value={}), \
-             mock.patch.object(scheduler, "send_digest", return_value=3) as send_digest, \
-             mock.patch.object(scheduler, "_seconds_until_digest", return_value=0):
-            scheduler.run_forever(None, None, CFG, dry_run=True, cycles=1)
-        send_digest.assert_called_once()
-
-    def test_a_job_not_yet_due_is_skipped_on_the_next_tick(self):
-        cfg = dataclasses.replace(
-            CFG, interval_stocks_seconds=10_000, interval_web_seconds=10_000,
-            interval_youtube_seconds=10_000,
-        )
-        calls, record = self._calls()
-        with mock.patch.object(scheduler, "run_once", side_effect=record), \
-             mock.patch.object(scheduler, "send_digest", return_value=0), \
-             mock.patch.object(scheduler, "_seconds_until_digest", return_value=10_000), \
-             mock.patch.object(scheduler, "TICK_SECONDS", 0):
-            scheduler.run_forever(None, None, cfg, dry_run=True, cycles=2)
-        # Every job ran on the first tick only -- the second tick found nothing due.
-        self.assertEqual(len(calls), len(scheduler.JOBS))
-
-
 class FeedbackListenerTests(unittest.TestCase):
     def setUp(self):
         self.conn = db.connect(":memory:")
@@ -1464,7 +2256,10 @@ class FeedbackListenerTests(unittest.TestCase):
 
     def test_a_recognized_button_records_feedback_and_acks_with_the_label(self):
         with mock.patch.object(feedback_listener, "api_call") as api_call:
-            feedback_listener._handle_callback(self.conn, "tok", self._callback(f"fb:fire:{self.score_id}"))
+            recorded = feedback_listener._handle_callback(
+                self.conn, "tok", self._callback(f"fb:fire:{self.score_id}")
+            )
+        self.assertTrue(recorded)
         row = self.conn.execute("SELECT * FROM feedback WHERE item_id = ?", (self.item.id,)).fetchone()
         self.assertEqual(row["verdict"], "fire")
         self.assertAlmostEqual(row["original_score"], 0.8)
@@ -1476,15 +2271,70 @@ class FeedbackListenerTests(unittest.TestCase):
 
     def test_garbage_callback_data_is_acked_but_records_nothing(self):
         with mock.patch.object(feedback_listener, "api_call") as api_call:
-            feedback_listener._handle_callback(self.conn, "tok", self._callback("not-a-real-payload"))
+            recorded = feedback_listener._handle_callback(
+                self.conn, "tok", self._callback("not-a-real-payload")
+            )
+        self.assertFalse(recorded)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 0)
         api_call.assert_called_once_with("tok", "answerCallbackQuery", {"callback_query_id": "cb1"})
 
     def test_a_score_id_that_no_longer_exists_is_acked_without_a_crash(self):
         with mock.patch.object(feedback_listener, "api_call") as api_call:
-            feedback_listener._handle_callback(self.conn, "tok", self._callback("fb:up:999999"))
+            recorded = feedback_listener._handle_callback(self.conn, "tok", self._callback("fb:up:999999"))
+        self.assertFalse(recorded)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 0)
         api_call.assert_called_once()
+
+    def _cfg(self):
+        return dataclasses.replace(CFG, telegram_bot_token="tok", telegram_chat_id="123")
+
+    def test_drain_handles_every_update_and_persists_the_offset(self):
+        updates = [
+            {"update_id": 10, "callback_query": self._callback(f"fb:fire:{self.score_id}")},
+            {"update_id": 11, "callback_query": self._callback("garbage")},
+        ]
+        def fake_api_call(token, method, params, timeout=15):
+            if method == "getUpdates":
+                return updates
+            return {}  # answerCallbackQuery, from _handle_callback
+
+        with mock.patch.object(feedback_listener, "api_call", side_effect=fake_api_call) as api_call:
+            count = feedback_listener.drain(self.conn, self._cfg())
+        # The garbage update is acked but must not count -- feedback_recorded
+        # is evidence of real feedback, not "how many updates were seen".
+        self.assertEqual(count, 1)
+        self.assertEqual(db.state_get(self.conn, "telegram_offset"), "12")
+        api_call.assert_any_call("tok", "getUpdates", {"offset": 0, "timeout": 0}, timeout=15)
+        self.assertEqual(
+            dict(self.conn.execute("SELECT name, count FROM metrics").fetchall()),
+            {"feedback_recorded": 1},
+        )
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1)
+
+    def test_drain_resumes_from_a_previously_persisted_offset(self):
+        db.state_set(self.conn, "telegram_offset", "5")
+        with mock.patch.object(feedback_listener, "api_call", return_value=[]) as api_call:
+            feedback_listener.drain(self.conn, self._cfg())
+        api_call.assert_called_once_with(
+            "tok", "getUpdates", {"offset": 5, "timeout": 0}, timeout=15
+        )
+
+    def test_drain_without_telegram_config_returns_zero_untouched(self):
+        with mock.patch.object(feedback_listener, "api_call") as api_call:
+            self.assertEqual(feedback_listener.drain(self.conn, CFG), 0)
+        api_call.assert_not_called()
+
+    def test_drain_swallows_a_transport_failure_and_counts_it(self):
+        # None, not 0 -- a distinct sentinel so the caller (__main__._drain_cmd)
+        # can tell a failed poll from "polled fine, nothing pending" and not
+        # record the job as a success.
+        with mock.patch.object(feedback_listener, "api_call", side_effect=OSError("down")):
+            self.assertIsNone(feedback_listener.drain(self.conn, self._cfg()))
+        self.assertEqual(
+            dict(self.conn.execute("SELECT name, count FROM metrics").fetchall()),
+            {"run_failed": 1},
+        )
+        self.assertIsNone(db.state_get(self.conn, "telegram_offset"))  # never advanced
 
 
 class FakeCDPConnection:
@@ -1655,6 +2505,37 @@ class ClaudeChatProviderTests(unittest.TestCase):
         provider = self._provider({"text": '{"a": 2}'})
         self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 2})
 
+    def test_preflight_fails_cleanly_without_org_id_and_touches_no_network(self):
+        provider = claude_chat.ClaudeChatProvider("claude-opus-5", org_id="", port=9222)
+        with mock.patch.object(claude_chat.cdp, "find_claude_tab") as find_tab:
+            ok, detail = provider.preflight()
+        self.assertFalse(ok)
+        self.assertIn("CLAUDE_ORG_ID", detail)
+        find_tab.assert_not_called()
+
+    def test_preflight_fails_cleanly_with_no_chrome_endpoint(self):
+        provider = claude_chat.ClaudeChatProvider("claude-opus-5", org_id="org", port=9222)
+        with mock.patch.object(
+            claude_chat.cdp, "find_claude_tab", side_effect=ConnectionRefusedError("refused")
+        ):
+            ok, detail = provider.preflight()
+        self.assertFalse(ok)
+        self.assertIn("Chrome DevTools endpoint", detail)
+
+    def test_preflight_fails_cleanly_with_no_claude_tab(self):
+        provider = claude_chat.ClaudeChatProvider("claude-opus-5", org_id="org", port=9222)
+        with mock.patch.object(claude_chat.cdp, "find_claude_tab", return_value=None):
+            ok, detail = provider.preflight()
+        self.assertFalse(ok)
+        self.assertIn("claude.ai tab", detail)
+
+    def test_preflight_succeeds_when_the_tab_is_open(self):
+        provider = claude_chat.ClaudeChatProvider("claude-opus-5", org_id="org", port=9222)
+        with mock.patch.object(
+            claude_chat.cdp, "find_claude_tab", return_value={"id": "1"}
+        ):
+            self.assertEqual(provider.preflight(), (True, ""))
+
 
 class FakeAnthropicClient:
     """Stands in for anthropic.Anthropic() -- only .messages.create is used.
@@ -1742,6 +2623,15 @@ class AnthropicProviderTests(unittest.TestCase):
         self.assertEqual(provider.complete_json("sys", "prompt", self.SCHEMA), {"a": 1})
         self.assertEqual(provider.usage["calls"], 0)  # nothing to record from
 
+    def test_preflight_is_a_key_presence_check_only(self):
+        provider = AnthropicProvider("claude-opus-5", client=FakeAnthropicClient())
+        with mock.patch.dict(os.environ, {}, clear=True):
+            ok, detail = provider.preflight()
+        self.assertFalse(ok)
+        self.assertIn("ANTHROPIC_API_KEY", detail)
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-x"}):
+            self.assertEqual(provider.preflight(), (True, ""))
+
 
 class FakeOpenAIClient:
     """Stands in for openai.OpenAI() -- only .chat.completions.create is used."""
@@ -1801,6 +2691,15 @@ class OpenAIProviderTests(unittest.TestCase):
         provider = OpenAIProvider("gpt-5", client=FakeOpenAIClient())
         with self.assertRaises(UnsupportedCapability):
             provider.search_json("prompt")
+
+    def test_preflight_is_a_key_presence_check_only(self):
+        provider = OpenAIProvider("gpt-5", client=FakeOpenAIClient())
+        with mock.patch.dict(os.environ, {}, clear=True):
+            ok, detail = provider.preflight()
+        self.assertFalse(ok)
+        self.assertIn("OPENAI_API_KEY", detail)
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "sk-x"}):
+            self.assertEqual(provider.preflight(), (True, ""))
 
 
 class SchemaContractTests(unittest.TestCase):
@@ -1872,6 +2771,820 @@ class CLITests(unittest.TestCase):
         )
         self.assertEqual(code, 2)
         self.assertIn("unknown provider 'bogus'", err)
+
+    def test_personal_state_probe_survives_an_off_contract_generated_at(self):
+        # valid JSON, valid v1 shape, but generated_at that isn't a proper
+        # "Z"-suffixed UTC timestamp must fall back to "age unknown" rather
+        # than tracebacking on offset-naive/None subtraction.
+        for generated_at in ("2026-08-01T00:00:00", None):
+            path = os.path.join(self.tmp.name, "ps.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {"contract_version": 1, "topics": [], "generated_at": generated_at}, fh
+                )
+            code, out, _err = self._main("personal-state", "--path", path)
+            self.assertEqual(code, 0)
+            self.assertIn("age unknown", out)
+
+    def test_personal_state_probe_prints_a_full_readout(self):
+        # Valid v1 artifact, proper Z-suffixed timestamp, >10 topics -- the
+        # normal-path shape, as opposed to the degenerate/error shape above.
+        topics = [{"key": f"t{i}", "weight": round(1.0 - i * 0.05, 2)} for i in range(12)]
+        path = os.path.join(self.tmp.name, "ps.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"contract_version": 1, "generated_at": "2026-08-01T00:00:00Z", "topics": topics},
+                fh,
+            )
+        code, out, _err = self._main("personal-state", "--path", path)
+        self.assertEqual(code, 0)
+        self.assertIn("contract_version=1", out)
+        self.assertIn("12 topic(s)", out)
+        self.assertIn("d old", out)
+        self.assertNotIn("age unknown", out)
+        listed_keys = [
+            line.split("'")[1] for line in out.splitlines() if line.strip().startswith("'t")
+        ]
+        self.assertEqual(listed_keys, [f"t{i}" for i in range(10)])
+
+
+class CLIPrintSafetyTests(unittest.TestCase):
+    """Regression: __main__.py's own output helpers must survive a narrow
+    console codepage the same way notify.print_safe already does. They used
+    plain print() instead of the already-imported print_safe, so a
+    model-generated character outside e.g. Windows cp1255 (a real one seen
+    live: '≥') crashed `discover`/`items` mid-run with a traceback and
+    lost every remaining candidate's output instead of just substituting
+    a '?' for the one unprintable character."""
+
+    def _narrow_stdout(self):
+        import io
+
+        return io.TextIOWrapper(io.BytesIO(), encoding="cp1255", errors="strict")
+
+    def test_print_discovered_survives_a_narrow_codepage(self):
+        from discovery.__main__ import _print_discovered
+        from discovery.pipeline import Outcome
+
+        item = an_item(title="Non-ASCII ≥ in the title")
+        score = a_score(item_id=1, interest_id=1, final_score=0.8)
+        score.reason = "Effect size ≥ threshold"
+        outcome = Outcome("scored", item, "", [], score)
+
+        with mock.patch("sys.stdout", self._narrow_stdout()):
+            _print_discovered(an_interest(), item, outcome)  # must not raise
+
+    def test_list_items_survives_a_narrow_codepage(self):
+        from discovery.__main__ import _list_items
+
+        conn = db.connect(":memory:")
+        self.addCleanup(conn.close)
+        db.init(conn)
+        db.upsert_interest(conn, an_interest())
+        item = stored_item(conn, title="Item", text=BODY)
+        interest_row = db.interest_by_key(conn, "k")
+        score = a_score(item.id, interest_row.id, 0.8)
+        score.reason = "Effect size ≥ threshold"
+        db.save_score(conn, score)
+
+        with mock.patch("sys.stdout", self._narrow_stdout()):
+            _list_items(conn, limit=10, min_score=0.0)  # must not raise
+
+    def test_personal_state_probe_survives_a_narrow_codepage(self):
+        from discovery.__main__ import _personal_state
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "ps.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "contract_version": 1,
+                    "generated_at": "2026-08-01T00:00:00Z",
+                    "topics": [{"key": "topic ≥ threshold", "weight": 0.9}],
+                },
+                fh,
+            )
+        args = SimpleNamespace(path=path)
+        with mock.patch("sys.stdout", self._narrow_stdout()):
+            _personal_state(None, args)  # must not raise
+
+
+class MainJobTests(unittest.TestCase):
+    """The heartbeat/counter wrapping and job dispatch helpers, exercised
+    directly rather than through argparse+a real provider -- a run-once/health
+    CLI invocation would otherwise mean constructing a real ClaudeChatProvider
+    and hitting localhost:9222 for real, which these tests must never do."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def test_run_job_success_records_ok_and_bumps_the_counter(self):
+        from discovery.__main__ import _run_job
+
+        code = _run_job(self.conn, "stocks", lambda: 0)
+        self.assertEqual(code, 0)
+        self.assertEqual(db.today_counts(self.conn), {"run_ok": 1})
+        self.assertIsNotNone(db.state_get(self.conn, "job:stocks:last_ok"))
+
+    def test_run_job_nonzero_exit_records_failure_without_raising(self):
+        from discovery.__main__ import _run_job
+
+        code = _run_job(self.conn, "stocks", lambda: 3)
+        self.assertEqual(code, 3)
+        self.assertEqual(db.today_counts(self.conn), {"run_failed": 1})
+        self.assertIsNotNone(db.state_get(self.conn, "job:stocks:last_fail"))
+
+    def test_run_job_an_exception_records_failure_and_still_propagates(self):
+        from discovery.__main__ import _run_job
+
+        def boom():
+            raise RuntimeError("dead")
+
+        with self.assertRaises(RuntimeError):
+            _run_job(self.conn, "stocks", boom)
+        self.assertEqual(db.today_counts(self.conn), {"run_failed": 1})
+        self.assertIsNotNone(db.state_get(self.conn, "job:stocks:last_fail"))
+
+    def test_run_once_cmd_exits_3_without_touching_run_once_when_preflight_fails(self):
+        from discovery import __main__ as main_module
+        from discovery.__main__ import _run_once_cmd
+
+        provider = FakeProvider()
+        provider.preflight = lambda: (False, "no CDP endpoint")
+        with mock.patch.object(main_module, "run_once") as run_once_fn:
+            code = _run_once_cmd(self.conn, provider, CFG, None, True, "stocks")
+        self.assertEqual(code, 3)
+        run_once_fn.assert_not_called()
+        self.assertEqual(db.today_counts(self.conn), {"provider_down": 1})
+
+    def test_run_once_cmd_runs_the_cycle_when_preflight_passes(self):
+        from discovery.__main__ import _run_once_cmd
+
+        db.upsert_interest(self.conn, an_interest(sources=[]))
+        code = _run_once_cmd(self.conn, FakeProvider(), CFG, None, True, "stocks")
+        self.assertEqual(code, 0)
+
+    def test_health_cmd_prints_the_report_and_exits_1_when_degraded(self):
+        from discovery.__main__ import _health_cmd
+
+        provider = FakeProvider()
+        provider.preflight = lambda: (False, "down")
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = _health_cmd(self.conn, CFG, provider, SimpleNamespace(notify=False))
+        self.assertEqual(code, 1)
+        self.assertIn("DEGRADED", out.getvalue())
+
+    def test_health_cmd_notify_flag_triggers_the_alert_path(self):
+        from discovery.__main__ import _health_cmd
+
+        provider = FakeProvider()
+        provider.preflight = lambda: (False, "down")
+        with mock.patch.object(notify, "send", return_value=True) as send, \
+             mock.patch("sys.stdout", new_callable=io.StringIO):
+            _health_cmd(self.conn, CFG, provider, SimpleNamespace(notify=True))
+        send.assert_called_once()
+
+    def test_drain_cmd_reports_the_count(self):
+        from discovery.__main__ import _drain_cmd
+
+        with mock.patch.object(feedback_listener, "drain", return_value=2), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = _drain_cmd(self.conn, CFG)
+        self.assertEqual(code, 0)
+        self.assertIn("drained 2", out.getvalue())
+
+    def test_drain_cmd_reports_failure_when_drain_returns_the_none_sentinel(self):
+        from discovery.__main__ import _drain_cmd
+
+        with mock.patch.object(feedback_listener, "drain", return_value=None):
+            code = _drain_cmd(self.conn, CFG)
+        self.assertEqual(code, 1)
+
+    def test_run_job_does_not_record_last_ok_for_a_failed_drain(self):
+        # End-to-end through _run_job: a transport failure must not stamp
+        # job:feedback:last_ok or bump run_ok alongside run_failed.
+        from discovery.__main__ import _drain_cmd, _run_job
+
+        with mock.patch.object(feedback_listener, "drain", return_value=None):
+            code = _run_job(self.conn, "feedback", lambda: _drain_cmd(self.conn, CFG))
+        self.assertEqual(code, 1)
+        self.assertEqual(db.today_counts(self.conn), {"run_failed": 1})
+        self.assertIsNone(db.state_get(self.conn, "job:feedback:last_ok"))
+        self.assertIsNotNone(db.state_get(self.conn, "job:feedback:last_fail"))
+
+    def test_digest_cmd_reports_the_count(self):
+        from discovery.__main__ import _digest_cmd
+
+        with mock.patch("discovery.__main__.send_digest", return_value=5), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = _digest_cmd(self.conn, CFG, True)
+        self.assertEqual(code, 0)
+        self.assertIn("sent 5", out.getvalue())
+
+
+class InstallTasksTests(unittest.TestCase):
+    """ops/install_tasks.py, entirely offline: a FakeRunner stands in for
+    subprocess so no test here ever registers, deletes or queries a real
+    Scheduled Task."""
+
+    def test_triggers_are_derived_from_config_not_hardcoded(self):
+        cfg = dataclasses.replace(
+            CFG, interval_stocks_seconds=111, interval_web_seconds=222,
+            interval_youtube_seconds=333, digest_time="13:45",
+        )
+        by_name = {t.name: t for t in install_tasks.build_tasks(cfg)}
+        self.assertEqual(
+            by_name["internet-discovery-collect-stocks"].trigger_value, 111
+        )
+        self.assertEqual(
+            by_name["internet-discovery-collect-web"].trigger_value, 222
+        )
+        self.assertEqual(
+            by_name["internet-discovery-collect-youtube"].trigger_value, 333
+        )
+        self.assertEqual(by_name["internet-discovery-digest"].trigger_value, "13:45")
+        # Not derived from Config by design (see the plan): fixed cadences.
+        self.assertEqual(by_name["internet-discovery-feedback"].trigger_value, 5 * 60)
+        self.assertEqual(by_name["internet-discovery-health"].trigger_value, 3 * 3600)
+
+    def test_six_tasks_share_the_prefix_and_carry_the_right_app_args(self):
+        names = [t.name for t in install_tasks.build_tasks(CFG)]
+        self.assertEqual(len(names), 6)
+        self.assertTrue(all(n.startswith("internet-discovery-") for n in names))
+        by_name = {t.name: t for t in install_tasks.build_tasks(CFG)}
+        self.assertEqual(
+            by_name["internet-discovery-collect-stocks"].app_args,
+            ["run-once", "--source", "stocks"],
+        )
+        self.assertEqual(by_name["internet-discovery-digest"].app_args, ["digest"])
+        self.assertEqual(
+            by_name["internet-discovery-feedback"].app_args, ["listen", "--drain"]
+        )
+        self.assertEqual(
+            by_name["internet-discovery-health"].app_args, ["health", "--notify"]
+        )
+
+    def test_rendered_xml_uses_the_d_flag_and_run_cmd(self):
+        task = install_tasks.build_tasks(CFG)[0]
+        xml = install_tasks.render_xml(task)
+        self.assertIn("/d /c", xml)
+        self.assertIn("run.cmd", xml)
+        self.assertIn("StartWhenAvailable>true<", xml)
+        self.assertIn("InteractiveToken", xml)
+        self.assertIn("IgnoreNew", xml)
+
+    def test_dry_run_install_spawns_no_process(self):
+        calls = []
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = install_tasks.install(CFG, runner=lambda args: calls.append(args), dry_run=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [])
+
+    def test_dry_run_prints_a_copy_pasteable_command_with_a_real_path(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = install_tasks.install(CFG, runner=lambda args: (0, "", ""), dry_run=True)
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        self.assertNotIn("<generated>.xml", text)
+        self.assertIn("schtasks /create /tn internet-discovery-collect-stocks", text)
+        self.assertIn(".xml /f", text)
+
+    def test_install_calls_schtasks_create_then_verifies_with_a_query(self):
+        calls = []
+
+        def fake_runner(args):
+            calls.append(args)
+            return 0, "SUCCESS", ""
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = install_tasks.install(CFG, runner=fake_runner, dry_run=False)
+        self.assertEqual(code, 0)
+        # One /create + one /query per task -- install() no longer trusts
+        # /create's exit code alone to mean the task actually exists.
+        self.assertEqual(len(calls), 12)
+        creates = [a for a in calls if "/create" in a]
+        queries = [a for a in calls if "/query" in a]
+        self.assertEqual(len(creates), 6)
+        self.assertEqual(len(queries), 6)
+        for args in creates:
+            self.assertEqual(args[0], "schtasks")
+            self.assertIn("/xml", args)
+        for args in queries:
+            self.assertEqual(args, ["schtasks", "/query", "/tn", args[-1]])
+
+    def test_install_fails_when_the_verification_query_cannot_find_the_task(self):
+        def fake_runner(args):
+            if "/create" in args:
+                return 0, "SUCCESS", ""
+            return 1, "", "ERROR: The system cannot find the file specified."
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO), \
+             mock.patch("sys.stderr", new_callable=io.StringIO):
+            code = install_tasks.install(CFG, runner=fake_runner, dry_run=False)
+        self.assertEqual(code, 1)
+
+    def test_install_reports_failure_without_raising(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO), \
+             mock.patch("sys.stderr", new_callable=io.StringIO):
+            code = install_tasks.install(CFG, runner=lambda args: (1, "", "denied"), dry_run=False)
+        self.assertEqual(code, 1)
+
+    def test_installed_xml_file_is_written_utf16le_with_bom(self):
+        # install() unlinks its temp XML file once /create + /query finish,
+        # so read it from inside the fake runner, while it still exists.
+        captured = {}
+
+        def fake_runner(args):
+            if "/create" in args:
+                path = args[args.index("/xml") + 1]
+                captured["bytes"] = open(path, "rb").read()
+            return 0, "SUCCESS", ""
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            install_tasks.install(CFG, runner=fake_runner, dry_run=False)
+        data = captured["bytes"]
+        self.assertEqual(data[:2], b"\xff\xfe")   # UTF-16LE BOM
+        self.assertIn("<Task", data.decode("utf-16"))
+
+    def test_collect_tasks_do_not_share_a_start_boundary(self):
+        tasks = install_tasks.build_tasks(CFG)
+        collect = [t for t in tasks if t.name.startswith("internet-discovery-collect-")]
+        starts = set()
+        for task in collect:
+            xml = install_tasks.render_xml(task)
+            start = xml.split("<StartBoundary>")[1].split("</StartBoundary>")[0]
+            starts.add(start)
+        self.assertEqual(len(starts), len(collect))
+
+    def test_daily_trigger_rolls_forward_when_todays_time_has_passed(self):
+        cfg = dataclasses.replace(CFG, digest_time="00:00")
+        task = next(t for t in install_tasks.build_tasks(cfg) if t.trigger_kind == "daily")
+        xml = install_tasks.render_xml(task)
+        start = xml.split("<StartBoundary>")[1].split("</StartBoundary>")[0]
+        start_dt = datetime.fromisoformat(start)
+        # 00:00 has already elapsed by the time any test runs; the rendered
+        # boundary must be in the future, not today's already-missed slot.
+        self.assertGreater(start_dt, datetime.now())
+
+    def test_uninstall_is_scoped_to_the_six_task_names_plus_soak(self):
+        calls = []
+        install_tasks.uninstall(runner=lambda args: calls.append(args) or (0, "", ""))
+        deleted = [args[args.index("/tn") + 1] for args in calls]
+        self.assertEqual(
+            sorted(deleted), sorted(install_tasks.TASK_NAMES + [install_tasks.SOAK_TASK])
+        )
+        self.assertTrue(all(name.startswith("internet-discovery-") for name in deleted))
+        self.assertTrue(all(not name.startswith("ec-") for name in deleted))
+
+    def test_status_parses_schtasks_query_output_for_our_prefix(self):
+        output = (
+            "HostName:                             HOST\r\n"
+            "TaskName:                             \\internet-discovery-health\r\n"
+            "Next Run Time:                        8/10/2026 11:00:00 PM\r\n"
+            "Status:                               Ready\r\n"
+            "Last Run Time:                        8/10/2026 8:00:00 PM\r\n"
+            "Last Result:                          0\r\n"
+            "\r\n"
+            "TaskName:                             \\some-other-task\r\n"
+            "Status:                               Ready\r\n"
+        )
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = install_tasks.status(runner=lambda args: (0, output, ""))
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        self.assertIn("internet-discovery-health:", text)
+        self.assertIn("Ready", text)
+        self.assertIn("internet-discovery-collect-stocks: not installed", text)
+        self.assertNotIn("some-other-task", text)
+
+    def test_soak_task_is_not_one_of_the_six_build_tasks(self):
+        # SOAK_TASK must stay out of _TASK_SPECS/build_tasks -- otherwise
+        # --install would create it (seven tasks) and recreate/reschedule it
+        # on every reinstall.
+        names = [t.name for t in install_tasks.build_tasks(CFG)]
+        self.assertEqual(len(names), 6)
+        self.assertNotIn(install_tasks.SOAK_TASK, names)
+
+    def test_soak_trigger_is_a_single_time_trigger_with_no_repetition(self):
+        task = install_tasks.TaskDef(
+            install_tasks.SOAK_TASK, [], "once", 24, "PT15M", script="soak_check.cmd"
+        )
+        xml = install_tasks.render_xml(task)
+        self.assertIn("<TimeTrigger>", xml)
+        self.assertNotIn("<Repetition>", xml)
+        self.assertIn("StartWhenAvailable>true<", xml)
+        start = xml.split("<StartBoundary>")[1].split("</StartBoundary>")[0]
+        start_dt = datetime.fromisoformat(start)
+        self.assertGreater(start_dt, datetime.now() + timedelta(hours=23))
+        self.assertLess(start_dt, datetime.now() + timedelta(hours=25))
+
+    def test_soak_action_points_at_soak_check_cmd_not_run_cmd(self):
+        task = install_tasks.TaskDef(
+            install_tasks.SOAK_TASK, [], "once", 24, "PT15M", script="soak_check.cmd"
+        )
+        xml = install_tasks.render_xml(task)
+        self.assertIn("soak_check.cmd", xml)
+        self.assertNotIn("run.cmd", xml)
+
+    def test_install_soak_creates_and_verifies_one_task(self):
+        calls = []
+
+        def fake_runner(args):
+            calls.append(args)
+            return 0, "SUCCESS", ""
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = install_tasks.install_soak(CFG, runner=fake_runner, dry_run=False, hours=24)
+        self.assertEqual(code, 0)
+        creates = [a for a in calls if "/create" in a]
+        queries = [a for a in calls if "/query" in a]
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(len(queries), 1)
+        self.assertEqual(creates[0][creates[0].index("/tn") + 1], install_tasks.SOAK_TASK)
+
+    def test_install_soak_dry_run_spawns_no_process(self):
+        calls = []
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = install_tasks.install_soak(
+                CFG, runner=lambda args: calls.append(args), dry_run=True, hours=24
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [])
+
+    def test_install_soak_prints_start_boundary_and_readout_path(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            install_tasks.install_soak(
+                CFG, runner=lambda args: (0, "SUCCESS", ""), dry_run=False, hours=24
+            )
+        text = out.getvalue()
+        self.assertIn("StartBoundary:", text)
+        self.assertIn("readout path", text)
+        self.assertIn("logs", text)
+
+    def test_uninstall_deletes_soak_task_even_if_never_registered(self):
+        # schtasks /delete on a name that was never created just fails --
+        # uninstall() still tries it and reports the miss, same as any other
+        # not-installed name; it must not skip it or raise.
+        calls = []
+
+        def fake_runner(args):
+            calls.append(args)
+            if install_tasks.SOAK_TASK in args:
+                return 1, "", "ERROR: The system cannot find the file specified."
+            return 0, "", ""
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = install_tasks.uninstall(runner=fake_runner)
+        self.assertEqual(code, 0)
+        deleted = [args[args.index("/tn") + 1] for args in calls]
+        self.assertIn(install_tasks.SOAK_TASK, deleted)
+
+    def test_main_routes_argv_to_the_right_function_with_dry_run_threaded(self):
+        # Regression: `--uninstall --dry-run` used to parse fine but dropped
+        # dry_run on the way to uninstall(), so a preview performed a real
+        # deletion of all seven tasks (including a live soak checkpoint).
+        cases = [
+            (["--install"], "install", False),
+            (["--install", "--dry-run"], "install", True),
+            (["--uninstall"], "uninstall", False),
+            (["--uninstall", "--dry-run"], "uninstall", True),
+            (["--soak"], "install_soak", False),
+            (["--soak", "--dry-run"], "install_soak", True),
+            (["--status"], "status", None),
+        ]
+        for argv, fn_name, expect_dry_run in cases:
+            with self.subTest(argv=argv):
+                with mock.patch.object(install_tasks, "install", return_value=0) as m_install, \
+                     mock.patch.object(install_tasks, "uninstall", return_value=0) as m_uninstall, \
+                     mock.patch.object(install_tasks, "install_soak", return_value=0) as m_soak, \
+                     mock.patch.object(install_tasks, "status", return_value=0) as m_status, \
+                     mock.patch.object(install_tasks.config, "load", return_value=CFG):
+                    code = install_tasks.main(argv)
+                self.assertEqual(code, 0)
+                mocks = {
+                    "install": m_install,
+                    "uninstall": m_uninstall,
+                    "install_soak": m_soak,
+                    "status": m_status,
+                }
+                mocks[fn_name].assert_called_once()
+                for other_name, other_mock in mocks.items():
+                    if other_name != fn_name:
+                        other_mock.assert_not_called()
+                if expect_dry_run is not None:
+                    self.assertEqual(mocks[fn_name].call_args.kwargs.get("dry_run"), expect_dry_run)
+
+    def test_main_rejects_status_with_dry_run(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):
+                install_tasks.main(["--status", "--dry-run"])
+
+    def test_status_reports_soak_task_only_when_present(self):
+        output_without_soak = (
+            "TaskName:                             \\internet-discovery-health\r\n"
+            "Status:                               Ready\r\n"
+            "\r\n"
+        )
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            install_tasks.status(runner=lambda args: (0, output_without_soak, ""))
+        self.assertNotIn(install_tasks.SOAK_TASK, out.getvalue())
+
+        output_with_soak = output_without_soak + (
+            f"TaskName:                             \\{install_tasks.SOAK_TASK}\r\n"
+            "Status:                               Ready\r\n"
+            "Next Run Time:                        8/11/2026 8:00:00 PM\r\n"
+            "\r\n"
+        )
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            install_tasks.status(runner=lambda args: (0, output_with_soak, ""))
+        self.assertIn(f"{install_tasks.SOAK_TASK}:", out.getvalue())
+
+
+class _FakeHTTPResponse:
+    def __init__(self, body=b'{"hits": []}', status=200, headers=None):
+        self.status = status
+        self._body = body
+        self.headers = headers or {}
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        return False
+
+
+class ConnectorReconTests(unittest.TestCase):
+    """exp_connectors.py (step-09a): offline, no network, no provider, no
+    real DB -- every test injects a fake fetcher into _http_get or exercises
+    the pure analysis/rule functions directly."""
+
+    def setUp(self):
+        exp_connectors._reset_http_state()
+
+    def tearDown(self):
+        exp_connectors._reset_http_state()
+
+    # (a) canonicalization + overlap/marginal-unique-rate math ------------
+
+    def test_canon_url_and_title(self):
+        self.assertEqual(exp_connectors.canon_url("HTTPS://Example.com/Path?x=1#frag"),
+                         "https://example.com/path")
+        self.assertEqual(exp_connectors.canon_url("https://example.com/path/"),
+                         "https://example.com/path")
+        self.assertEqual(exp_connectors.canon_title("Some, Title! 2026"), "sometitle2026")
+
+    def test_jaccard_overlap_exact_tie(self):
+        a = {"https://e.com/1", "https://e.com/2"}
+        self.assertEqual(exp_connectors.jaccard_overlap(a, set(a)), 1.0)
+
+    def test_jaccard_overlap_empty_sets(self):
+        self.assertEqual(exp_connectors.jaccard_overlap(set(), set()), 0.0)
+
+    def test_marginal_unique_rate_hand_computed(self):
+        sample = {"a", "b", "c", "d"}
+        baseline = {"a", "b"}
+        self.assertAlmostEqual(exp_connectors.marginal_unique_rate(sample, baseline), 0.5)
+
+    def test_marginal_unique_rate_empty_sample_is_void(self):
+        self.assertIsNone(exp_connectors.marginal_unique_rate(set(), {"a"}))
+
+    # (b) falsification rule ------------------------------------------------
+
+    def test_falsification_no_baseline_is_void(self):
+        metrics = {"hackernews": {"marginal_unique_rate": 0.9, "jaccard_overlap": 0.1}}
+        self.assertEqual(exp_connectors.apply_falsification_rule(metrics, False), "VOID_NO_BASELINE")
+
+    def test_falsification_no_measurable_connectors(self):
+        metrics = {"hackernews": {"marginal_unique_rate": None, "jaccard_overlap": None},
+                  "reddit": {"marginal_unique_rate": None, "jaccard_overlap": 0.2}}
+        self.assertEqual(exp_connectors.apply_falsification_rule(metrics, True),
+                         "VOID_NO_MEASURABLE_CONNECTORS")
+
+    def test_falsification_all_below_threshold_yields_falsified_not_void(self):
+        metrics = {
+            "hackernews": {"marginal_unique_rate": 0.10, "jaccard_overlap": 0.50},
+            "reddit": {"marginal_unique_rate": 0.39, "jaccard_overlap": 0.10},   # rate just under 0.40
+            "arxiv": {"marginal_unique_rate": 0.90, "jaccard_overlap": 0.31},    # overlap just over 0.30
+        }
+        self.assertEqual(exp_connectors.apply_falsification_rule(metrics, True), "H1_FALSIFIED")
+
+    def test_falsification_supported_when_one_connector_clears_bar(self):
+        metrics = {
+            "hackernews": {"marginal_unique_rate": 0.10, "jaccard_overlap": 0.50},
+            "pubmed": {"marginal_unique_rate": 0.45, "jaccard_overlap": 0.20},
+        }
+        self.assertEqual(exp_connectors.apply_falsification_rule(metrics, True), "H1_SUPPORTED")
+
+    # (c) request counter + per-host spacing --------------------------------
+
+    def test_request_cap_refuses_41st(self):
+        with mock.patch("exp_connectors.time.sleep"), \
+             mock.patch("exp_connectors.urllib.request.urlopen",
+                        return_value=_FakeHTTPResponse()) as m_urlopen:
+            for i in range(exp_connectors.MAX_REQUESTS):
+                exp_connectors._http_get(f"https://host{i}.example/path")
+            self.assertEqual(m_urlopen.call_count, exp_connectors.MAX_REQUESTS)
+            with self.assertRaises(RuntimeError):
+                exp_connectors._http_get("https://host-over.example/path")
+            self.assertEqual(m_urlopen.call_count, exp_connectors.MAX_REQUESTS)
+
+    def test_per_host_spacing_honored(self):
+        fake_times = iter([0.0, 0.5, 1.5])
+        with mock.patch("exp_connectors.time.monotonic", side_effect=lambda: next(fake_times)), \
+             mock.patch("exp_connectors.time.sleep") as m_sleep, \
+             mock.patch("exp_connectors.urllib.request.urlopen", return_value=_FakeHTTPResponse()):
+            exp_connectors._http_get("https://hn.algolia.com/api/v1/search_by_date?query=a")
+            exp_connectors._http_get("https://hn.algolia.com/api/v1/search_by_date?query=b")
+        m_sleep.assert_called_once()
+        self.assertAlmostEqual(m_sleep.call_args[0][0], 0.5, places=3)
+
+    def test_arxiv_has_its_own_wider_spacing(self):
+        self.assertEqual(exp_connectors.HOST_MIN_GAP_SECONDS["export.arxiv.org"], 3.0)
+        self.assertEqual(exp_connectors.DEFAULT_MIN_GAP_SECONDS, 1.0)
+
+    def test_per_connector_cap_refuses_11th(self):
+        with mock.patch("exp_connectors.time.sleep"), \
+             mock.patch("exp_connectors.urllib.request.urlopen",
+                        return_value=_FakeHTTPResponse()) as m_urlopen:
+            for i in range(exp_connectors.PER_CONNECTOR_CAP):
+                exp_connectors._http_get(f"https://hn.algolia.com/api/v1/search_by_date?query={i}",
+                                         connector="hackernews")
+            self.assertEqual(m_urlopen.call_count, exp_connectors.PER_CONNECTOR_CAP)
+            with self.assertRaises(RuntimeError):
+                exp_connectors._http_get("https://hn.algolia.com/api/v1/search_by_date?query=over",
+                                         connector="hackernews")
+            self.assertEqual(m_urlopen.call_count, exp_connectors.PER_CONNECTOR_CAP)
+            # a different connector's own cap is untouched by hackernews's
+            exp_connectors._http_get("https://export.arxiv.org/api/query?search_query=x",
+                                     connector="arxiv")
+            self.assertEqual(m_urlopen.call_count, exp_connectors.PER_CONNECTOR_CAP + 1)
+
+    # (d) missing corpus / missing network / failed preflight -> VOID/PENDING
+
+    def test_load_corpus_urls_missing_file_is_void(self):
+        with tempfile.TemporaryDirectory() as d:
+            missing = os.path.join(d, "discovery.db")
+            urls, status = exp_connectors.load_corpus_urls(missing)
+        self.assertIsNone(urls)
+        self.assertFalse(status["available"])
+        self.assertIn(missing, status["reason"])
+
+    def test_build_x_entry_not_implemented_regardless_of_provider_ok(self):
+        # x has no sampler at all in this harness version -- the status must
+        # say so plainly and identically whether or not a live provider is
+        # reachable (repair: it used to say PENDING unconditionally, implying
+        # a live session alone would resolve it).
+        for provider_ok, provider_why in ((False, "CLAUDE_ORG_ID is not set"), (True, "")):
+            with self.subTest(provider_ok=provider_ok):
+                entry = exp_connectors.build_x_entry(["ai-agents-dev-tools"], provider_ok, provider_why)
+                self.assertEqual(entry["availability"]["status"], "NOT_IMPLEMENTED")
+                self.assertEqual(entry["sample"]["status"], "NOT_IMPLEMENTED")
+                self.assertIsNone(entry["metrics"]["marginal_unique_rate"])
+                self.assertEqual(entry["metrics"]["marginal_unique_rate_status"], "NOT_IMPLEMENTED")
+                self.assertIsNone(entry["command_to_complete"])
+                self.assertTrue(entry["follow_up"])
+
+    def test_http_connector_entry_void_when_endpoint_unreachable(self):
+        def boom(url, timeout=15, connector=None):
+            raise exp_connectors.ConnectorUnreachable("host.example: connection refused")
+
+        interests_by_key = {"ai-agents-dev-tools": an_interest(
+            key="ai-agents-dev-tools", title="T", positive_signals=["s1", "s2", "s3"])}
+        with mock.patch("exp_connectors._http_get", side_effect=boom):
+            entry = exp_connectors.build_http_connector_entry(
+                "hackernews", ["ai-agents-dev-tools"], interests_by_key, set(), False,
+                datetime.now(timezone.utc), "deadbeef", provider=None, provider_ok=False, lab=None)
+        self.assertEqual(entry["sample"]["status"], "VOID_UNREACHABLE")
+        self.assertIn("connection refused", entry["failure_behavior"])
+        self.assertIn("connection refused", entry["availability"]["detail"])
+        self.assertEqual(entry["metrics"]["n_sampled"], 0)
+        self.assertIsNone(entry["metrics"]["marginal_unique_rate"])
+        self.assertEqual(entry["metrics"]["marginal_unique_rate_status"], "VOID_UNREACHABLE")
+
+    def test_http_connector_entry_void_on_low_n(self):
+        def empty_hits(url, timeout=15, connector=None):
+            return 200, b'{"hits": []}', {}
+
+        interests_by_key = {"ai-agents-dev-tools": an_interest(
+            key="ai-agents-dev-tools", title="T", positive_signals=["s1", "s2", "s3"])}
+        with mock.patch("exp_connectors._http_get", side_effect=empty_hits):
+            entry = exp_connectors.build_http_connector_entry(
+                "hackernews", ["ai-agents-dev-tools"], interests_by_key, set(), False,
+                datetime.now(timezone.utc), "deadbeef", provider=None, provider_ok=False, lab=None)
+        self.assertEqual(entry["sample"]["status"], "VOID_LOW_N")
+        # availability is about reachability (http 200), not sample size --
+        # repair: these two used to be conflated into one 'detail' field.
+        self.assertIn("reachable", entry["availability"]["detail"])
+        self.assertNotIn("< 5", entry["availability"]["detail"])
+        self.assertIn("< 5", entry["sample"]["detail"])
+
+    def test_http_connector_entry_computes_offline_baseline_when_corpus_available(self):
+        # repair: baseline_available used to be hardcoded False with no code
+        # path that could ever set it True. The offline lane's substitute
+        # baseline is the corpus alone (pre-registration) when reachable.
+        def five_hits(url, timeout=15, connector=None):
+            hits = [{"title": f"T{i}", "url": f"https://e.com/{i}",
+                    "created_at": "2026-08-01T00:00:00.000Z", "objectID": str(i)}
+                   for i in range(1, 6)]
+            return 200, json.dumps({"hits": hits}).encode(), {}
+
+        interests_by_key = {"ai-agents-dev-tools": an_interest(
+            key="ai-agents-dev-tools", title="T", positive_signals=["s1", "s2", "s3"])}
+        corpus_urls = {"https://e.com/1", "https://e.com/2"}   # 2 of the 5 sampled urls known
+        with mock.patch("exp_connectors._http_get", side_effect=five_hits):
+            entry = exp_connectors.build_http_connector_entry(
+                "hackernews", ["ai-agents-dev-tools"], interests_by_key, corpus_urls, True,
+                datetime.now(timezone.utc), "deadbeef", provider=None, provider_ok=False, lab=None)
+        self.assertEqual(entry["sample"]["status"], "OK")
+        self.assertAlmostEqual(entry["metrics"]["marginal_unique_rate"], 0.6)
+        self.assertEqual(entry["metrics"]["marginal_unique_rate_status"],
+                         "OK_OFFLINE_LANE_CORPUS_ONLY_BASELINE")
+
+    def test_http_connector_entry_void_no_baseline_when_corpus_unavailable(self):
+        def five_hits(url, timeout=15, connector=None):
+            hits = [{"title": f"T{i}", "url": f"https://e.com/{i}",
+                    "created_at": "2026-08-01T00:00:00.000Z", "objectID": str(i)}
+                   for i in range(1, 6)]
+            return 200, json.dumps({"hits": hits}).encode(), {}
+
+        interests_by_key = {"ai-agents-dev-tools": an_interest(
+            key="ai-agents-dev-tools", title="T", positive_signals=["s1", "s2", "s3"])}
+        with mock.patch("exp_connectors._http_get", side_effect=five_hits):
+            entry = exp_connectors.build_http_connector_entry(
+                "hackernews", ["ai-agents-dev-tools"], interests_by_key, set(), False,
+                datetime.now(timezone.utc), "deadbeef", provider=None, provider_ok=False, lab=None)
+        self.assertEqual(entry["sample"]["status"], "OK")
+        self.assertIsNone(entry["metrics"]["marginal_unique_rate"])
+        self.assertEqual(entry["metrics"]["marginal_unique_rate_status"], "VOID_NO_BASELINE")
+
+    def test_above_bar_not_spent_when_baseline_unavailable(self):
+        # repair: above-bar sub-metric used to fire on provider_ok alone,
+        # spending provider budget even when the connector's own primary
+        # metric was structurally void this pass.
+        def five_hits(url, timeout=15, connector=None):
+            hits = [{"title": f"T{i}", "url": f"https://e.com/{i}",
+                    "created_at": "2026-08-01T00:00:00.000Z", "objectID": str(i)}
+                   for i in range(1, 6)]
+            return 200, json.dumps({"hits": hits}).encode(), {}
+
+        interests_by_key = {"ai-agents-dev-tools": an_interest(
+            key="ai-agents-dev-tools", title="T", positive_signals=["s1", "s2", "s3"])}
+        with mock.patch("exp_connectors._http_get", side_effect=five_hits):
+            entry = exp_connectors.build_http_connector_entry(
+                "hackernews", ["ai-agents-dev-tools"], interests_by_key, set(), False,
+                datetime.now(timezone.utc), "deadbeef", provider=object(), provider_ok=True, lab=None)
+        self.assertIsNone(entry["metrics"]["above_bar_count"])
+        self.assertEqual(entry["metrics"]["above_bar_status"], "VOID_NO_BASELINE")
+
+    # (e) provenance on every dossier record --------------------------------
+
+    def test_per_interest_records_carry_provenance(self):
+        def one_hit(url, timeout=15, connector=None):
+            body = json.dumps({"hits": [{"title": "T1", "url": "https://e.com/1",
+                                        "created_at": "2026-08-01T00:00:00.000Z",
+                                        "objectID": "1"}]}).encode()
+            return 200, body, {}
+
+        interests_by_key = {"ai-agents-dev-tools": an_interest(
+            key="ai-agents-dev-tools", title="T", positive_signals=["s1", "s2", "s3"])}
+        with mock.patch("exp_connectors._http_get", side_effect=one_hit):
+            entry = exp_connectors.build_http_connector_entry(
+                "hackernews", ["ai-agents-dev-tools"], interests_by_key, set(), False,
+                datetime.now(timezone.utc), "deadbeef", provider=None, provider_ok=False, lab=None)
+        pi = entry["sample"]["per_interest"][0]
+        self.assertEqual(pi["lane"], "zero_spend")
+        self.assertEqual(pi["git_commit"], "deadbeef")
+        self.assertTrue(pi["collected_at"])
+        self.assertEqual(entry["metrics"]["sample_validity_rate"], 1.0)
+
+    # (f) discovery.db is opened mode=ro only --------------------------------
+
+    def test_load_corpus_urls_opens_mode_ro(self):
+        captured = {}
+        real_connect = sqlite3.connect
+
+        def spy_connect(*args, **kwargs):
+            captured["uri"] = args[0]
+            return real_connect(*args, **kwargs)
+
+        with tempfile.TemporaryDirectory() as d:
+            db_path = os.path.join(d, "discovery.db")
+            conn = sqlite3.connect(db_path)
+            conn.execute("CREATE TABLE candidate_items (id INTEGER PRIMARY KEY, url TEXT)")
+            conn.execute("INSERT INTO candidate_items (url) VALUES ('https://e.com/x')")
+            conn.commit()
+            conn.close()
+            with mock.patch("db_replay.sqlite3.connect", side_effect=spy_connect):
+                urls, status = exp_connectors.load_corpus_urls(db_path)
+        self.assertTrue(status["available"])
+        self.assertIn("https://e.com/x", urls)
+        self.assertIn("mode=ro", captured["uri"])
 
 
 if __name__ == "__main__":

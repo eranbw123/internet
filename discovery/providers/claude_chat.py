@@ -32,6 +32,12 @@ from .base import LLMProvider, ProviderError, parse_json_array, parse_json_objec
 
 DEFAULT_PORT = 9222
 
+# Bound on preflight()'s reachability check only -- a port that accepts
+# connections but never answers (frozen Chrome, an unrelated service
+# squatting on 9222) must not hang a "free" check forever. Real completions
+# use their own, longer timeouts (see _completion/_attempt).
+PREFLIGHT_TIMEOUT_SECONDS = 5
+
 # claude.ai's server-side web search tool, as its own web client names it.
 WEB_SEARCH_TOOLS = [{"name": "web_search", "type": "web_search_v0"}]
 
@@ -72,6 +78,26 @@ class ClaudeChatProvider(LLMProvider):
         # injectable so tests never open a socket.
         self._connect = connect or self._connect_chrome
         self._connection = None
+
+    # --- preflight ------------------------------------------------------------
+
+    def preflight(self):
+        """A free, local check: no CDP call, no completion. Used by health.py
+        to gate a whole run-once before it spends anything. Bounded by
+        PREFLIGHT_TIMEOUT_SECONDS (an unresponsive port must not hang this),
+        and (OSError, ValueError) covers both a dead/refusing socket and a
+        non-CDP listener answering with something that isn't JSON
+        (json.JSONDecodeError is a ValueError) -- either way, "not
+        reachable", not a crash."""
+        if not self.org_id:
+            return False, "CLAUDE_ORG_ID is not set"
+        try:
+            tab = cdp.find_claude_tab(self.port, timeout=PREFLIGHT_TIMEOUT_SECONDS)
+        except (OSError, ValueError) as e:
+            return False, f"no Chrome DevTools endpoint on port {self.port} ({e})"
+        if not tab:
+            return False, f"no open claude.ai tab in the Chrome on port {self.port}"
+        return True, ""
 
     # --- the two provider methods -------------------------------------------
 

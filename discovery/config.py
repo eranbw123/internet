@@ -27,12 +27,27 @@ class Config:
     telegram_chat_id: str
     youtube_api_key: str = ""   # YouTube Data API v3 key; only the youtube collector needs it
     max_scores_per_cycle: int = 25   # hard ceiling on LLM scoring calls per run_once()
-    # Per-job schedule (see scheduler.py).
+    personal_state_path: str = ""    # ai repo's derived contract artifact; see discovery/personal_state.py
+    # Per-job cadence. No in-process scheduler reads these anymore (see
+    # health.py/__main__.py's "run" removal) -- the OS scheduler's triggers
+    # are derived from these same fields instead.
     interval_stocks_seconds: int = 3600
     interval_web_seconds: int = 4 * 3600
     interval_youtube_seconds: int = 4 * 3600
     digest_time: str = "08:00"      # local HH:MM, once per day
     digest_max_items: int = 10      # Discovery items per digest; Alerts are unbounded and immediate
+    # Failed-send retry policy (see db.pending_notifications); raised from the
+    # smaller db.py module constants, which stay as that function's own
+    # defaults so a call site that doesn't pass cfg still gets a sane policy.
+    send_max_attempts: int = 5
+    send_retry_seconds: int = 30 * 60
+    # Provider preflight (see health.py). Empty command = never spawn
+    # anything -- the default, and what every test and other machine gets.
+    chrome_launch_cmd: str = ""
+    chrome_launch_wait_seconds: int = 15
+    # `health` staleness + alert throttling.
+    health_stale_factor: int = 3
+    health_alert_cooldown_seconds: int = 6 * 3600
 
 
 def load():
@@ -56,9 +71,22 @@ def load():
         telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
         youtube_api_key=os.environ.get("YOUTUBE_API_KEY", ""),
         max_scores_per_cycle=int(os.environ.get("DISCOVERY_MAX_SCORES", "25")),
+        personal_state_path=os.environ.get(
+            "DISCOVERY_PERSONAL_STATE", str(REPO_ROOT / "personal_state.json")
+        ),
         interval_stocks_seconds=int(os.environ.get("DISCOVERY_INTERVAL_STOCKS", "3600")),
         interval_web_seconds=int(os.environ.get("DISCOVERY_INTERVAL_WEB", str(4 * 3600))),
         interval_youtube_seconds=int(os.environ.get("DISCOVERY_INTERVAL_YOUTUBE", str(4 * 3600))),
         digest_time=os.environ.get("DISCOVERY_DIGEST_TIME", "08:00"),
         digest_max_items=int(os.environ.get("DISCOVERY_DIGEST_MAX", "10")),
+        send_max_attempts=int(os.environ.get("DISCOVERY_SEND_MAX_ATTEMPTS", "5")),
+        send_retry_seconds=int(os.environ.get("DISCOVERY_SEND_RETRY_SECONDS", str(30 * 60))),
+        chrome_launch_cmd=os.environ.get("DISCOVERY_CHROME_LAUNCH_CMD", ""),
+        chrome_launch_wait_seconds=int(
+            os.environ.get("DISCOVERY_CHROME_LAUNCH_WAIT_SECONDS", "15")
+        ),
+        health_stale_factor=int(os.environ.get("DISCOVERY_HEALTH_STALE_FACTOR", "3")),
+        health_alert_cooldown_seconds=int(
+            os.environ.get("DISCOVERY_HEALTH_ALERT_COOLDOWN_SECONDS", str(6 * 3600))
+        ),
     )

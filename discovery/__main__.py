@@ -5,27 +5,38 @@
     init          create/upgrade discovery.db and load interests.json
     run-once      one collect -> score -> notify cycle (--source to limit
                   collection to one collector; Alerts still send immediately,
-                  Discovery items still just queue for `digest`)
-    run           the same, on a loop -- stocks/web_search/youtube each on
-                  their own cadence plus a daily digest (see scheduler.py)
+                  Discovery items still just queue for `digest`). Gated by a
+                  provider preflight (health.py) -- a dead Chrome/CDP exits 3
+                  before touching a single collector or LLM call.
     discover      run one collector across all active interests, print
                   candidates and scores, never sends (e.g. `discover web_search`)
     score         push one candidate through the pipeline and print the verdict
     digest        send the pending Discovery digest now (Alerts are unaffected)
-    listen        long-poll Telegram for feedback-button presses (blocking)
+    listen        long-poll Telegram for feedback-button presses (blocking);
+                  --drain runs one bounded pass instead, for a scheduled task
     items         list recently scored items
     feedback      record feedback on an item, by item id
     stats         funnel, feedback and cost over a trailing window
+    health        job staleness, provider reachability, pending sends;
+                  --notify alerts on degraded/recovery (rate-limited)
+    personal-state  print the ai repo's personal-state contract artifact
+
+There is no `run`/scheduler loop -- an OS scheduler (see
+ops/install_tasks.py) calls the commands above on their own cadence instead;
+a session-child tick loop gets reaped the moment the SSH session disconnects.
 """
 import argparse
 import json
 import sys
 from collections import Counter
 
-from . import config, db, feedback_listener, interests, providers, scheduler, stats
+from datetime import datetime, timezone
+
+from . import config, db, feedback_listener, health, interests, personal_state, providers, stats
 from .collectors import COLLECTORS
 from .models import CandidateItem
 from .notify import FEEDBACK_VERDICTS, print_safe
+from .personal_state import PersonalStateError
 from .pipeline import Budget, deliver, ingest, run_once, send_digest
 
 
@@ -44,8 +55,6 @@ def main(argv=None):
     ro.add_argument(
         "--source", choices=sorted(COLLECTORS), help="collect only this collector's items"
     )
-    run = sub.add_parser("run", help="scheduler loop: per-job cadence + daily digest")
-    run.add_argument("--cycles", type=int, help="stop after N scheduler ticks (tests)")
     sub.add_parser("digest", help="send the pending Discovery digest now")
     disc = sub.add_parser(
         "discover", help="run a collector across all active interests; print, never send"
@@ -63,7 +72,11 @@ def main(argv=None):
     listing = sub.add_parser("items", help="list recently scored items")
     listing.add_argument("--limit", type=int, default=20)
     listing.add_argument("--min-score", type=float, default=0.0, help="0-1 final score")
-    sub.add_parser("listen", help="long-poll Telegram for feedback-button presses (blocking)")
+    ln = sub.add_parser("listen", help="long-poll Telegram for feedback-button presses (blocking)")
+    ln.add_argument(
+        "--drain", action="store_true",
+        help="one bounded pass instead of blocking (for a scheduled task)",
+    )
     fb = sub.add_parser("feedback", help="rate an item")
     fb.add_argument("item_id", type=int)
     fb.add_argument("verdict", choices=sorted(FEEDBACK_VERDICTS))
@@ -71,6 +84,17 @@ def main(argv=None):
     fb.add_argument("--note", default="")
     st = sub.add_parser("stats", help="funnel, feedback rates and estimated cost")
     st.add_argument("--days", type=int, default=7, help="trailing window (default 7)")
+    he = sub.add_parser(
+        "health", help="job staleness, provider reachability, pending sends"
+    )
+    he.add_argument(
+        "--notify", action="store_true",
+        help="alert on degraded/recovery over Telegram, rate-limited",
+    )
+    ps = sub.add_parser(
+        "personal-state", help="print the ai repo's personal-state contract artifact"
+    )
+    ps.add_argument("--path", help="override DISCOVERY_PERSONAL_STATE / cfg.personal_state_path")
 
     args = parser.parse_args(argv)
     cfg = config.load()
@@ -123,16 +147,19 @@ def _dispatch(conn, cfg, args, provider):
         print(f"{cfg.db_path}: schema ready, {count} interests loaded")
     elif args.command == "run-once":
         sources = [args.source] if args.source else None
-        print(run_once(conn, provider(), cfg, sources=sources, dry_run=args.dry_run))
-    elif args.command == "run":
-        scheduler.run_forever(conn, provider(), cfg, dry_run=args.dry_run, cycles=args.cycles)
+        job_name = health.job_name_for_source(args.source)
+        return _run_job(
+            conn, job_name, lambda: _run_once_cmd(conn, provider(), cfg, sources, args.dry_run, job_name)
+        )
     elif args.command == "discover":
         return _discover(conn, provider(), cfg, args)
     elif args.command == "score":
         return _score_one(conn, provider(), cfg, args)
     elif args.command == "digest":
-        print(f"sent {send_digest(conn, cfg, dry_run=args.dry_run)} digest item(s)")
+        return _run_job(conn, "digest", lambda: _digest_cmd(conn, cfg, args.dry_run))
     elif args.command == "listen":
+        if args.drain:
+            return _run_job(conn, "feedback", lambda: _drain_cmd(conn, cfg))
         feedback_listener.listen(conn, cfg)
     elif args.command == "items":
         _list_items(conn, args.limit, args.min_score)
@@ -147,8 +174,65 @@ def _dispatch(conn, cfg, args, provider):
         db.add_feedback(conn, args.item_id, args.interest_id, args.verdict, args.note, original_score)
         print(f"recorded {args.verdict} on item {args.item_id}")
     elif args.command == "stats":
-        print_safe(stats.report(conn, args.days))
+        print_safe(stats.report(conn, args.days, cfg))
+    elif args.command == "health":
+        return _health_cmd(conn, cfg, provider(), args)
+    elif args.command == "personal-state":
+        return _personal_state(cfg, args)
     return 0
+
+
+def _run_job(conn, job_name, fn):
+    """Wraps a job command with a `job:<name>:last_ok`/`last_fail` heartbeat
+    and the matching run_ok/run_failed ops counter -- the failure path fires
+    whether the job returns a non-zero exit code (e.g. run-once's preflight
+    bailout) or raises outright, so a crash is never invisible to `health`."""
+    try:
+        code = fn() or 0
+    except Exception:
+        db.bump(conn, {"run_failed": 1})
+        db.state_set(conn, f"job:{job_name}:last_fail", db.now())
+        raise
+    if code == 0:
+        db.bump(conn, {"run_ok": 1})
+        db.state_set(conn, f"job:{job_name}:last_ok", db.now())
+    else:
+        db.bump(conn, {"run_failed": 1})
+        db.state_set(conn, f"job:{job_name}:last_fail", db.now())
+    return code
+
+
+def _run_once_cmd(conn, provider, cfg, sources, dry_run, job_name):
+    if not health.preflight_gate(conn, provider, cfg, job_name):
+        return 3
+    print(run_once(conn, provider, cfg, sources=sources, dry_run=dry_run))
+    return 0
+
+
+def _digest_cmd(conn, cfg, dry_run):
+    print(f"sent {send_digest(conn, cfg, dry_run=dry_run)} digest item(s)")
+    return 0
+
+
+def _drain_cmd(conn, cfg):
+    count = feedback_listener.drain(conn, cfg)
+    if count is None:
+        # A transport failure -- drain() already printed/counted it. Report
+        # it as a job failure too so `job:feedback:last_ok` isn't stamped
+        # (and run_ok isn't bumped) for an invocation that never actually
+        # reached Telegram.
+        print("feedback drain failed", file=sys.stderr)
+        return 1
+    print(f"drained {count} feedback update(s)")
+    return 0
+
+
+def _health_cmd(conn, cfg, provider, args):
+    result = health.check(conn, cfg, provider)
+    print_safe(health.format_report(result))
+    if args.notify:
+        health.notify_if_needed(conn, cfg, result)
+    return 1 if result["degraded"] else 0
 
 
 def _discover(conn, provider, cfg, args):
@@ -178,8 +262,14 @@ def _discover(conn, provider, cfg, args):
                 origin_interest=interest.key, budget=budget,
             )
             counts[outcome.stage] += 1
+            # Flushed per item rather than once at the end (see pipeline.py's
+            # run_once() for the same fix and its rationale): _print_discovered
+            # below is exactly what killed a real run mid-loop once already
+            # (a narrow console codepage choking on a model-generated
+            # character) and silently lost every already-scored item's funnel
+            # counts with it, even though their DB rows were already committed.
+            db.bump(conn, {"collected": 1, outcome.stage: 1})
             _print_discovered(interest, item, outcome)
-    db.bump(conn, counts)
     print(f"\n{total} candidate(s) from '{args.source}'", file=sys.stderr)
     return 0
 
@@ -189,11 +279,11 @@ def _print_discovered(interest, item, outcome):
     header = f"[{interest.key}] {outcome.stage}"
     if query:
         header += f"  (query: {query!r})"
-    print(header)
-    print(f"      {item.title}")
-    print(f"      {item.url}")
+    print_safe(header)
+    print_safe(f"      {item.title}")
+    print_safe(f"      {item.url}")
     if outcome.score is not None:
-        print(f"      score={outcome.score.final_score:.2f}  {outcome.score.reason}")
+        print_safe(f"      score={outcome.score.final_score:.2f}  {outcome.score.reason}")
 
 
 def _score_one(conn, provider, cfg, args):
@@ -253,9 +343,34 @@ def _list_items(conn, limit, min_score):
     ).fetchall()
     for row in rows:
         # Shown 0-100 for the same reason notify.format_message does it.
-        print(f"[{row['final_score'] * 100:>3.0f}] #{row['id']} {row['interest']}: {row['title']}")
-        print(f"      {row['reason']}")
-        print(f"      {row['url']}")
+        print_safe(f"[{row['final_score'] * 100:>3.0f}] #{row['id']} {row['interest']}: {row['title']}")
+        print_safe(f"      {row['reason']}")
+        print_safe(f"      {row['url']}")
+
+
+def _personal_state(cfg, args):
+    """Human-checkable probe: load the ai repo's contract artifact and print
+    what internet would see, without touching the pipeline."""
+    path = args.path or cfg.personal_state_path
+    try:
+        state = personal_state.load(path)
+    except PersonalStateError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    try:
+        generated = datetime.fromisoformat(state.generated_at.replace("Z", "+00:00"))
+        age_days = (datetime.now(timezone.utc) - generated).days
+        age = f"{age_days}d old"
+    except (AttributeError, TypeError, ValueError):
+        age = "age unknown"
+
+    print_safe(f"{path}: contract_version={state.contract_version}")
+    print_safe(f"generated_at={state.generated_at} ({age})")
+    print_safe(f"{len(state.topics)} topic(s)")
+    for topic in state.topics[:10]:
+        print_safe(f"  {topic.get('key')!r}  weight={topic.get('weight')}")
+    return 0
 
 
 if __name__ == "__main__":

@@ -51,6 +51,15 @@ class LLMProvider:
     def search_json(self, prompt, max_searches=5, max_tokens=16000):
         raise UnsupportedCapability(f"{self.name} has no web search capability")
 
+    def preflight(self):
+        """Cheap reachability check, called by health.py before a single
+        collector or LLM call is made. Default: always reachable -- a
+        provider with nothing worth checking for free (an API-key vendor's
+        actual availability can only be confirmed by spending a call)
+        overrides this only for a free, local check (see ClaudeChatProvider,
+        which can confirm Chrome/CDP/the claude.ai tab without any spend)."""
+        return True, ""
+
 
 def parse_json_object(text, what="response"):
     try:

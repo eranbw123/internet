@@ -136,3 +136,15 @@ CREATE TABLE IF NOT EXISTS llm_usage (
 
 CREATE INDEX IF NOT EXISTS idx_scores_interest ON scores(interest_id, final_score);
 CREATE INDEX IF NOT EXISTS idx_feedback_interest ON feedback(interest_id, created_at);
+
+-- Durable key/value store for service-level bookkeeping: job heartbeats
+-- (job:<name>:last_ok / job:<name>:last_fail), the persisted Telegram
+-- getUpdates offset, and health's own alert-dedup state. Separately
+-- scheduled OS tasks (see ops/install_tasks.py) can now overlap on this
+-- same discovery.db -- this is what lets each one pick up where the last
+-- one left off instead of racing or replaying.
+CREATE TABLE IF NOT EXISTS service_state (
+    key         TEXT PRIMARY KEY,
+    value       TEXT NOT NULL,
+    updated_at  TEXT NOT NULL
+);

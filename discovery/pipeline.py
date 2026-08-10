@@ -3,9 +3,9 @@
     collect -> normalize -> dedup -> persist -> interest matching
             -> cheap pre-filter -> LLM scoring -> threshold -> notification
 
-`ingest()` is that whole chain for one candidate and is what both the
-scheduler and `python -m app score` call, so a manual run exercises exactly
-the production path.
+`ingest()` is that whole chain for one candidate and is what both run_once()
+and `python -m app score` call, so a manual run exercises exactly the
+production path.
 
 Two properties everything else leans on:
 
@@ -63,9 +63,10 @@ class Outcome:
 
 def run_once(conn, provider, cfg, sources=None, dry_run=False):
     """One full cycle over every active interest. `sources`, if given,
-    restricts collection to those collector names (scheduler.py's per-job
-    cadence, or `run-once --source`) -- an interest that doesn't list a given
-    source in its own `sources` still skips it. Returns a counts summary.
+    restricts collection to those collector names (`run-once --source`, one
+    per OS-scheduled job -- see health.py/ops/install_tasks.py) -- an
+    interest that doesn't list a given source in its own `sources` still
+    skips it. Returns a counts summary.
 
     At most `cfg.max_scores_per_cycle` items are scored. Past that the cycle
     keeps collecting and filtering but stops paying: the surplus is stored
@@ -87,13 +88,21 @@ def run_once(conn, provider, cfg, sources=None, dry_run=False):
                 origin_interest=interest.key, budget=budget,
             )
             counts[outcome.stage] += 1
+            # Flushed per item, not once at the end of the whole cycle: this
+            # loop does real per-item I/O (LLM calls, external fetches), each
+            # a chance to throw. Every item's own DB rows are already durably
+            # committed by ingest() regardless -- only the funnel counters
+            # were at risk of vanishing for a cycle that scored real items
+            # and then died before reaching the trailing db.bump() below.
+            db.bump(conn, {"collected": 1, outcome.stage: 1})
 
     # Items stored on an earlier cycle that passed the filter but never got a
     # score (the run died, the API was down, the budget ran out) -- scored with
     # whatever budget this cycle's own candidates left over.
-    counts["scored"] += _score_backlog(conn, provider, interests, budget)
+    backlog_scored = _score_backlog(conn, provider, interests, budget)
+    counts["scored"] += backlog_scored
     counts["notified"] = deliver(conn, cfg, dry_run)
-    db.bump(conn, counts)
+    db.bump(conn, {"scored": backlog_scored, "notified": counts["notified"]})
     db.record_usage(conn, provider)   # per cycle, so `run` reports without exiting
     return {stage: counts[stage] for stage in STAGES}
 
@@ -171,7 +180,14 @@ def _score(conn, provider, item, matches, detail=""):
         # of re-failing this item on every cycle while the provider is down.
         db.mark_score_attempt(conn, item.id)
         return Outcome("errors", item, str(e), matches)
-    db.save_score(conn, score)
+    # Mirrors item.id = db.insert_item(conn, item) above: the caller gets a
+    # ScoreResult whose id actually reflects the row just written, the same
+    # contract CandidateItem.id already carries. Nothing in the current
+    # pipeline reads it back off this object (deliver()/send_digest() re-query
+    # score_id from the DB), but leaving it None was still a real inconsistency
+    # -- exactly the kind of stale-id bug that bites the next caller who
+    # reasonably assumes it works like item.id.
+    score.id = db.save_score(conn, score)
     return Outcome("scored", item, detail, matches, score)
 
 
@@ -208,15 +224,19 @@ def _score_backlog(conn, provider, interests, budget):
 
 # --- stage 8: threshold + notification ---------------------------------------
 
-def notification_ready(conn):
+def notification_ready(conn, cfg):
     """Scores that cleared their interest's bar and have not been sent.
 
     The threshold lives in SQL (`final_score >= interests.min_score`) so a
-    lowered bar picks up items scored under the old one automatically.
+    lowered bar picks up items scored under the old one automatically. The
+    retry policy (attempt cap, cool-off) comes from cfg -- see
+    db.pending_notifications().
     """
     by_id = {i.id: i for i in db.active_interests(conn)}
     ready = []
-    for row in db.pending_notifications(conn):
+    for row in db.pending_notifications(
+        conn, max_attempts=cfg.send_max_attempts, retry_after_seconds=cfg.send_retry_seconds
+    ):
         item = db.get_item(conn, row["item_id"])
         interest = by_id.get(row["interest_id"])
         if item is None or interest is None:
@@ -229,7 +249,7 @@ def deliver(conn, cfg, dry_run=False):
     """ALERT-type items only, sent the moment they clear the bar. DISCOVERY
     items are left pending -- send_digest() is what clears those."""
     sent = 0
-    for row, item, interest in notification_ready(conn):
+    for row, item, interest in notification_ready(conn, cfg):
         if not notify.is_alert(item):
             continue
         sent += _send_one(conn, cfg, row, item, interest, dry_run)
@@ -243,7 +263,7 @@ def send_digest(conn, cfg, dry_run=False):
     marked notified. Alerts are never touched here; deliver() already sent
     them."""
     sent = 0
-    for row, item, interest in notification_ready(conn):
+    for row, item, interest in notification_ready(conn, cfg):
         if notify.is_alert(item):
             continue
         if sent >= cfg.digest_max_items:
@@ -265,4 +285,6 @@ def _send_one(conn, cfg, row, item, interest, dry_run):
     # Recorded either way: a failed send stays recorded as not-ok rather
     # than being retried forever on every cycle.
     db.record_notification(conn, row["score_id"], "telegram", ok)
+    if not ok:
+        db.bump(conn, {"send_failed": 1})
     return 1

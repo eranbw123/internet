@@ -14,6 +14,21 @@ discovery.db
 discovery.db-shm
 discovery.db-wal
 
+# Inbound derived artifact published by the ai repo's personal_state.py
+# (see discovery/personal_state.py). Never produced or committed here.
+personal_state.json
+
 __pycache__/
 *.pyc
 .venv/
+
+# Engine-lab run artifacts: full prompt/response logs and per-experiment state.
+# The lab code and LAB.md ARE committed; what a run produced stays local.
+experiments/**/runs.jsonl
+experiments/**/state.json
+experiments/lab/artifacts/
+
+# Per-job stdout/stderr from the installed Scheduled Tasks (see
+# ops/install_tasks.py, ops/run.cmd). Inbound-only, never committed.
+logs/
+backups/

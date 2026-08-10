@@ -32,26 +32,32 @@ cp .env.example .env                 # set CLAUDE_ORG_ID (+ Telegram, optional)
 $EDITOR interests.json               # what you care about
 python -m app init                          # create discovery.db, load interests
 python -m app --dry-run run-once            # one cycle, prints pushes instead of sending
-python -m app run                           # scheduler: stocks/web_search/youtube on their own
-                                             # cadence, plus a daily digest (see below)
-python -m app listen                        # separate process: records feedback-button presses
+python -m app listen --drain                # one bounded pass: record feedback-button presses
 python -m app stats                         # is it finding anything you care about?
+python -m app health                        # is it actually alive right now?
 ```
+
+There is no in-process scheduler loop — each command above is short-lived and
+idempotent, meant to be fired on its own cadence by the OS scheduler (see
+[Running it as an appliance](#running-it-as-an-appliance)) rather than run in
+a long-lived session.
 
 ## Commands
 
 | Command | What it does |
 | --- | --- |
 | `init` | Create/upgrade `discovery.db` and load `interests.json` |
-| `run-once [--source X]` | One collect → score → notify cycle |
-| `run` | The scheduler loop: per-collector cadence plus a daily digest |
-| `listen` | Long-polls Telegram for feedback buttons. **Its own process**, alongside `run` |
+| `run-once [--source X]` | One collect → score → notify cycle. Gated by a provider preflight — exits 3 without touching a collector/LLM if Chrome/CDP is down |
+| `listen` | Long-polls Telegram for feedback buttons, blocking — interactive use |
+| `listen --drain` | One bounded feedback pass instead of blocking — for a scheduled task |
 | `digest` | Send the pending Discovery digest now |
 | `discover <source>` | Run one collector across every interest and print what it found — never sends |
 | `score` | Push one candidate through the real pipeline and print the verdict |
 | `items` | List recently scored items |
 | `feedback <id> <verdict>` | Rate an item from the CLI |
-| `stats [--days N]` | Funnel, feedback rates and estimated cost — see [Stats](#stats) |
+| `stats [--days N]` | Funnel, feedback rates, estimated cost and a HEALTH section — see [Stats](#stats) |
+| `health [--notify]` | Job staleness, provider reachability, pending/abandoned sends; `--notify` alerts on degraded/recovery, rate-limited |
+| `personal-state [--path]` | Print the sibling `ai` repo's personal-state artifact as this repo would read it — see [Personal-state contract](#personal-state-contract) |
 
 Run it from the repo root — the `stocks` collector imports `watch.py`.
 `python -m app` and `python -m discovery` are the same CLI. Global flags
@@ -144,13 +150,35 @@ place rather than duplicating it.
 anything above 1 is treated as the old scale and divided by 100, so a stale
 `75` doesn't silently mean "never notify".)
 
+## Personal-state contract
+
+`discovery/personal_state.py` can read a derived "personal state" artifact
+produced by the sibling `ai` repo (a JSON file of topics the owner has been
+talking about, per `ai`'s `PERSONAL_STATE_CONTRACT.md`, contract version 1).
+It's the only place in this repo that knows that schema; unknown top-level or
+per-topic keys are ignored rather than rejected, so `ai` can add fields
+without a version bump.
+
+```bash
+python -m discovery personal-state              # human-checkable probe: version, age, top topics
+python -m discovery personal-state --path X.json
+```
+
+The artifact path comes from `DISCOVERY_PERSONAL_STATE` (default
+`personal_state.json` at the repo root — gitignored, inbound only, never
+committed here). An interest can opt in to appending the artifact's top N
+topic keys to its `positive_signals` via a `"personal_state_top_terms": N`
+key in `interests.json` — but `init` doesn't pass the loaded state into that
+path yet, so the key has no effect even if set. For now, `personal-state`
+above is the only way to see what this repo would read.
+
 ## Collectors
 
 | Source | Status | What it does |
 | --- | --- | --- |
 | `web_search` | working | The provider's server-side web search returns candidate articles |
 | `stocks` | working | Notable price moves via `watch.py`'s Yahoo fetch |
-| `youtube` | working | Recent uploads/search results, transcript split into overlapping time windows, one candidate **per segment** |
+| `youtube` | working | Recent uploads/search results; transcript available → one candidate **per segment**, otherwise one **video-level** candidate (title + description) |
 
 A collector is one function — `collect(interest, cfg, provider, conn=None) -> list[CandidateItem]`
 — registered in `discovery/collectors/__init__.py`. Collectors fetch and shape
@@ -162,26 +190,38 @@ transcript fetch) only for dedup to discard it a moment later.
 
 ### `youtube`
 
-Needs `YOUTUBE_API_KEY` (video search/metadata) and, for transcripts,
+Needs `YOUTUBE_API_KEY` (video verification/metadata) and, for transcripts,
 `pip install youtube-transcript-api`. A video without an available transcript
 in the requested language is logged and skipped, not an error — captions are
-off for plenty of videos.
+off for plenty of videos, and the unofficial transcript endpoint also
+soft-blocks bursting IPs from time to time.
 
-Because a 90-minute video can hide one great 6-minute discussion, this
-collector doesn't score whole videos: it fetches the transcript, slides a
-fixed, overlapping time window across it, and emits one `CandidateItem` per
-window, each with its own start/end time and deep link
-(`...watch?v=ID&t=<seconds>`). The existing per-item scoring and threshold
-then decide which *segments* are worth a push — nothing extra to configure
-for that part.
+Videos are found by the LLM provider, not by keyword search: one web-search
+conversation per interest turns up candidate video URLs (with a relevance
+estimate each), then a single batched `videos.list` call verifies the ids
+actually exist and are recent — 1 quota unit instead of 100 per
+`search.list` query. Transcript fetches are the scarce resource, so only the
+top `max_transcript_fetches` videos by estimate are fetched each cycle,
+paced a couple of seconds apart.
+
+Because a 90-minute video can hide one great 6-minute discussion, a video
+with a fetched transcript isn't scored whole: the transcript is sliced into
+a fixed, overlapping time window, and one `CandidateItem` per window is
+emitted, each with its own start/end time and deep link
+(`...watch?v=ID&t=<seconds>`). A video whose transcript wasn't fetched this
+cycle — no captions, the endpoint blocked, or simply ranked below the fetch
+budget — degrades gracefully instead of being dropped: it's still emitted as
+one video-level candidate (title + description, no deep link), so the
+discovery + verification work already spent on it isn't wasted. Either way a
+video is processed exactly once — a video-level item is never later
+"upgraded" to segments if transcripts come back.
 
 ```json
 "sources": ["youtube"],
 "source_config": {
   "youtube": {
-    "channels": ["UCxxxxxxxxxxxxxxxxxxxxxx"],
-    "queries": ["orexin agonist podcast discussion"],
-    "max_videos": 5,
+    "max_candidate_videos": 10,
+    "max_transcript_fetches": 4,
     "recency_days": 14,
     "chunk_seconds": 360,
     "chunk_overlap_seconds": 60
@@ -189,8 +229,7 @@ for that part.
 }
 ```
 
-`channels` are channel ids, `queries` are search terms — either or both. All
-knobs above are optional and shown at their defaults.
+All knobs above are optional and shown at their defaults.
 
 ```bash
 python -m app discover youtube
@@ -247,18 +286,23 @@ Four feedback buttons ride under every message — 🔥 Very interesting,
 👍 Interesting, 👎 Not interesting, 🗑 Bad match:
 
 ```bash
-python -m app run                    # sends Alerts immediately, per-job schedule
+python -m app run-once               # sends Alerts immediately as they clear the bar
 python -m app digest                 # send the pending Discovery digest right now
 python -m app listen                 # long-poll Telegram, record button presses (blocking)
+python -m app listen --drain         # or: one bounded pass, for a scheduled task
 ```
 
-`run` and `listen` are separate, both long-running processes — one sleeps on
-a timer, the other blocks on Telegram's long poll; run both.
+`listen`/`listen --drain` and the collect/digest commands are independent —
+one records feedback, the others collect/score/send; nothing here shares a
+process. `listen` and `listen --drain` share the same persisted Telegram
+offset, so a button press that arrives while nothing is listening is caught
+by the next drain instead of being lost.
 
 A failed send is recorded as not-delivered and retried on a later delivery
-pass — after a 15-minute cool-off, up to 3 attempts in total — so a transient
-Telegram outage delays a push rather than losing it. A delivered message is
-final: retries never duplicate it.
+pass — after a cool-off (`DISCOVERY_SEND_RETRY_SECONDS`, default 30 minutes),
+up to `DISCOVERY_SEND_MAX_ATTEMPTS` attempts in total (default 5) — so a
+transient Telegram outage delays a push rather than losing it. A delivered
+message is final: retries never duplicate it.
 
 ### Creating the bot
 
@@ -325,6 +369,8 @@ day, so a window is just a date filter.
 | --- | --- | --- |
 | `CLAUDE_ORG_ID` | *(none)* | **Required** for the default provider — your claude.ai organization id |
 | `CLAUDE_BROWSER_PORT` | `9222` | Chrome DevTools port the default provider attaches to |
+| `DISCOVERY_CHROME_LAUNCH_CMD` | *(none)* | Optional `cmd /d /c` command `run-once` runs ONCE if the provider preflight check finds Chrome/CDP down. Empty ⇒ never spawn anything. **Must be a detached form** (e.g. `start "" "C:\...\chrome.exe" --remote-debugging-port=9222`) — a non-detached command blocks run-once until the wait below is hit |
+| `DISCOVERY_CHROME_LAUNCH_WAIT_SECONDS` | `15` | How long to wait after `DISCOVERY_CHROME_LAUNCH_CMD` before re-checking preflight (also bounds how long the launch command itself is allowed to run) |
 | `ANTHROPIC_API_KEY` | *(none)* | Required only when `DISCOVERY_PROVIDER=anthropic` |
 | `OPENAI_API_KEY` | *(none)* | Required only when `DISCOVERY_PROVIDER=openai` |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | *(none)* | Unset ⇒ pushes print to stdout |
@@ -334,15 +380,53 @@ day, so a window is just a date filter.
 | `DISCOVERY_INTERESTS` | `interests.json` | Interests file |
 | `DISCOVERY_MAX_ITEMS` | `8` | Items per source per cycle |
 | `DISCOVERY_MAX_SCORES` | `25` | Hard cap on LLM scoring calls per cycle. Anything over waits for the next cycle |
-| `DISCOVERY_INTERVAL_STOCKS` | `3600` | `run`'s stocks job cadence, seconds |
-| `DISCOVERY_INTERVAL_WEB` | `14400` | `run`'s web_search job cadence, seconds |
-| `DISCOVERY_INTERVAL_YOUTUBE` | `14400` | `run`'s youtube job cadence, seconds |
-| `DISCOVERY_DIGEST_TIME` | `08:00` | Local time-of-day `run` sends the Discovery digest |
+| `DISCOVERY_PERSONAL_STATE` | `personal_state.json` | Path to the `ai` repo's personal-state artifact — see [Personal-state contract](#personal-state-contract) |
+| `DISCOVERY_INTERVAL_STOCKS` | `3600` | `run-once --source stocks` cadence, seconds (read by the OS scheduler) |
+| `DISCOVERY_INTERVAL_WEB` | `14400` | `run-once --source web_search` cadence, seconds |
+| `DISCOVERY_INTERVAL_YOUTUBE` | `14400` | `run-once --source youtube` cadence, seconds |
+| `DISCOVERY_DIGEST_TIME` | `08:00` | Local time-of-day the `digest` job sends the Discovery digest |
 | `DISCOVERY_DIGEST_MAX` | `10` | Discovery items per digest, highest score first |
 | `DISCOVERY_MIN_MATCH` | `0.25` | Pre-filter: weakest interest match worth scoring |
 | `DISCOVERY_MIN_TEXT_CHARS` | `120` | Pre-filter: least text worth sending to an LLM |
 
 `--provider`, `--model` and `--db` override the environment for one run.
+
+## Running it as an appliance
+
+There is no in-process scheduler (see [How a cycle works](#how-a-cycle-works))
+-- an OS scheduler has to call the commands above on their own cadence.
+`ops/install_tasks.py` registers six one-purpose Windows Scheduled Tasks
+(`internet-discovery-collect-stocks/-web/-youtube`, `-digest`, `-feedback`,
+`-health`), one XML task per job, trigger intervals read straight from
+`config.load()` so a `.env` change and a re-`--install` is all it takes to
+reschedule.
+
+**One manual prerequisite:** Chrome has to be running, in the same
+interactive Windows session the tasks run in, launched with
+`--remote-debugging-port=9222` and logged into claude.ai -- that's the
+default provider's only way in, and it doesn't exist under a service
+principal. `run-once` won't even try a collector without it (see the
+provider preflight in [Commands](#commands)); `DISCOVERY_CHROME_LAUNCH_CMD`
+can relaunch it once automatically, see [Configuration](#configuration).
+
+```bash
+python ops/install_tasks.py --dry-run      # print every task's XML + schtasks command, register nothing
+python ops/install_tasks.py --install      # create/update all six tasks
+python ops/install_tasks.py --status       # state, last run, last result, next run
+python ops/install_tasks.py --uninstall    # delete only the six tasks this script created
+python ops/install_tasks.py --soak         # register the one-shot 24h soak checkpoint, see ops/SOAK.md
+```
+
+Each task runs `ops/run.cmd`, which sets `PYTHONIOENCODING=utf-8`, `cd`s to
+the repo root and runs `python -m app <args>`, appending stdout+stderr to
+`logs\<args>-<YYYYMMDD>.log` (the log name comes from the full argument
+list, not just the first one -- the three `run-once --source ...` collect
+tasks all start with `run-once` and would otherwise collide on one
+exclusively-locked file; gitignored, inbound-only -- never committed) and
+propagating the exit code. `python -m app health` (or
+`python -m app stats`, which includes the same HEALTH section) is the
+fastest way to check the appliance is actually alive without digging through
+logs.
 
 ## Tests
 
@@ -350,6 +434,6 @@ day, so a window is just a date filter.
 python test_discovery.py
 ```
 
-117 tests, network fully stubbed — they never hit an LLM API, Telegram, or
+215 tests, network fully stubbed — they never hit an LLM API, Telegram, or
 Yahoo. The provider seam is the whole stub: a fake object with `complete_json`
 and `search_json`.
