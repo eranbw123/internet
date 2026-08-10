@@ -265,18 +265,28 @@ creates a scratch conversation, reads the streamed reply, and deletes it.
 `CLAUDE_ORG_ID`, just a logged-in chatgpt.com tab in the same Chrome
 (`CHATGPT_BROWSER_PORT`, falling back to `CLAUDE_BROWSER_PORT`, default 9222).
 Sending one message is more involved than Claude's because chatgpt.com gates
-its send endpoint behind a "sentinel" proof-of-work the read endpoints don't:
-per call the provider reads the session token from `/api/auth/session`, asks
-`/backend-api/sentinel/chat-requirements` for the challenge, solves the
-proof-of-work (a SHA3-512 search, run in-page — SubtleCrypto has no SHA3, so a
-compact keccak verified against Python's `hashlib` is embedded), then POSTs to
-`/backend-api/conversation` and reads the SSE stream (both the full-snapshot
-and delta-encoded shapes). History is disabled on the request and the scratch
-conversation is hidden afterward.
+its send endpoint behind a "sentinel" challenge the read endpoints don't. Per
+call the provider, all in-page:
+
+1. reads the session token from `/api/auth/session`;
+2. asks `/backend-api/sentinel/chat-requirements` for the challenge and
+   **solves the proof-of-work** — a SHA3-512 search; SubtleCrypto has no SHA3,
+   so a compact keccak verified against Python's `hashlib` is embedded;
+3. forwards the **turnstile** token (chatgpt.com sets `turnstile.required` for
+   web sessions, but accepts its own challenge value echoed back — verified
+   live);
+4. POSTs to `/backend-api/conversation` and reads the SSE stream (full-snapshot
+   `message.content.parts`, with delta-encoded frames handled as a fallback).
+
+History is disabled on the request and the scratch conversation is hidden
+afterward. This path has been **verified end to end against live chatgpt.com**
+— both scoring (`complete_json`) and web search (`search_json`, ChatGPT's own
+search) return correctly.
 
 Both browser transports carry the same two caveats: the endpoints are internal
-and undocumented (they can drift), and heavy automated use sits uneasily with
-each site's terms — the per-cycle score budget keeps volume modest.
+and undocumented (they can drift — the sentinel/turnstile shapes especially),
+and heavy automated use sits uneasily with each site's terms — the per-cycle
+score budget keeps volume modest.
 
 No vendor SDK is imported outside `discovery/providers/`. A capability a
 provider lacks raises `UnsupportedCapability` and that collector is skipped

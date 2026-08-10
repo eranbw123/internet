@@ -2693,8 +2693,12 @@ class ChatGPTBrowserProviderTests(unittest.TestCase):
         js = self.connections[0].js[0]
         for token in ("sha3_512_hex", "/sentinel/chat-requirements",
                       "OpenAI-Sentinel-Chat-Requirements-Token",
-                      "OpenAI-Sentinel-Proof-Token", "/api/auth/session"):
+                      "OpenAI-Sentinel-Proof-Token",
+                      "OpenAI-Sentinel-Turnstile-Token",  # forwarded, not thrown on
+                      "/api/auth/session"):
             self.assertIn(token, js, f"completion JS lost {token!r}")
+        # turnstile.required must NOT abort the send -- echoing dx works live
+        self.assertNotIn("throw new Error('chatgpt.com demanded", js)
 
     def test_no_chrome_endpoint_is_a_clean_provider_error(self):
         provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)

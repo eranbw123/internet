@@ -211,27 +211,33 @@ JSON + validate + one retry). `search_json` sets `system_hints:["search"]`
 discovery now run on ChatGPT too.
 
 The hard part vs claude.ai: chatgpt.com gates `/backend-api/conversation`
-behind a sentinel proof-of-work. Per call, in-page JS: read token from
+behind a sentinel challenge. Per call, in-page JS: read token from
 `/api/auth/session` → POST `/backend-api/sentinel/chat-requirements` → if
 `proofofwork.required`, solve it (SHA3-512 prefix search; **SubtleCrypto has no
 SHA3**, so a compact BigInt keccak is embedded — cross-checked byte-for-byte
 against Python `hashlib.sha3_512` on 4 vectors; server only checks the answer's
 hash prefix, so the config array is pure entropy, iters capped ~150k≈8s with a
-graceful-fallback token) → POST conversation with the two `OpenAI-Sentinel-*`
-headers, `history_and_training_disabled:true`, SSE read handling BOTH
-full-snapshot and delta-v1 (`o:add`/`append`, bare-`v` continuation) shapes →
-best-effort PATCH `is_visible:false`. Turnstile-required ⇒ ProviderError (open
-the tab, send one message by hand). Structure mirrors claude_chat: lazy connect,
-one reconnect on dropped socket, JS-exception/empty/None all → ProviderError.
+graceful-fallback token) → **if `turnstile.required`, echo `turnstile.dx` back
+as `OpenAI-Sentinel-Turnstile-Token`** (live sessions set required:true but
+accept the echoed challenge — do NOT throw) → POST conversation with the
+sentinel headers, `history_and_training_disabled:true`, SSE read: assistant
+snapshots live in `message.content.parts` (cumulative; overwrite only on a
+non-empty join so a trailing empty can't wipe the answer); delta-v1
+(`o:add`/`append`, bare-`v`) kept as fallback → best-effort PATCH
+`is_visible:false`. Structure mirrors claude_chat: lazy connect, one reconnect
+on dropped socket, JS-exception/empty/None all → ProviderError.
 
-Verified: (1) offline python suite stubs the CDP seam like claude_chat's
-(16 tests). (2) the JS core the python tests can't reach was executed in Node
-against a simulated chatgpt.com — delta-v1 + full-snapshot SSE both accumulate
-(incl. a line split across reads), PoW solves, sentinel headers forwarded.
-**NOT yet run against live chatgpt.com** — same honest posture as claude_chat's
-undocumented endpoints; live send may need slug/payload tweaks. Direct `openai`
-API provider unchanged (scoring-only, no server-side search) — the point of
-this step is that ChatGPT discovery goes through the browser, not a key.
+**LIVE-VERIFIED (2026-08-10)** against the owner's real chatgpt.com tab on :9222
+(plan_type plus, model resolved gpt-5-6): `complete_json` returned
+`{answer:4, word:'hello'}`; `web_search.collect` returned 3 real Nebius items
+(real URLs/titles/summaries) through ChatGPT's own search. First live run
+exposed the two bugs now fixed: turnstile was thrown on (chatgpt.com sets
+required:true) — fixed by echoing dx; and the SSE guard. Diagnostics captured
+the real frame shapes (see the two fixes). Offline: python suite stubs the CDP
+seam like claude_chat's (16 tests, incl. a JS-contract lock for the sentinel/
+turnstile/PoW tokens); the JS SSE+PoW core also executed in Node vs a simulated
+server. Direct `openai` API provider unchanged (scoring-only, no server-side
+search) — the point is ChatGPT discovery goes through the browser, not a key.
 
 ## interests.json rewrite (2026-08-10, owner-supplied)
 Full owner rewrite: 40 interests, defaults `min_score` 0.8 / `sources` []
