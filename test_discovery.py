@@ -3122,11 +3122,13 @@ class InstallTasksTests(unittest.TestCase):
         # boundary must be in the future, not today's already-missed slot.
         self.assertGreater(start_dt, datetime.now())
 
-    def test_uninstall_is_scoped_to_the_six_task_names_only(self):
+    def test_uninstall_is_scoped_to_the_six_task_names_plus_soak(self):
         calls = []
         install_tasks.uninstall(runner=lambda args: calls.append(args) or (0, "", ""))
         deleted = [args[args.index("/tn") + 1] for args in calls]
-        self.assertEqual(sorted(deleted), sorted(install_tasks.TASK_NAMES))
+        self.assertEqual(
+            sorted(deleted), sorted(install_tasks.TASK_NAMES + [install_tasks.SOAK_TASK])
+        )
         self.assertTrue(all(name.startswith("internet-discovery-") for name in deleted))
         self.assertTrue(all(not name.startswith("ec-") for name in deleted))
 
@@ -3150,6 +3152,108 @@ class InstallTasksTests(unittest.TestCase):
         self.assertIn("Ready", text)
         self.assertIn("internet-discovery-collect-stocks: not installed", text)
         self.assertNotIn("some-other-task", text)
+
+    def test_soak_task_is_not_one_of_the_six_build_tasks(self):
+        # SOAK_TASK must stay out of _TASK_SPECS/build_tasks -- otherwise
+        # --install would create it (seven tasks) and recreate/reschedule it
+        # on every reinstall.
+        names = [t.name for t in install_tasks.build_tasks(CFG)]
+        self.assertEqual(len(names), 6)
+        self.assertNotIn(install_tasks.SOAK_TASK, names)
+
+    def test_soak_trigger_is_a_single_time_trigger_with_no_repetition(self):
+        task = install_tasks.TaskDef(
+            install_tasks.SOAK_TASK, [], "once", 24, "PT15M", script="soak_check.cmd"
+        )
+        xml = install_tasks.render_xml(task)
+        self.assertIn("<TimeTrigger>", xml)
+        self.assertNotIn("<Repetition>", xml)
+        self.assertIn("StartWhenAvailable>true<", xml)
+        start = xml.split("<StartBoundary>")[1].split("</StartBoundary>")[0]
+        start_dt = datetime.fromisoformat(start)
+        self.assertGreater(start_dt, datetime.now() + timedelta(hours=23))
+        self.assertLess(start_dt, datetime.now() + timedelta(hours=25))
+
+    def test_soak_action_points_at_soak_check_cmd_not_run_cmd(self):
+        task = install_tasks.TaskDef(
+            install_tasks.SOAK_TASK, [], "once", 24, "PT15M", script="soak_check.cmd"
+        )
+        xml = install_tasks.render_xml(task)
+        self.assertIn("soak_check.cmd", xml)
+        self.assertNotIn("run.cmd", xml)
+
+    def test_install_soak_creates_and_verifies_one_task(self):
+        calls = []
+
+        def fake_runner(args):
+            calls.append(args)
+            return 0, "SUCCESS", ""
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = install_tasks.install_soak(CFG, runner=fake_runner, dry_run=False, hours=24)
+        self.assertEqual(code, 0)
+        creates = [a for a in calls if "/create" in a]
+        queries = [a for a in calls if "/query" in a]
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(len(queries), 1)
+        self.assertEqual(creates[0][creates[0].index("/tn") + 1], install_tasks.SOAK_TASK)
+
+    def test_install_soak_dry_run_spawns_no_process(self):
+        calls = []
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = install_tasks.install_soak(
+                CFG, runner=lambda args: calls.append(args), dry_run=True, hours=24
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [])
+
+    def test_install_soak_prints_start_boundary_and_readout_path(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            install_tasks.install_soak(
+                CFG, runner=lambda args: (0, "SUCCESS", ""), dry_run=False, hours=24
+            )
+        text = out.getvalue()
+        self.assertIn("StartBoundary:", text)
+        self.assertIn("readout path", text)
+        self.assertIn("logs", text)
+
+    def test_uninstall_deletes_soak_task_even_if_never_registered(self):
+        # schtasks /delete on a name that was never created just fails --
+        # uninstall() still tries it and reports the miss, same as any other
+        # not-installed name; it must not skip it or raise.
+        calls = []
+
+        def fake_runner(args):
+            calls.append(args)
+            if install_tasks.SOAK_TASK in args:
+                return 1, "", "ERROR: The system cannot find the file specified."
+            return 0, "", ""
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = install_tasks.uninstall(runner=fake_runner)
+        self.assertEqual(code, 0)
+        deleted = [args[args.index("/tn") + 1] for args in calls]
+        self.assertIn(install_tasks.SOAK_TASK, deleted)
+
+    def test_status_reports_soak_task_only_when_present(self):
+        output_without_soak = (
+            "TaskName:                             \\internet-discovery-health\r\n"
+            "Status:                               Ready\r\n"
+            "\r\n"
+        )
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            install_tasks.status(runner=lambda args: (0, output_without_soak, ""))
+        self.assertNotIn(install_tasks.SOAK_TASK, out.getvalue())
+
+        output_with_soak = output_without_soak + (
+            f"TaskName:                             \\{install_tasks.SOAK_TASK}\r\n"
+            "Status:                               Ready\r\n"
+            "Next Run Time:                        8/11/2026 8:00:00 PM\r\n"
+            "\r\n"
+        )
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            install_tasks.status(runner=lambda args: (0, output_with_soak, ""))
+        self.assertIn(f"{install_tasks.SOAK_TASK}:", out.getvalue())
 
 
 if __name__ == "__main__":

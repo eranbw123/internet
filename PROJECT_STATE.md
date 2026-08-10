@@ -16,14 +16,30 @@ staggered per task so same-length intervals never coincide.
 `--dry-run`/`--install`/`--uninstall` (prefix-scoped)/`--status`. Tasks run
 `ops/run.cmd` (utf-8 stdout, `cd` to repo root, `python -m app %*`, log name
 built from the full arg list so the three `run-once` collectors don't share
-one file, exit code propagated); `logs/` is gitignored, inbound-only. Live
-install, fault-injection drills and the 24h soak are a separate,
-not-yet-done step (offline tests stub `schtasks`/`subprocess` via an
-injected fake runner) — it needs a live operator session (real Chrome/CDP,
-Telegram, `schtasks`, and 24h wall-clock time), which an isolated-worktree
-implementer/repair session cannot provide; do not mark it done without that
-session's evidence. Every invocation is short-lived, idempotent and
-overlap-safe:
+one file, exit code propagated); `logs/` is gitignored, inbound-only.
+
+`--soak [--soak-hours N] [--dry-run]` registers a seventh, one-shot task
+(`SOAK_TASK` = `internet-discovery-soak-check`, deliberately outside
+`_TASK_SPECS`/`build_tasks()` so `--install` never creates/reschedules it;
+`--uninstall` deletes it if present) whose single `<TimeTrigger>` (no
+`<Repetition>`) fires once, `N` hours out (default 24); it shells to
+`ops/soak_check.cmd`, which appends `stats --days 1` + `health` +
+prefix-filtered `schtasks /query` to `logs\soak-<date>.txt`. `--soak` is
+composable with `--dry-run` (argparse's own group can't express "exclusive
+among these four, but not with dry-run", so `main()` checks mutual
+exclusivity by hand). `install()`'s per-task registration (tempfile write +
+`schtasks /create /XML` + `/query` verify) is factored into `_register_task`,
+shared by `install()` and `install_soak()` — one registration path, not two.
+Runbook + resume procedure: `ops/SOAK.md`.
+
+Live install, fault-injection drills and the live 24h wall-clock soak
+execution are still a separate, not-yet-done step — they need a live
+operator session (real Chrome/CDP, Telegram, `schtasks`, and 24h wall-clock
+time), which an isolated-worktree implementer/repair session cannot
+provide; do not mark that part done without that session's evidence. The
+offline-implementable half (the soak-checkpoint scheduling artifact +
+runbook above) is done and tested. Every invocation is short-lived,
+idempotent and overlap-safe:
 `db.connect` sets `PRAGMA busy_timeout=5000`, and a new `service_state`
 key/value table (`db.state_get`/`state_set`) persists job heartbeats
 (`job:<name>:last_ok`/`last_fail`), the Telegram `getUpdates` offset, and
@@ -207,7 +223,7 @@ All timestamps UTC via `db.now()`/`db.ago()`. No token metering on
 claude_chat (calls only).
 
 ## Tests
-`python test_discovery.py` (215) + `python test_watch.py` (10), offline, both
+`python test_discovery.py` (228) + `python test_watch.py` (10), offline, both
 green; CI on push/PR.
 
 ## Known issues

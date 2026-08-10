@@ -414,6 +414,7 @@ python ops/install_tasks.py --dry-run      # print every task's XML + schtasks c
 python ops/install_tasks.py --install      # create/update all six tasks
 python ops/install_tasks.py --status       # state, last run, last result, next run
 python ops/install_tasks.py --uninstall    # delete only the six tasks this script created
+python ops/install_tasks.py --soak         # register the one-shot 24h soak checkpoint, see ops/SOAK.md
 ```
 
 Each task runs `ops/run.cmd`, which sets `PYTHONIOENCODING=utf-8`, `cd`s to

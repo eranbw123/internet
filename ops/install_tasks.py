@@ -7,6 +7,9 @@ tick loop. Every task shells out to ops/run.cmd, which calls `python -m app`.
     python ops/install_tasks.py --install       # create/update all six tasks
     python ops/install_tasks.py --uninstall     # delete only tasks this script created
     python ops/install_tasks.py --status        # state/last-run/last-result/next-run
+    python ops/install_tasks.py --soak [--soak-hours 24] [--dry-run]
+        # register the one-shot 24h soak-checkpoint task (see ops/SOAK.md);
+        # composable with --dry-run to preview without registering
 
 Cadence for the collect-* tasks and the digest time come from `config.load()`
 (interval_stocks_seconds / interval_web_seconds / interval_youtube_seconds /
@@ -48,14 +51,21 @@ _TASK_SPECS = [
 
 TASK_NAMES = [f"{PREFIX}{suffix}" for suffix, *_ in _TASK_SPECS]
 
+# The one-shot 24h soak checkpoint (objective C). Deliberately NOT a
+# _TASK_SPECS entry: build_tasks()/install() must keep creating exactly the
+# six recurring tasks, so a normal --install never touches this one, and
+# a re-run of --install never reschedules or recreates it.
+SOAK_TASK = f"{PREFIX}soak-check"
+
 
 @dataclass
 class TaskDef:
     name: str
     app_args: list
-    trigger_kind: str   # "interval" | "daily"
-    trigger_value: object   # seconds (interval) or "HH:MM" (daily)
+    trigger_kind: str   # "interval" | "daily" | "once"
+    trigger_value: object   # seconds (interval), "HH:MM" (daily), or hours (once)
     exec_time_limit: str    # ISO-8601 duration
+    script: str = "run.cmd"   # ops/<script>, the .cmd the action shells out to
 
 
 def build_tasks(cfg):
@@ -85,13 +95,13 @@ def _current_user():
     return f"{domain}\\{name}" if domain else name
 
 
-def _action_command(app_args):
+def _action_command(app_args, script="run.cmd"):
     repo_root = config.REPO_ROOT
-    run_cmd = str(repo_root / "ops" / "run.cmd")
+    run_cmd = str(repo_root / "ops" / script)
     command = r"C:\Windows\System32\cmd.exe"
     # /d is mandatory: this machine has a cmd AutoRun hook that otherwise runs
     # on every cmd.exe invocation and breaks the working directory.
-    arguments = f'/d /c "{run_cmd}" {" ".join(app_args)}'
+    arguments = " ".join([f'/d /c "{run_cmd}"'] + list(app_args))
     return command, arguments, str(repo_root)
 
 
@@ -113,6 +123,15 @@ def _trigger_xml(task):
         <DaysInterval>1</DaysInterval>
       </ScheduleByDay>
     </CalendarTrigger>"""
+    if task.trigger_kind == "once":
+        # The soak checkpoint: a single firing `trigger_value` hours out, no
+        # <Repetition> -- that element would turn a one-shot checkpoint into
+        # a recurring task.
+        start = now + timedelta(hours=task.trigger_value)
+        return f"""    <TimeTrigger>
+      <StartBoundary>{start.isoformat()}</StartBoundary>
+      <Enabled>true</Enabled>
+    </TimeTrigger>"""
     # Stagger each interval task's initial StartBoundary by its position in
     # TASK_NAMES: two tasks sharing an interval (e.g. collect-web and
     # collect-youtube, both 4h by default) would otherwise get an identical
@@ -138,7 +157,7 @@ def render_xml(task):
     interactive logged-on user (LogonType=InteractiveToken), not a service/S4U
     principal, because the default provider's Chrome/CDP session only exists
     there."""
-    command, arguments, workdir = _action_command(task.app_args)
+    command, arguments, workdir = _action_command(task.app_args, task.script)
     return f"""<?xml version="1.0" encoding="UTF-16"?>
 <Task version="1.4" xmlns="http://schemas.microsoft.com/windows/2004/02/mit/task">
   <RegistrationInfo>
@@ -193,57 +212,88 @@ def _default_runner(args):
     return proc.returncode, proc.stdout, proc.stderr
 
 
+def _register_task(task, runner, dry_run):
+    """Render, write and register ONE task via `schtasks /create /XML`, then
+    verify with a `/query` follow-up. The single registration path for both
+    the six recurring tasks (`install`) and the one-shot soak checkpoint
+    (`install_soak`) -- there is no second, parallel way this script talks
+    to `schtasks /create`. Returns True on success."""
+    xml = render_xml(task)
+    fd, path = tempfile.mkstemp(suffix=".xml", prefix=f"{task.name}-")
+    os.close(fd)
+    # schtasks /XML rejects some UTF-8 files; UTF-16 with BOM (the
+    # `"utf-16"` codec picks the native, little-endian order and writes
+    # the BOM) is what it wants.
+    Path(path).write_bytes(xml.encode("utf-16"))
+    cmd = ["schtasks", "/create", "/tn", task.name, "/xml", path, "/f"]
+    if dry_run:
+        # The real path, not a placeholder -- this line has to be
+        # copy-pasteable to actually reproduce the registration.
+        print(f"--- {task.name} ---")
+        print(xml)
+        print(subprocess.list2cmdline(cmd) + "\n")
+        return True
+    try:
+        code, out, err = runner(cmd)
+        if code != 0:
+            print(f"{task.name}: FAILED: {(err or out).strip()}", file=sys.stderr)
+            return False
+        # Confirm the import actually landed rather than trusting
+        # schtasks' exit code alone.
+        vcode, vout, verr = runner(["schtasks", "/query", "/tn", task.name])
+        if vcode == 0:
+            print(f"{task.name}: installed")
+            return True
+        print(
+            f"{task.name}: created but not found on verification query: "
+            f"{(verr or vout).strip()}",
+            file=sys.stderr,
+        )
+        return False
+    finally:
+        try:
+            os.unlink(path)
+        except OSError:
+            pass
+
+
 def install(cfg, runner=None, dry_run=False):
     runner = runner or _default_runner
     ok = True
     for task in build_tasks(cfg):
-        xml = render_xml(task)
-        fd, path = tempfile.mkstemp(suffix=".xml", prefix=f"{task.name}-")
-        os.close(fd)
-        # schtasks /XML rejects some UTF-8 files; UTF-16 with BOM (the
-        # `"utf-16"` codec picks the native, little-endian order and writes
-        # the BOM) is what it wants.
-        Path(path).write_bytes(xml.encode("utf-16"))
-        cmd = ["schtasks", "/create", "/tn", task.name, "/xml", path, "/f"]
-        if dry_run:
-            # The real path, not a placeholder -- this line has to be
-            # copy-pasteable to actually reproduce the registration.
-            print(f"--- {task.name} ---")
-            print(xml)
-            print(subprocess.list2cmdline(cmd) + "\n")
-            continue
-        try:
-            code, out, err = runner(cmd)
-            if code != 0:
-                ok = False
-                print(f"{task.name}: FAILED: {(err or out).strip()}", file=sys.stderr)
-                continue
-            # Confirm the import actually landed rather than trusting
-            # schtasks' exit code alone.
-            vcode, vout, verr = runner(["schtasks", "/query", "/tn", task.name])
-            if vcode == 0:
-                print(f"{task.name}: installed")
-            else:
-                ok = False
-                print(
-                    f"{task.name}: created but not found on verification query: "
-                    f"{(verr or vout).strip()}",
-                    file=sys.stderr,
-                )
-        finally:
-            try:
-                os.unlink(path)
-            except OSError:
-                pass
+        if not _register_task(task, runner, dry_run):
+            ok = False
+    return 0 if ok else 1
+
+
+def install_soak(cfg, runner=None, dry_run=False, hours=24):
+    """Register the one-shot 24h soak checkpoint (objective C): fires once,
+    `hours` after this call, running ops/soak_check.cmd (no `python -m app`
+    args) which appends a stats+health+schtasks readout to
+    `logs\\soak-<date>.txt`. Not a `_TASK_SPECS` entry -- `--install` never
+    creates, recreates or reschedules it; see SOAK_TASK. `cfg` is accepted
+    for symmetry with `install()` and future cfg-derived settings; nothing
+    here reads it yet."""
+    runner = runner or _default_runner
+    task = TaskDef(SOAK_TASK, [], "once", hours, "PT15M", script="soak_check.cmd")
+    ok = _register_task(task, runner, dry_run)
+    if not dry_run:
+        start = _trigger_xml(task).split("<StartBoundary>")[1].split("</StartBoundary>")[0]
+        fire_date = (datetime.now() + timedelta(hours=hours)).strftime("%Y%m%d")
+        readout = str(config.REPO_ROOT / "logs" / f"soak-{fire_date}.txt")
+        print(f"soak checkpoint StartBoundary: {start}")
+        print(f"soak readout path (approx, actual date is when it fires): {readout}")
     return 0 if ok else 1
 
 
 def uninstall(runner=None, dry_run=False):
-    """Only ever touches the six names this script creates -- TASK_NAMES is a
-    fixed, prefix-scoped whitelist, so this can never reach a task (e.g. an
-    `ec-*` canary task) it did not itself create."""
+    """Only ever touches the six names this script creates plus the one-shot
+    soak checkpoint -- TASK_NAMES + [SOAK_TASK] is a fixed, prefix-scoped
+    whitelist, so this can never reach a task (e.g. an `ec-*` canary task) it
+    did not itself create. Deleting a soak task that was never registered is
+    a harmless no-op reported the same as any other `schtasks /delete` miss."""
     runner = runner or _default_runner
-    for name in TASK_NAMES:
+    for name in TASK_NAMES + [SOAK_TASK]:
         cmd = ["schtasks", "/delete", "/tn", name, "/f"]
         if dry_run:
             print(" ".join(cmd))
@@ -291,23 +341,43 @@ def status(runner=None):
         print(f"{name}:")
         for key in ("Status", "Last Run Time", "Last Result", "Next Run Time"):
             print(f"  {key}: {block.get(key, '?')}")
+    # The soak checkpoint is one-shot and optional -- only report it (never
+    # "not installed") when a --soak call has actually registered it.
+    soak_block = blocks.get(SOAK_TASK)
+    if soak_block is not None:
+        print(f"{SOAK_TASK}:")
+        for key in ("Status", "Last Run Time", "Last Result", "Next Run Time"):
+            print(f"  {key}: {soak_block.get(key, '?')}")
     return 0
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    group = parser.add_mutually_exclusive_group(required=True)
-    group.add_argument("--dry-run", action="store_true", help="print XML + schtasks commands, register nothing")
+    # --dry-run is deliberately NOT in the mutually-exclusive group below: it
+    # has to compose with --soak (preview the checkpoint without registering
+    # it) the same way it already implicitly composes with plain --install
+    # (the bare `--dry-run` invocation in the usage block above). The other
+    # four actions stay mutually exclusive with each other, checked by hand
+    # since argparse's own group can't express "exclusive among these, but
+    # not with that other flag".
+    group = parser.add_mutually_exclusive_group(required=False)
     group.add_argument("--install", action="store_true", help="create/update all six tasks")
     group.add_argument("--uninstall", action="store_true", help="delete only the tasks this script created")
     group.add_argument("--status", action="store_true", help="state/last-run/last-result/next-run per task")
+    group.add_argument("--soak", action="store_true", help="register the one-shot 24h soak-checkpoint task")
+    parser.add_argument("--dry-run", action="store_true", help="print XML + schtasks commands, register nothing")
+    parser.add_argument("--soak-hours", type=float, default=24.0, help="hours until --soak's checkpoint fires (default 24)")
     args = parser.parse_args(argv)
+    if not (args.install or args.uninstall or args.status or args.soak or args.dry_run):
+        parser.error("one of --install/--uninstall/--status/--soak/--dry-run is required")
 
     if args.status:
         return status()
     if args.uninstall:
         return uninstall()
     cfg = config.load()
+    if args.soak:
+        return install_soak(cfg, dry_run=args.dry_run, hours=args.soak_hours)
     return install(cfg, dry_run=args.dry_run)
 
 
