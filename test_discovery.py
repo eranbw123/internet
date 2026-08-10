@@ -33,8 +33,10 @@ from discovery import (
     notify,
     personal_state,
     pipeline,
+    providers,
     scoring,
     stats,
+    teach,
 )
 from discovery.personal_state import PersonalState, PersonalStateError
 from discovery.collectors import COLLECTORS, stocks, web_search, youtube
@@ -2337,6 +2339,204 @@ class FeedbackListenerTests(unittest.TestCase):
         self.assertIsNone(db.state_get(self.conn, "telegram_offset"))  # never advanced
 
 
+class TeachTests(unittest.TestCase):
+    """teach.py's WEIGHTS/BAND_WIDTH are set from the documented rationale
+    (lab proposals 003/004: notify flips track bar proximity, not scorer
+    variance) *before* this fixture was written, and are never adjusted
+    afterwards to make these assertions pass -- that would be Goodharting
+    the acceptance test. If the first honest measurement had shown
+    band_lift < 2.0, the honest thing to do was report that, not tune the
+    weights; it didn't, and what follows is that first honest measurement.
+
+    Fixture: two interests with bars at 0.70 and 0.50. Five near-bar,
+    low-confidence items are inserted FIRST (so recency ranks them last);
+    three far-from-bar, high-confidence items are inserted LAST (so recency
+    ranks them first). Recency is deliberately anti-correlated with bar
+    proximity.
+    """
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        db.upsert_interest(self.conn, an_interest(key="a", min_score=0.70))
+        db.upsert_interest(self.conn, an_interest(key="b", min_score=0.50))
+        self.a = db.interest_by_key(self.conn, "a")
+        self.b = db.interest_by_key(self.conn, "b")
+        self.near = [
+            self._plant("near-a1", self.a, 0.705, 0.40),
+            self._plant("near-a2", self.a, 0.695, 0.45),
+            self._plant("near-b1", self.b, 0.505, 0.40),
+            self._plant("near-b2", self.b, 0.495, 0.45),
+            self._plant("near-b3", self.b, 0.510, 0.50),
+        ]
+        self.far = [
+            self._plant("far-a1", self.a, 0.99, 0.95),
+            self._plant("far-a2", self.a, 0.20, 0.95),
+            self._plant("far-b1", self.b, 0.98, 0.95),
+        ]
+
+    def _plant(self, url, interest_row, final_score, confidence):
+        item = stored_item(self.conn, url=url, title=url)
+        score = a_score(item.id, interest_row.id, final_score, interest_key=interest_row.key)
+        score.confidence = confidence
+        db.save_score(self.conn, score)
+        return item
+
+    def test_build_queue_ranks_planted_near_bar_low_confidence_items_first(self):
+        rows = teach.build_queue(self.conn, limit=100)
+        near_ids = {item.id for item in self.near}
+        far_ids = {item.id for item in self.far}
+        positions = {row["item_id"]: i for i, row in enumerate(rows)}
+        self.assertEqual(set(positions), near_ids | far_ids)
+        self.assertLess(max(positions[i] for i in near_ids), min(positions[i] for i in far_ids))
+
+    def test_queue_metrics_beats_the_recency_baseline_on_band_share(self):
+        metrics = teach.queue_metrics(self.conn, limit=4)
+        self.assertEqual(metrics["pool_size"], 8)
+        self.assertEqual(metrics["n"], 4)
+        self.assertGreater(metrics["queue"]["band_share"], metrics["baseline"]["band_share"])
+        self.assertGreaterEqual(metrics["band_lift"], 2.0)
+
+    def test_determinism_across_repeated_calls(self):
+        self.assertEqual(
+            teach.build_queue(self.conn, limit=4), teach.build_queue(self.conn, limit=4)
+        )
+        self.assertEqual(
+            teach.queue_metrics(self.conn, limit=4), teach.queue_metrics(self.conn, limit=4)
+        )
+
+
+class TeachLabelFlowTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        db.upsert_interest(self.conn, an_interest())
+        self.interest = db.interest_by_key(self.conn, "k")
+        self.items = [
+            stored_item(self.conn, url=f"https://e.com/t{i}", title=f"t{i}") for i in range(4)
+        ]
+        for i, item in enumerate(self.items):
+            db.save_score(self.conn, a_score(item.id, self.interest.id, 0.90 - i * 0.01))
+
+    def _feed(self, tokens):
+        reader = iter(tokens)
+        return lambda prompt="": next(reader)
+
+    def test_labeling_the_four_verdicts_writes_one_feedback_row_each(self):
+        rows_before = teach.build_queue(self.conn, limit=4)
+        codes = list(notify.FEEDBACK_VERDICTS)
+        code = teach.run_interactive(self.conn, limit=4, read=self._feed(codes))
+        self.assertEqual(code, 0)
+        feedback_rows = self.conn.execute(
+            "SELECT item_id, interest_id, verdict, original_score FROM feedback ORDER BY id"
+        ).fetchall()
+        self.assertEqual(len(feedback_rows), 4)
+        for expected, verdict, fb in zip(rows_before, codes, feedback_rows):
+            self.assertEqual(fb["item_id"], expected["item_id"])
+            self.assertEqual(fb["interest_id"], expected["interest_id"])
+            self.assertEqual(fb["verdict"], verdict)
+            self.assertAlmostEqual(fb["original_score"], expected["final_score"])
+
+    def test_skip_writes_nothing_quit_stops_early(self):
+        code = teach.run_interactive(self.conn, limit=4, read=self._feed(["s", "q"]))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 0)
+        self.assertEqual(len(teach.build_queue(self.conn, limit=10)), 4)
+
+    def test_an_unrecognized_token_reprompts_instead_of_crashing(self):
+        code = teach.run_interactive(self.conn, limit=1, read=self._feed(["bogus", "fire"]))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1)
+
+    def test_eof_from_the_reader_exits_cleanly_with_zero(self):
+        def raise_eof(prompt=""):
+            raise EOFError
+
+        code = teach.run_interactive(self.conn, limit=4, read=raise_eof)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 0)
+
+    def test_a_labeled_item_is_absent_from_the_next_build_queue(self):
+        teach.run_interactive(self.conn, limit=1, read=self._feed(["fire"]))
+        remaining = {row["item_id"] for row in teach.build_queue(self.conn, limit=10)}
+        self.assertEqual(len(remaining), 3)
+
+    def test_an_item_labeled_via_the_telegram_listener_is_also_excluded(self):
+        score_id = self.conn.execute(
+            "SELECT id FROM scores WHERE item_id = ?", (self.items[0].id,)
+        ).fetchone()["id"]
+        callback = {"id": "cb1", "data": f"fb:up:{score_id}", "message": {"chat": {"id": 1}}}
+        with mock.patch.object(feedback_listener, "api_call"):
+            self.assertTrue(feedback_listener._handle_callback(self.conn, "tok", callback))
+        remaining = {row["item_id"] for row in teach.build_queue(self.conn, limit=10)}
+        self.assertNotIn(self.items[0].id, remaining)
+
+
+class TeachIsolationTests(unittest.TestCase):
+    """Labeling must grow `feedback` and touch nothing else -- no
+    `notifications` row (that table drives delivery accounting, not
+    teaching), no `metrics`/`service_state` write, no `scores`/
+    `candidate_items` mutation."""
+
+    TABLES = ("notifications", "metrics", "service_state", "scores", "candidate_items")
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        db.upsert_interest(self.conn, an_interest())
+        interest = db.interest_by_key(self.conn, "k")
+        self.items = [
+            stored_item(self.conn, url=f"https://e.com/i{i}", title=f"i{i}") for i in range(3)
+        ]
+        for item in self.items:
+            db.save_score(self.conn, a_score(item.id, interest.id, 0.9))
+
+    def _snapshot(self):
+        return {t: [tuple(r) for r in self.conn.execute(f"SELECT * FROM {t}").fetchall()]
+                for t in self.TABLES}
+
+    def test_a_full_run_only_grows_feedback(self):
+        before = self._snapshot()
+        reader = iter(["fire", "s", "q"])
+        teach.run_interactive(self.conn, limit=3, read=lambda prompt="": next(reader))
+        after = self._snapshot()
+        self.assertEqual(before, after)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1)
+
+
+class TeachDegenerateTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def _no_read(self, prompt=""):
+        raise AssertionError("an empty pool must never prompt for input")
+
+    def test_an_empty_pool_exits_cleanly_everywhere(self):
+        self.assertEqual(teach.build_queue(self.conn), [])
+        self.assertEqual(teach.run_interactive(self.conn, read=self._no_read), 0)
+        metrics = teach.queue_metrics(self.conn)
+        self.assertEqual(metrics["pool_size"], 0)
+        self.assertIn("nothing to teach on", teach.format_queue([]))
+        self.assertIn("nothing to teach on", teach.format_metrics(metrics))
+
+    def test_an_unknown_interest_key_behaves_like_an_empty_pool(self):
+        db.upsert_interest(self.conn, an_interest())
+        item = stored_item(self.conn)
+        db.save_score(self.conn, a_score(item.id, db.interest_by_key(self.conn, "k").id, 0.9))
+        self.assertEqual(teach.build_queue(self.conn, interest="nope"), [])
+
+    def test_a_pool_smaller_than_the_limit_returns_the_whole_pool(self):
+        db.upsert_interest(self.conn, an_interest())
+        item = stored_item(self.conn)
+        db.save_score(self.conn, a_score(item.id, db.interest_by_key(self.conn, "k").id, 0.9))
+        self.assertEqual(len(teach.build_queue(self.conn, limit=10)), 1)
+
+
 class FakeCDPConnection:
     """Stands in for cdp.CDPConnection. `replies` feeds the completion calls in
     order: a string/dict is returned as-is, an Exception is raised. Create and
@@ -2806,6 +3006,96 @@ class CLITests(unittest.TestCase):
             line.split("'")[1] for line in out.splitlines() if line.strip().startswith("'t")
         ]
         self.assertEqual(listed_keys, [f"t{i}" for i in range(10)])
+
+
+class TeachCLITests(unittest.TestCase):
+    """`python -m app teach` wiring: --list/--explain, provider isolation,
+    the interactive default, and --send reusing the existing Telegram flow
+    end to end (see FeedbackListenerTests for the flow it reuses)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = os.path.join(self.tmp.name, "t.db")
+        conn = db.connect(self.db_path)
+        db.init(conn)
+        db.upsert_interest(conn, an_interest())
+        interest = db.interest_by_key(conn, "k")
+        item = stored_item(conn)
+        db.save_score(conn, a_score(item.id, interest.id, 0.8))
+        conn.close()
+
+    def _main(self, *argv, read_inputs=None):
+        import contextlib
+
+        from discovery.__main__ import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(out))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            if read_inputs is not None:
+                stack.enter_context(mock.patch("builtins.input", side_effect=iter(read_inputs)))
+            code = main(["--db", self.db_path, *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_list_prints_the_ranked_queue_and_exits_zero(self):
+        code, out, _err = self._main("teach", "--list")
+        self.assertEqual(code, 0)
+        self.assertIn("queued item(s)", out)
+
+    def test_explain_prints_queue_metrics_and_exits_zero(self):
+        code, out, _err = self._main("teach", "--explain")
+        self.assertEqual(code, 0)
+        self.assertIn("pool_size=", out)
+        self.assertIn("band_lift", out)
+
+    def test_teach_never_constructs_a_provider(self):
+        with mock.patch.object(
+            providers, "get_provider", side_effect=AssertionError("must not build a provider")
+        ):
+            code, _out, _err = self._main("teach", "--list")
+        self.assertEqual(code, 0)
+
+    def test_interactive_default_records_a_label_via_the_injected_reader(self):
+        code, _out, _err = self._main("teach", "--limit", "1", read_inputs=["fire"])
+        self.assertEqual(code, 0)
+        conn = db.connect(self.db_path)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1)
+
+    def test_send_reuses_format_message_and_the_feedback_keyboard(self):
+        sent = []
+
+        def fake_send(cfg, text, reply_markup=None, dry_run=False):
+            sent.append((text, reply_markup))
+            return True
+
+        with mock.patch.object(notify, "send", side_effect=fake_send):
+            code, _out, _err = self._main("teach", "--send", "--limit", "1")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sent), 1)
+        text, markup = sent[0]
+        self.assertIn("DISCOVERY", text)
+        callback_datas = [b["callback_data"] for row in markup["inline_keyboard"] for b in row]
+        self.assertEqual(len(callback_datas), 4)
+        score_id = callback_datas[0].split(":")[2]
+        self.assertTrue(all(cd.endswith(f":{score_id}") for cd in callback_datas))
+
+        # Proof the send path reuses the existing flow, not a new one: feed
+        # one of those exact payloads into the real listener callback.
+        callback = {"id": "cb", "data": callback_datas[0], "message": {"chat": {"id": 1}}}
+        conn = db.connect(self.db_path)
+        self.addCleanup(conn.close)
+        with mock.patch.object(feedback_listener, "api_call"):
+            self.assertTrue(feedback_listener._handle_callback(conn, "tok", callback))
+        self.assertEqual(conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1)
+
+    def test_dry_run_send_never_touches_the_network(self):
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            code, _out, _err = self._main("--dry-run", "teach", "--send")
+        self.assertEqual(code, 0)
+        urlopen.assert_not_called()
 
 
 class CLIPrintSafetyTests(unittest.TestCase):

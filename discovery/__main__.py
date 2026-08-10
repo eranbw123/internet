@@ -20,6 +20,8 @@
     health        job staleness, provider reachability, pending sends;
                   --notify alerts on degraded/recovery (rate-limited)
     personal-state  print the ai repo's personal-state contract artifact
+    teach         rank scored-but-unlabeled items by expected information
+                  value and record labels; --list/--explain/--send
 
 There is no `run`/scheduler loop -- an OS scheduler (see
 ops/install_tasks.py) calls the commands above on their own cadence instead;
@@ -32,7 +34,7 @@ from collections import Counter
 
 from datetime import datetime, timezone
 
-from . import config, db, feedback_listener, health, interests, personal_state, providers, stats
+from . import config, db, feedback_listener, health, interests, personal_state, providers, stats, teach
 from .collectors import COLLECTORS
 from .models import CandidateItem
 from .notify import FEEDBACK_VERDICTS, print_safe
@@ -95,6 +97,15 @@ def main(argv=None):
         "personal-state", help="print the ai repo's personal-state contract artifact"
     )
     ps.add_argument("--path", help="override DISCOVERY_PERSONAL_STATE / cfg.personal_state_path")
+    te = sub.add_parser(
+        "teach", help="rank scored-but-unlabeled items by expected information value"
+    )
+    te.add_argument("--limit", type=int, help="default 10, or 5 for --send")
+    te.add_argument("--interest", help="restrict to one interest key")
+    mode = te.add_mutually_exclusive_group()
+    mode.add_argument("--list", action="store_true", help="print the ranked queue and exit")
+    mode.add_argument("--explain", action="store_true", help="print queue_metrics and exit")
+    mode.add_argument("--send", action="store_true", help="push the top items to Telegram")
 
     args = parser.parse_args(argv)
     cfg = config.load()
@@ -179,6 +190,8 @@ def _dispatch(conn, cfg, args, provider):
         return _health_cmd(conn, cfg, provider(), args)
     elif args.command == "personal-state":
         return _personal_state(cfg, args)
+    elif args.command == "teach":
+        return _teach_cmd(conn, cfg, args)
     return 0
 
 
@@ -371,6 +384,25 @@ def _personal_state(cfg, args):
     for topic in state.topics[:10]:
         print_safe(f"  {topic.get('key')!r}  weight={topic.get('weight')}")
     return 0
+
+
+def _teach_cmd(conn, cfg, args):
+    """No provider() call anywhere on this path -- `teach` stays in the
+    no-provider command family alongside `items`/`feedback`/`stats`."""
+    limit = args.limit if args.limit is not None else (5 if args.send else 10)
+    if args.list:
+        print_safe(teach.format_queue(teach.build_queue(conn, limit, args.interest)))
+        return 0
+    if args.explain:
+        print_safe(teach.format_metrics(teach.queue_metrics(conn, limit, args.interest)))
+        return 0
+    if args.send:
+        teach.run_send(conn, cfg, limit, args.interest, dry_run=args.dry_run)
+        return 0
+    # `input` looked up here, not as teach.run_interactive's bound default --
+    # a default value is captured once at import time, so patching
+    # builtins.input in a test would never reach it.
+    return teach.run_interactive(conn, limit, args.interest, read=input)
 
 
 if __name__ == "__main__":

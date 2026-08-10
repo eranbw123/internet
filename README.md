@@ -58,6 +58,7 @@ a long-lived session.
 | `stats [--days N]` | Funnel, feedback rates, estimated cost and a HEALTH section — see [Stats](#stats) |
 | `health [--notify]` | Job staleness, provider reachability, pending/abandoned sends; `--notify` alerts on degraded/recovery, rate-limited |
 | `personal-state [--path]` | Print the sibling `ai` repo's personal-state artifact as this repo would read it — see [Personal-state contract](#personal-state-contract) |
+| `teach [--list\|--explain\|--send]` | Label the highest information-value scored-but-unlabeled items — see [Teach](#teach) |
 
 Run it from the repo root — the `stocks` collector imports `watch.py`.
 `python -m app` and `python -m discovery` are the same CLI. Global flags
@@ -328,6 +329,27 @@ fed back into its scoring prompt as worked examples; nothing retrains or
 re-ranks automatically. `python -m app stats` is where the feedback earns its
 keep — it's what tells you whether the score tracks your verdicts.
 
+## Teach
+
+```bash
+python -m app teach                          # interactive: label the highest-value queue
+python -m app teach --list                   # print the ranked queue, no prompting
+python -m app teach --explain --limit 20      # ranker vs recency-baseline readout
+python -m app teach --send --dry-run          # push top items to Telegram (prints instead of sending)
+```
+
+Labeling everything scored is slow, and not every label teaches equally.
+`teach` ranks already-scored, not-yet-labeled items by expected information
+value — bar proximity, model self-uncertainty, and interest label scarcity
+(see `discovery/teach.py`'s docstring for the formula) — and records verdicts
+through the exact same `db.add_feedback` call the Telegram buttons use.
+`--send` pushes the top of the queue to Telegram instead, reusing
+`notify.format_message`/`feedback_keyboard`, so those labels come back
+through the existing `listen`/`listen --drain` flow. `--explain` is the
+acceptance-evidence command: it reports the ranked queue's `band_share` /
+`mean_gap` / `mean_confidence` / `interests_covered` against the same pool
+ordered by recency, honestly — including if recency wins.
+
 ## Stats
 
 ```bash
@@ -439,6 +461,6 @@ logs.
 python test_discovery.py
 ```
 
-252 tests, network fully stubbed — they never hit an LLM API, Telegram, or
+271 tests, network fully stubbed — they never hit an LLM API, Telegram, or
 Yahoo. The provider seam is the whole stub: a fake object with `complete_json`
 and `search_json`.
