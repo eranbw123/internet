@@ -152,7 +152,16 @@ def _exploration(conn, since, cfg):
     above so exploitation quality is never diluted by exploration noise.
     Printed only when there's something to show (an explore_* metric row, a
     non-owner interest row, or the flag on); a report with none of that is
-    byte-identical to before this section existed."""
+    byte-identical to before this section existed.
+
+    The two halves below read differently on purpose right now: "explore:
+    notified" only ever grows from pipeline.deliver()'s ALERT path (the
+    only caller that passes lane_counts today); a DISCOVERY item sent via
+    `digest` -> send_digest() bumps no funnel metric at all (true for
+    exploitation too, unchanged from before this step). The per-derived-
+    interest table below it is queried straight off the notifications
+    table, so it shows every send regardless of channel. Until digest-time
+    metrics exist, "explore: notified" undercounts what the table shows."""
     m = {
         row["name"]: row["n"]
         for row in conn.execute(
@@ -185,6 +194,10 @@ def _feedback(conn, since):
     ).fetchall()
     counts = {row["verdict"]: row["n"] for row in rows}
     total = sum(counts.values())
+    # Deliberately NOT restricted to layer='owner' like _funnel()'s notified
+    # scalar above -- the 🔥/👍/👎/🗑 buttons work the same on a derived
+    # notification as an owner one, so "% of sent" is honestly a rate over
+    # every push that could have been rated, exploit and explore alike.
     sent = _scalar(
         conn, "SELECT COUNT(*) FROM notifications WHERE ok = 1 AND sent_at >= ?", (since,)
     )
@@ -278,6 +291,9 @@ def _cost(conn, since, days):
         total += token_cost + search_cost
 
     if priced_rows:
+        # Also deliberately lane-agnostic (see _feedback()'s comment above):
+        # spend isn't tracked per interest/lane at all, so "per notification"
+        # is honestly total spend over every push, not an owner-only rate.
         notified = _scalar(
             conn, "SELECT COUNT(*) FROM notifications WHERE ok = 1 AND sent_at >= ?", (since,)
         )

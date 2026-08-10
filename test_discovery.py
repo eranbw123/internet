@@ -3136,40 +3136,60 @@ class ExplorationLaneTests(unittest.TestCase):
     # --- backlog lane fairness ---------------------------------------------------
 
     def test_backlog_lane_fairness_zero_explore_budget_still_drains_owner(self):
-        cfg = dataclasses.replace(self.cfg, explore_max_scores_per_cycle=0)
-        owner_item = stored_item(self.conn, url="https://e.com/owner-b", title="Owner item 9")
-        db.set_prefilter(self.conn, owner_item.id, True, "ok")
-        explore_item = stored_item(
-            self.conn, url="https://e.com/explore-b",
-            title="Exclusive zeta research finding 9",
-        )
-        db.set_prefilter(self.conn, explore_item.id, True, "ok")
+        # Owner rows inserted first (lower ids); explore rows inserted after
+        # (higher ids, so they sort newest-first) and outnumber the exploit
+        # budget -- a fixture with 1-of-each can't distinguish a correct
+        # per-lane page from a single `ORDER BY id DESC LIMIT
+        # budget+explore_budget` pass that happens to land entirely on the
+        # unbudgeted lane and never even reaches the owner rows.
+        cfg = dataclasses.replace(self.cfg, explore_max_scores_per_cycle=0, max_scores_per_cycle=2)
+        owner_items = []
+        for n in range(3):
+            item = stored_item(self.conn, url=f"https://e.com/owner-b{n}", title=f"Owner item {n}")
+            db.set_prefilter(self.conn, item.id, True, "ok")
+            owner_items.append(item)
+        explore_items = []
+        for n in range(5):  # > the exploit budget (2), all newer than every owner row
+            item = stored_item(
+                self.conn, url=f"https://e.com/explore-b{n}",
+                title=f"Exclusive zeta research finding {n}",
+            )
+            db.set_prefilter(self.conn, item.id, True, "ok")
+            explore_items.append(item)
+
+        def scored_ids(items):
+            return {
+                item.id for item in items
+                if self.conn.execute(
+                    "SELECT 1 FROM scores WHERE item_id = ?", (item.id,)
+                ).fetchone()
+            }
 
         provider = FakeProvider({"Owner item": 0.9})
         with mock.patch.dict(COLLECTORS, {"fake": lambda i, c, p, conn=None: []}):
             summary = pipeline.run_once(self.conn, provider, cfg, dry_run=True)
-        self.assertEqual(summary["scored"], 1)
-        self.assertIsNone(
-            self.conn.execute(
-                "SELECT 1 FROM scores WHERE item_id = ?", (explore_item.id,)
-            ).fetchone()
-        )
-        unscored = self.conn.execute(
-            "SELECT title FROM candidate_items WHERE prefilter_ok = 1 AND id NOT IN"
-            " (SELECT item_id FROM scores)"
-        ).fetchall()
-        self.assertEqual([r["title"] for r in unscored], ["Exclusive zeta research finding 9"])
+        # The exploit budget (2) caps how many owner items land this cycle --
+        # the point being that it drains at all despite the newer, unbudgeted
+        # explore rows sitting on top of the backlog.
+        self.assertEqual(summary["scored"], 2)
+        self.assertEqual(len(scored_ids(owner_items)), 2)
+        self.assertEqual(scored_ids(explore_items), set())
 
-        # Next cycle, explore budget is back -- the skipped item is scored.
+        # Next cycle: raise the exploit budget so the remaining owner item
+        # drains too, still with explore budget at 0.
+        cfg2 = dataclasses.replace(cfg, max_scores_per_cycle=5)
+        with mock.patch.dict(COLLECTORS, {"fake": lambda i, c, p, conn=None: []}):
+            pipeline.run_once(self.conn, provider, cfg2, dry_run=True)
+        self.assertEqual(scored_ids(owner_items), {i.id for i in owner_items})
+        self.assertEqual(scored_ids(explore_items), set())
+
+        # Explore budget is back (self.cfg's cap of 2) -- skipped items are
+        # scored, never dropped.
         provider2 = FakeProvider({"Exclusive zeta research": 0.9})
         with mock.patch.dict(COLLECTORS, {"fake": lambda i, c, p, conn=None: []}):
             summary2 = pipeline.run_once(self.conn, provider2, self.cfg, dry_run=True)
-        self.assertEqual(summary2["scored"], 1)
-        self.assertIsNotNone(
-            self.conn.execute(
-                "SELECT 1 FROM scores WHERE item_id = ?", (explore_item.id,)
-            ).fetchone()
-        )
+        self.assertEqual(summary2["scored"], 2)
+        self.assertEqual(len(scored_ids(explore_items)), 2)
 
     # --- classification ------------------------------------------------------
 

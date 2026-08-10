@@ -433,9 +433,18 @@ and a new explore one (`explore_max_scores_per_cycle`, env
 if cfg.dynamic_interests else 0)`, so the flag off makes it structurally
 zero, not merely filtered. `ingest()`'s `explore_budget=None` kwarg default
 preserves every pre-existing caller (`score`, `teach`, tests) untouched.
-`_score_backlog()` takes both budgets, LIMITs on their sum, and `continue`s
-(not `break`s) past an exhausted lane's rows so the other lane keeps
-draining. `Outcome.lane` (default 'exploit') drives `db.bump()`'s metric
+`_score_backlog()` takes both budgets and pages through the backlog with an
+id cursor (repair: a single `ORDER BY id DESC LIMIT budget+explore_budget`
+select could permanently starve the exploit lane -- lane is only known
+after fetching+matching a row, so a batch that happened to be entirely
+explore-classified while explore_budget was 0/spent would `continue` past
+every row and return with the exploit backlog never even reached, and
+since a lane-blocked item is deferred rather than attempted it re-occupies
+that same newest-first window on every future cycle too); each page still
+`continue`s (not `break`s) past an exhausted lane's rows so the other lane
+keeps draining, and paging stops once both budgets are spent or a page
+returns fewer rows than requested (backlog exhausted). `Outcome.lane`
+(default 'exploit') drives `db.bump()`'s metric
 name (`explore_<stage>` vs `<stage>`; 'collected' stays unprefixed --
 collection is always owner-driven since a derived row's `sources` is always
 `[]`) at all three per-item/trailing bump sites. `deliver()`/`send_digest()`

@@ -237,41 +237,61 @@ def _score(conn, provider, item, matches, detail="", lane="exploit"):
 
 
 def _score_backlog(conn, provider, interests, budget, explore_budget=None):
-    """Newest first and capped by whatever budget each lane has left this
-    cycle (LIMIT is the sum of both). Without the cap a persistent scoring
-    failure would re-attempt every unscored item ever stored, on every
-    cycle, forever. Items whose last scoring attempt failed recently are
-    skipped until the cool-off passes (never dropped) -- a provider outage
-    otherwise re-fails the whole backlog every cycle.
+    """Newest first, paged in batches sized to whatever budget each lane has
+    left this cycle. Without a cap a persistent scoring failure would
+    re-attempt every unscored item ever stored, on every cycle, forever.
+    Items whose last scoring attempt failed recently are skipped until the
+    cool-off passes (never dropped) -- a provider outage otherwise re-fails
+    the whole backlog every cycle.
+
+    A single SELECT ... LIMIT <sum of both budgets> is NOT enough: lane is
+    only known after fetching+matching a row, so a batch that happens to be
+    all one lane (e.g. the newest rows are all explore-classified while
+    explore_budget is 0/spent) would `continue` past every row and return
+    with the exploit budget untouched and the exploit backlog never
+    reached -- a real, not transient, starvation, since a lane-blocked
+    backlog item is deferred, not attempted, and so keeps re-occupying the
+    newest-first window on every future cycle too. Paging with an id cursor
+    fixes this: a batch that makes no lane spend still advances the cursor,
+    so the next page reaches older rows (which may belong to the
+    unstarved lane) instead of re-fetching the same stuck rows forever.
 
     Returns a Counter of items actually scored per lane. One lane running
     out never stops the other from draining: an exhausted lane's items are
     skipped (`continue`), not a `break` of the whole pass."""
     scored = Counter()
-    limit = budget.remaining + (explore_budget.remaining if explore_budget is not None else 0)
-    if limit <= 0:
-        return scored
-    rows = conn.execute(
-        """
-        SELECT id FROM candidate_items
-        WHERE prefilter_ok = 1
-          AND NOT EXISTS (SELECT 1 FROM scores s WHERE s.item_id = candidate_items.id)
-          AND (score_attempted_at IS NULL OR score_attempted_at < ?)
-        ORDER BY id DESC LIMIT ?
-        """,
-        (db.ago(db.SCORE_RETRY_SECONDS), limit),
-    ).fetchall()
-    for row in rows:
-        item = db.get_item(conn, row["id"])
-        matches = matching.match_interests(item, interests)
-        if not matches:
-            continue
-        lane = classify_lane(matches)
-        lane_budget = explore_budget if lane == "explore" else budget
-        if lane_budget is not None and not lane_budget.spend():
-            continue  # this lane is out for the cycle -- let the other lane keep draining
-        if _score(conn, provider, item, matches, lane=lane).stage == "scored":
-            scored[lane] += 1
+    cursor_id = None
+    while budget.remaining > 0 or (explore_budget is not None and explore_budget.remaining > 0):
+        batch_limit = budget.remaining + (explore_budget.remaining if explore_budget is not None else 0)
+        if batch_limit <= 0:
+            break
+        rows = conn.execute(
+            """
+            SELECT id FROM candidate_items
+            WHERE prefilter_ok = 1
+              AND NOT EXISTS (SELECT 1 FROM scores s WHERE s.item_id = candidate_items.id)
+              AND (score_attempted_at IS NULL OR score_attempted_at < ?)
+              AND (? IS NULL OR id < ?)
+            ORDER BY id DESC LIMIT ?
+            """,
+            (db.ago(db.SCORE_RETRY_SECONDS), cursor_id, cursor_id, batch_limit),
+        ).fetchall()
+        if not rows:
+            break
+        cursor_id = rows[-1]["id"]  # oldest id fetched this page -- next page starts below it
+        for row in rows:
+            item = db.get_item(conn, row["id"])
+            matches = matching.match_interests(item, interests)
+            if not matches:
+                continue
+            lane = classify_lane(matches)
+            lane_budget = explore_budget if lane == "explore" else budget
+            if lane_budget is not None and not lane_budget.spend():
+                continue  # this lane is out for the cycle -- let the other lane keep draining
+            if _score(conn, provider, item, matches, lane=lane).stage == "scored":
+                scored[lane] += 1
+        if len(rows) < batch_limit:
+            break  # fewer rows than asked for -- the eligible backlog is exhausted
     return scored
 
 
@@ -319,7 +339,11 @@ def send_digest(conn, cfg, dry_run=False, lane_counts=None):
     notification_ready()'s order), capped at cfg.digest_max_items. Anything
     past the cap simply stays pending for tomorrow's digest -- it was never
     marked notified. Alerts are never touched here; deliver() already sent
-    them. `lane_counts`: see deliver()."""
+    them. `lane_counts`: see deliver() -- no caller passes one today (the
+    `digest` CLI command bumps no funnel metric at all, same as before this
+    step), so a digest send never increments notified/explore_notified; the
+    parameter exists so a future caller that does want that split doesn't
+    need a signature change to get it."""
     sent = 0
     for row, item, interest in notification_ready(conn, cfg):
         if notify.is_alert(item):
