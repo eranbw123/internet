@@ -26,6 +26,7 @@ from discovery import (
     dedup,
     feedback_listener,
     health,
+    interest_state,
     interests,
     matching,
     models,
@@ -551,6 +552,84 @@ class DBTests(unittest.TestCase):
         # A live retry candidate (under the cap) is not "abandoned".
         self.assertEqual(db.abandoned_notifications(self.conn, max_attempts=10), 0)
 
+    # --- layered interest state: owner immutability + provenance -----------
+
+    def test_owner_row_survives_a_derived_write_attempt_by_key_collision(self):
+        """Structurally impossible in production (interests.load_file()
+        rejects an owner key carrying DERIVED_KEY_PREFIX), but guarded here
+        too -- upsert_derived_interest() refuses a non-prefixed key outright."""
+        db.upsert_interest(self.conn, an_interest(key="owner1"))
+        with self.assertRaises(ValueError):
+            db.upsert_derived_interest(
+                self.conn, an_interest(key="owner1", layer="inferred"), {}
+            )
+        stored = db.interest_by_key(self.conn, "owner1")
+        self.assertEqual(stored.layer, "owner")
+
+    def test_set_interest_layer_refuses_an_owner_row(self):
+        db.upsert_interest(self.conn, an_interest(key="owner1"))
+        with self.assertRaises(db.OwnerInterestImmutable):
+            db.set_interest_layer(self.conn, "owner1", "inferred", {})
+        self.assertEqual(db.interest_by_key(self.conn, "owner1").layer, "owner")
+
+    def test_set_interest_layer_refuses_a_key_that_does_not_exist(self):
+        with self.assertRaises(db.OwnerInterestImmutable):
+            db.set_interest_layer(self.conn, "derived:nope", "emerging", {})
+
+    def test_the_owner_layer_trigger_aborts_a_raw_update(self):
+        db.upsert_interest(self.conn, an_interest(key="owner1"))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("UPDATE interests SET layer = 'inferred' WHERE key = 'owner1'")
+        self.assertEqual(db.interest_by_key(self.conn, "owner1").layer, "owner")
+
+    def test_the_owner_delete_trigger_aborts_a_raw_delete(self):
+        db.upsert_interest(self.conn, an_interest(key="owner1"))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("DELETE FROM interests WHERE key = 'owner1'")
+        self.assertIsNotNone(db.interest_by_key(self.conn, "owner1"))
+
+    def test_upsert_derived_interest_round_trips_layer_and_provenance(self):
+        interest = an_interest(
+            key="derived:gizmo", title="gizmo", positive_signals=["gizmo"], layer="exploratory"
+        )
+        db.upsert_derived_interest(self.conn, interest, {"source": "corpus", "term": "gizmo"})
+        stored = db.interest_by_key(self.conn, "derived:gizmo")
+        self.assertEqual(stored.layer, "exploratory")
+        self.assertEqual(stored.provenance, {"source": "corpus", "term": "gizmo"})
+        row = self.conn.execute(
+            "SELECT active FROM interests WHERE key = 'derived:gizmo'"
+        ).fetchone()
+        self.assertEqual(row["active"], 0)   # exploratory never spends provider budget
+
+    def test_upsert_derived_interest_inferred_is_active(self):
+        interest = an_interest(key="derived:gizmo", layer="inferred", min_score=0.8)
+        db.upsert_derived_interest(self.conn, interest, {})
+        row = self.conn.execute(
+            "SELECT active FROM interests WHERE key = 'derived:gizmo'"
+        ).fetchone()
+        self.assertEqual(row["active"], 1)
+
+    def test_interest_events_is_append_only_and_ordered(self):
+        db.add_interest_event(self.conn, "derived:x", "automation", "enter", None, "exploratory", {"observations": 1})
+        db.add_interest_event(self.conn, "derived:x", "automation", "promote", "exploratory", "emerging", {"observations": 5})
+        events = db.interest_events(self.conn, "derived:x")
+        self.assertEqual([e["action"] for e in events], ["enter", "promote"])
+        self.assertEqual(events[0]["to_layer"], "exploratory")
+        self.assertEqual(events[1]["evidence"], {"observations": 5})
+        self.assertEqual(db.interest_events(self.conn, "derived:nothing-here"), [])
+
+    def test_list_interests_filters_by_layer_and_puts_owner_first(self):
+        db.upsert_interest(self.conn, an_interest(key="owner1"))
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:x", layer="exploratory"), {}
+        )
+        keys = [r["key"] for r in db.list_interests(self.conn)]
+        self.assertEqual(keys, ["owner1", "derived:x"])
+        self.assertEqual(
+            [r["key"] for r in db.list_interests(self.conn, layer="exploratory")], ["derived:x"]
+        )
+        self.assertEqual(db.list_interests(self.conn, layer="inferred"), [])
+
 
 class StatsTests(unittest.TestCase):
     def setUp(self):
@@ -887,6 +966,21 @@ class InterestsFileTests(unittest.TestCase):
         self.assertEqual(with_state, no_state)
         self.assertEqual(with_state, plain)
 
+    def test_an_owner_key_carrying_the_derived_prefix_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._load({"interests": [{"key": "derived:x", "title": "X"}]})
+        self.assertIn("derived:x", str(ctx.exception))
+
+    def test_load_blocked_reads_the_optional_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "i.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"interests": [], "blocked_derived_terms": ["spam", "clickbait"]}, fh)
+            self.assertEqual(interests.load_blocked(path), ["spam", "clickbait"])
+
+    def test_load_blocked_defaults_to_empty_list_when_absent(self):
+        self.assertEqual(interests.load_blocked("interests.json"), [])
+
 
 class PersonalStateTests(unittest.TestCase):
     def _write(self, data):
@@ -978,6 +1072,384 @@ class PersonalStateTests(unittest.TestCase):
         with self.assertRaises(PersonalStateError):
             personal_state.load(missing_key)
         self.assertIsNone(personal_state.load_optional(missing_key))
+
+
+NOW = datetime(2026, 8, 10, tzinfo=timezone.utc)
+FRESH = (NOW - timedelta(days=1)).isoformat(timespec="seconds")
+STALE = (NOW - timedelta(days=40)).isoformat(timespec="seconds")
+
+
+class InterestStateDecideTests(unittest.TestCase):
+    """decide() is pure -- no DB, no clock of its own -- so the whole ladder
+    is exercised as a table, current_layer/evidence/blocked in, Transition
+    (or None) out."""
+
+    RULES = interest_state.Rules()
+
+    CASES = [
+        ("absent, never observed -> stays absent",
+         None, dict(observations=0), False, None),
+        ("absent, observed once -> enters exploratory",
+         None, dict(observations=1, last_seen=FRESH), False, ("exploratory", "enter")),
+        ("absent, blocked -> never enters even though observed",
+         None, dict(observations=9, last_seen=FRESH), True, None),
+        ("exploratory, below the observation bar -> stays",
+         "exploratory", dict(observations=4, distinct_days=3, last_seen=FRESH), False, None),
+        ("exploratory, below the distinct-day bar -> stays",
+         "exploratory", dict(observations=5, distinct_days=2, last_seen=FRESH), False, None),
+        ("exploratory, both bars cleared -> promotes to emerging",
+         "exploratory", dict(observations=5, distinct_days=3, last_seen=FRESH), False,
+         ("emerging", "promote")),
+        ("emerging, feedback bar not cleared -> stays",
+         "emerging", dict(observations=5, distinct_days=3, positive_feedback=1,
+                           negative_feedback=0, last_seen=FRESH), False, None),
+        ("emerging, feedback tied (not strictly positive) -> stays",
+         "emerging", dict(observations=5, distinct_days=3, positive_feedback=2,
+                           negative_feedback=2, last_seen=FRESH), False, None),
+        ("emerging, observation bar regressed even with feedback -> stays",
+         "emerging", dict(observations=4, distinct_days=3, positive_feedback=5,
+                           negative_feedback=0, last_seen=FRESH), False, None),
+        ("emerging, every bar cleared -> promotes to inferred",
+         "emerging", dict(observations=5, distinct_days=3, positive_feedback=2,
+                           negative_feedback=0, last_seen=FRESH), False,
+         ("inferred", "promote")),
+        ("inferred, nothing above it and still fresh -> stays",
+         "inferred", dict(observations=5, distinct_days=3, last_seen=FRESH), False, None),
+        ("inferred, idle -> decays one rung to emerging",
+         "inferred", dict(last_seen=STALE), False, ("emerging", "decay")),
+        ("emerging, idle -> decays one rung to exploratory",
+         "emerging", dict(last_seen=STALE), False, ("exploratory", "decay")),
+        ("exploratory, idle -> decays to retired",
+         "exploratory", dict(last_seen=STALE), False, ("retired", "decay")),
+        ("exploratory, never actually observed this evidence -> treated as idle",
+         "exploratory", dict(last_seen=None), False, ("retired", "decay")),
+        ("exploratory, negative feedback dominates -> immediate retire",
+         "exploratory", dict(negative_feedback=3, positive_feedback=0, last_seen=FRESH), False,
+         ("retired", "retire_negative_feedback")),
+        ("inferred, negative feedback dominates -> immediate retire even though active",
+         "inferred", dict(negative_feedback=3, positive_feedback=1, last_seen=FRESH), False,
+         ("retired", "retire_negative_feedback")),
+        ("inferred, negative feedback at the bar but not dominant -> stays",
+         "inferred", dict(negative_feedback=3, positive_feedback=3, last_seen=FRESH), False, None),
+        ("retired, re-entry evidence below the anti-flap multiplier -> stays retired",
+         "retired", dict(observations=9), False, None),
+        ("retired, re-entry evidence clears the multiplier -> re-enters at exploratory",
+         "retired", dict(observations=10), False, ("exploratory", "reentry")),
+        ("exploratory, blocked -> retired",
+         "exploratory", dict(last_seen=FRESH), True, ("retired", "retire_blocked")),
+        ("retired, blocked -> stays retired, no duplicate event",
+         "retired", dict(observations=100), True, None),
+    ]
+
+    def test_the_ladder(self):
+        for name, current_layer, evidence_kwargs, blocked, expected in self.CASES:
+            with self.subTest(name):
+                evidence = interest_state.Evidence(**evidence_kwargs)
+                transition = interest_state.decide(current_layer, evidence, self.RULES, NOW, blocked)
+                if expected is None:
+                    self.assertIsNone(transition, name)
+                else:
+                    to_layer, action = expected
+                    self.assertEqual((transition.to_layer, transition.action), (to_layer, action), name)
+                    self.assertEqual(transition.from_layer, current_layer)
+
+    def test_decide_never_emits_a_transition_into_owner(self):
+        """Never any transition to OWNER, from any state, ever."""
+        evidences = [
+            interest_state.Evidence(),
+            interest_state.Evidence(observations=100, distinct_days=50, last_seen=FRESH),
+            interest_state.Evidence(positive_feedback=10, negative_feedback=0, last_seen=FRESH),
+            interest_state.Evidence(negative_feedback=10, positive_feedback=0, last_seen=FRESH),
+            interest_state.Evidence(last_seen=STALE),
+        ]
+        for current_layer in (None, "exploratory", "emerging", "inferred", "retired"):
+            for evidence in evidences:
+                for blocked in (False, True):
+                    transition = interest_state.decide(current_layer, evidence, self.RULES, NOW, blocked)
+                    if transition is not None:
+                        self.assertNotEqual(transition.to_layer, "owner")
+
+    def test_personal_state_seed_evidence_can_never_promote_on_its_own(self):
+        """Zero observations (what a seed transition's Evidence carries) can
+        never clear the exploratory -> emerging bar by itself -- it may only
+        decay (never observed = stale), never promote."""
+        seeded = interest_state.Evidence()
+        transition = interest_state.decide("exploratory", seeded, self.RULES, NOW, blocked=False)
+        self.assertTrue(transition is None or transition.action != "promote")
+
+
+class InterestStateEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.rules = interest_state.Rules()
+
+    _counter = 0
+
+    def _item(self, title, days_ago=0):
+        InterestStateEvidenceTests._counter += 1
+        seen = (NOW - timedelta(days=days_ago)).isoformat(timespec="seconds")
+        item = normalize.normalize(an_item(title=title, url=f"https://e.com/{self._counter}"))
+        self.conn.execute(
+            "INSERT INTO candidate_items (source, type, title, text, url, dedup_key, url_hash,"
+            " title_hash, content_hash, first_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (item.source, item.type, item.title, item.text, item.url, item.dedup_key,
+             item.url_hash, item.title_hash, item.content_hash, seen),
+        )
+        self.conn.commit()
+
+    def test_gather_evidence_counts_observations_and_distinct_days(self):
+        self._item("Gizmo breakthrough announced", days_ago=1)
+        self._item("Another gizmo update lands", days_ago=1)
+        self._item("Gizmo momentum continues", days_ago=3)
+        evidence = interest_state.gather_evidence(self.conn, self.rules, NOW)
+        self.assertEqual(evidence["gizmo"].observations, 3)
+        self.assertEqual(evidence["gizmo"].distinct_days, 2)
+
+    def test_gather_evidence_excludes_owner_covered_terms(self):
+        db.upsert_interest(self.conn, an_interest(title="Gizmo watch", positive_signals=["gizmo"]))
+        self._item("Gizmo breakthrough announced", days_ago=1)
+        evidence = interest_state.gather_evidence(self.conn, self.rules, NOW)
+        self.assertNotIn("gizmo", evidence)
+
+    def test_gather_evidence_excludes_an_existing_non_retired_derived_term_but_not_a_retired_one(self):
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="exploratory"), {}
+        )
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:widget", layer="retired"), {}
+        )
+        self._item("Gizmo breakthrough announced", days_ago=1)
+        self._item("Widget breakthrough announced", days_ago=1)
+        evidence = interest_state.gather_evidence(self.conn, self.rules, NOW)
+        self.assertNotIn("gizmo", evidence)
+        self.assertIn("widget", evidence)   # retired terms are still reconsidered (re-entry)
+
+    def test_gather_evidence_ignores_items_outside_the_window(self):
+        self._item("Gizmo breakthrough announced", days_ago=200)
+        evidence = interest_state.gather_evidence(self.conn, self.rules, NOW)
+        self.assertNotIn("gizmo", evidence)
+
+    def test_gather_evidence_counts_feedback_on_matching_titles(self):
+        item = normalize.normalize(an_item(title="Gizmo breakthrough announced", url="https://e.com/g1"))
+        item.id = db.insert_item(self.conn, item)
+        db.add_feedback(self.conn, item.id, None, "up")
+        db.add_feedback(self.conn, item.id, None, "trash")
+        self._item("Gizmo momentum continues", days_ago=1)
+        evidence = interest_state.gather_evidence(self.conn, self.rules, NOW)
+        self.assertEqual(evidence["gizmo"].positive_feedback, 1)
+        self.assertEqual(evidence["gizmo"].negative_feedback, 1)
+
+    def test_gather_evidence_skips_a_verdict_outside_feedback_verdicts_rather_than_assuming_positive(self):
+        item = normalize.normalize(an_item(title="Gizmo breakthrough announced", url="https://e.com/g1"))
+        item.id = db.insert_item(self.conn, item)
+        db.add_feedback(self.conn, item.id, None, "not-a-real-verdict")
+        self._item("Gizmo momentum continues", days_ago=1)
+        evidence = interest_state.gather_evidence(self.conn, self.rules, NOW)
+        self.assertEqual(evidence["gizmo"].positive_feedback, 0)
+        self.assertEqual(evidence["gizmo"].negative_feedback, 0)
+
+    def test_gather_evidence_is_truncated_deterministically(self):
+        rules = dataclasses.replace(self.rules, max_candidates=1)
+        self._item("Gizmo news today", days_ago=1)
+        self._item("Gizmo update lands", days_ago=1)
+        self._item("Widget only mention here", days_ago=1)
+        evidence = interest_state.gather_evidence(self.conn, rules, NOW)
+        # "gizmo" (2 observations) beats every single-observation term.
+        self.assertEqual(list(evidence), ["gizmo"])
+
+
+class InterestStateApplyTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.cfg = dataclasses.replace(CFG, dynamic_interests=False)
+
+    def _seed_items(self, title, n, distinct_days=3):
+        for i in range(n):
+            day = i % distinct_days
+            seen = (NOW - timedelta(days=day)).isoformat(timespec="seconds")
+            self.conn.execute(
+                "INSERT INTO candidate_items (source, type, title, text, url, dedup_key,"
+                " url_hash, title_hash, content_hash, first_seen_at)"
+                " VALUES ('web_search', 'article', ?, 'body', ?, ?, ?, ?, NULL, ?)",
+                (title, f"https://e.com/{title}-{i}", f"k{title}-{i}", f"u{title}-{i}",
+                 f"t{title}-{i}", seen),
+            )
+        self.conn.commit()
+
+    def _positive_feedback(self, term, up=0, fire=0):
+        """Feedback rows on an item whose title contains `term` -- gathered
+        regardless of the evidence window (see interest_state._feedback_index)."""
+        item = normalize.normalize(an_item(title=f"{term} feedback item", url=f"https://fb/{term}"))
+        item.id = db.insert_item(self.conn, item)
+        for _ in range(up):
+            db.add_feedback(self.conn, item.id, None, "up")
+        for _ in range(fire):
+            db.add_feedback(self.conn, item.id, None, "fire")
+
+    def test_default_off_is_a_true_noop(self):
+        """Byte-identical to today with the flag off: no row, no query, no
+        write -- not just a filtered result."""
+        self._seed_items("Gizmo breakthrough", 10)
+        before = self.conn.execute("SELECT COUNT(*) c FROM interests").fetchone()["c"]
+        summary = interest_state.apply_transitions(self.conn, self.cfg)
+        after = self.conn.execute("SELECT COUNT(*) c FROM interests").fetchone()["c"]
+        self.assertEqual(summary, {
+            "enabled": False, "seeded": 0, "entered": 0, "promoted": 0,
+            "decayed": 0, "retired": 0, "reentered": 0, "capped": 0,
+        })
+        self.assertEqual(before, after)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM interest_events").fetchone()["c"], 0)
+
+    def test_a_fresh_term_enters_exploratory_then_needs_a_second_pass_to_promote(self):
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True)
+        # "Gizmo breakthrough" also seeds a "breakthrough" candidate; only
+        # "gizmo" is asserted on below, the point being one ladder rung per
+        # apply_transitions() call, not a specific candidate count.
+        self._seed_items("Gizmo breakthrough", 5, distinct_days=3)
+
+        first = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertGreaterEqual(first["entered"], 1)
+        self.assertEqual(first["promoted"], 0)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = 'derived:gizmo'").fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("exploratory", 0))
+
+        second = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertGreaterEqual(second["promoted"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = 'derived:gizmo'").fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("emerging", 0))
+
+        events = db.interest_events(self.conn, "derived:gizmo")
+        self.assertEqual([e["action"] for e in events], ["enter", "promote"])
+
+    def test_promotion_to_inferred_is_capped_and_recorded(self):
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True, derived_max_active=0)
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="emerging"), {}
+        )
+        self._seed_items("Gizmo breakthrough", 5, distinct_days=3)
+        self._positive_feedback("gizmo", up=1, fire=1)
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary["promoted"], 0)
+        self.assertEqual(summary["capped"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = 'derived:gizmo'").fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("emerging", 0))
+        events = db.interest_events(self.conn, "derived:gizmo")
+        self.assertEqual(events[-1]["action"], "promotion_capped")
+
+    def test_inferred_interest_carries_the_derived_min_score_floor(self):
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True, derived_min_score=0.9)
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="emerging"), {}
+        )
+        self._seed_items("Gizmo breakthrough", 5, distinct_days=3)
+        self._positive_feedback("gizmo", up=1, fire=1)   # clears the emerging -> inferred bar
+        interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        row = self.conn.execute(
+            "SELECT layer, active, min_score, positive_signals FROM interests WHERE key = 'derived:gizmo'"
+        ).fetchone()
+        self.assertEqual(row["layer"], "inferred")
+        self.assertEqual(row["active"], 1)
+        self.assertEqual(row["min_score"], 0.9)
+        self.assertEqual(json.loads(row["positive_signals"]), ["gizmo"])
+
+    def test_idle_derived_interest_decays_one_rung(self):
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True)
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="inferred"), {}
+        )
+        # upsert_derived_interest() always stamps last_observed_at = db.now()
+        # (real wall-clock); backdate it past decay_idle_days so this test's
+        # "idle" is genuine rather than an artifact of a fixed injected `now`.
+        stale = (NOW - timedelta(days=40)).isoformat(timespec="seconds")
+        self.conn.execute(
+            "UPDATE interests SET last_observed_at = ? WHERE key = 'derived:gizmo'", (stale,)
+        )
+        self.conn.commit()
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary["decayed"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = 'derived:gizmo'").fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("emerging", 0))
+
+    def test_a_freshly_written_derived_interest_is_not_immediately_idle(self):
+        """Regression: last_observed_at is the decay-staleness baseline for a
+        row with no corpus evidence this pass (see upsert_derived_interest's
+        docstring) -- a row written moments ago must not decay on its very
+        next re-evaluation just because it has no fresh window evidence."""
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True)
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="inferred"), {}
+        )
+        fresh = NOW.isoformat(timespec="seconds")
+        self.conn.execute(
+            "UPDATE interests SET last_observed_at = ? WHERE key = 'derived:gizmo'", (fresh,)
+        )
+        self.conn.commit()
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary["decayed"], 0)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = 'derived:gizmo'").fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("inferred", 1))
+
+    def test_blocked_term_already_tracked_is_retired(self):
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True)
+        path = os.path.join(tempfile.mkdtemp(), "interests.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"interests": [], "blocked_derived_terms": ["gizmo"]}, fh)
+        cfg = dataclasses.replace(cfg, interests_path=path)
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="exploratory"), {}
+        )
+        self._seed_items("Gizmo breakthrough", 5, distinct_days=3)
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary["retired"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = 'derived:gizmo'").fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("retired", 0))
+
+    def test_personal_state_seed_never_promotes_by_itself(self):
+        cfg = dataclasses.replace(
+            self.cfg, dynamic_interests=True,
+            personal_state_path=self._personal_state_artifact(["nocorpusterm"]),
+        )
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary["seeded"], 1)
+        row = self.conn.execute(
+            "SELECT layer, active FROM interests WHERE key = 'derived:nocorpusterm'"
+        ).fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("exploratory", 0))
+        # Pin last_observed_at to this test's own fixed clock -- production
+        # apply_transitions()'s `now` and db.upsert_derived_interest()'s
+        # db.now() are both real wall-clock and so agree, but here `now` is
+        # injected and fixed, so pin the row to match rather than lean on
+        # the sandbox's real clock happening to agree with NOW.
+        self.conn.execute(
+            "UPDATE interests SET last_observed_at = ? WHERE key = 'derived:nocorpusterm'",
+            (NOW.isoformat(timespec="seconds"),),
+        )
+        self.conn.commit()
+        # A second pass, same instant, no new corpus evidence: must never
+        # promote it (the hard requirement), and -- since no idle time has
+        # actually elapsed since the seed -- must not decay it either. Zero
+        # observations can only ever demote/hold, never advance the ladder.
+        summary2 = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary2["promoted"], 0)
+        row2 = self.conn.execute(
+            "SELECT layer FROM interests WHERE key = 'derived:nocorpusterm'"
+        ).fetchone()
+        self.assertEqual(row2["layer"], "exploratory")
+
+    def _personal_state_artifact(self, terms):
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "personal_state.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "contract_version": 1,
+                "generated_at": "2026-08-10T00:00:00Z",
+                "topics": [{"key": t, "weight": 1.0} for t in terms],
+            }, fh)
+        return path
 
 
 class ScoringTests(unittest.TestCase):
@@ -3006,6 +3478,154 @@ class CLITests(unittest.TestCase):
             line.split("'")[1] for line in out.splitlines() if line.strip().startswith("'t")
         ]
         self.assertEqual(listed_keys, [f"t{i}" for i in range(10)])
+
+    def test_interests_list_is_empty_before_init(self):
+        code, out, _err = self._main("interests")
+        self.assertEqual(code, 0)
+        self.assertIn("no interests", out)
+
+    def test_interests_why_on_an_owner_key_shows_the_sync_event(self):
+        path = self._interests_file('{"interests": [{"key": "x", "title": "X"}]}')
+        self._main("init", env={"DISCOVERY_INTERESTS": path})
+        code, out, _err = self._main("interests", "--why", "x")
+        self.assertEqual(code, 0)
+        self.assertIn("owner_sync", out)
+        self.assertIn("-> owner", out)
+
+    def test_interests_why_on_an_unknown_key_exits_cleanly(self):
+        code, _out, err = self._main("interests", "--why", "nope")
+        self.assertEqual(code, 2)
+        self.assertIn("no interest with key", err)
+
+    def test_interests_layer_filter(self):
+        path = self._interests_file('{"interests": [{"key": "x", "title": "X"}]}')
+        self._main("init", env={"DISCOVERY_INTERESTS": path})
+        code, out, _err = self._main("interests", "--layer", "owner")
+        self.assertEqual(code, 0)
+        self.assertIn("layer=owner", out)
+        code, out, _err = self._main("interests", "--layer", "inferred")
+        self.assertEqual(code, 0)
+        self.assertIn("no interests", out)
+
+    def test_interests_refresh_is_a_noop_when_the_flag_is_off(self):
+        code, out, _err = self._main("interests", "--refresh")
+        self.assertEqual(code, 0)
+        self.assertIn("dynamic interests are off", out)
+
+    def test_interests_refresh_runs_apply_transitions_when_the_flag_is_on(self):
+        code, out, _err = self._main(
+            "interests", "--refresh", env={"DISCOVERY_DYNAMIC_INTERESTS": "1"}
+        )
+        self.assertEqual(code, 0)
+        self.assertIn('"enabled": true', out)
+
+    def test_interests_refresh_with_a_missing_interests_file_exits_cleanly(self):
+        missing = os.path.join(self.tmp.name, "nope.json")
+        code, _out, err = self._main(
+            "interests", "--refresh",
+            env={"DISCOVERY_DYNAMIC_INTERESTS": "1", "DISCOVERY_INTERESTS": missing},
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("not found", err)
+
+    def test_interests_refresh_with_a_malformed_interests_file_exits_cleanly(self):
+        path = self._interests_file("{ not json")
+        code, _out, err = self._main(
+            "interests", "--refresh",
+            env={"DISCOVERY_DYNAMIC_INTERESTS": "1", "DISCOVERY_INTERESTS": path},
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("malformed interests file", err)
+
+
+class TeachCLITests(unittest.TestCase):
+    """`python -m app teach` wiring: --list/--explain, provider isolation,
+    the interactive default, and --send reusing the existing Telegram flow
+    end to end (see FeedbackListenerTests for the flow it reuses)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = os.path.join(self.tmp.name, "t.db")
+        conn = db.connect(self.db_path)
+        db.init(conn)
+        db.upsert_interest(conn, an_interest())
+        interest = db.interest_by_key(conn, "k")
+        item = stored_item(conn)
+        db.save_score(conn, a_score(item.id, interest.id, 0.8))
+        conn.close()
+
+    def _main(self, *argv, read_inputs=None):
+        import contextlib
+
+        from discovery.__main__ import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(out))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            if read_inputs is not None:
+                stack.enter_context(mock.patch("builtins.input", side_effect=iter(read_inputs)))
+            code = main(["--db", self.db_path, *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_list_prints_the_ranked_queue_and_exits_zero(self):
+        code, out, _err = self._main("teach", "--list")
+        self.assertEqual(code, 0)
+        self.assertIn("queued item(s)", out)
+
+    def test_explain_prints_queue_metrics_and_exits_zero(self):
+        code, out, _err = self._main("teach", "--explain")
+        self.assertEqual(code, 0)
+        self.assertIn("pool_size=", out)
+        self.assertIn("band_lift", out)
+
+    def test_teach_never_constructs_a_provider(self):
+        with mock.patch.object(
+            providers, "get_provider", side_effect=AssertionError("must not build a provider")
+        ):
+            code, _out, _err = self._main("teach", "--list")
+        self.assertEqual(code, 0)
+
+    def test_interactive_default_records_a_label_via_the_injected_reader(self):
+        code, _out, _err = self._main("teach", "--limit", "1", read_inputs=["fire"])
+        self.assertEqual(code, 0)
+        conn = db.connect(self.db_path)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1)
+
+    def test_send_reuses_format_message_and_the_feedback_keyboard(self):
+        sent = []
+
+        def fake_send(cfg, text, reply_markup=None, dry_run=False):
+            sent.append((text, reply_markup))
+            return True
+
+        with mock.patch.object(notify, "send", side_effect=fake_send):
+            code, _out, _err = self._main("teach", "--send", "--limit", "1")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sent), 1)
+        text, markup = sent[0]
+        self.assertIn("DISCOVERY", text)
+        callback_datas = [b["callback_data"] for row in markup["inline_keyboard"] for b in row]
+        self.assertEqual(len(callback_datas), 4)
+        score_id = callback_datas[0].split(":")[2]
+        self.assertTrue(all(cd.endswith(f":{score_id}") for cd in callback_datas))
+
+        # Proof the send path reuses the existing flow, not a new one: feed
+        # one of those exact payloads into the real listener callback.
+        callback = {"id": "cb", "data": callback_datas[0], "message": {"chat": {"id": 1}}}
+        conn = db.connect(self.db_path)
+        self.addCleanup(conn.close)
+        with mock.patch.object(feedback_listener, "api_call"):
+            self.assertTrue(feedback_listener._handle_callback(conn, "tok", callback))
+        self.assertEqual(conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1)
+
+    def test_dry_run_send_never_touches_the_network(self):
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            code, _out, _err = self._main("--dry-run", "teach", "--send")
+        self.assertEqual(code, 0)
+        urlopen.assert_not_called()
 
 
 class TeachCLITests(unittest.TestCase):

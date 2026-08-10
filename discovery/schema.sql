@@ -13,8 +13,31 @@ CREATE TABLE IF NOT EXISTS interests (
     min_score         REAL NOT NULL DEFAULT 0.7,    -- threshold on scores.final_score
     sources           TEXT NOT NULL DEFAULT '[]',   -- JSON array of collector names
     source_config     TEXT NOT NULL DEFAULT '{}',   -- JSON, keyed by collector name
-    active            INTEGER NOT NULL DEFAULT 1
+    active            INTEGER NOT NULL DEFAULT 1,
+    -- Layered interest state (discovery/interest_state.py). 'owner' rows
+    -- come from interests.json and are structurally immutable by automation
+    -- (see db.py's OwnerInterestImmutable guards + the triggers below).
+    layer             TEXT NOT NULL DEFAULT 'owner',
+    provenance        TEXT NOT NULL DEFAULT '{}',   -- JSON: how this row came to be
+    last_observed_at  TEXT
 );
+
+-- Append-only provenance log for the layered interest state. Nothing ever
+-- UPDATEs or DELETEs a row here -- `python -m app interests --why <key>`
+-- reads it straight through. `actor` is 'owner_sync' (interests.sync, the
+-- `init` path) or 'automation' (discovery/interest_state.py).
+CREATE TABLE IF NOT EXISTS interest_events (
+    id            INTEGER PRIMARY KEY,
+    at            TEXT NOT NULL,
+    interest_key  TEXT NOT NULL,
+    actor         TEXT NOT NULL,
+    action        TEXT NOT NULL,
+    from_layer    TEXT,
+    to_layer      TEXT,
+    evidence      TEXT NOT NULL DEFAULT '{}'         -- JSON
+);
+
+CREATE INDEX IF NOT EXISTS idx_interest_events_key ON interest_events(interest_key);
 
 CREATE TABLE IF NOT EXISTS candidate_items (
     id               INTEGER PRIMARY KEY,

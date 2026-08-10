@@ -96,6 +96,66 @@ append the artifact's top N topic keys to `positive_signals`; absent the key
 readout. Not yet wired into `init`/production sync — this step only
 establishes the contract boundary.
 
+## layered interest state (step-07)
+`interests` gains `layer` (owner/inferred/emerging/exploratory/retired,
+default 'owner'), `provenance` (JSON), `last_observed_at`; append-only
+`interest_events` (indexed on `interest_key`) is the provenance log —
+nothing ever UPDATEs/DELETEs it. Off by default: `DISCOVERY_DYNAMIC_INTERESTS`
+(`cfg.dynamic_interests`, default False) gates everything —
+`interest_state.apply_transitions()` is a zeroed no-op with it off; no
+derived row, query, or LLM/network call happens either way. Owner rows are
+immutable to automation three ways: `db.upsert_interest`'s ON CONFLICT is
+`WHERE layer='owner'`; the two derived-only write helpers
+(`upsert_derived_interest`, `set_interest_layer`, in `db.py`, the ONLY
+functions allowed to write a non-owner row) carry `WHERE layer != 'owner'`
+and raise `OwnerInterestImmutable` on a zero rowcount; two SQLite triggers
+(`db.TRIGGERS_SQL`, applied in `db.init` AFTER the additive-ALTER pass since
+they reference `layer`) abort any raw UPDATE/DELETE touching an owner row.
+Derived keys are namespaced `derived:<term>` (`db.DERIVED_KEY_PREFIX`);
+`interests.load_file` raises ValueError if an owner key carries it —
+structurally prevents owner/derived collision.
+
+`discovery/interest_state.py` (stdlib only): `Rules` (frozen dataclass,
+8 thresholds, construct directly — no new env vars), `Evidence`
+(observations/distinct_days/first_seen/last_seen/pos+neg feedback/sources),
+`gather_evidence()` (title tokens only, via `matching._tokens` — no second
+tokenizer — of `candidate_items` in `evidence_window_days`, excluding
+owner-covered and already-tracked-non-retired terms, deterministic
+truncation to `max_candidates`), `decide()` (pure, no DB/clock: absent→
+exploratory→emerging→inferred on observations/distinct_days/feedback bars;
+idle `decay_idle_days` demotes one rung; negative-feedback-dominant retires
+immediately; retired re-enters only at exploratory at
+`promote_observations*reentry_multiplier` observations — anti-flapping;
+blocklisted terms never enter and retire if already tracked; NEVER emits
+layer='owner', asserted). `apply_transitions()` snapshots already-tracked
+rows before writing so one call advances a term at most one ladder rung
+(new-entry and progression are separate passes). Optional
+`personal_state`-seeded rows land at exploratory with zero observations —
+can never promote on their own (step-05's carried-forward constraint:
+knowledge-state signals stay non-predictive-validated). Staleness (repair:
+was measured off this-pass evidence alone, so a seeded or between-window
+row with no fresh observation this pass decayed on its very next
+re-evaluation regardless of `decay_idle_days` — a seed was actively
+counterproductive, harder to ever adopt than never seeding at all) is now
+measured against `interests.last_observed_at` as the fallback baseline
+(`apply_transitions()` merges it into `Evidence.last_seen` before calling
+`decide()`, which itself stays pure/DB-free); `upsert_derived_interest`
+stamps it on every write, seed included, precisely so a freshly written row
+isn't idle before it's ever had a chance to be observed. Operational meaning:
+exploratory/emerging are `active=0, sources='[]'` (reviewable, zero spend);
+inferred is `active=1, min_score=max(cfg.derived_min_score, owner floor),
+positive_signals=[term]` (participates in matching against items owner
+collectors already fetch — no new collector call); promotion past
+`cfg.derived_max_active` inferred rows is skipped and logged as
+`promotion_capped` rather than dropped silently. Config: exactly
+`dynamic_interests`/`derived_max_active` (5)/`derived_min_score` (0.80,
+at/above today's owner bars). CLI: `python -m app interests [--layer L]
+[--why KEY] [--refresh]` — list (owner first), provenance chain, or run
+`apply_transitions` (prints the off-message and changes nothing if the flag
+is off). `interests.sync` now appends one 'owner_sync' event per interest.
+Scheduling the refresh on a cadence is deferred to a later step — not
+wired into `ops/install_tasks.py` here.
+
 ## engine lab (`experiments/lab/`, branch `engine-lab`)
 Reusable prompt-optimization loop for the whole engine, generalized from the
 x prompt lab: `lab_common.py` (budget cap, runs.jsonl full-prompt log,
@@ -288,7 +348,7 @@ All timestamps UTC via `db.now()`/`db.ago()`. No token metering on
 claude_chat (calls only).
 
 ## Tests
-`python test_discovery.py` (228) + `python test_watch.py` (10), offline, both
+`python test_discovery.py` (309) + `python test_watch.py` (10), offline, both
 green; CI on push/PR.
 
 ## Known issues

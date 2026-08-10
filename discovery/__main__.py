@@ -17,6 +17,10 @@
     items         list recently scored items
     feedback      record feedback on an item, by item id
     stats         funnel, feedback and cost over a trailing window
+    interests     layered interest state (discovery/interest_state.py):
+                  list (owner rows first), --layer to filter, --why <key>
+                  for the provenance chain, --refresh to run
+                  promotion/decay (a no-op unless DISCOVERY_DYNAMIC_INTERESTS)
     health        job staleness, provider reachability, pending sends;
                   --notify alerts on degraded/recovery (rate-limited)
     personal-state  print the ai repo's personal-state contract artifact
@@ -40,6 +44,7 @@ from .models import CandidateItem
 from .notify import FEEDBACK_VERDICTS, print_safe
 from .personal_state import PersonalStateError
 from .pipeline import Budget, deliver, ingest, run_once, send_digest
+from . import interest_state
 
 
 def main(argv=None):
@@ -92,6 +97,15 @@ def main(argv=None):
     he.add_argument(
         "--notify", action="store_true",
         help="alert on degraded/recovery over Telegram, rate-limited",
+    )
+    it = sub.add_parser(
+        "interests", help="layered interest state: list, --why <key>, --refresh"
+    )
+    it.add_argument("--layer", choices=list(interest_state.LAYERS), help="filter the listing")
+    it.add_argument("--why", metavar="KEY", help="print the provenance chain for one interest")
+    it.add_argument(
+        "--refresh", action="store_true",
+        help="run promotion/decay and write changes (no-op unless DISCOVERY_DYNAMIC_INTERESTS)",
     )
     ps = sub.add_parser(
         "personal-state", help="print the ai repo's personal-state contract artifact"
@@ -188,6 +202,8 @@ def _dispatch(conn, cfg, args, provider):
         print_safe(stats.report(conn, args.days, cfg))
     elif args.command == "health":
         return _health_cmd(conn, cfg, provider(), args)
+    elif args.command == "interests":
+        return _interests_cmd(conn, cfg, args)
     elif args.command == "personal-state":
         return _personal_state(cfg, args)
     elif args.command == "teach":
@@ -359,6 +375,64 @@ def _list_items(conn, limit, min_score):
         print_safe(f"[{row['final_score'] * 100:>3.0f}] #{row['id']} {row['interest']}: {row['title']}")
         print_safe(f"      {row['reason']}")
         print_safe(f"      {row['url']}")
+
+
+def _interests_cmd(conn, cfg, args):
+    if args.why:
+        return _interests_why(conn, args.why)
+    if args.refresh:
+        return _interests_refresh(conn, cfg)
+    return _interests_list(conn, args.layer)
+
+
+def _interests_list(conn, layer):
+    rows = db.list_interests(conn, layer)
+    if not rows:
+        print_safe("no interests" + (f" at layer '{layer}'" if layer else ""))
+        return 0
+    for row in rows:
+        print_safe(
+            f"{row['key']}  layer={row['layer']}  active={row['active']}  "
+            f"min_score={row['min_score']:.2f}  last_observed_at={row['last_observed_at'] or '-'}"
+        )
+    return 0
+
+
+def _interests_why(conn, key):
+    events = db.interest_events(conn, key)
+    if not events:
+        row = conn.execute("SELECT 1 FROM interests WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            print(f"no interest with key {key!r}", file=sys.stderr)
+            return 2
+        print_safe(f"{key}: no events recorded")
+        return 0
+    print_safe(f"{key}:")
+    for e in events:
+        print_safe(
+            f"  {e['at']}  {e['actor']}  {e['action']}  "
+            f"{e['from_layer'] or '-'} -> {e['to_layer'] or '-'}  {json.dumps(e['evidence'])}"
+        )
+    return 0
+
+
+def _interests_refresh(conn, cfg):
+    if not cfg.dynamic_interests:
+        print_safe("dynamic interests are off (DISCOVERY_DYNAMIC_INTERESTS)")
+        return 0
+    # apply_transitions() reads cfg.interests_path (blocked_derived_terms) via
+    # a bare open()/json.loads -- same failure modes as `init`'s interests.sync,
+    # so isolate them the same way rather than letting them traceback.
+    try:
+        summary = interest_state.apply_transitions(conn, cfg)
+    except FileNotFoundError:
+        print(f"interests file not found: {cfg.interests_path}", file=sys.stderr)
+        return 2
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        print(f"malformed interests file {cfg.interests_path}: {e}", file=sys.stderr)
+        return 2
+    print_safe(f"refresh: {json.dumps(summary)}")
+    return 0
 
 
 def _personal_state(cfg, args):

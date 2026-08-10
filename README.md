@@ -56,6 +56,7 @@ a long-lived session.
 | `items` | List recently scored items |
 | `feedback <id> <verdict>` | Rate an item from the CLI |
 | `stats [--days N]` | Funnel, feedback rates, estimated cost and a HEALTH section — see [Stats](#stats) |
+| `interests [--layer L] [--why KEY] [--refresh]` | Layered interest state: list (owner rows first, `--layer` filters), `--why <key>` prints the append-only provenance chain, `--refresh` runs promotion/decay — a no-op unless `DISCOVERY_DYNAMIC_INTERESTS` is set |
 | `health [--notify]` | Job staleness, provider reachability, pending/abandoned sends; `--notify` alerts on degraded/recovery, rate-limited |
 | `personal-state [--path]` | Print the sibling `ai` repo's personal-state artifact as this repo would read it — see [Personal-state contract](#personal-state-contract) |
 | `teach [--list\|--explain\|--send]` | Label the highest information-value scored-but-unlabeled items — see [Teach](#teach) |
@@ -403,6 +404,9 @@ day, so a window is just a date filter.
 | `DISCOVERY_MAX_ITEMS` | `8` | Items per source per cycle |
 | `DISCOVERY_MAX_SCORES` | `25` | Hard cap on LLM scoring calls per cycle. Anything over waits for the next cycle |
 | `DISCOVERY_PERSONAL_STATE` | `personal_state.json` | Path to the `ai` repo's personal-state artifact — see [Personal-state contract](#personal-state-contract) |
+| `DISCOVERY_DYNAMIC_INTERESTS` | *(off)* | `1`/`true` enables the layered interest state (`interests --refresh`, `discovery/interest_state.py`). Off by default: no derived interest is ever created |
+| `DISCOVERY_DERIVED_MAX_ACTIVE` | `5` | Max derived interests promoted to `inferred` (active, scored) at once |
+| `DISCOVERY_DERIVED_MIN_SCORE` | `0.80` | Floor `min_score` a derived interest is held to, at or above today's owner bars |
 | `DISCOVERY_INTERVAL_STOCKS` | `3600` | `run-once --source stocks` cadence, seconds (read by the OS scheduler) |
 | `DISCOVERY_INTERVAL_WEB` | `14400` | `run-once --source web_search` cadence, seconds |
 | `DISCOVERY_INTERVAL_YOUTUBE` | `14400` | `run-once --source youtube` cadence, seconds |

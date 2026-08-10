@@ -41,6 +41,11 @@ class Interest:
     min_score: float = 0.70       # threshold against final_score, 0-1
     sources: list = field(default_factory=list)
     source_config: dict = field(default_factory=dict)   # per-source knobs
+    # Layered interest state (discovery/interest_state.py). Owner interests
+    # (interests.json) are always layer="owner"; everything else is written
+    # only by the guarded db.py helpers -- see OwnerInterestImmutable.
+    layer: str = "owner"
+    provenance: dict = field(default_factory=dict)      # JSON -- how this row came to be
     id: int = None
 
 
