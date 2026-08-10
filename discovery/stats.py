@@ -53,6 +53,7 @@ def report(conn, days=7, cfg=None):
     ]
     lines += _funnel(conn, since, days)
     lines += _per_interest(conn, since)
+    lines += _exploration(conn, since, cfg)
     lines += _feedback(conn, since)
     lines += _score_by_verdict(conn, since)
     lines += _cost(conn, since, days)
@@ -76,8 +77,17 @@ def _funnel(conn, since, days):
     collected = m.get("collected", 0)
     survived = collected - m.get("duplicate", 0) - m.get("filtered", 0)
     to_llm = m.get("scored", 0) + m.get("errors", 0)
+    # Restricted to owner interests -- a derived/inferred row's notification
+    # is exploration, not exploitation quality; see _exploration() below.
     notified = _scalar(
-        conn, "SELECT COUNT(*) FROM notifications WHERE ok = 1 AND sent_at >= ?", (since,)
+        conn,
+        """
+        SELECT COUNT(*) FROM notifications x
+        JOIN scores s     ON s.id = x.score_id
+        JOIN interests n  ON n.id = s.interest_id
+        WHERE x.ok = 1 AND x.sent_at >= ? AND n.layer = 'owner'
+        """,
+        (since,),
     )
 
     lines = ["FUNNEL"]
@@ -101,8 +111,15 @@ def _funnel(conn, since, days):
 # --- per interest ------------------------------------------------------------
 
 def _per_interest(conn, since):
+    """Owner interests only -- a derived/inferred row's send rate is
+    exploration, reported separately by _exploration() below so it can never
+    quietly dilute the exploitation numbers this table exists to show."""
+    return _per_interest_rows(conn, since, owner=True)
+
+
+def _per_interest_rows(conn, since, owner):
     rows = conn.execute(
-        """
+        f"""
         SELECT n.key,
                COUNT(x.id) AS sent,
                (SELECT COUNT(*) FROM scores s2 WHERE s2.interest_id = n.id
@@ -110,7 +127,7 @@ def _per_interest(conn, since):
         FROM interests n
         LEFT JOIN scores s ON s.interest_id = n.id
         LEFT JOIN notifications x ON x.score_id = s.id AND x.ok = 1 AND x.sent_at >= ?
-        WHERE n.active = 1
+        WHERE n.active = 1 AND n.layer {'=' if owner else '!='} 'owner'
         GROUP BY n.id ORDER BY sent DESC, n.key
         """,
         (since, since),
@@ -118,11 +135,44 @@ def _per_interest(conn, since):
     if not rows:
         return []
 
-    lines = ["NOTIFICATIONS PER INTEREST", f"{'interest':<26}{'sent':>6}{'scored':>8}{'rate':>8}"]
+    title = "NOTIFICATIONS PER INTEREST" if owner else "NOTIFICATIONS PER DERIVED INTEREST"
+    lines = [title, f"{'interest':<26}{'sent':>6}{'scored':>8}{'rate':>8}"]
     for row in rows:
         rate = f"{row['sent'] / row['scored'] * 100:.0f}%" if row["scored"] else "-"
         lines.append(f"{row['key'][:25]:<26}{row['sent']:>6}{row['scored']:>8}{rate:>8}")
     lines.append("")
+    return lines
+
+
+# --- exploration (step-10) ----------------------------------------------------
+
+def _exploration(conn, since, cfg):
+    """Derived/inferred-layer lane -- discovery/interest_state.py's dynamic
+    interests -- kept fully separate from FUNNEL/NOTIFICATIONS PER INTEREST
+    above so exploitation quality is never diluted by exploration noise.
+    Printed only when there's something to show (an explore_* metric row, a
+    non-owner interest row, or the flag on); a report with none of that is
+    byte-identical to before this section existed."""
+    m = {
+        row["name"]: row["n"]
+        for row in conn.execute(
+            "SELECT name, SUM(count) n FROM metrics WHERE day >= ? GROUP BY name", (since,)
+        ).fetchall()
+        if row["name"].startswith("explore_")
+    }
+    layers = conn.execute(
+        "SELECT layer, COUNT(*) n FROM interests WHERE layer != 'owner' GROUP BY layer ORDER BY layer"
+    ).fetchall()
+    if not m and not layers and not (cfg and cfg.dynamic_interests):
+        return []
+
+    lines = ["EXPLORATION"]
+    if layers:
+        lines.append("interests by layer: " + ", ".join(f"{r['layer']}={r['n']}" for r in layers))
+    for stage in ("scored", "deferred", "errors", "notified"):
+        lines.append(_row(f"explore: {stage}", m.get(f"explore_{stage}", 0), None))
+    lines.append("")
+    lines += _per_interest_rows(conn, since, owner=False)
     return lines
 
 

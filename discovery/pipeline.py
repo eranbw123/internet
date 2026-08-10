@@ -37,6 +37,9 @@ class Outcome:
     detail: str = ""
     matches: list = field(default_factory=list)   # [(interest, match_score, terms)]
     score: ScoreResult = None
+    # 'explore' iff the best match (matches[0]) is a non-owner interest --
+    # see classify_lane(). Drives which budget/counter this outcome charges.
+    lane: str = "exploit"
 
     def as_dict(self):
         return {
@@ -74,18 +77,27 @@ def run_once(conn, provider, cfg, sources=None, dry_run=False):
     suddenly returns hundreds of candidates costs one cycle's budget, not
     hundreds of LLM calls.
 
+    A second, wholly separate budget (`cfg.explore_max_scores_per_cycle`)
+    pays for items whose best match is a non-owner (derived) interest --
+    see Outcome.lane / classify_lane(). Structurally zero while
+    `cfg.dynamic_interests` is off, so a stray derived row still can't spend
+    a single exploration score. Exploration outcomes are bumped under
+    `explore_<stage>` metric names (see outcome_metric()) so exploitation
+    funnel/quality numbers in stats.py never include them.
+
     Always ends by delivering ALERT-type notifications immediately; DISCOVERY
     ones are left pending for send_digest() to batch."""
     interests = db.active_interests(conn)
     counts = Counter()
     budget = Budget(cfg.max_scores_per_cycle)
+    explore_budget = Budget(cfg.explore_max_scores_per_cycle if cfg.dynamic_interests else 0)
 
     for interest in interests:
         for item in _collect(conn, interest, cfg, provider, sources):
             counts["collected"] += 1
             outcome = ingest(
                 conn, provider, cfg, item, interests,
-                origin_interest=interest.key, budget=budget,
+                origin_interest=interest.key, budget=budget, explore_budget=explore_budget,
             )
             counts[outcome.stage] += 1
             # Flushed per item, not once at the end of the whole cycle: this
@@ -94,17 +106,30 @@ def run_once(conn, provider, cfg, sources=None, dry_run=False):
             # committed by ingest() regardless -- only the funnel counters
             # were at risk of vanishing for a cycle that scored real items
             # and then died before reaching the trailing db.bump() below.
-            db.bump(conn, {"collected": 1, outcome.stage: 1})
+            db.bump(conn, {"collected": 1, outcome_metric(outcome): 1})
 
     # Items stored on an earlier cycle that passed the filter but never got a
     # score (the run died, the API was down, the budget ran out) -- scored with
-    # whatever budget this cycle's own candidates left over.
-    backlog_scored = _score_backlog(conn, provider, interests, budget)
-    counts["scored"] += backlog_scored
-    counts["notified"] = deliver(conn, cfg, dry_run)
-    db.bump(conn, {"scored": backlog_scored, "notified": counts["notified"]})
+    # whatever budget this cycle's own candidates (of the matching lane) left
+    # over.
+    backlog = _score_backlog(conn, provider, interests, budget, explore_budget)
+    counts["scored"] += backlog["exploit"] + backlog["explore"]
+    lane_notified = Counter()
+    counts["notified"] = deliver(conn, cfg, dry_run, lane_counts=lane_notified)
+    db.bump(conn, {
+        "scored": backlog["exploit"],
+        "explore_scored": backlog["explore"],
+        "notified": lane_notified["exploit"],
+        "explore_notified": lane_notified["explore"],
+    })
     db.record_usage(conn, provider)   # per cycle, so `run` reports without exiting
     return {stage: counts[stage] for stage in STAGES}
+
+
+def outcome_metric(outcome):
+    """The db.bump() name for one Outcome -- explore_<stage> for the
+    exploration lane, <stage> unprefixed for exploit (today's behavior)."""
+    return f"explore_{outcome.stage}" if outcome.lane == "explore" else outcome.stage
 
 
 class Budget:
@@ -142,35 +167,55 @@ def _collect(conn, interest, cfg, provider, sources=None):
 
 # --- stages 2-7: one candidate through the chain -----------------------------
 
-def ingest(conn, provider, cfg, item, interests, origin_interest=None, force=False, budget=None):
-    """Normalize, dedup, persist, match, filter, score. Returns an Outcome."""
+def classify_lane(matches):
+    """'explore' iff the best match (matches[0], match_interests()'s own
+    strongest-first order) is a non-owner interest -- the best match is what
+    drives the score's feedback block, min_score bar and notification
+    attribution, so it's what decides the lane. A plain attribute compare,
+    trivially total: no matches (never reached with prefilter already
+    passed, but defensive) is exploit, same as an owner match."""
+    return "explore" if matches and matches[0][0].layer != "owner" else "exploit"
+
+
+def ingest(conn, provider, cfg, item, interests, origin_interest=None, force=False,
+           budget=None, explore_budget=None):
+    """Normalize, dedup, persist, match, filter, score. Returns an Outcome.
+
+    `explore_budget` defaults to None so every existing caller (score --,
+    teach.py, tests) keeps ingest()'s old single-budget behavior untouched --
+    only run_once()/`_discover` pass both."""
     normalize.normalize(item, origin_interest)
+    # Computed before dedup/insert -- match_interests() is a pure function of
+    # item + interests (no item.id involved), so the lane a duplicate would
+    # have charged is known even though a duplicate is never itself scored.
+    matches = matching.match_interests(item, interests)
+    lane = classify_lane(matches)
 
     duplicate = dedup.find_duplicate(conn, item)
     if duplicate is not None and not force:
-        return Outcome("duplicate", duplicate.existing, duplicate.reason)
+        return Outcome("duplicate", duplicate.existing, duplicate.reason, lane=lane)
 
     item.id = db.insert_item(conn, item)
-    matches = matching.match_interests(item, interests)
     db.save_matches(conn, item.id, matches)
 
     ok, reason = matching.prefilter(item, matches, cfg)
     db.set_prefilter(conn, item.id, ok, reason)
     if not ok:
-        return Outcome("filtered", item, reason, matches)
+        return Outcome("filtered", item, reason, matches, lane=lane)
 
     if db.is_scored(conn, item.id):
         if not force:
-            return Outcome("already_scored", item, "scored on an earlier run", matches)
+            return Outcome("already_scored", item, "scored on an earlier run", matches, lane=lane)
         db.delete_score(conn, item.id)
 
-    if budget is not None and not budget.spend():
-        return Outcome("deferred", item, "cycle score budget spent", matches)
+    lane_budget = explore_budget if lane == "explore" else budget
+    if lane_budget is not None and not lane_budget.spend():
+        return Outcome("deferred", item, "cycle score budget spent", matches, lane=lane)
 
-    return _score(conn, provider, item, matches, reason)
+    return _score(conn, provider, item, matches, reason, lane=lane)
 
 
-def _score(conn, provider, item, matches, detail=""):
+def _score(conn, provider, item, matches, detail="", lane="exploit"):
     feedback = db.recent_feedback(conn, matches[0][0].id)
     try:
         score = scoring.score_candidate(provider, item, matches, feedback)
@@ -179,7 +224,7 @@ def _score(conn, provider, item, matches, detail=""):
         # Stamp the failure so _score_backlog() waits out a cool-off instead
         # of re-failing this item on every cycle while the provider is down.
         db.mark_score_attempt(conn, item.id)
-        return Outcome("errors", item, str(e), matches)
+        return Outcome("errors", item, str(e), matches, lane=lane)
     # Mirrors item.id = db.insert_item(conn, item) above: the caller gets a
     # ScoreResult whose id actually reflects the row just written, the same
     # contract CandidateItem.id already carries. Nothing in the current
@@ -188,17 +233,24 @@ def _score(conn, provider, item, matches, detail=""):
     # -- exactly the kind of stale-id bug that bites the next caller who
     # reasonably assumes it works like item.id.
     score.id = db.save_score(conn, score)
-    return Outcome("scored", item, detail, matches, score)
+    return Outcome("scored", item, detail, matches, score, lane=lane)
 
 
-def _score_backlog(conn, provider, interests, budget):
-    """Newest first and capped by whatever budget the cycle has left. Without
-    the cap a persistent scoring failure would re-attempt every unscored item
-    ever stored, on every cycle, forever. Items whose last scoring attempt
-    failed recently are skipped until the cool-off passes (never dropped) --
-    a provider outage otherwise re-fails the whole backlog every cycle."""
-    if budget.remaining <= 0:
-        return 0
+def _score_backlog(conn, provider, interests, budget, explore_budget=None):
+    """Newest first and capped by whatever budget each lane has left this
+    cycle (LIMIT is the sum of both). Without the cap a persistent scoring
+    failure would re-attempt every unscored item ever stored, on every
+    cycle, forever. Items whose last scoring attempt failed recently are
+    skipped until the cool-off passes (never dropped) -- a provider outage
+    otherwise re-fails the whole backlog every cycle.
+
+    Returns a Counter of items actually scored per lane. One lane running
+    out never stops the other from draining: an exhausted lane's items are
+    skipped (`continue`), not a `break` of the whole pass."""
+    scored = Counter()
+    limit = budget.remaining + (explore_budget.remaining if explore_budget is not None else 0)
+    if limit <= 0:
+        return scored
     rows = conn.execute(
         """
         SELECT id FROM candidate_items
@@ -207,18 +259,19 @@ def _score_backlog(conn, provider, interests, budget):
           AND (score_attempted_at IS NULL OR score_attempted_at < ?)
         ORDER BY id DESC LIMIT ?
         """,
-        (db.ago(db.SCORE_RETRY_SECONDS), budget.remaining),
+        (db.ago(db.SCORE_RETRY_SECONDS), limit),
     ).fetchall()
-    scored = 0
     for row in rows:
         item = db.get_item(conn, row["id"])
         matches = matching.match_interests(item, interests)
         if not matches:
             continue
-        if not budget.spend():
-            break
-        if _score(conn, provider, item, matches).stage == "scored":
-            scored += 1
+        lane = classify_lane(matches)
+        lane_budget = explore_budget if lane == "explore" else budget
+        if lane_budget is not None and not lane_budget.spend():
+            continue  # this lane is out for the cycle -- let the other lane keep draining
+        if _score(conn, provider, item, matches, lane=lane).stage == "scored":
+            scored[lane] += 1
     return scored
 
 
@@ -245,34 +298,39 @@ def notification_ready(conn, cfg):
     return ready
 
 
-def deliver(conn, cfg, dry_run=False):
+def deliver(conn, cfg, dry_run=False, lane_counts=None):
     """ALERT-type items only, sent the moment they clear the bar. DISCOVERY
-    items are left pending -- send_digest() is what clears those."""
+    items are left pending -- send_digest() is what clears those.
+
+    `lane_counts`, if given, is a Counter bumped with 'exploit'/'explore' per
+    attempt (owner vs. derived interest) -- run_once() uses it to bump
+    notified/explore_notified separately; every other caller (CLI, tests)
+    leaves it None and gets the old plain int back, unchanged."""
     sent = 0
     for row, item, interest in notification_ready(conn, cfg):
         if not notify.is_alert(item):
             continue
-        sent += _send_one(conn, cfg, row, item, interest, dry_run)
+        sent += _send_one(conn, cfg, row, item, interest, dry_run, lane_counts)
     return sent
 
 
-def send_digest(conn, cfg, dry_run=False):
+def send_digest(conn, cfg, dry_run=False, lane_counts=None):
     """DISCOVERY items only, sorted by final_score (already
     notification_ready()'s order), capped at cfg.digest_max_items. Anything
     past the cap simply stays pending for tomorrow's digest -- it was never
     marked notified. Alerts are never touched here; deliver() already sent
-    them."""
+    them. `lane_counts`: see deliver()."""
     sent = 0
     for row, item, interest in notification_ready(conn, cfg):
         if notify.is_alert(item):
             continue
         if sent >= cfg.digest_max_items:
             break
-        sent += _send_one(conn, cfg, row, item, interest, dry_run)
+        sent += _send_one(conn, cfg, row, item, interest, dry_run, lane_counts)
     return sent
 
 
-def _send_one(conn, cfg, row, item, interest, dry_run):
+def _send_one(conn, cfg, row, item, interest, dry_run, lane_counts=None):
     text = notify.format_message(
         interest,
         item,
@@ -287,4 +345,6 @@ def _send_one(conn, cfg, row, item, interest, dry_run):
     db.record_notification(conn, row["score_id"], "telegram", ok)
     if not ok:
         db.bump(conn, {"send_failed": 1})
+    if lane_counts is not None:
+        lane_counts["explore" if interest.layer != "owner" else "exploit"] += 1
     return 1

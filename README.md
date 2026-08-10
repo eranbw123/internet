@@ -448,6 +448,7 @@ day, so a window is just a date filter.
 | `DISCOVERY_DIGEST_MAX` | `10` | Discovery items per digest, highest score first |
 | `DISCOVERY_MIN_MATCH` | `0.25` | Pre-filter: weakest interest match worth scoring |
 | `DISCOVERY_MIN_TEXT_CHARS` | `120` | Pre-filter: least text worth sending to an LLM |
+| `DISCOVERY_EXPLORE_MAX_SCORES` | `5` | Separate per-cycle LLM score cap for exploration (derived/inferred-interest) items — see [Exploration lane](#exploration-lane-step-10) |
 
 `--provider`, `--model` and `--db` override the environment for one run.
 
@@ -499,7 +500,7 @@ logs.
 python test_discovery.py
 ```
 
-320 tests, network fully stubbed — they never hit an LLM API, Telegram, or
+323 tests, network fully stubbed — they never hit an LLM API, Telegram, or
 Yahoo. The provider seam is the whole stub: a fake object with `complete_json`
 and `search_json`.
 
@@ -565,3 +566,41 @@ python -m app interests --why derived:<term>   # the full provenance chain, incl
 
 Nothing here is run against production stores by this implementer session —
 the command sequence above is documented, not executed.
+
+## Exploration lane (step-10)
+
+Exploitation (owner interests) and exploration (derived/inferred interests,
+see [Layered interest state](#layered-interest-state)) are separated at the
+scoring boundary, not just at promotion time. An item's lane is decided once,
+by the strongest interest it matched: **explore iff its best match
+(`matches[0]` from `matching.match_interests()`) is a non-owner interest** --
+that's the interest whose feedback block, `min_score` bar and notification
+attribution actually drive the score, so it's what should drive accounting
+too. A weaker derived match alongside a stronger owner one still charges
+exploitation and behaves exactly as before this step.
+
+Each lane pays from its own `pipeline.Budget`: `DISCOVERY_MAX_SCORES` for
+exploitation (unchanged) and `DISCOVERY_EXPLORE_MAX_SCORES` (`5`) for
+exploration. With `DISCOVERY_DYNAMIC_INTERESTS` off the exploration budget is
+constructed as zero, structurally -- even a stray active derived row can't
+spend a score. An exhausted lane's items are deferred and picked up on a
+later cycle exactly like today's single-budget overflow; the other lane is
+never starved by it.
+
+Exploration outcomes are counted under `explore_scored` / `explore_deferred`
+/ `explore_errors` / `explore_notified`, entirely separate metric names from
+their exploitation counterparts, so a struggling or noisy exploration lane
+can never dilute the FUNNEL/NOTIFICATIONS PER INTEREST numbers `stats`
+exists to report on. `stats.report()` grows an EXPLORATION section (only
+when there's a non-owner interest, an `explore_*` metric, or the flag on) --
+interest counts by layer, the explore_* funnel figures, and a "NOTIFICATIONS
+PER DERIVED INTEREST" table shaped like the owner one above it. No new
+threshold: a derived interest's `min_score` (already `derived_min_score`,
+floor `0.80`) is what a derived score has to clear to notify at all --
+distinct budgets and distinct metrics were the missing pieces, not a
+distinct bar.
+
+This worktree has no `discovery.db`, so every number above comes from
+synthetic in-memory fixtures in `test_discovery.py`'s `ExplorationLaneTests`
+-- not a real-corpus reading. Live readout once dynamic interests are
+running for real: `python -m app stats --days 7`, EXPLORATION section.

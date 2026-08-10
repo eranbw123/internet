@@ -54,6 +54,10 @@ class Config:
     dynamic_interests: bool = False
     derived_max_active: int = 5
     derived_min_score: float = 0.80
+    # Exploration lane (step-10): a separate per-cycle LLM budget for items
+    # whose best interest match is non-owner (derived). No new threshold --
+    # derived_min_score above already bars notification; see PROJECT_STATE.md.
+    explore_max_scores_per_cycle: int = 5
 
 
 def load():
@@ -99,4 +103,5 @@ def load():
         in ("1", "true"),
         derived_max_active=int(os.environ.get("DISCOVERY_DERIVED_MAX_ACTIVE", "5")),
         derived_min_score=float(os.environ.get("DISCOVERY_DERIVED_MIN_SCORE", "0.80")),
+        explore_max_scores_per_cycle=int(os.environ.get("DISCOVERY_EXPLORE_MAX_SCORES", "5")),
     )

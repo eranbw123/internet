@@ -2936,6 +2936,286 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(self._pending_titles(), [])
 
+    # --- exploration lane (step-10): default-off no-op ------------------------
+
+    def test_default_off_never_writes_an_explore_metric_or_shows_the_section(self):
+        """With DISCOVERY_DYNAMIC_INTERESTS off (CFG's default) and no derived
+        interest anywhere in play, run_once is byte-identical to before this
+        step: same summary shape, and the metrics table never grows an
+        explore_* name; stats.report has no EXPLORATION section either."""
+        provider = FakeProvider({"Good": 0.9, "Meh": 0.2})
+        summary = self._run(provider)
+        self.assertEqual(
+            summary,
+            {"collected": 2, "duplicate": 0, "filtered": 0, "already_scored": 0,
+             "scored": 2, "deferred": 0, "errors": 0, "notified": 0},
+        )
+        names = {r["name"] for r in self.conn.execute("SELECT DISTINCT name FROM metrics").fetchall()}
+        self.assertFalse(any(n.startswith("explore_") for n in names))
+        self.assertNotIn("EXPLORATION", stats.report(self.conn, days=7, cfg=CFG))
+
+    def test_default_off_a_stray_active_derived_row_still_cannot_spend_explore_budget(self):
+        """Defense in depth: interest_state.py never creates a non-owner row
+        while the flag is off, but even a manually-inserted active derived
+        row can't spend an exploration score -- explore_budget is
+        Budget(0) whenever cfg.dynamic_interests is False, structurally, not
+        merely filtered out afterwards."""
+        db.upsert_derived_interest(
+            self.conn,
+            an_interest(
+                key="derived:zeta", title="Zeta signal", layer="inferred", sources=[],
+                positive_signals=["exclusive zeta research"],
+            ),
+            {},
+        )
+
+        def collector(interest, cfg, provider, conn=None):
+            return [an_item(source="fake", title="Exclusive zeta research finding",
+                             url="https://e.com/zeta")]
+
+        provider = FakeProvider({"zeta": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            summary = pipeline.run_once(self.conn, provider, CFG, dry_run=True)
+        self.assertEqual((summary["deferred"], summary["scored"]), (1, 0))
+
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("explore_deferred"), 1)
+        self.assertNotIn("deferred", metrics)
+        self.assertNotIn("scored", metrics)
+
+
+class LaneProvider(FakeProvider):
+    """Like FakeProvider, but each needle can also pick which interest_key
+    the model claims (default 'k') -- the exploration tests need a score
+    landing on a *specific* interest (owner vs. derived) to prove
+    notification attribution stays split, not just the match-time lane."""
+
+    def __init__(self, scores, keys=None):
+        super().__init__(scores)
+        self.keys = keys or {}
+
+    def complete_json(self, system, prompt, schema, max_tokens=2000):
+        self.prompts.append(prompt)
+        for needle, value in self.scores.items():
+            if needle in prompt:
+                if isinstance(value, Exception):
+                    raise value
+                return self._payload(value, self.keys.get(needle, "k"))
+        raise AssertionError(f"LaneProvider got an unexpected prompt:\n{prompt}")
+
+
+class ExplorationLaneTests(unittest.TestCase):
+    """step-10: exploit (owner-layer) vs explore (derived/inferred-layer)
+    lane separation at the scoring boundary. classify_lane()'s rule: an
+    item's lane is 'explore' iff matches[0] (match_interests()'s own
+    strongest-first order) is a non-owner interest."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        db.upsert_interest(self.conn, an_interest(
+            key="k", positive_signals=["good stuff"], min_score=0.70, sources=["fake"],
+        ))
+        db.upsert_derived_interest(
+            self.conn,
+            an_interest(
+                key="derived:zeta", title="Zeta signal", layer="inferred", sources=[],
+                positive_signals=["exclusive zeta research"], min_score=0.80,
+            ),
+            {},
+        )
+        self.cfg = dataclasses.replace(CFG, dynamic_interests=True, explore_max_scores_per_cycle=2)
+
+    def _owner_item(self, n):
+        return an_item(source="fake", title=f"Owner item {n}", url=f"https://e.com/owner-{n}")
+
+    def _explore_item(self, n):
+        return an_item(
+            source="fake", title=f"Exclusive zeta research finding {n}",
+            url=f"https://e.com/explore-{n}",
+        )
+
+    # --- budget cap + isolation ------------------------------------------------
+
+    def test_explore_budget_cap_is_enforced_without_starving_owner_items(self):
+        owner_items = [self._owner_item(n) for n in range(3)]
+        explore_items = [self._explore_item(n) for n in range(5)]  # cap is 2
+
+        def collector(interest, cfg, provider, conn=None):
+            return owner_items + explore_items if interest.key == "k" else []
+
+        provider = FakeProvider({"Owner item": 0.9, "Exclusive zeta research": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            pipeline.run_once(self.conn, provider, self.cfg, dry_run=True)
+
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("explore_scored"), 2)     # the cap, exactly
+        self.assertEqual(metrics.get("explore_deferred"), 3)   # 5 - 2 overflow
+        self.assertEqual(metrics.get("scored"), 3)             # every owner item, untouched
+        self.assertNotIn("deferred", metrics)                  # exploit budget never ran dry
+        explore_calls = sum(1 for p in provider.prompts if "Exclusive zeta research" in p)
+        self.assertEqual(explore_calls, 2)
+
+    def test_exhausted_exploit_budget_does_not_draw_from_explore_budget(self):
+        cfg = dataclasses.replace(self.cfg, max_scores_per_cycle=1)
+        owner_items = [self._owner_item(n) for n in range(3)]
+        explore_items = [self._explore_item(n) for n in range(2)]
+
+        def collector(interest, cfg, provider, conn=None):
+            return owner_items + explore_items if interest.key == "k" else []
+
+        provider = FakeProvider({"Owner item": 0.9, "Exclusive zeta research": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            pipeline.run_once(self.conn, provider, cfg, dry_run=True)
+
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("scored"), 1)             # the exploit cap, exactly
+        self.assertEqual(metrics.get("deferred"), 2)           # 3 owner - 1 scored
+        self.assertEqual(metrics.get("explore_scored"), 2)     # both explore items, untouched
+        self.assertNotIn("explore_deferred", metrics)
+
+    # --- metrics isolation -------------------------------------------------------
+
+    def test_metrics_isolation_owner_and_derived_notifications_split(self):
+        owner_item = an_item(
+            source="fake", type="market_event", title="Owner alert",
+            url="https://e.com/owner-alert",
+        )
+        explore_item = an_item(
+            source="fake", type="market_event",
+            title="Exclusive zeta research breakthrough",
+            url="https://e.com/explore-alert",
+        )
+
+        def collector(interest, cfg, provider, conn=None):
+            return [owner_item, explore_item] if interest.key == "k" else []
+
+        provider = LaneProvider(
+            {"Owner alert": 0.95, "Exclusive zeta research": 0.95},
+            keys={"Owner alert": "k", "Exclusive zeta research": "derived:zeta"},
+        )
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            summary = pipeline.run_once(self.conn, provider, self.cfg, dry_run=True)
+        self.assertEqual(summary["notified"], 2)   # both attempted, neither dropped
+
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("notified"), 1)
+        self.assertEqual(metrics.get("explore_notified"), 1)
+
+        text = stats.report(self.conn, days=7)
+        self.assertRegex(text, r"notifications sent\s+1\s")           # FUNNEL: owner only
+        self.assertRegex(text, r"(?m)^k\s+1\s+1\s+100%")              # owner-only per-interest table
+        self.assertIn("EXPLORATION", text)
+        self.assertRegex(text, r"(?m)^derived:zeta\s+1\s+1\s+100%")   # derived-only table
+
+    def test_containment_explore_error_does_not_touch_exploit(self):
+        owner_item = an_item(
+            source="fake", type="market_event", title="Owner alert",
+            url="https://e.com/owner-alert",
+        )
+        explore_item = self._explore_item(0)
+
+        def collector(interest, cfg, provider, conn=None):
+            return [owner_item, explore_item] if interest.key == "k" else []
+
+        provider = FakeProvider({
+            "Owner alert": 0.95,
+            "Exclusive zeta research": RuntimeError("boom"),
+        })
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            summary = pipeline.run_once(self.conn, provider, self.cfg, dry_run=True)
+
+        self.assertEqual(summary["errors"], 1)
+        self.assertEqual(summary["notified"], 1)
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("explore_errors"), 1)
+        self.assertNotIn("errors", metrics)
+        self.assertEqual(metrics.get("scored"), 1)
+
+    # --- backlog lane fairness ---------------------------------------------------
+
+    def test_backlog_lane_fairness_zero_explore_budget_still_drains_owner(self):
+        cfg = dataclasses.replace(self.cfg, explore_max_scores_per_cycle=0)
+        owner_item = stored_item(self.conn, url="https://e.com/owner-b", title="Owner item 9")
+        db.set_prefilter(self.conn, owner_item.id, True, "ok")
+        explore_item = stored_item(
+            self.conn, url="https://e.com/explore-b",
+            title="Exclusive zeta research finding 9",
+        )
+        db.set_prefilter(self.conn, explore_item.id, True, "ok")
+
+        provider = FakeProvider({"Owner item": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": lambda i, c, p, conn=None: []}):
+            summary = pipeline.run_once(self.conn, provider, cfg, dry_run=True)
+        self.assertEqual(summary["scored"], 1)
+        self.assertIsNone(
+            self.conn.execute(
+                "SELECT 1 FROM scores WHERE item_id = ?", (explore_item.id,)
+            ).fetchone()
+        )
+        unscored = self.conn.execute(
+            "SELECT title FROM candidate_items WHERE prefilter_ok = 1 AND id NOT IN"
+            " (SELECT item_id FROM scores)"
+        ).fetchall()
+        self.assertEqual([r["title"] for r in unscored], ["Exclusive zeta research finding 9"])
+
+        # Next cycle, explore budget is back -- the skipped item is scored.
+        provider2 = FakeProvider({"Exclusive zeta research": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": lambda i, c, p, conn=None: []}):
+            summary2 = pipeline.run_once(self.conn, provider2, self.cfg, dry_run=True)
+        self.assertEqual(summary2["scored"], 1)
+        self.assertIsNotNone(
+            self.conn.execute(
+                "SELECT 1 FROM scores WHERE item_id = ?", (explore_item.id,)
+            ).fetchone()
+        )
+
+    # --- classification ------------------------------------------------------
+
+    def test_classification_owner_best_match_wins_even_with_a_weaker_derived_match(self):
+        item = an_item(
+            source="fake", title="Good stuff about zeta research trends",
+            url="https://e.com/mixed",
+        )
+
+        def collector(interest, cfg, provider, conn=None):
+            return [item] if interest.key == "k" else []
+
+        provider = FakeProvider({"Good stuff": 0.8})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            summary = pipeline.run_once(self.conn, provider, self.cfg, dry_run=True)
+
+        self.assertEqual(summary["scored"], 1)
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("scored"), 1)
+        self.assertNotIn("explore_scored", metrics)
+        row = self.conn.execute(
+            "SELECT n.key FROM scores s JOIN interests n ON n.id = s.interest_id"
+        ).fetchone()
+        self.assertEqual(row["key"], "k")
+
+    # --- _discover CLI path ---------------------------------------------------
+
+    def test_discover_cli_path_enforces_both_budgets(self):
+        from discovery.__main__ import _discover
+
+        def collector(interest, cfg, provider, conn=None):
+            if interest.key != "k":
+                return []
+            return [self._explore_item(n) for n in range(4)]  # cap is 2
+
+        provider = FakeProvider({"Exclusive zeta research": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}), \
+             mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = _discover(self.conn, provider, self.cfg, SimpleNamespace(source="fake"))
+        self.assertEqual(code, 0)
+
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("explore_scored"), 2)
+        self.assertEqual(metrics.get("explore_deferred"), 2)
+        self.assertNotIn("scored", metrics)
+
 
 class FeedbackListenerTests(unittest.TestCase):
     def setUp(self):

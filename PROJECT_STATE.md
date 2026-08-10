@@ -348,7 +348,7 @@ All timestamps UTC via `db.now()`/`db.ago()`. No token metering on
 claude_chat (calls only).
 
 ## Tests
-`python test_discovery.py` (314) + `python test_watch.py` (10), offline, both
+`python test_discovery.py` (323) + `python test_watch.py` (10), offline, both
 green; CI on push/PR.
 
 ## Known issues
@@ -413,3 +413,53 @@ even calls `personal_state.load_optional()` or reads `item_interests`.
 -- every test above is a synthetic fixture. The live-session command
 sequence for the real loop is in README.md's "Real-data loop demo" section;
 it has not been run here.
+
+## exploration engine (step-10)
+Exploitation (owner interests) and exploration (derived/inferred interests,
+see "layered interest state (step-07)" above) are now separated at the
+scoring boundary, not just at promotion time. Lane rule -- the one thing
+everything hangs on: an item is 'explore' iff `matches[0]` (the strongest
+match from `matching.match_interests()`, sorted strongest-first) is a
+non-owner interest; `pipeline.classify_lane()` is the single, trivially-total
+implementation, computed once per item before dedup so it's stable across
+that item's whole `ingest()` path. A weaker derived match alongside a
+stronger owner one still charges exploitation, byte-identical to before this
+step.
+
+Two `pipeline.Budget` instances per cycle (`run_once`/`__main__._discover`,
+the only construction sites): the existing exploit one (`DISCOVERY_MAX_SCORES`)
+and a new explore one (`explore_max_scores_per_cycle`, env
+`DISCOVERY_EXPLORE_MAX_SCORES`, default `5`) -- `Budget(cfg.explore_max_scores_per_cycle
+if cfg.dynamic_interests else 0)`, so the flag off makes it structurally
+zero, not merely filtered. `ingest()`'s `explore_budget=None` kwarg default
+preserves every pre-existing caller (`score`, `teach`, tests) untouched.
+`_score_backlog()` takes both budgets, LIMITs on their sum, and `continue`s
+(not `break`s) past an exhausted lane's rows so the other lane keeps
+draining. `Outcome.lane` (default 'exploit') drives `db.bump()`'s metric
+name (`explore_<stage>` vs `<stage>`; 'collected' stays unprefixed --
+collection is always owner-driven since a derived row's `sources` is always
+`[]`) at all three per-item/trailing bump sites. `deliver()`/`send_digest()`
+gained an optional `lane_counts` Counter (default None -- every existing
+caller's plain-int return is unchanged) so `run_once` can bump
+`notified`/`explore_notified` by the *actually persisted* score's interest
+layer (a join, not `Outcome.lane` -- the model can pick a different
+shortlisted interest than the match-time best).
+
+`stats.py`: `_funnel`'s `notified` scalar and `_per_interest` now join
+notifications -> scores -> interests and restrict to `layer = 'owner'` (a
+real repair -- before this step a derived/inferred notification silently
+inflated exploitation's own numbers). A new EXPLORATION section (interest
+counts by layer, `explore_scored`/`explore_deferred`/`explore_errors`/
+`explore_notified`, and a "NOTIFICATIONS PER DERIVED INTEREST" table shaped
+like the owner one) prints only when there's a non-owner interest row, an
+`explore_*` metric, or `cfg.dynamic_interests` -- a default-off report is
+byte-identical to before this step existed.
+
+**No new threshold.** `derived_min_score` (step-07, floor `0.80`) already
+gates which derived scores can notify at all; this step only needed distinct
+*budgets* and distinct *metrics*, not a distinct bar. Do not re-add one.
+
+**Real-data posture.** This worktree has no `discovery.db` -- every number
+in `test_discovery.py`'s `ExplorationLaneTests` is a synthetic in-memory
+fixture. Live readout once dynamic interests are running for real:
+`python -m app stats --days 7`, EXPLORATION section.

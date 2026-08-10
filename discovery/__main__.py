@@ -43,7 +43,7 @@ from .collectors import COLLECTORS
 from .models import CandidateItem
 from .notify import FEEDBACK_VERDICTS, print_safe
 from .personal_state import PersonalStateError
-from .pipeline import Budget, deliver, ingest, run_once, send_digest
+from .pipeline import Budget, deliver, ingest, outcome_metric, run_once, send_digest
 from . import interest_state
 
 
@@ -277,6 +277,7 @@ def _discover(conn, provider, cfg, args):
     total = 0
     counts = Counter()
     budget = Budget(cfg.max_scores_per_cycle)
+    explore_budget = Budget(cfg.explore_max_scores_per_cycle if cfg.dynamic_interests else 0)
     for interest in active:
         try:
             candidates = collect(interest, cfg, provider, conn)
@@ -288,7 +289,7 @@ def _discover(conn, provider, cfg, args):
             counts["collected"] += 1
             outcome = ingest(
                 conn, provider, cfg, item, active,
-                origin_interest=interest.key, budget=budget,
+                origin_interest=interest.key, budget=budget, explore_budget=explore_budget,
             )
             counts[outcome.stage] += 1
             # Flushed per item rather than once at the end (see pipeline.py's
@@ -297,7 +298,7 @@ def _discover(conn, provider, cfg, args):
             # (a narrow console codepage choking on a model-generated
             # character) and silently lost every already-scored item's funnel
             # counts with it, even though their DB rows were already committed.
-            db.bump(conn, {"collected": 1, outcome.stage: 1})
+            db.bump(conn, {"collected": 1, outcome_metric(outcome): 1})
             _print_discovered(interest, item, outcome)
     print(f"\n{total} candidate(s) from '{args.source}'", file=sys.stderr)
     return 0
