@@ -19,7 +19,10 @@ built from the full arg list so the three `run-once` collectors don't share
 one file, exit code propagated); `logs/` is gitignored, inbound-only. Live
 install, fault-injection drills and the 24h soak are a separate,
 not-yet-done step (offline tests stub `schtasks`/`subprocess` via an
-injected fake runner). Every invocation is short-lived, idempotent and
+injected fake runner) — it needs a live operator session (real Chrome/CDP,
+Telegram, `schtasks`, and 24h wall-clock time), which an isolated-worktree
+implementer/repair session cannot provide; do not mark it done without that
+session's evidence. Every invocation is short-lived, idempotent and
 overlap-safe:
 `db.connect` sets `PRAGMA busy_timeout=5000`, and a new `service_state`
 key/value table (`db.state_get`/`state_set`) persists job heartbeats
