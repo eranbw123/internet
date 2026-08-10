@@ -52,6 +52,7 @@ python -m app stats                         # is it finding anything you care ab
 | `items` | List recently scored items |
 | `feedback <id> <verdict>` | Rate an item from the CLI |
 | `stats [--days N]` | Funnel, feedback rates and estimated cost — see [Stats](#stats) |
+| `personal-state [--path]` | Print the sibling `ai` repo's personal-state artifact as this repo would read it — see [Personal-state contract](#personal-state-contract) |
 
 Run it from the repo root — the `stocks` collector imports `watch.py`.
 `python -m app` and `python -m discovery` are the same CLI. Global flags
@@ -143,6 +144,28 @@ place rather than duplicating it.
 `min_score` is a **0–1** threshold on the final score. (It used to be 0–100;
 anything above 1 is treated as the old scale and divided by 100, so a stale
 `75` doesn't silently mean "never notify".)
+
+## Personal-state contract
+
+`discovery/personal_state.py` can read a derived "personal state" artifact
+produced by the sibling `ai` repo (a JSON file of topics the owner has been
+talking about, per `ai`'s `PERSONAL_STATE_CONTRACT.md`, contract version 1).
+It's the only place in this repo that knows that schema; unknown top-level or
+per-topic keys are ignored rather than rejected, so `ai` can add fields
+without a version bump.
+
+```bash
+python -m discovery personal-state              # human-checkable probe: version, age, top topics
+python -m discovery personal-state --path X.json
+```
+
+The artifact path comes from `DISCOVERY_PERSONAL_STATE` (default
+`personal_state.json` at the repo root — gitignored, inbound only, never
+committed here). An interest can opt in to appending the artifact's top N
+topic keys to its `positive_signals` via a `"personal_state_top_terms": N`
+key in `interests.json` — but `init` doesn't pass the loaded state into that
+path yet, so the key has no effect even if set. For now, `personal-state`
+above is the only way to see what this repo would read.
 
 ## Collectors
 
@@ -345,6 +368,7 @@ day, so a window is just a date filter.
 | `DISCOVERY_INTERESTS` | `interests.json` | Interests file |
 | `DISCOVERY_MAX_ITEMS` | `8` | Items per source per cycle |
 | `DISCOVERY_MAX_SCORES` | `25` | Hard cap on LLM scoring calls per cycle. Anything over waits for the next cycle |
+| `DISCOVERY_PERSONAL_STATE` | `personal_state.json` | Path to the `ai` repo's personal-state artifact — see [Personal-state contract](#personal-state-contract) |
 | `DISCOVERY_INTERVAL_STOCKS` | `3600` | `run`'s stocks job cadence, seconds |
 | `DISCOVERY_INTERVAL_WEB` | `14400` | `run`'s web_search job cadence, seconds |
 | `DISCOVERY_INTERVAL_YOUTUBE` | `14400` | `run`'s youtube job cadence, seconds |
@@ -361,6 +385,6 @@ day, so a window is just a date filter.
 python test_discovery.py
 ```
 
-117 tests, network fully stubbed — they never hit an LLM API, Telegram, or
+172 tests, network fully stubbed — they never hit an LLM API, Telegram, or
 Yahoo. The provider seam is the whole stub: a fake object with `complete_json`
 and `search_json`.

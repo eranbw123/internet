@@ -1,6 +1,21 @@
 # PROJECT_STATE.md — `internet`
 
-Updated 2026-08-09. Imported by `CLAUDE.md`. Current state only — not a log.
+Updated 2026-08-10. Imported by `CLAUDE.md`. Current state only — not a log.
+
+## personal-state contract (consumer side)
+`discovery/personal_state.py` is the ONLY reader of the `ai` repo's derived
+personal-state artifact (schema owned by `ai`'s `PERSONAL_STATE_CONTRACT.md`);
+nothing else here opens it, opens `conversations.db`, or imports from `ai`.
+`SUPPORTED_VERSIONS = {1}`; unknown top-level/per-topic keys are ignored.
+Path comes from `DISCOVERY_PERSONAL_STATE` (`cfg.personal_state_path`,
+default `personal_state.json` at repo root, gitignored — inbound, never
+committed). `load_optional()` is the fail-soft form the pipeline should use.
+`interests.json` entries may opt in via `"personal_state_top_terms": N` to
+append the artifact's top N topic keys to `positive_signals`; absent the key
+(today's `interests.json`), behavior is byte-identical to before this landed.
+`python -m discovery personal-state [--path]` prints a human-checkable
+readout. Not yet wired into `init`/production sync — this step only
+establishes the contract boundary.
 
 ## engine lab (`experiments/lab/`, branch `engine-lab`)
 Reusable prompt-optimization loop for the whole engine, generalized from the

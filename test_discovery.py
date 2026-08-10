@@ -29,11 +29,13 @@ from discovery import (
     models,
     normalize,
     notify,
+    personal_state,
     pipeline,
     scheduler,
     scoring,
     stats,
 )
+from discovery.personal_state import PersonalState, PersonalStateError
 from discovery.collectors import COLLECTORS, stocks, web_search, youtube
 from discovery.models import CandidateItem, Interest, ScoreResult
 from discovery.providers import PROVIDERS, claude_chat
@@ -634,6 +636,142 @@ class InterestsFileTests(unittest.TestCase):
             with open(path, "w", encoding="utf-8") as fh:
                 json.dump(data, fh)
             return interests.load_file(path)
+
+    def test_personal_state_top_terms_are_appended_when_opted_in(self):
+        state = PersonalState(
+            contract_version=1,
+            generated_at="2026-08-10T00:00:00Z",
+            topics=[
+                {"key": "orexin", "weight": 1.0},
+                {"key": "wakefulness", "weight": 0.5},
+                {"key": "narcolepsy", "weight": 0.3},
+            ],
+        )
+        data = {
+            "interests": [{
+                "key": "x", "title": "X",
+                "positive_signals": ["orexin", "existing"],
+                "personal_state_top_terms": 2,
+            }]
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "i.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            (with_state,) = interests.load_file(path, state=state)
+            (without_key,) = interests.load_file(path, state=None)
+        # Existing signals first, order stable, de-duplicated against "orexin".
+        self.assertEqual(with_state.positive_signals, ["orexin", "existing", "wakefulness"])
+        # No state loaded -> the key is inert, byte-identical to no state at all.
+        self.assertEqual(without_key.positive_signals, ["orexin", "existing"])
+
+    def test_without_the_opt_in_key_behavior_is_unchanged_by_state(self):
+        state = PersonalState(
+            contract_version=1, generated_at="2026-08-10T00:00:00Z",
+            topics=[{"key": "orexin", "weight": 1.0}],
+        )
+        data = {"interests": [{"key": "x", "title": "X", "positive_signals": ["a"]}]}
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "i.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(data, fh)
+            with_state = interests.load_file(path, state=state)
+            no_state = interests.load_file(path, state=None)
+            plain = interests.load_file(path)
+        self.assertEqual(with_state, no_state)
+        self.assertEqual(with_state, plain)
+
+
+class PersonalStateTests(unittest.TestCase):
+    def _write(self, data):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "personal_state.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh)
+        return path
+
+    def _artifact(self, **overrides):
+        base = {
+            "contract_version": 1,
+            "generated_at": "2026-08-10T00:00:00Z",
+            "window_days": 180,
+            "conversation_count": 12,
+            "sources": {"claude": 8, "chatgpt": 4},
+            "topics": [
+                {"key": "orexin", "weight": 1.0, "conversations": 5, "last_seen": "2026-08-09T00:00:00Z"},
+                {"key": "wakefulness", "weight": 0.6, "conversations": 3, "last_seen": "2026-08-08T00:00:00Z"},
+                {"key": "narcolepsy", "weight": 0.4, "conversations": 2, "last_seen": "2026-08-01T00:00:00Z"},
+            ],
+        }
+        base.update(overrides)
+        return base
+
+    def test_valid_v1_artifact_loads_and_top_terms_are_in_order(self):
+        path = self._write(self._artifact())
+        state = personal_state.load(path)
+        self.assertEqual(state.contract_version, 1)
+        self.assertEqual(state.top_terms(2), ["orexin", "wakefulness"])
+        self.assertEqual(state.top_terms(10), ["orexin", "wakefulness", "narcolepsy"])
+
+    def test_an_unsupported_version_names_found_and_supported_in_the_message(self):
+        path = self._write(self._artifact(contract_version=2))
+        with self.assertRaises(PersonalStateError) as ctx:
+            personal_state.load(path)
+        message = str(ctx.exception)
+        self.assertIn("2", message)
+        self.assertIn(str(sorted(personal_state.SUPPORTED_VERSIONS)), message)
+        # load_optional never raises -- the fail-soft wrapper the pipeline uses.
+        self.assertIsNone(personal_state.load_optional(path))
+
+    def test_forward_compat_ignores_unknown_top_level_and_per_topic_keys(self):
+        data = self._artifact(some_future_field="ignored")
+        data["topics"][0]["some_future_topic_field"] = "ignored"
+        path = self._write(data)
+        state = personal_state.load(path)
+        self.assertEqual(state.top_terms(1), ["orexin"])
+
+    def test_malformed_json_raises_and_load_optional_returns_none(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "bad.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        with self.assertRaises(PersonalStateError):
+            personal_state.load(path)
+        self.assertIsNone(personal_state.load_optional(path))
+
+    def test_missing_file_raises_and_load_optional_returns_none(self):
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "does-not-exist.json")
+        with self.assertRaises(PersonalStateError):
+            personal_state.load(path)
+        self.assertIsNone(personal_state.load_optional(path))
+
+    def test_a_non_dict_artifact_raises_and_load_optional_returns_none(self):
+        # A truncated/zeroed producer write (`null`, a bare number, ...) must
+        # not escape as a raw TypeError -- `"contract_version" not in data`
+        # only makes sense once `data` is known to be a mapping.
+        for bad in (None, 5, [1, 2]):
+            path = self._write(bad)
+            with self.assertRaises(PersonalStateError):
+                personal_state.load(path)
+            self.assertIsNone(personal_state.load_optional(path))
+
+    def test_malformed_topics_raise_instead_of_failing_later_at_top_terms(self):
+        # `topics` not a list, and a topic missing its `key`, must be caught
+        # in load() itself -- interests.load_file calls top_terms() after
+        # load_optional() has already returned, outside any fail-soft guard.
+        not_a_list = self._write(self._artifact(topics={"a": 1}))
+        with self.assertRaises(PersonalStateError):
+            personal_state.load(not_a_list)
+        self.assertIsNone(personal_state.load_optional(not_a_list))
+
+        missing_key = self._write(self._artifact(topics=[{"weight": 1}]))
+        with self.assertRaises(PersonalStateError):
+            personal_state.load(missing_key)
+        self.assertIsNone(personal_state.load_optional(missing_key))
 
 
 class ScoringTests(unittest.TestCase):
@@ -2364,6 +2502,41 @@ class CLITests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("unknown provider 'bogus'", err)
 
+    def test_personal_state_probe_survives_an_off_contract_generated_at(self):
+        # valid JSON, valid v1 shape, but generated_at that isn't a proper
+        # "Z"-suffixed UTC timestamp must fall back to "age unknown" rather
+        # than tracebacking on offset-naive/None subtraction.
+        for generated_at in ("2026-08-01T00:00:00", None):
+            path = os.path.join(self.tmp.name, "ps.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {"contract_version": 1, "topics": [], "generated_at": generated_at}, fh
+                )
+            code, out, _err = self._main("personal-state", "--path", path)
+            self.assertEqual(code, 0)
+            self.assertIn("age unknown", out)
+
+    def test_personal_state_probe_prints_a_full_readout(self):
+        # Valid v1 artifact, proper Z-suffixed timestamp, >10 topics -- the
+        # normal-path shape, as opposed to the degenerate/error shape above.
+        topics = [{"key": f"t{i}", "weight": round(1.0 - i * 0.05, 2)} for i in range(12)]
+        path = os.path.join(self.tmp.name, "ps.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {"contract_version": 1, "generated_at": "2026-08-01T00:00:00Z", "topics": topics},
+                fh,
+            )
+        code, out, _err = self._main("personal-state", "--path", path)
+        self.assertEqual(code, 0)
+        self.assertIn("contract_version=1", out)
+        self.assertIn("12 topic(s)", out)
+        self.assertIn("d old", out)
+        self.assertNotIn("age unknown", out)
+        listed_keys = [
+            line.split("'")[1] for line in out.splitlines() if line.strip().startswith("'t")
+        ]
+        self.assertEqual(listed_keys, [f"t{i}" for i in range(10)])
+
 
 class CLIPrintSafetyTests(unittest.TestCase):
     """Regression: __main__.py's own output helpers must survive a narrow
@@ -2406,6 +2579,25 @@ class CLIPrintSafetyTests(unittest.TestCase):
 
         with mock.patch("sys.stdout", self._narrow_stdout()):
             _list_items(conn, limit=10, min_score=0.0)  # must not raise
+
+    def test_personal_state_probe_survives_a_narrow_codepage(self):
+        from discovery.__main__ import _personal_state
+
+        tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(tmp.cleanup)
+        path = os.path.join(tmp.name, "ps.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "contract_version": 1,
+                    "generated_at": "2026-08-01T00:00:00Z",
+                    "topics": [{"key": "topic ≥ threshold", "weight": 0.9}],
+                },
+                fh,
+            )
+        args = SimpleNamespace(path=path)
+        with mock.patch("sys.stdout", self._narrow_stdout()):
+            _personal_state(None, args)  # must not raise
 
 
 if __name__ == "__main__":
