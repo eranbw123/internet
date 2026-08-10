@@ -3408,6 +3408,23 @@ class ConnectorReconTests(unittest.TestCase):
         self.assertEqual(exp_connectors.HOST_MIN_GAP_SECONDS["export.arxiv.org"], 3.0)
         self.assertEqual(exp_connectors.DEFAULT_MIN_GAP_SECONDS, 1.0)
 
+    def test_per_connector_cap_refuses_11th(self):
+        with mock.patch("exp_connectors.time.sleep"), \
+             mock.patch("exp_connectors.urllib.request.urlopen",
+                        return_value=_FakeHTTPResponse()) as m_urlopen:
+            for i in range(exp_connectors.PER_CONNECTOR_CAP):
+                exp_connectors._http_get(f"https://hn.algolia.com/api/v1/search_by_date?query={i}",
+                                         connector="hackernews")
+            self.assertEqual(m_urlopen.call_count, exp_connectors.PER_CONNECTOR_CAP)
+            with self.assertRaises(RuntimeError):
+                exp_connectors._http_get("https://hn.algolia.com/api/v1/search_by_date?query=over",
+                                         connector="hackernews")
+            self.assertEqual(m_urlopen.call_count, exp_connectors.PER_CONNECTOR_CAP)
+            # a different connector's own cap is untouched by hackernews's
+            exp_connectors._http_get("https://export.arxiv.org/api/query?search_query=x",
+                                     connector="arxiv")
+            self.assertEqual(m_urlopen.call_count, exp_connectors.PER_CONNECTOR_CAP + 1)
+
     # (d) missing corpus / missing network / failed preflight -> VOID/PENDING
 
     def test_load_corpus_urls_missing_file_is_void(self):
@@ -3418,15 +3435,23 @@ class ConnectorReconTests(unittest.TestCase):
         self.assertFalse(status["available"])
         self.assertIn(missing, status["reason"])
 
-    def test_build_x_entry_pending_when_preflight_fails(self):
-        entry = exp_connectors.build_x_entry(["ai-agents-dev-tools"], False,
-                                             "CLAUDE_ORG_ID is not set")
-        self.assertEqual(entry["availability"]["status"], "PENDING")
-        self.assertIsNone(entry["metrics"]["marginal_unique_rate"])
-        self.assertEqual(entry["metrics"]["marginal_unique_rate_status"], "PENDING_LIVE_LANE")
+    def test_build_x_entry_not_implemented_regardless_of_provider_ok(self):
+        # x has no sampler at all in this harness version -- the status must
+        # say so plainly and identically whether or not a live provider is
+        # reachable (repair: it used to say PENDING unconditionally, implying
+        # a live session alone would resolve it).
+        for provider_ok, provider_why in ((False, "CLAUDE_ORG_ID is not set"), (True, "")):
+            with self.subTest(provider_ok=provider_ok):
+                entry = exp_connectors.build_x_entry(["ai-agents-dev-tools"], provider_ok, provider_why)
+                self.assertEqual(entry["availability"]["status"], "NOT_IMPLEMENTED")
+                self.assertEqual(entry["sample"]["status"], "NOT_IMPLEMENTED")
+                self.assertIsNone(entry["metrics"]["marginal_unique_rate"])
+                self.assertEqual(entry["metrics"]["marginal_unique_rate_status"], "NOT_IMPLEMENTED")
+                self.assertIsNone(entry["command_to_complete"])
+                self.assertTrue(entry["follow_up"])
 
     def test_http_connector_entry_void_when_endpoint_unreachable(self):
-        def boom(url, timeout=15):
+        def boom(url, timeout=15, connector=None):
             raise exp_connectors.ConnectorUnreachable("host.example: connection refused")
 
         interests_by_key = {"ai-agents-dev-tools": an_interest(
@@ -3437,11 +3462,13 @@ class ConnectorReconTests(unittest.TestCase):
                 datetime.now(timezone.utc), "deadbeef", provider=None, provider_ok=False, lab=None)
         self.assertEqual(entry["sample"]["status"], "VOID_UNREACHABLE")
         self.assertIn("connection refused", entry["failure_behavior"])
+        self.assertIn("connection refused", entry["availability"]["detail"])
         self.assertEqual(entry["metrics"]["n_sampled"], 0)
         self.assertIsNone(entry["metrics"]["marginal_unique_rate"])
+        self.assertEqual(entry["metrics"]["marginal_unique_rate_status"], "VOID_UNREACHABLE")
 
     def test_http_connector_entry_void_on_low_n(self):
-        def empty_hits(url, timeout=15):
+        def empty_hits(url, timeout=15, connector=None):
             return 200, b'{"hits": []}', {}
 
         interests_by_key = {"ai-agents-dev-tools": an_interest(
@@ -3451,11 +3478,74 @@ class ConnectorReconTests(unittest.TestCase):
                 "hackernews", ["ai-agents-dev-tools"], interests_by_key, set(), False,
                 datetime.now(timezone.utc), "deadbeef", provider=None, provider_ok=False, lab=None)
         self.assertEqual(entry["sample"]["status"], "VOID_LOW_N")
+        # availability is about reachability (http 200), not sample size --
+        # repair: these two used to be conflated into one 'detail' field.
+        self.assertIn("reachable", entry["availability"]["detail"])
+        self.assertNotIn("< 5", entry["availability"]["detail"])
+        self.assertIn("< 5", entry["sample"]["detail"])
+
+    def test_http_connector_entry_computes_offline_baseline_when_corpus_available(self):
+        # repair: baseline_available used to be hardcoded False with no code
+        # path that could ever set it True. The offline lane's substitute
+        # baseline is the corpus alone (pre-registration) when reachable.
+        def five_hits(url, timeout=15, connector=None):
+            hits = [{"title": f"T{i}", "url": f"https://e.com/{i}",
+                    "created_at": "2026-08-01T00:00:00.000Z", "objectID": str(i)}
+                   for i in range(1, 6)]
+            return 200, json.dumps({"hits": hits}).encode(), {}
+
+        interests_by_key = {"ai-agents-dev-tools": an_interest(
+            key="ai-agents-dev-tools", title="T", positive_signals=["s1", "s2", "s3"])}
+        corpus_urls = {"https://e.com/1", "https://e.com/2"}   # 2 of the 5 sampled urls known
+        with mock.patch("exp_connectors._http_get", side_effect=five_hits):
+            entry = exp_connectors.build_http_connector_entry(
+                "hackernews", ["ai-agents-dev-tools"], interests_by_key, corpus_urls, True,
+                datetime.now(timezone.utc), "deadbeef", provider=None, provider_ok=False, lab=None)
+        self.assertEqual(entry["sample"]["status"], "OK")
+        self.assertAlmostEqual(entry["metrics"]["marginal_unique_rate"], 0.6)
+        self.assertEqual(entry["metrics"]["marginal_unique_rate_status"],
+                         "OK_OFFLINE_LANE_CORPUS_ONLY_BASELINE")
+
+    def test_http_connector_entry_void_no_baseline_when_corpus_unavailable(self):
+        def five_hits(url, timeout=15, connector=None):
+            hits = [{"title": f"T{i}", "url": f"https://e.com/{i}",
+                    "created_at": "2026-08-01T00:00:00.000Z", "objectID": str(i)}
+                   for i in range(1, 6)]
+            return 200, json.dumps({"hits": hits}).encode(), {}
+
+        interests_by_key = {"ai-agents-dev-tools": an_interest(
+            key="ai-agents-dev-tools", title="T", positive_signals=["s1", "s2", "s3"])}
+        with mock.patch("exp_connectors._http_get", side_effect=five_hits):
+            entry = exp_connectors.build_http_connector_entry(
+                "hackernews", ["ai-agents-dev-tools"], interests_by_key, set(), False,
+                datetime.now(timezone.utc), "deadbeef", provider=None, provider_ok=False, lab=None)
+        self.assertEqual(entry["sample"]["status"], "OK")
+        self.assertIsNone(entry["metrics"]["marginal_unique_rate"])
+        self.assertEqual(entry["metrics"]["marginal_unique_rate_status"], "VOID_NO_BASELINE")
+
+    def test_above_bar_not_spent_when_baseline_unavailable(self):
+        # repair: above-bar sub-metric used to fire on provider_ok alone,
+        # spending provider budget even when the connector's own primary
+        # metric was structurally void this pass.
+        def five_hits(url, timeout=15, connector=None):
+            hits = [{"title": f"T{i}", "url": f"https://e.com/{i}",
+                    "created_at": "2026-08-01T00:00:00.000Z", "objectID": str(i)}
+                   for i in range(1, 6)]
+            return 200, json.dumps({"hits": hits}).encode(), {}
+
+        interests_by_key = {"ai-agents-dev-tools": an_interest(
+            key="ai-agents-dev-tools", title="T", positive_signals=["s1", "s2", "s3"])}
+        with mock.patch("exp_connectors._http_get", side_effect=five_hits):
+            entry = exp_connectors.build_http_connector_entry(
+                "hackernews", ["ai-agents-dev-tools"], interests_by_key, set(), False,
+                datetime.now(timezone.utc), "deadbeef", provider=object(), provider_ok=True, lab=None)
+        self.assertIsNone(entry["metrics"]["above_bar_count"])
+        self.assertEqual(entry["metrics"]["above_bar_status"], "VOID_NO_BASELINE")
 
     # (e) provenance on every dossier record --------------------------------
 
     def test_per_interest_records_carry_provenance(self):
-        def one_hit(url, timeout=15):
+        def one_hit(url, timeout=15, connector=None):
             body = json.dumps({"hits": [{"title": "T1", "url": "https://e.com/1",
                                         "created_at": "2026-08-01T00:00:00.000Z",
                                         "objectID": "1"}]}).encode()

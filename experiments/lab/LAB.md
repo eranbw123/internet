@@ -88,6 +88,11 @@ python experiments/lab/exp_connectors.py sample
 python experiments/lab/exp_connectors.py report
 ```
 
+The live lane (x sampling via `search_json`, a `web_search` baseline
+sampler, the above-bar sub-metric) is NOT YET IMPLEMENTED — `sample` only
+ever runs the zero-spend HTTP connectors; see PROJECT_STATE.md for what's
+still needed before a live re-run produces new evidence.
+
 Retires `blind_rate.py` (guardrail 8): proposal 002 was mothballed
 indefinitely by owner decision ("proceed label-free"), every label-gated
 metric is already gated elsewhere, and the frozen 67-item batch under the

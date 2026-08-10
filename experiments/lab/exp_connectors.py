@@ -17,9 +17,16 @@ BASELINE: the existing `web_search` collector's sample over the same
 interests, same window, same per-interest item cap. For the zero-spend
 (offline) lane the baseline is the stored production corpus; if neither the
 corpus nor a web_search sample is reachable, the metric is recorded as VOID,
-never as 0. (In practice the web_search sample always needs a provider call,
-so it is *structurally* unavailable in the zero-spend lane -- see
-`verdict_detail` in the persisted dossier.)
+never as 0. `marginal_unique_rate` is computed against the corpus alone
+whenever `discovery.db` is reachable (an honest offline-lane substitute for
+the full corpus-UNION-web_search_sample baseline). `jaccard_overlap_with_
+web_search_sample` always needs an actual web_search sample, which needs a
+provider call -- and THIS HARNESS VERSION DOES NOT YET IMPLEMENT a web_search
+baseline sampler or an `x` connector sampler (both need `provider.search_
+json`), independent of whether a live provider is reachable. So `x`'s entry
+and the overlap component are recorded NOT_IMPLEMENTED, not merely PENDING
+on an operator session -- see `lanes.live.blocking_work` in the persisted
+dossier for exactly what code is missing.
 
 PRIMARY METRIC: `marginal_unique_rate` = |sample_urls \\ (corpus_urls UNION
 web_search_sample_urls)| / |sample_urls|, computed per connector, pooled
@@ -255,31 +262,41 @@ def utf8_stdout():
 
 _request_count = 0
 _last_request_at = {}
+_connector_request_count = {}
 
 
 def _reset_http_state():
     """Test seam: reset module-level counters between test cases."""
-    global _request_count, _last_request_at
+    global _request_count, _last_request_at, _connector_request_count
     _request_count = 0
     _last_request_at = {}
+    _connector_request_count = {}
 
 
 class ConnectorUnreachable(Exception):
     """The endpoint could not be reached at all (DNS/connect/timeout)."""
 
 
-def _http_get(url, timeout=15):
-    """The harness's ONE network entry point: enforces the request-count cap,
-    per-host spacing (arxiv gets its own 3s etiquette gap), a descriptive
-    User-Agent, and the timeout. Returns (status, body_bytes, headers_dict).
-    Tests monkeypatch this whole function to exercise the connector-shaping
-    and analysis code without touching the network; the counter/spacing
-    logic itself is tested by patching urllib.request.urlopen underneath it.
+def _http_get(url, connector=None, timeout=15):
+    """The harness's ONE network entry point: enforces the global
+    request-count cap AND (when `connector` is given) the pre-registered
+    per-connector cap at runtime -- not just via the import-time
+    `_static_budget_check()` sanity check, which would otherwise silently
+    drift from reality if a sampler grew a retry or a paged fetch. Also
+    enforces per-host spacing (arxiv gets its own 3s etiquette gap), a
+    descriptive User-Agent, and the timeout. Returns (status, body_bytes,
+    headers_dict). Tests monkeypatch this whole function to exercise the
+    connector-shaping and analysis code without touching the network; the
+    counter/spacing logic itself is tested by patching
+    urllib.request.urlopen underneath it.
     """
     global _request_count
     host = urllib.parse.urlparse(url).netloc
     if _request_count >= MAX_REQUESTS:
         raise RuntimeError(f"request cap {MAX_REQUESTS} reached; refusing {url}")
+    if connector is not None and _connector_request_count.get(connector, 0) >= PER_CONNECTOR_CAP:
+        raise RuntimeError(f"per-connector cap {PER_CONNECTOR_CAP} reached for "
+                           f"'{connector}'; refusing {url}")
     min_gap = HOST_MIN_GAP_SECONDS.get(host, DEFAULT_MIN_GAP_SECONDS)
     last = _last_request_at.get(host)
     if last is not None:
@@ -299,9 +316,13 @@ def _http_get(url, timeout=15):
     except (urllib.error.URLError, TimeoutError, OSError) as e:
         _request_count += 1
         _last_request_at[host] = time.monotonic()
+        if connector is not None:
+            _connector_request_count[connector] = _connector_request_count.get(connector, 0) + 1
         raise ConnectorUnreachable(f"{host}: {e}") from e
     _request_count += 1
     _last_request_at[host] = time.monotonic()
+    if connector is not None:
+        _connector_request_count[connector] = _connector_request_count.get(connector, 0) + 1
     return status, body, headers
 
 
@@ -502,13 +523,13 @@ def parse_pubmed_summaries(body):
     return out
 
 
-def _sample(url, parser):
+def _sample(url, parser, connector=None):
     """One bounded fetch-and-parse through _http_get. Never raises: any
     failure (network, HTTP status, parse) lands in entry['error']."""
     entry = {"records": [], "http_status": None, "endpoint": url, "error": None,
              "rate_limit_headers": {}}
     try:
-        status, body, headers = _http_get(url)
+        status, body, headers = _http_get(url, connector=connector)
     except Exception as e:
         entry["error"] = str(e)
         return entry
@@ -529,7 +550,7 @@ def sample_pubmed(query, n=N_PER_QUERY):
     entry = {"records": [], "http_status": None, "endpoint": esearch_url, "error": None,
              "rate_limit_headers": {}}
     try:
-        status, body, headers = _http_get(esearch_url)
+        status, body, headers = _http_get(esearch_url, connector="pubmed")
     except Exception as e:
         entry["error"] = f"esearch failed: {e}"
         return entry
@@ -548,7 +569,7 @@ def sample_pubmed(query, n=N_PER_QUERY):
     esummary_url = pubmed_esummary_url(ids)
     entry["endpoint"] = f"{esearch_url} -> {esummary_url}"
     try:
-        status2, body2, headers2 = _http_get(esummary_url)
+        status2, body2, headers2 = _http_get(esummary_url, connector="pubmed")
     except Exception as e:
         entry["error"] = f"esummary failed: {e}"
         return entry
@@ -565,17 +586,19 @@ def sample_pubmed(query, n=N_PER_QUERY):
 
 
 CONNECTOR_SAMPLERS = {
-    "hackernews": lambda q, n=N_PER_QUERY: _sample(hn_url(q, n), parse_hn),
-    "reddit": lambda q, n=N_PER_QUERY: _sample(reddit_url(q, n), parse_reddit),
-    "arxiv": lambda q, n=N_PER_QUERY: _sample(arxiv_url(q, n), parse_arxiv),
+    "hackernews": lambda q, n=N_PER_QUERY: _sample(hn_url(q, n), parse_hn, connector="hackernews"),
+    "reddit": lambda q, n=N_PER_QUERY: _sample(reddit_url(q, n), parse_reddit, connector="reddit"),
+    "arxiv": lambda q, n=N_PER_QUERY: _sample(arxiv_url(q, n), parse_arxiv, connector="arxiv"),
     "pubmed": sample_pubmed,
 }
 
 
 def _static_budget_check():
-    """Guards the pre-registered request caps against a future edit to
-    APPLICABILITY: fails loudly at import time rather than silently
-    overspending."""
+    """Import-time sanity check on the pre-registered request caps against
+    APPLICABILITY -- fails loudly before any request is attempted rather than
+    silently overspending. The actual guarantee is the runtime per-connector
+    counter in `_http_get` (this is a cheap early warning, not the enforcement
+    point)."""
     per_query_requests = {"hackernews": 1, "reddit": 1, "arxiv": 1, "pubmed": 2}
     total = 0
     for name, per_query in per_query_requests.items():
@@ -649,25 +672,40 @@ def git_head_sha():
 
 
 def build_x_entry(applicable, provider_ok, provider_why):
-    detail = (f"provider.search_json requires a live claude.ai Chrome/CDP session; "
-             f"provider.preflight() here: {provider_ok} "
-             f"({provider_why or 'reachable, but this lane makes 0 provider calls by pre-registration'})")
+    """x has NO sampler in this harness version: unlike the 4 HTTP connectors,
+    nothing here ever calls provider.search_json. This is a code gap, not an
+    operator-session gap -- status is NOT_IMPLEMENTED regardless of
+    provider_ok, and there is deliberately no `command_to_complete` a reader
+    could run today, since running `sample` (even live) would not change this
+    entry until an x sampler is written."""
+    detail = (
+        "x sampling via provider.search_json is NOT IMPLEMENTED in this harness "
+        "version -- no code path calls search_json for x, independent of provider "
+        f"reachability (provider.preflight() here: {provider_ok}, "
+        f"{provider_why or 'reachable'}). Re-running `sample`, live or not, will "
+        "not change this entry until that sampler is written."
+    )
     return {
         "name": "x",
         "applicable_interests": list(applicable),
-        "availability": {"reachable": None, "status": "PENDING", "detail": detail, "checked_at": now()},
-        "sample": {"status": "PENDING", "detail": detail, "per_interest": []},
+        "availability": {"reachable": None, "status": "NOT_IMPLEMENTED", "detail": detail,
+                         "checked_at": now()},
+        "sample": {"status": "NOT_IMPLEMENTED", "detail": detail, "per_interest": []},
         "metrics": {
-            "marginal_unique_rate": None, "marginal_unique_rate_status": "PENDING_LIVE_LANE",
-            "jaccard_overlap_with_web_search_sample": None, "jaccard_overlap_status": "PENDING_LIVE_LANE",
+            "marginal_unique_rate": None, "marginal_unique_rate_status": "NOT_IMPLEMENTED",
+            "jaccard_overlap_with_web_search_sample": None, "jaccard_overlap_status": "NOT_IMPLEMENTED",
             "sample_validity_rate": None, "median_age_days": None,
-            "above_bar_count": None, "above_bar_status": "PENDING_LIVE_LANE",
+            "above_bar_count": None, "above_bar_status": "NOT_IMPLEMENTED",
             "n_sampled": 0, "n_unique_urls": 0,
         },
         "failure_behavior": None,
-        "command_to_complete": (
-            "python experiments/lab/exp_connectors.py sample  # from a live operator "
-            "session: Chrome --remote-debugging-port=9222, logged into claude.ai"
+        "command_to_complete": None,
+        "follow_up": (
+            "Implement an x sampler in exp_connectors.py (provider.search_json "
+            "against the same mechanical query rule the HTTP connectors use), "
+            "THEN re-run python experiments/lab/exp_connectors.py sample from a "
+            "live operator session (Chrome --remote-debugging-port=9222, logged "
+            "into claude.ai)."
         ),
     }
 
@@ -702,15 +740,36 @@ def build_http_connector_entry(name, applicable, interests_by_key, corpus_urls, 
 
     sample_urls = dedup_urls(all_records)
 
+    # marginal_unique_rate: the offline-lane substitute baseline is the
+    # corpus alone (pre-registration). If the sample itself is void (VALIDITY
+    # VOIDS explicitly lists "sample n < 5 for a connector"), that void
+    # reason wins over the baseline question. jaccard_overlap always stays
+    # void here -- it needs a web_search sample, which this harness does not
+    # yet implement (see build_x_entry / lanes.live.blocking_work).
+    if sample_status_ != "OK":
+        mur, mur_status = None, sample_status_
+    elif not corpus_available:
+        mur, mur_status = None, "VOID_NO_BASELINE"
+    else:
+        mur = marginal_unique_rate(sample_urls, corpus_urls)
+        mur_status = "OK_OFFLINE_LANE_CORPUS_ONLY_BASELINE" if mur is not None else "VOID_EMPTY_SAMPLE"
+
+    # Above-bar sub-metric only spends provider calls when the pass could
+    # also produce a real marginal_unique_rate -- otherwise it is budget
+    # spent on a non-decisive number attached to an unusable connector-level
+    # result this pass (reviewer finding).
     above_bar_count = above_bar_n = None
-    above_bar_status = "VOID_NO_PROVIDER"
-    if provider_ok:
+    if provider_ok and corpus_available:
         above_bar_count, above_bar_n = score_records_above_bar(provider, lab, per_interest, interests_by_key)
         above_bar_status = "OK"
+    elif not provider_ok:
+        above_bar_status = "VOID_NO_PROVIDER"
+    else:
+        above_bar_status = "VOID_NO_BASELINE"
 
     metrics = {
-        "marginal_unique_rate": None,
-        "marginal_unique_rate_status": "VOID_NO_BASELINE",
+        "marginal_unique_rate": mur,
+        "marginal_unique_rate_status": mur_status,
         "jaccard_overlap_with_web_search_sample": None,
         "jaccard_overlap_status": "VOID_NO_WEB_SEARCH_SAMPLE",
         "sample_validity_rate": validity_rate(all_records),
@@ -721,17 +780,23 @@ def build_http_connector_entry(name, applicable, interests_by_key, corpus_urls, 
         "n_sampled": len(all_records),
         "n_unique_urls": len(sample_urls),
     }
-    if corpus_available and sample_urls:
-        # Diagnostic only, NOT the pre-registered primary metric (which also
-        # needs the web_search sample). corpus is a subset of the true
-        # baseline, so this is an upper bound on the true marginal_unique_rate.
-        metrics["marginal_unique_rate_vs_corpus_only_diagnostic"] = marginal_unique_rate(sample_urls, corpus_urls)
 
     failures = [f"{pi['interest']}: {pi['error']}" for pi in per_interest if pi["error"]]
     rl = {pi["interest"]: pi["rate_limit_headers"] for pi in per_interest if pi["rate_limit_headers"]}
     failure_behavior = "; ".join(failures) if failures else "no failures observed in this pass"
     if rl:
         failure_behavior += f" | rate-limit headers observed: {rl}"
+
+    # availability.detail is reachability only (did the endpoint answer at
+    # all) -- distinct from sample.detail, which is about sample size/shape.
+    # Conflating the two mislabeled a clean HTTP 200 with 0 hits as an
+    # "unreachable-looking" availability detail (reviewer finding).
+    if successes:
+        availability_detail = f"reachable (http {successes[0]['http_status']})"
+    elif per_interest:
+        availability_detail = "; ".join(f"{pi['interest']}: {pi['error']}" for pi in per_interest)
+    else:
+        availability_detail = "no probed interest maps to this connector"
 
     return {
         "name": name,
@@ -741,7 +806,7 @@ def build_http_connector_entry(name, applicable, interests_by_key, corpus_urls, 
             "http_status": next((pi["http_status"] for pi in per_interest if pi["http_status"] is not None), None),
             "endpoint": per_interest[0]["endpoint"] if per_interest else None,
             "checked_at": per_interest[0]["collected_at"] if per_interest else now(),
-            "detail": sample_detail or "reachable",
+            "detail": availability_detail,
         },
         "sample": {"status": sample_status_, "detail": sample_detail, "per_interest": per_interest},
         "metrics": metrics,
@@ -768,11 +833,16 @@ def run_sample(lab, cfg):
                 name, applicable, interests_by_key, corpus_urls or set(), corpus_status["available"],
                 now_dt, git_commit, provider, provider_ok, lab))
 
-    # web_search_sample is structurally live-lane-only (needs a provider
-    # call); the zero-spend lane never has it, so the pre-registered
-    # baseline (corpus UNION web_search_sample) can never be fully assembled
-    # here regardless of corpus availability.
-    baseline_available = False
+    # baseline_available reflects whether *a* baseline could be assembled at
+    # all this pass. Per pre-registration, the offline lane's baseline
+    # substitutes corpus alone when discovery.db is reachable -- so this is
+    # corpus reachability, not hardcoded False (previous bug: no code path
+    # could ever set it True). jaccard_overlap_with_web_search_sample still
+    # needs an actual web_search sample, which this harness does not yet
+    # implement, so apply_falsification_rule's own "measurable" check (both
+    # metrics present) still returns VOID_NO_MEASURABLE_CONNECTORS rather than
+    # a decisive verdict whenever that's the only gap.
+    baseline_available = corpus_status["available"]
     connector_metrics_for_rule = {
         c["name"]: {"marginal_unique_rate": c["metrics"]["marginal_unique_rate"],
                     "jaccard_overlap": c["metrics"]["jaccard_overlap_with_web_search_sample"]}
@@ -780,18 +850,18 @@ def run_sample(lab, cfg):
     }
     verdict = apply_falsification_rule(connector_metrics_for_rule, baseline_available)
 
-    corpus_note = ("available" if corpus_status["available"]
-                   else f"not available -- {corpus_status['reason']}")
+    corpus_note = ("reachable" if corpus_status["available"]
+                   else f"not reachable -- {corpus_status['reason']}")
     verdict_detail = (
         "The pre-registered primary metric needs corpus UNION web_search_sample as "
-        "its baseline. web_search_sample requires a provider.search_json call, which "
-        "the zero-spend lane never makes by design -- so marginal_unique_rate and "
-        "jaccard_overlap_with_web_search_sample are VOID for every connector this "
-        f"pass, regardless of corpus availability (corpus at {cfg.db_path}: "
-        f"{corpus_note}). H1 is UNDECIDED, not falsified, until a live-lane pass "
-        "supplies the web_search sample. Reproduce with: "
-        "python experiments/lab/exp_connectors.py sample (from a live operator "
-        "session: Chrome --remote-debugging-port=9222, logged into claude.ai)."
+        "its baseline; the offline lane substitutes corpus alone when reachable "
+        f"(discovery.db at {cfg.db_path}: {corpus_note}). "
+        "jaccard_overlap_with_web_search_sample always needs an actual web_search "
+        "sample, which this harness version does not yet implement (no x sampler, "
+        "no web_search baseline sampler -- see lanes.live.blocking_work), so no "
+        "connector this pass has both metrics measured and H1 cannot be resolved "
+        "as SUPPORTED or FALSIFIED. Completing H1 needs that code AND a live "
+        "claude.ai Chrome/CDP session to run it."
     )
 
     dossier = {
@@ -814,12 +884,22 @@ def run_sample(lab, cfg):
             },
             "live": {
                 "status": "PENDING",
-                "reason": (f"provider.preflight() = {provider_ok} ({provider_why or 'ok'}); "
-                          "x's search_json sample, the web_search baseline sample, and the "
-                          "above-bar sub-metric all require a live claude.ai Chrome/CDP "
-                          "session, which an isolated worktree implementer session cannot "
-                          "provide (see PROJECT_STATE.md step-01 precedent)."),
-                "command_to_complete": "python experiments/lab/exp_connectors.py sample",
+                "reason": (
+                    "Not just an operator-session gap: this harness version does not "
+                    "yet implement x's provider.search_json sampling or a web_search "
+                    "baseline sampler, so even a live claude.ai Chrome/CDP session would "
+                    "reproduce this zero-spend lane's connectors[] unchanged for x and "
+                    "for jaccard_overlap_with_web_search_sample on every connector. "
+                    f"provider.preflight() here: {provider_ok} ({provider_why or 'ok'})."
+                ),
+                "blocking_work": [
+                    "implement an x sampler: provider.search_json against the same "
+                    "mechanical query rule the HTTP connectors use",
+                    "implement a web_search baseline sampler over the probed interests "
+                    "so jaccard_overlap_with_web_search_sample and the full corpus "
+                    "UNION web_search_sample primary metric become computable",
+                ],
+                "command_to_complete": None,
             },
         },
         "corpus": {**corpus_status, "path": cfg.db_path},
