@@ -1,4 +1,6 @@
 """Claude provider: structured outputs for scoring, server-side web search."""
+import os
+
 from .base import LLMProvider, ProviderError, parse_json_array, parse_json_object
 
 
@@ -13,6 +15,13 @@ class AnthropicProvider(LLMProvider):
 
             client = anthropic.Anthropic()
         self.client = client
+
+    def preflight(self):
+        # A key-presence check only -- confirming the key actually works
+        # would mean spending a real call, which preflight must never do.
+        if not os.environ.get("ANTHROPIC_API_KEY"):
+            return False, "ANTHROPIC_API_KEY is not set"
+        return True, ""
 
     def complete_json(self, system, prompt, schema, max_tokens=8000):
         response = self.client.messages.create(

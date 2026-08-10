@@ -8,7 +8,7 @@ Two kinds of push, distinguished only by `item.type`:
   ALERT      time-sensitive (today: stocks.py's market_event) -- sent
              immediately by pipeline.deliver() every cycle.
   DISCOVERY  everything else -- held and sent later, batched, by
-             pipeline.send_digest() (see scheduler.py's daily digest job).
+             pipeline.send_digest() (the daily `digest` job).
 """
 import json
 import sys

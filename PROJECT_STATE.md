@@ -2,6 +2,40 @@
 
 Updated 2026-08-10. Imported by `CLAUDE.md`. Current state only — not a log.
 
+## service hardening (step-01): no more in-process scheduler
+`discovery/scheduler.py` and the `run` subcommand are DELETED — the
+SSH-session-child tick loop is gone; an OS scheduler must call `run-once
+--source <name>` / `digest` / `listen --drain` / `health --notify` on their
+own cadence instead (installer not yet landed in this worktree). Every
+invocation is short-lived, idempotent and now overlap-safe:
+`db.connect` sets `PRAGMA busy_timeout=5000`, and a new `service_state`
+key/value table (`db.state_get`/`state_set`) persists job heartbeats
+(`job:<name>:last_ok`/`last_fail`), the Telegram `getUpdates` offset, and
+`health`'s own alert-dedup state across separate processes.
+
+`run-once` is gated by `providers/base.LLMProvider.preflight()` (base:
+always ok; `anthropic`/`openai`: API-key presence only; `ClaudeChatProvider`:
+free local check via `cdp.list_tabs`/`find_claude_tab` — CLAUDE_ORG_ID set,
+CDP endpoint up, a claude.ai tab open). `discovery/health.py` owns the gate
+(`preflight_gate`, optional one-shot `cfg.chrome_launch_cmd` relaunch +
+`chrome_launch_wait_seconds` re-check) and the readout (`check`/
+`format_report`/`notify_if_needed`): job staleness (never-run = unknown, not
+stale), provider reachability, pending/abandoned notification counts,
+today's `metrics` counters (`run_ok`/`run_failed`/`provider_down`/
+`send_failed`/`feedback_recorded`). `python -m app health [--notify]`
+exits 0/1; `--notify` alerts at most once per
+`cfg.health_alert_cooldown_seconds` while degraded plus one recovery message,
+gated on `service_state`. `stats.report(conn, days, cfg=None)` grows a
+HEALTH section when `cfg` is passed (no live provider check — read-only).
+
+`feedback_listener.drain(conn, cfg)` is one bounded `getUpdates` pass
+(`python -m app listen --drain`) sharing the persisted offset with the
+blocking `listen`, so a button press during downtime is caught by the next
+drain instead of lost. Send-retry policy moved onto `Config`
+(`send_max_attempts`=5, `send_retry_seconds`=30min, raised from db.py's
+3/15min module-constant defaults, which stay as `db.pending_notifications`'s
+own fallback); `pipeline._send_one` bumps `send_failed` on a failed send.
+
 ## personal-state contract (consumer side)
 `discovery/personal_state.py` is the ONLY reader of the `ai` repo's derived
 personal-state artifact (schema owned by `ai`'s `PERSONAL_STATE_CONTRACT.md`);

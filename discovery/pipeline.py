@@ -3,9 +3,9 @@
     collect -> normalize -> dedup -> persist -> interest matching
             -> cheap pre-filter -> LLM scoring -> threshold -> notification
 
-`ingest()` is that whole chain for one candidate and is what both the
-scheduler and `python -m app score` call, so a manual run exercises exactly
-the production path.
+`ingest()` is that whole chain for one candidate and is what both run_once()
+and `python -m app score` call, so a manual run exercises exactly the
+production path.
 
 Two properties everything else leans on:
 
@@ -63,9 +63,10 @@ class Outcome:
 
 def run_once(conn, provider, cfg, sources=None, dry_run=False):
     """One full cycle over every active interest. `sources`, if given,
-    restricts collection to those collector names (scheduler.py's per-job
-    cadence, or `run-once --source`) -- an interest that doesn't list a given
-    source in its own `sources` still skips it. Returns a counts summary.
+    restricts collection to those collector names (`run-once --source`, one
+    per OS-scheduled job -- see health.py/ops/install_tasks.py) -- an
+    interest that doesn't list a given source in its own `sources` still
+    skips it. Returns a counts summary.
 
     At most `cfg.max_scores_per_cycle` items are scored. Past that the cycle
     keeps collecting and filtering but stops paying: the surplus is stored
@@ -223,15 +224,19 @@ def _score_backlog(conn, provider, interests, budget):
 
 # --- stage 8: threshold + notification ---------------------------------------
 
-def notification_ready(conn):
+def notification_ready(conn, cfg):
     """Scores that cleared their interest's bar and have not been sent.
 
     The threshold lives in SQL (`final_score >= interests.min_score`) so a
-    lowered bar picks up items scored under the old one automatically.
+    lowered bar picks up items scored under the old one automatically. The
+    retry policy (attempt cap, cool-off) comes from cfg -- see
+    db.pending_notifications().
     """
     by_id = {i.id: i for i in db.active_interests(conn)}
     ready = []
-    for row in db.pending_notifications(conn):
+    for row in db.pending_notifications(
+        conn, max_attempts=cfg.send_max_attempts, retry_after_seconds=cfg.send_retry_seconds
+    ):
         item = db.get_item(conn, row["item_id"])
         interest = by_id.get(row["interest_id"])
         if item is None or interest is None:
@@ -244,7 +249,7 @@ def deliver(conn, cfg, dry_run=False):
     """ALERT-type items only, sent the moment they clear the bar. DISCOVERY
     items are left pending -- send_digest() is what clears those."""
     sent = 0
-    for row, item, interest in notification_ready(conn):
+    for row, item, interest in notification_ready(conn, cfg):
         if not notify.is_alert(item):
             continue
         sent += _send_one(conn, cfg, row, item, interest, dry_run)
@@ -258,7 +263,7 @@ def send_digest(conn, cfg, dry_run=False):
     marked notified. Alerts are never touched here; deliver() already sent
     them."""
     sent = 0
-    for row, item, interest in notification_ready(conn):
+    for row, item, interest in notification_ready(conn, cfg):
         if notify.is_alert(item):
             continue
         if sent >= cfg.digest_max_items:
@@ -280,4 +285,6 @@ def _send_one(conn, cfg, row, item, interest, dry_run):
     # Recorded either way: a failed send stays recorded as not-ok rather
     # than being retried forever on every cycle.
     db.record_notification(conn, row["score_id"], "telegram", ok)
+    if not ok:
+        db.bump(conn, {"send_failed": 1})
     return 1

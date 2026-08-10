@@ -24,6 +24,7 @@ from discovery import (
     db,
     dedup,
     feedback_listener,
+    health,
     interests,
     matching,
     models,
@@ -31,7 +32,6 @@ from discovery import (
     notify,
     personal_state,
     pipeline,
-    scheduler,
     scoring,
     stats,
 )
@@ -53,6 +53,11 @@ CFG = config.Config(
     min_text_chars=40,
     telegram_bot_token="",
     telegram_chat_id="",
+    # Pinned to the db.py module constants (rather than Config's own raised
+    # defaults) so the retry-policy tests below stay exact regardless of
+    # what config.load()'s production defaults are.
+    send_max_attempts=db.MAX_SEND_ATTEMPTS,
+    send_retry_seconds=db.RESEND_FAILED_AFTER_SECONDS,
 )
 
 BODY = (
@@ -486,6 +491,51 @@ class DBTests(unittest.TestCase):
             ("m1", 2, 150, 15, 2),
         )
 
+    def test_state_get_defaults_and_set_round_trips(self):
+        self.assertIsNone(db.state_get(self.conn, "job:stocks:last_ok"))
+        self.assertEqual(db.state_get(self.conn, "job:stocks:last_ok", "none yet"), "none yet")
+        db.state_set(self.conn, "job:stocks:last_ok", db.now())
+        stamp = db.state_get(self.conn, "job:stocks:last_ok")
+        self.assertIsNotNone(stamp)
+        db.state_set(self.conn, "job:stocks:last_ok", "later")
+        self.assertEqual(db.state_get(self.conn, "job:stocks:last_ok"), "later")
+        # One row per key, not one per write.
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) c FROM service_state WHERE key = 'job:stocks:last_ok'"
+            ).fetchone()["c"],
+            1,
+        )
+
+    def test_today_counts_reads_back_metrics(self):
+        db.bump(self.conn, {"run_ok": 2, "send_failed": 1})
+        self.assertEqual(db.today_counts(self.conn), {"run_ok": 2, "send_failed": 1})
+
+    def test_pending_notification_stats_and_abandoned_notifications(self):
+        db.upsert_interest(self.conn, an_interest())
+        (interest,) = db.active_interests(self.conn)
+        older = stored_item(self.conn, url="https://e.com/older").id
+        newer = stored_item(self.conn, url="https://e.com/newer").id
+        db.save_score(self.conn, a_score(older, interest.id, 0.9))
+        db.save_score(self.conn, a_score(newer, interest.id, 0.9))
+
+        count, oldest = db.pending_notification_stats(self.conn)
+        self.assertEqual(count, 2)
+        older_created = self.conn.execute(
+            "SELECT created_at FROM scores WHERE item_id = ?", (older,)
+        ).fetchone()["created_at"]
+        self.assertEqual(oldest, older_created)
+        self.assertEqual(db.abandoned_notifications(self.conn, max_attempts=3), 0)
+
+        score_id = self.conn.execute(
+            "SELECT id FROM scores WHERE item_id = ?", (older,)
+        ).fetchone()["id"]
+        for _ in range(3):
+            db.record_notification(self.conn, score_id, "telegram", False)
+        self.assertEqual(db.abandoned_notifications(self.conn, max_attempts=3), 1)
+        # A live retry candidate (under the cap) is not "abandoned".
+        self.assertEqual(db.abandoned_notifications(self.conn, max_attempts=10), 0)
+
 
 class StatsTests(unittest.TestCase):
     def setUp(self):
@@ -580,6 +630,147 @@ class StatsTests(unittest.TestCase):
         text = stats.report(self.conn, days=7)
         self.assertIn("TOTAL $10.00", text)
         self.assertIn("3 calls via the claude.ai session", text)
+
+    def test_report_without_cfg_omits_the_health_section(self):
+        self.assertNotIn("HEALTH", stats.report(self.conn, days=7))
+
+    def test_report_with_cfg_adds_a_health_section_without_checking_the_provider(self):
+        text = stats.report(self.conn, days=7, cfg=CFG)
+        self.assertIn("HEALTH", text)
+        self.assertIn("provider: not checked", text)
+        self.assertIn("overall: OK", text)
+
+
+class HealthTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def test_job_name_for_source_maps_collector_names_onto_config_fields(self):
+        self.assertEqual(health.job_name_for_source("web_search"), "web")
+        self.assertEqual(health.job_name_for_source("stocks"), "stocks")
+        self.assertEqual(health.job_name_for_source("youtube"), "youtube")
+        self.assertEqual(health.job_name_for_source(None), "run-once")
+        self.assertEqual(health.job_name_for_source("manual"), "manual")
+
+    def test_check_is_not_degraded_before_any_job_has_ever_run(self):
+        # A job never run is "unknown", not "stale" -- a fresh `init` must
+        # not read as degraded just because nothing has fired yet.
+        result = health.check(self.conn, CFG)
+        self.assertFalse(result["degraded"])
+        self.assertIsNone(result["provider_ok"])
+        self.assertTrue(all(not j["stale"] for j in result["jobs"]))
+
+    def test_check_flags_a_job_whose_last_ok_is_older_than_the_stale_threshold(self):
+        cfg = dataclasses.replace(CFG, interval_stocks_seconds=100, health_stale_factor=3)
+        db.state_set(self.conn, "job:stocks:last_ok", db.ago(301))
+        result = health.check(self.conn, cfg)
+        stocks = next(j for j in result["jobs"] if j["name"] == "stocks")
+        self.assertTrue(stocks["stale"])
+        self.assertTrue(result["degraded"])
+
+    def test_check_reflects_a_down_provider(self):
+        provider = FakeProvider()
+        provider.preflight = lambda: (False, "no CDP endpoint")
+        result = health.check(self.conn, CFG, provider)
+        self.assertEqual(result["provider_ok"], False)
+        self.assertEqual(result["provider_detail"], "no CDP endpoint")
+        self.assertTrue(result["degraded"])
+
+    def test_check_reports_abandoned_notifications_without_gating_degraded(self):
+        # Abandoned sends are an expected artifact of an outage that already
+        # passed (the retry policy is designed to eventually give up), and
+        # there is no ack/clear path for them -- gating `degraded` on an
+        # unbounded, all-time count would latch it forever the first time an
+        # outage outlasts the retry window, so it must be reported but not
+        # count towards degraded.
+        db.upsert_interest(self.conn, an_interest())
+        (interest,) = db.active_interests(self.conn)
+        item = stored_item(self.conn)
+        score_id = db.save_score(self.conn, a_score(item.id, interest.id, 0.9))
+        for _ in range(CFG.send_max_attempts):
+            db.record_notification(self.conn, score_id, "telegram", False)
+        result = health.check(self.conn, CFG)
+        self.assertEqual(result["abandoned"], 1)
+        self.assertFalse(result["degraded"])
+
+    def test_format_report_is_plain_text_and_mentions_every_job(self):
+        text = health.format_report(health.check(self.conn, CFG))
+        self.assertIn("HEALTH", text)
+        for name in ("stocks", "web", "youtube", "digest", "feedback"):
+            self.assertIn(name, text)
+
+    def test_preflight_gate_passes_through_a_healthy_provider_without_side_effects(self):
+        provider = FakeProvider()
+        self.assertTrue(health.preflight_gate(self.conn, provider, CFG, "stocks"))
+        self.assertEqual(db.today_counts(self.conn), {})
+        self.assertIsNone(db.state_get(self.conn, "job:stocks:last_fail"))
+
+    def test_preflight_gate_records_the_failure_and_returns_false(self):
+        provider = FakeProvider()
+        provider.preflight = lambda: (False, "no claude.ai tab")
+        self.assertFalse(health.preflight_gate(self.conn, provider, CFG, "stocks"))
+        self.assertEqual(db.today_counts(self.conn), {"provider_down": 1})
+        self.assertIsNotNone(db.state_get(self.conn, "job:stocks:last_fail"))
+
+    def test_preflight_gate_launches_chrome_once_and_rechecks(self):
+        provider = FakeProvider()
+        calls = [(False, "down"), (True, "")]
+        provider.preflight = lambda: calls.pop(0)
+        cfg = dataclasses.replace(
+            CFG, chrome_launch_cmd="chrome.cmd", chrome_launch_wait_seconds=0
+        )
+        with mock.patch("discovery.health.subprocess.run") as run, \
+             mock.patch("discovery.health.time.sleep") as sleep:
+            self.assertTrue(health.preflight_gate(self.conn, provider, cfg, "stocks"))
+        run.assert_called_once_with(["cmd", "/d", "/c", "chrome.cmd"], check=False, timeout=0)
+        sleep.assert_called_once_with(0)
+        self.assertEqual(db.today_counts(self.conn), {})  # recovered -- no provider_down
+
+    def test_preflight_gate_survives_a_launch_command_that_never_returns(self):
+        # A non-detached chrome_launch_cmd (still running Chrome itself when
+        # the timeout hits) must not hang run-once forever.
+        import subprocess
+
+        provider = FakeProvider()
+        provider.preflight = lambda: (False, "down")
+        cfg = dataclasses.replace(
+            CFG, chrome_launch_cmd="chrome.cmd", chrome_launch_wait_seconds=0
+        )
+        with mock.patch(
+            "discovery.health.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="chrome.cmd", timeout=0),
+        ), mock.patch("discovery.health.time.sleep"):
+            self.assertFalse(health.preflight_gate(self.conn, provider, cfg, "stocks"))
+        self.assertEqual(db.today_counts(self.conn), {"provider_down": 1})
+
+    def test_notify_if_needed_sends_once_while_degraded_then_respects_cooldown(self):
+        cfg = dataclasses.replace(CFG, health_alert_cooldown_seconds=3600)
+        result = {"degraded": True, "jobs": [], "provider_ok": False, "provider_detail": "down",
+                  "pending_count": 0, "pending_oldest": None, "abandoned": 0, "counters": {}}
+        with mock.patch.object(notify, "send", return_value=True) as send:
+            health.notify_if_needed(self.conn, cfg, result)
+        send.assert_called_once()
+        self.assertEqual(db.state_get(self.conn, "health:last_status"), "degraded")
+
+        with mock.patch.object(notify, "send", return_value=True) as send:
+            health.notify_if_needed(self.conn, cfg, result)
+        send.assert_not_called()  # still within the cooldown
+
+    def test_notify_if_needed_sends_exactly_one_recovery_message_on_transition(self):
+        db.state_set(self.conn, "health:last_status", "degraded")
+        ok_result = {"degraded": False, "jobs": [], "provider_ok": True, "provider_detail": "",
+                     "pending_count": 0, "pending_oldest": None, "abandoned": 0, "counters": {}}
+        with mock.patch.object(notify, "send", return_value=True) as send:
+            health.notify_if_needed(self.conn, CFG, ok_result)
+        send.assert_called_once()
+        self.assertIn("recovered", send.call_args.args[1])
+        self.assertEqual(db.state_get(self.conn, "health:last_status"), "ok")
+
+        with mock.patch.object(notify, "send", return_value=True) as send:
+            health.notify_if_needed(self.conn, CFG, ok_result)
+        send.assert_not_called()  # already ok -- no repeat recovery message
 
 
 class InterestsFileTests(unittest.TestCase):
@@ -2037,47 +2228,6 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(self._pending_titles(), [])
 
 
-class SchedulerTests(unittest.TestCase):
-    def _calls(self):
-        calls = []
-
-        def record(conn, provider, cfg, sources=None, dry_run=False):
-            calls.append(sources)
-            return {}
-
-        return calls, record
-
-    def test_first_tick_runs_every_collector_job(self):
-        calls, record = self._calls()
-        with mock.patch.object(scheduler, "run_once", side_effect=record), \
-             mock.patch.object(scheduler, "send_digest", return_value=0), \
-             mock.patch.object(scheduler, "_seconds_until_digest", return_value=10_000):
-            scheduler.run_forever(None, None, CFG, dry_run=True, cycles=1)
-        expected = [tuple(sources) for sources, _field in scheduler.JOBS.values()]
-        self.assertEqual(sorted(map(tuple, calls)), sorted(expected))
-
-    def test_digest_fires_only_once_its_due(self):
-        with mock.patch.object(scheduler, "run_once", return_value={}), \
-             mock.patch.object(scheduler, "send_digest", return_value=3) as send_digest, \
-             mock.patch.object(scheduler, "_seconds_until_digest", return_value=0):
-            scheduler.run_forever(None, None, CFG, dry_run=True, cycles=1)
-        send_digest.assert_called_once()
-
-    def test_a_job_not_yet_due_is_skipped_on_the_next_tick(self):
-        cfg = dataclasses.replace(
-            CFG, interval_stocks_seconds=10_000, interval_web_seconds=10_000,
-            interval_youtube_seconds=10_000,
-        )
-        calls, record = self._calls()
-        with mock.patch.object(scheduler, "run_once", side_effect=record), \
-             mock.patch.object(scheduler, "send_digest", return_value=0), \
-             mock.patch.object(scheduler, "_seconds_until_digest", return_value=10_000), \
-             mock.patch.object(scheduler, "TICK_SECONDS", 0):
-            scheduler.run_forever(None, None, cfg, dry_run=True, cycles=2)
-        # Every job ran on the first tick only -- the second tick found nothing due.
-        self.assertEqual(len(calls), len(scheduler.JOBS))
-
-
 class FeedbackListenerTests(unittest.TestCase):
     def setUp(self):
         self.conn = db.connect(":memory:")
@@ -2093,7 +2243,10 @@ class FeedbackListenerTests(unittest.TestCase):
 
     def test_a_recognized_button_records_feedback_and_acks_with_the_label(self):
         with mock.patch.object(feedback_listener, "api_call") as api_call:
-            feedback_listener._handle_callback(self.conn, "tok", self._callback(f"fb:fire:{self.score_id}"))
+            recorded = feedback_listener._handle_callback(
+                self.conn, "tok", self._callback(f"fb:fire:{self.score_id}")
+            )
+        self.assertTrue(recorded)
         row = self.conn.execute("SELECT * FROM feedback WHERE item_id = ?", (self.item.id,)).fetchone()
         self.assertEqual(row["verdict"], "fire")
         self.assertAlmostEqual(row["original_score"], 0.8)
@@ -2105,15 +2258,70 @@ class FeedbackListenerTests(unittest.TestCase):
 
     def test_garbage_callback_data_is_acked_but_records_nothing(self):
         with mock.patch.object(feedback_listener, "api_call") as api_call:
-            feedback_listener._handle_callback(self.conn, "tok", self._callback("not-a-real-payload"))
+            recorded = feedback_listener._handle_callback(
+                self.conn, "tok", self._callback("not-a-real-payload")
+            )
+        self.assertFalse(recorded)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 0)
         api_call.assert_called_once_with("tok", "answerCallbackQuery", {"callback_query_id": "cb1"})
 
     def test_a_score_id_that_no_longer_exists_is_acked_without_a_crash(self):
         with mock.patch.object(feedback_listener, "api_call") as api_call:
-            feedback_listener._handle_callback(self.conn, "tok", self._callback("fb:up:999999"))
+            recorded = feedback_listener._handle_callback(self.conn, "tok", self._callback("fb:up:999999"))
+        self.assertFalse(recorded)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 0)
         api_call.assert_called_once()
+
+    def _cfg(self):
+        return dataclasses.replace(CFG, telegram_bot_token="tok", telegram_chat_id="123")
+
+    def test_drain_handles_every_update_and_persists_the_offset(self):
+        updates = [
+            {"update_id": 10, "callback_query": self._callback(f"fb:fire:{self.score_id}")},
+            {"update_id": 11, "callback_query": self._callback("garbage")},
+        ]
+        def fake_api_call(token, method, params, timeout=15):
+            if method == "getUpdates":
+                return updates
+            return {}  # answerCallbackQuery, from _handle_callback
+
+        with mock.patch.object(feedback_listener, "api_call", side_effect=fake_api_call) as api_call:
+            count = feedback_listener.drain(self.conn, self._cfg())
+        # The garbage update is acked but must not count -- feedback_recorded
+        # is evidence of real feedback, not "how many updates were seen".
+        self.assertEqual(count, 1)
+        self.assertEqual(db.state_get(self.conn, "telegram_offset"), "12")
+        api_call.assert_any_call("tok", "getUpdates", {"offset": 0, "timeout": 0}, timeout=15)
+        self.assertEqual(
+            dict(self.conn.execute("SELECT name, count FROM metrics").fetchall()),
+            {"feedback_recorded": 1},
+        )
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1)
+
+    def test_drain_resumes_from_a_previously_persisted_offset(self):
+        db.state_set(self.conn, "telegram_offset", "5")
+        with mock.patch.object(feedback_listener, "api_call", return_value=[]) as api_call:
+            feedback_listener.drain(self.conn, self._cfg())
+        api_call.assert_called_once_with(
+            "tok", "getUpdates", {"offset": 5, "timeout": 0}, timeout=15
+        )
+
+    def test_drain_without_telegram_config_returns_zero_untouched(self):
+        with mock.patch.object(feedback_listener, "api_call") as api_call:
+            self.assertEqual(feedback_listener.drain(self.conn, CFG), 0)
+        api_call.assert_not_called()
+
+    def test_drain_swallows_a_transport_failure_and_counts_it(self):
+        # None, not 0 -- a distinct sentinel so the caller (__main__._drain_cmd)
+        # can tell a failed poll from "polled fine, nothing pending" and not
+        # record the job as a success.
+        with mock.patch.object(feedback_listener, "api_call", side_effect=OSError("down")):
+            self.assertIsNone(feedback_listener.drain(self.conn, self._cfg()))
+        self.assertEqual(
+            dict(self.conn.execute("SELECT name, count FROM metrics").fetchall()),
+            {"run_failed": 1},
+        )
+        self.assertIsNone(db.state_get(self.conn, "telegram_offset"))  # never advanced
 
 
 class FakeCDPConnection:
@@ -2284,6 +2492,37 @@ class ClaudeChatProviderTests(unittest.TestCase):
         provider = self._provider({"text": '{"a": 2}'})
         self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 2})
 
+    def test_preflight_fails_cleanly_without_org_id_and_touches_no_network(self):
+        provider = claude_chat.ClaudeChatProvider("claude-opus-5", org_id="", port=9222)
+        with mock.patch.object(claude_chat.cdp, "find_claude_tab") as find_tab:
+            ok, detail = provider.preflight()
+        self.assertFalse(ok)
+        self.assertIn("CLAUDE_ORG_ID", detail)
+        find_tab.assert_not_called()
+
+    def test_preflight_fails_cleanly_with_no_chrome_endpoint(self):
+        provider = claude_chat.ClaudeChatProvider("claude-opus-5", org_id="org", port=9222)
+        with mock.patch.object(
+            claude_chat.cdp, "find_claude_tab", side_effect=ConnectionRefusedError("refused")
+        ):
+            ok, detail = provider.preflight()
+        self.assertFalse(ok)
+        self.assertIn("Chrome DevTools endpoint", detail)
+
+    def test_preflight_fails_cleanly_with_no_claude_tab(self):
+        provider = claude_chat.ClaudeChatProvider("claude-opus-5", org_id="org", port=9222)
+        with mock.patch.object(claude_chat.cdp, "find_claude_tab", return_value=None):
+            ok, detail = provider.preflight()
+        self.assertFalse(ok)
+        self.assertIn("claude.ai tab", detail)
+
+    def test_preflight_succeeds_when_the_tab_is_open(self):
+        provider = claude_chat.ClaudeChatProvider("claude-opus-5", org_id="org", port=9222)
+        with mock.patch.object(
+            claude_chat.cdp, "find_claude_tab", return_value={"id": "1"}
+        ):
+            self.assertEqual(provider.preflight(), (True, ""))
+
 
 class FakeAnthropicClient:
     """Stands in for anthropic.Anthropic() -- only .messages.create is used.
@@ -2371,6 +2610,15 @@ class AnthropicProviderTests(unittest.TestCase):
         self.assertEqual(provider.complete_json("sys", "prompt", self.SCHEMA), {"a": 1})
         self.assertEqual(provider.usage["calls"], 0)  # nothing to record from
 
+    def test_preflight_is_a_key_presence_check_only(self):
+        provider = AnthropicProvider("claude-opus-5", client=FakeAnthropicClient())
+        with mock.patch.dict(os.environ, {}, clear=True):
+            ok, detail = provider.preflight()
+        self.assertFalse(ok)
+        self.assertIn("ANTHROPIC_API_KEY", detail)
+        with mock.patch.dict(os.environ, {"ANTHROPIC_API_KEY": "sk-x"}):
+            self.assertEqual(provider.preflight(), (True, ""))
+
 
 class FakeOpenAIClient:
     """Stands in for openai.OpenAI() -- only .chat.completions.create is used."""
@@ -2430,6 +2678,15 @@ class OpenAIProviderTests(unittest.TestCase):
         provider = OpenAIProvider("gpt-5", client=FakeOpenAIClient())
         with self.assertRaises(UnsupportedCapability):
             provider.search_json("prompt")
+
+    def test_preflight_is_a_key_presence_check_only(self):
+        provider = OpenAIProvider("gpt-5", client=FakeOpenAIClient())
+        with mock.patch.dict(os.environ, {}, clear=True):
+            ok, detail = provider.preflight()
+        self.assertFalse(ok)
+        self.assertIn("OPENAI_API_KEY", detail)
+        with mock.patch.dict(os.environ, {"OPENAI_API_KEY": "sk-x"}):
+            self.assertEqual(provider.preflight(), (True, ""))
 
 
 class SchemaContractTests(unittest.TestCase):
@@ -2598,6 +2855,121 @@ class CLIPrintSafetyTests(unittest.TestCase):
         args = SimpleNamespace(path=path)
         with mock.patch("sys.stdout", self._narrow_stdout()):
             _personal_state(None, args)  # must not raise
+
+
+class MainJobTests(unittest.TestCase):
+    """The heartbeat/counter wrapping and job dispatch helpers, exercised
+    directly rather than through argparse+a real provider -- a run-once/health
+    CLI invocation would otherwise mean constructing a real ClaudeChatProvider
+    and hitting localhost:9222 for real, which these tests must never do."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def test_run_job_success_records_ok_and_bumps_the_counter(self):
+        from discovery.__main__ import _run_job
+
+        code = _run_job(self.conn, "stocks", lambda: 0)
+        self.assertEqual(code, 0)
+        self.assertEqual(db.today_counts(self.conn), {"run_ok": 1})
+        self.assertIsNotNone(db.state_get(self.conn, "job:stocks:last_ok"))
+
+    def test_run_job_nonzero_exit_records_failure_without_raising(self):
+        from discovery.__main__ import _run_job
+
+        code = _run_job(self.conn, "stocks", lambda: 3)
+        self.assertEqual(code, 3)
+        self.assertEqual(db.today_counts(self.conn), {"run_failed": 1})
+        self.assertIsNotNone(db.state_get(self.conn, "job:stocks:last_fail"))
+
+    def test_run_job_an_exception_records_failure_and_still_propagates(self):
+        from discovery.__main__ import _run_job
+
+        def boom():
+            raise RuntimeError("dead")
+
+        with self.assertRaises(RuntimeError):
+            _run_job(self.conn, "stocks", boom)
+        self.assertEqual(db.today_counts(self.conn), {"run_failed": 1})
+        self.assertIsNotNone(db.state_get(self.conn, "job:stocks:last_fail"))
+
+    def test_run_once_cmd_exits_3_without_touching_run_once_when_preflight_fails(self):
+        from discovery import __main__ as main_module
+        from discovery.__main__ import _run_once_cmd
+
+        provider = FakeProvider()
+        provider.preflight = lambda: (False, "no CDP endpoint")
+        with mock.patch.object(main_module, "run_once") as run_once_fn:
+            code = _run_once_cmd(self.conn, provider, CFG, None, True, "stocks")
+        self.assertEqual(code, 3)
+        run_once_fn.assert_not_called()
+        self.assertEqual(db.today_counts(self.conn), {"provider_down": 1})
+
+    def test_run_once_cmd_runs_the_cycle_when_preflight_passes(self):
+        from discovery.__main__ import _run_once_cmd
+
+        db.upsert_interest(self.conn, an_interest(sources=[]))
+        code = _run_once_cmd(self.conn, FakeProvider(), CFG, None, True, "stocks")
+        self.assertEqual(code, 0)
+
+    def test_health_cmd_prints_the_report_and_exits_1_when_degraded(self):
+        from discovery.__main__ import _health_cmd
+
+        provider = FakeProvider()
+        provider.preflight = lambda: (False, "down")
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = _health_cmd(self.conn, CFG, provider, SimpleNamespace(notify=False))
+        self.assertEqual(code, 1)
+        self.assertIn("DEGRADED", out.getvalue())
+
+    def test_health_cmd_notify_flag_triggers_the_alert_path(self):
+        from discovery.__main__ import _health_cmd
+
+        provider = FakeProvider()
+        provider.preflight = lambda: (False, "down")
+        with mock.patch.object(notify, "send", return_value=True) as send, \
+             mock.patch("sys.stdout", new_callable=io.StringIO):
+            _health_cmd(self.conn, CFG, provider, SimpleNamespace(notify=True))
+        send.assert_called_once()
+
+    def test_drain_cmd_reports_the_count(self):
+        from discovery.__main__ import _drain_cmd
+
+        with mock.patch.object(feedback_listener, "drain", return_value=2), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = _drain_cmd(self.conn, CFG)
+        self.assertEqual(code, 0)
+        self.assertIn("drained 2", out.getvalue())
+
+    def test_drain_cmd_reports_failure_when_drain_returns_the_none_sentinel(self):
+        from discovery.__main__ import _drain_cmd
+
+        with mock.patch.object(feedback_listener, "drain", return_value=None):
+            code = _drain_cmd(self.conn, CFG)
+        self.assertEqual(code, 1)
+
+    def test_run_job_does_not_record_last_ok_for_a_failed_drain(self):
+        # End-to-end through _run_job: a transport failure must not stamp
+        # job:feedback:last_ok or bump run_ok alongside run_failed.
+        from discovery.__main__ import _drain_cmd, _run_job
+
+        with mock.patch.object(feedback_listener, "drain", return_value=None):
+            code = _run_job(self.conn, "feedback", lambda: _drain_cmd(self.conn, CFG))
+        self.assertEqual(code, 1)
+        self.assertEqual(db.today_counts(self.conn), {"run_failed": 1})
+        self.assertIsNone(db.state_get(self.conn, "job:feedback:last_ok"))
+        self.assertIsNotNone(db.state_get(self.conn, "job:feedback:last_fail"))
+
+    def test_digest_cmd_reports_the_count(self):
+        from discovery.__main__ import _digest_cmd
+
+        with mock.patch("discovery.__main__.send_digest", return_value=5), \
+             mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = _digest_cmd(self.conn, CFG, True)
+        self.assertEqual(code, 0)
+        self.assertIn("sent 5", out.getvalue())
 
 
 if __name__ == "__main__":
