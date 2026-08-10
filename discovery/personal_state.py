@@ -52,6 +52,11 @@ def load(path):
     except json.JSONDecodeError as e:
         raise PersonalStateError(f"personal-state artifact at {path} is not valid JSON: {e}") from e
 
+    if not isinstance(data, dict):
+        raise PersonalStateError(
+            f"personal-state artifact at {path} must be a JSON object, got {type(data).__name__}"
+        )
+
     if "contract_version" not in data or "topics" not in data:
         raise PersonalStateError(
             f"personal-state artifact at {path} is missing required key(s) "
@@ -67,10 +72,19 @@ def load(path):
             f"in discovery/personal_state.py to add support for it."
         )
 
+    topics = data["topics"]
+    if not isinstance(topics, list) or any(
+        not isinstance(t, dict) or not isinstance(t.get("key"), str) for t in topics
+    ):
+        raise PersonalStateError(
+            f"personal-state artifact at {path} has malformed 'topics': "
+            f"expected a list of objects each with a string 'key'"
+        )
+
     return PersonalState(
         contract_version=version,
         generated_at=data.get("generated_at", ""),
-        topics=data["topics"],
+        topics=topics,
     )
 
 

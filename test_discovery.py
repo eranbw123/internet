@@ -749,6 +749,30 @@ class PersonalStateTests(unittest.TestCase):
             personal_state.load(path)
         self.assertIsNone(personal_state.load_optional(path))
 
+    def test_a_non_dict_artifact_raises_and_load_optional_returns_none(self):
+        # A truncated/zeroed producer write (`null`, a bare number, ...) must
+        # not escape as a raw TypeError -- `"contract_version" not in data`
+        # only makes sense once `data` is known to be a mapping.
+        for bad in (None, 5, [1, 2]):
+            path = self._write(bad)
+            with self.assertRaises(PersonalStateError):
+                personal_state.load(path)
+            self.assertIsNone(personal_state.load_optional(path))
+
+    def test_malformed_topics_raise_instead_of_failing_later_at_top_terms(self):
+        # `topics` not a list, and a topic missing its `key`, must be caught
+        # in load() itself -- interests.load_file calls top_terms() after
+        # load_optional() has already returned, outside any fail-soft guard.
+        not_a_list = self._write(self._artifact(topics={"a": 1}))
+        with self.assertRaises(PersonalStateError):
+            personal_state.load(not_a_list)
+        self.assertIsNone(personal_state.load_optional(not_a_list))
+
+        missing_key = self._write(self._artifact(topics=[{"weight": 1}]))
+        with self.assertRaises(PersonalStateError):
+            personal_state.load(missing_key)
+        self.assertIsNone(personal_state.load_optional(missing_key))
+
 
 class ScoringTests(unittest.TestCase):
     def _matches(self, *interests_):
@@ -2477,6 +2501,20 @@ class CLITests(unittest.TestCase):
         )
         self.assertEqual(code, 2)
         self.assertIn("unknown provider 'bogus'", err)
+
+    def test_personal_state_probe_survives_an_off_contract_generated_at(self):
+        # valid JSON, valid v1 shape, but generated_at that isn't a proper
+        # "Z"-suffixed UTC timestamp must fall back to "age unknown" rather
+        # than tracebacking on offset-naive/None subtraction.
+        for generated_at in ("2026-08-01T00:00:00", None):
+            path = os.path.join(self.tmp.name, "ps.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump(
+                    {"contract_version": 1, "topics": [], "generated_at": generated_at}, fh
+                )
+            code, out, _err = self._main("personal-state", "--path", path)
+            self.assertEqual(code, 0)
+            self.assertIn("age unknown", out)
 
 
 class CLIPrintSafetyTests(unittest.TestCase):

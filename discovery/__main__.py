@@ -288,7 +288,7 @@ def _personal_state(cfg, args):
         generated = datetime.fromisoformat(state.generated_at.replace("Z", "+00:00"))
         age_days = (datetime.now(timezone.utc) - generated).days
         age = f"{age_days}d old"
-    except ValueError:
+    except (AttributeError, TypeError, ValueError):
         age = "age unknown"
 
     print(f"{path}: contract_version={state.contract_version}")
