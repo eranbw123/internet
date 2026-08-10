@@ -56,7 +56,7 @@ a long-lived session.
 | `items` | List recently scored items |
 | `feedback <id> <verdict>` | Rate an item from the CLI |
 | `stats [--days N]` | Funnel, feedback rates, estimated cost and a HEALTH section — see [Stats](#stats) |
-| `interests [--layer L] [--why KEY] [--refresh]` | Layered interest state: list (owner rows first, `--layer` filters), `--why <key>` prints the append-only provenance chain, `--refresh` runs promotion/decay — a no-op unless `DISCOVERY_DYNAMIC_INTERESTS` is set |
+| `interests [--layer L] [--why KEY] [--refresh]` | Layered interest state: list (owner rows first, `--layer` filters), `--why <key>` prints the append-only provenance chain, `--refresh` runs promotion/decay — a no-op unless `DISCOVERY_DYNAMIC_INTERESTS` is set — see [Layered interest state](#layered-interest-state) |
 | `health [--notify]` | Job staleness, provider reachability, pending/abandoned sends; `--notify` alerts on degraded/recovery, rate-limited |
 | `personal-state [--path]` | Print the sibling `ai` repo's personal-state artifact as this repo would read it — see [Personal-state contract](#personal-state-contract) |
 | `teach [--list\|--explain\|--send]` | Label the highest information-value scored-but-unlabeled items — see [Teach](#teach) |
@@ -146,11 +146,45 @@ than what the scorer says in isolation. Add `--notify` to run delivery too.
 ```
 
 `key` is the identity across runs — re-running `init` updates an interest in
-place rather than duplicating it.
+place rather than duplicating it. Every interest loaded from this file is
+layer `owner` — the layer that's immutable to automation; see
+[Layered interest state](#layered-interest-state) for how the system can add
+its own interests alongside these.
 
 `min_score` is a **0–1** threshold on the final score. (It used to be 0–100;
 anything above 1 is treated as the old scale and divided by 100, so a stale
 `75` doesn't silently mean "never notify".)
+
+## Layered interest state
+
+Off by default (`DISCOVERY_DYNAMIC_INTERESTS`, unset) — with it off, `interests
+--refresh` prints a no-op message and nothing derived is ever created,
+queried, or costs an LLM/network call. Turned on, the system can propose its
+own interests instead of only scoring against the ones you wrote in
+`interests.json`.
+
+Every interest has a `layer`: `owner` (from `interests.json`, always
+present, never touched by automation — enforced at the SQLite level, not
+just in code) or one of four automation-managed layers a term climbs
+through as evidence accumulates — `exploratory` → `emerging` → `inferred` —
+or falls to: `retired`. Promotion needs enough distinct-day observations and,
+past a point, positive feedback; going quiet for a while demotes one rung,
+and negative-feedback-dominant terms retire immediately. A retired term can
+re-enter, but only at `exploratory` and at a higher bar than first entry, so
+it can't flap in and out. `exploratory`/`emerging` are visible but inactive
+(`active=0`, unscored, zero spend — purely for you to review); only
+`inferred` interests are actually scored, at a `min_score` floor
+(`DISCOVERY_DERIVED_MIN_SCORE`, `0.80`) at or above today's owner bars, and
+against items owner collectors already fetched — turning one on never adds a
+new collector call. At most `DISCOVERY_DERIVED_MAX_ACTIVE` (`5`) are active
+at once; anything past the cap stays pending rather than being scored.
+
+Every promotion, demotion, and retirement is appended to an
+`interest_events` log — nothing is ever overwritten or deleted from it — so
+`python -m app interests --why <key>` can show the full chain that led a
+term to its current layer. `python -m app interests --refresh` runs one
+promotion/decay pass; `python -m app interests [--layer L]` lists current
+state, owner rows first.
 
 ## Personal-state contract
 
@@ -465,6 +499,6 @@ logs.
 python test_discovery.py
 ```
 
-271 tests, network fully stubbed — they never hit an LLM API, Telegram, or
+315 tests, network fully stubbed — they never hit an LLM API, Telegram, or
 Yahoo. The provider seam is the whole stub: a fake object with `complete_json`
 and `search_json`.
