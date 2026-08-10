@@ -15,6 +15,8 @@ Every figure is a plain SQL aggregate; nothing here writes.
 """
 from datetime import date, timedelta
 
+from . import health
+
 # USD per 1M tokens (input, output), from public list pricing. A model that is
 # not here still gets its token counts reported -- it is just left out of the
 # dollar total rather than guessed at.
@@ -38,8 +40,12 @@ def since_day(days):
     return (date.today() - timedelta(days=days - 1)).isoformat()
 
 
-def report(conn, days=7):
-    """The whole report as one string, so callers just print it."""
+def report(conn, days=7, cfg=None):
+    """The whole report as one string, so callers just print it. `cfg` is
+    optional -- pass it (as `python -m app stats` does) to also get the
+    HEALTH section (job staleness, pending/abandoned sends, today's ops
+    counters); without it the report is the funnel/feedback/cost figures
+    only, same as before this section existed."""
     since = since_day(days)
     lines = [
         f"Discovery stats -- last {days} day(s), from {since}",
@@ -50,6 +56,12 @@ def report(conn, days=7):
     lines += _feedback(conn, since)
     lines += _score_by_verdict(conn, since)
     lines += _cost(conn, since, days)
+    if cfg is not None:
+        # No provider passed: a read-only report must not pay for a live
+        # CDP/API reachability check just to print itself -- `python -m app
+        # health` is the command for a real verdict.
+        lines.append(health.format_report(health.check(conn, cfg)))
+        lines.append("")
     return "\n".join(lines)
 
 

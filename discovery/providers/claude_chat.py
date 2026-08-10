@@ -73,6 +73,21 @@ class ClaudeChatProvider(LLMProvider):
         self._connect = connect or self._connect_chrome
         self._connection = None
 
+    # --- preflight ------------------------------------------------------------
+
+    def preflight(self):
+        """A free, local check: no CDP call, no completion. Used by health.py
+        to gate a whole run-once before it spends anything."""
+        if not self.org_id:
+            return False, "CLAUDE_ORG_ID is not set"
+        try:
+            tab = cdp.find_claude_tab(self.port)
+        except OSError as e:
+            return False, f"no Chrome DevTools endpoint on port {self.port} ({e})"
+        if not tab:
+            return False, f"no open claude.ai tab in the Chrome on port {self.port}"
+        return True, ""
+
     # --- the two provider methods -------------------------------------------
 
     def complete_json(self, system, prompt, schema, max_tokens=8000):

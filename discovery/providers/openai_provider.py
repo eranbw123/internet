@@ -3,6 +3,8 @@
 Here so the pipeline can be pointed at a second vendor by changing
 DISCOVERY_PROVIDER, with no pipeline code aware of either.
 """
+import os
+
 from .base import LLMProvider, UnsupportedCapability, parse_json_object
 
 
@@ -16,6 +18,11 @@ class OpenAIProvider(LLMProvider):
 
             client = openai.OpenAI()
         self.client = client
+
+    def preflight(self):
+        if not os.environ.get("OPENAI_API_KEY"):
+            return False, "OPENAI_API_KEY is not set"
+        return True, ""
 
     def complete_json(self, system, prompt, schema, max_tokens=8000):
         response = self.client.chat.completions.create(

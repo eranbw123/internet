@@ -43,6 +43,11 @@ def connect(db_path):
     conn = sqlite3.connect(db_path)
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    # Separately scheduled OS tasks (collect/digest/feedback/health) can now
+    # overlap on the same discovery.db -- wait out a writer instead of
+    # raising "database is locked" the instant two tasks land in the same
+    # second.
+    conn.execute("PRAGMA busy_timeout = 5000")
     return conn
 
 
@@ -280,10 +285,15 @@ def delete_score(conn, item_id):
     conn.commit()
 
 
-def pending_notifications(conn):
+def pending_notifications(conn, max_attempts=MAX_SEND_ATTEMPTS, retry_after_seconds=RESEND_FAILED_AFTER_SECONDS):
     """Scores at or above their interest's bar that still need sending: never
     attempted, or last attempt failed and is old enough to retry (and under
-    the attempt cap). A success is final; retries never duplicate it."""
+    the attempt cap). A success is final; retries never duplicate it.
+
+    `max_attempts`/`retry_after_seconds` default to this module's constants
+    so a caller that doesn't pass them (tests, `score --notify`) keeps the
+    old behavior; production goes through pipeline.notification_ready(),
+    which passes cfg.send_max_attempts/cfg.send_retry_seconds."""
     return conn.execute(
         """
         SELECT s.id AS score_id, s.item_id, s.interest_id, s.final_score,
@@ -299,7 +309,7 @@ def pending_notifications(conn):
           )
         ORDER BY s.final_score DESC
         """,
-        (MAX_SEND_ATTEMPTS, ago(RESEND_FAILED_AFTER_SECONDS)),
+        (max_attempts, ago(retry_after_seconds)),
     ).fetchall()
 
 
@@ -355,6 +365,29 @@ def recent_feedback(conn, interest_id, limit=10):
     ).fetchall()
 
 
+# --- service state -----------------------------------------------------------
+# Durable key/value store (see schema.sql) for the handful of things that
+# make a short-lived, overlap-safe invocation resumable: job heartbeats
+# (job:<name>:last_ok / last_fail, written by __main__.py and health.py),
+# the persisted Telegram getUpdates offset, and health's own alert-dedup
+# state (health:last_status / health:last_alert_at).
+
+def state_get(conn, key, default=None):
+    row = conn.execute("SELECT value FROM service_state WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def state_set(conn, key, value):
+    conn.execute(
+        """
+        INSERT INTO service_state (key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (key, str(value), now()),
+    )
+    conn.commit()
+
+
 # --- metrics -----------------------------------------------------------------
 
 def bump(conn, counts):
@@ -371,6 +404,37 @@ def bump(conn, counts):
         rows,
     )
     conn.commit()
+
+
+def today_counts(conn):
+    """Today's ops/funnel counters as a plain dict -- what `health` and
+    stats.report's HEALTH section show as "today: run_ok=3, ..."."""
+    rows = conn.execute("SELECT name, count FROM metrics WHERE day = ?", (today(),)).fetchall()
+    return {row["name"]: row["count"] for row in rows}
+
+
+def pending_notification_stats(conn):
+    """Count and oldest score-creation time of notifications not yet
+    delivered (cleared their interest's bar, no successful send yet) --
+    regardless of retry cool-off, unlike pending_notifications() which is
+    scoped to what's eligible to (re)send *right now*. Used by `health`."""
+    row = conn.execute(
+        """
+        SELECT COUNT(*) AS n, MIN(s.created_at) AS oldest
+        FROM scores s
+        JOIN interests n ON n.id = s.interest_id
+        WHERE s.final_score >= n.min_score AND n.active = 1
+          AND NOT EXISTS (SELECT 1 FROM notifications x WHERE x.score_id = s.id AND x.ok = 1)
+        """
+    ).fetchone()
+    return row["n"], row["oldest"]
+
+
+def abandoned_notifications(conn, max_attempts):
+    """Notifications that gave up: never delivered and out of retries."""
+    return conn.execute(
+        "SELECT COUNT(*) c FROM notifications WHERE ok = 0 AND attempts >= ?", (max_attempts,)
+    ).fetchone()["c"]
 
 
 def record_usage(conn, provider):
