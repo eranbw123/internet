@@ -245,6 +245,27 @@ cached strategist prompt + 2–4 angle searches, dedup_key=status id, add
 `experiments/x_prompt_lab/` (untracked). Fallback transports if ever needed:
 twitterapi.io ($0.15/1k) or t.me/s/walter_bloomberg scrape.
 
+## teach: information-value labeling queue (step-06)
+`discovery/teach.py` (no new table, no LLM call) ranks already-scored,
+not-yet-labeled items by expected `information` value — WEIGHTS-combined
+bar proximity (gap to `interests.min_score`, decaying over `BAND_WIDTH`),
+model self-uncertainty (`1 - confidence`), and per-interest label scarcity —
+rationale: proposals 003/004 found notify flips track bar proximity, not
+scorer variance, and corpus band_density is only .148. `build_queue`/
+`baseline_queue`/`queue_metrics` compare the ranker against the honest
+recency baseline over the same pool; both arms are always reported, even if
+the baseline wins. `python -m app teach` is the interactive labeling loop
+(records via the existing `db.add_feedback`, same call the Telegram
+listener makes); `--list` prints without prompting; `--explain` prints
+`queue_metrics`; `--send` pushes the top of the queue to Telegram by reusing
+`notify.format_message`/`feedback_keyboard`/`send`, so labels come back
+through the existing `listen`/`listen --drain` flow with no new callback
+format. The acceptance evidence (`band_lift >= 2.0`, band_share strictly
+higher) is measured on a **synthetic planted fixture** in `test_discovery.py`
+(recency deliberately anti-correlated with bar proximity) — this worktree
+has no `discovery.db`, so no real-corpus number is claimed. Live readout,
+once `discovery.db` exists: `python -m app teach --explain --limit 20`.
+
 ## Open decision
 `recency_days` is both prompt bias and HARD verify drop. Proposal (not
 implemented): per-interest `strict_recency` (default true); false = keep old

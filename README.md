@@ -328,6 +328,27 @@ fed back into its scoring prompt as worked examples; nothing retrains or
 re-ranks automatically. `python -m app stats` is where the feedback earns its
 keep — it's what tells you whether the score tracks your verdicts.
 
+## Teach
+
+```bash
+python -m app teach                          # interactive: label the highest-value queue
+python -m app teach --list                   # print the ranked queue, no prompting
+python -m app teach --explain --limit 20      # ranker vs recency-baseline readout
+python -m app teach --send --dry-run          # push top items to Telegram (prints instead of sending)
+```
+
+Labeling everything scored is slow, and not every label teaches equally.
+`teach` ranks already-scored, not-yet-labeled items by expected information
+value — bar proximity, model self-uncertainty, and interest label scarcity
+(see `discovery/teach.py`'s docstring for the formula) — and records verdicts
+through the exact same `db.add_feedback` call the Telegram buttons use.
+`--send` pushes the top of the queue to Telegram instead, reusing
+`notify.format_message`/`feedback_keyboard`, so those labels come back
+through the existing `listen`/`listen --drain` flow. `--explain` is the
+acceptance-evidence command: it reports the ranked queue's `band_share` /
+`mean_gap` / `mean_confidence` / `interests_covered` against the same pool
+ordered by recency, honestly — including if recency wins.
+
 ## Stats
 
 ```bash
