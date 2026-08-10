@@ -3036,7 +3036,16 @@ class InstallTasksTests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertEqual(calls, [])
 
-    def test_install_calls_schtasks_create_per_task(self):
+    def test_dry_run_prints_a_copy_pasteable_command_with_a_real_path(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = install_tasks.install(CFG, runner=lambda args: (0, "", ""), dry_run=True)
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        self.assertNotIn("<generated>.xml", text)
+        self.assertIn("schtasks /create /tn internet-discovery-collect-stocks", text)
+        self.assertIn(".xml /f", text)
+
+    def test_install_calls_schtasks_create_then_verifies_with_a_query(self):
         calls = []
 
         def fake_runner(args):
@@ -3046,17 +3055,72 @@ class InstallTasksTests(unittest.TestCase):
         with mock.patch("sys.stdout", new_callable=io.StringIO):
             code = install_tasks.install(CFG, runner=fake_runner, dry_run=False)
         self.assertEqual(code, 0)
-        self.assertEqual(len(calls), 6)
-        for args in calls:
+        # One /create + one /query per task -- install() no longer trusts
+        # /create's exit code alone to mean the task actually exists.
+        self.assertEqual(len(calls), 12)
+        creates = [a for a in calls if "/create" in a]
+        queries = [a for a in calls if "/query" in a]
+        self.assertEqual(len(creates), 6)
+        self.assertEqual(len(queries), 6)
+        for args in creates:
             self.assertEqual(args[0], "schtasks")
-            self.assertIn("/create", args)
             self.assertIn("/xml", args)
+        for args in queries:
+            self.assertEqual(args, ["schtasks", "/query", "/tn", args[-1]])
+
+    def test_install_fails_when_the_verification_query_cannot_find_the_task(self):
+        def fake_runner(args):
+            if "/create" in args:
+                return 0, "SUCCESS", ""
+            return 1, "", "ERROR: The system cannot find the file specified."
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO), \
+             mock.patch("sys.stderr", new_callable=io.StringIO):
+            code = install_tasks.install(CFG, runner=fake_runner, dry_run=False)
+        self.assertEqual(code, 1)
 
     def test_install_reports_failure_without_raising(self):
         with mock.patch("sys.stdout", new_callable=io.StringIO), \
              mock.patch("sys.stderr", new_callable=io.StringIO):
             code = install_tasks.install(CFG, runner=lambda args: (1, "", "denied"), dry_run=False)
         self.assertEqual(code, 1)
+
+    def test_installed_xml_file_is_written_utf16le_with_bom(self):
+        # install() unlinks its temp XML file once /create + /query finish,
+        # so read it from inside the fake runner, while it still exists.
+        captured = {}
+
+        def fake_runner(args):
+            if "/create" in args:
+                path = args[args.index("/xml") + 1]
+                captured["bytes"] = open(path, "rb").read()
+            return 0, "SUCCESS", ""
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            install_tasks.install(CFG, runner=fake_runner, dry_run=False)
+        data = captured["bytes"]
+        self.assertEqual(data[:2], b"\xff\xfe")   # UTF-16LE BOM
+        self.assertIn("<Task", data.decode("utf-16"))
+
+    def test_collect_tasks_do_not_share_a_start_boundary(self):
+        tasks = install_tasks.build_tasks(CFG)
+        collect = [t for t in tasks if t.name.startswith("internet-discovery-collect-")]
+        starts = set()
+        for task in collect:
+            xml = install_tasks.render_xml(task)
+            start = xml.split("<StartBoundary>")[1].split("</StartBoundary>")[0]
+            starts.add(start)
+        self.assertEqual(len(starts), len(collect))
+
+    def test_daily_trigger_rolls_forward_when_todays_time_has_passed(self):
+        cfg = dataclasses.replace(CFG, digest_time="00:00")
+        task = next(t for t in install_tasks.build_tasks(cfg) if t.trigger_kind == "daily")
+        xml = install_tasks.render_xml(task)
+        start = xml.split("<StartBoundary>")[1].split("</StartBoundary>")[0]
+        start_dt = datetime.fromisoformat(start)
+        # 00:00 has already elapsed by the time any test runs; the rendered
+        # boundary must be in the future, not today's already-missed slot.
+        self.assertGreater(start_dt, datetime.now())
 
     def test_uninstall_is_scoped_to_the_six_task_names_only(self):
         calls = []

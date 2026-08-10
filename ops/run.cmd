@@ -14,6 +14,14 @@ if not exist logs mkdir logs
 rem Locale-proof YYYYMMDD -- %date% is locale-dependent and not safe to slice.
 for /f %%D in ('powershell -NoProfile -Command "Get-Date -Format yyyyMMdd"') do set LOGDATE=%%D
 
-set LOGFILE=logs\%1-%LOGDATE%.log
+rem Log basename comes from the FULL argument list, not just %1: the three
+rem collect tasks all start with "run-once", so a %1-only name gave all
+rem three the same log file (logs\run-once-<date>.log). cmd's `>>` opens that
+rem file without FILE_SHARE_WRITE and holds it for the whole run, so a second
+rem task hitting the same name exits rc=1 before python even starts -- a
+rem silently dropped run with no log line, no heartbeat, no counter.
+set LOGNAME=%*
+set LOGNAME=%LOGNAME: =_%
+set LOGFILE=logs\%LOGNAME%-%LOGDATE%.log
 python -m app %* >> "%LOGFILE%" 2>&1
 exit /b %ERRORLEVEL%

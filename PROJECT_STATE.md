@@ -3,24 +3,24 @@
 Updated 2026-08-10. Imported by `CLAUDE.md`. Current state only — not a log.
 
 ## service hardening (step-01): no more in-process scheduler
-`discovery/scheduler.py` and the `run` subcommand are DELETED — the
-SSH-session-child tick loop is gone; `ops/install_tasks.py` IS the scheduler
-now: six Windows Scheduled Tasks (`internet-discovery-collect-stocks/-web
-/-youtube`, `-digest`, `-feedback`, `-health`) call `run-once --source
-<name>` / `digest` / `listen --drain` / `health --notify` on their own
-cadence, every trigger interval read from `config.load()` so a `.env` change
-+ `--install` reschedules. Registers via generated Task Scheduler XML
-(UTF-16LE+BOM) + `schtasks /create /XML` — `StartWhenAvailable`,
-`MultipleInstancesPolicy=IgnoreNew`, `RestartOnFailure`, and an
-`InteractiveToken` principal (Chrome/CDP only exists in that session).
-`--dry-run`/`--install`/`--uninstall` (prefix-scoped, only ever touches its
-own six names)/`--status`. Each task runs `ops/run.cmd`
-(`PYTHONIOENCODING=utf-8`, `cd` to repo root, `python -m app %*`, appends to
-`logs\<first-arg>-<YYYYMMDD>.log`, propagates exit code); `logs/` is
-gitignored, inbound-only. Live install + fault-injection drills + the 24h
-soak are a separate, not-yet-done step (offline tests only stub
-`schtasks`/`subprocess` via an injected fake runner). Every invocation is
-short-lived, idempotent and overlap-safe:
+`discovery/scheduler.py` and `run` are DELETED; `ops/install_tasks.py` is the
+scheduler now: six Windows Scheduled Tasks (`internet-discovery-collect-
+stocks/-web/-youtube`, `-digest`, `-feedback`, `-health`) call `run-once
+--source <name>` / `digest` / `listen --drain` / `health --notify` on
+cadences read from `config.load()` (`.env` change + `--install`
+reschedules). Registered via generated Task Scheduler XML (UTF-16LE+BOM) +
+`schtasks /create /XML`, each creation verified with a `/query` follow-up;
+`StartWhenAvailable`, `IgnoreNew`, `RestartOnFailure`, `InteractiveToken`
+principal (Chrome/CDP only exists in that session), `StartBoundary`
+staggered per task so same-length intervals never coincide.
+`--dry-run`/`--install`/`--uninstall` (prefix-scoped)/`--status`. Tasks run
+`ops/run.cmd` (utf-8 stdout, `cd` to repo root, `python -m app %*`, log name
+built from the full arg list so the three `run-once` collectors don't share
+one file, exit code propagated); `logs/` is gitignored, inbound-only. Live
+install, fault-injection drills and the 24h soak are a separate,
+not-yet-done step (offline tests stub `schtasks`/`subprocess` via an
+injected fake runner). Every invocation is short-lived, idempotent and
+overlap-safe:
 `db.connect` sets `PRAGMA busy_timeout=5000`, and a new `service_state`
 key/value table (`db.state_get`/`state_set`) persists job heartbeats
 (`job:<name>:last_ok`/`last_fail`), the Telegram `getUpdates` offset, and

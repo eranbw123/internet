@@ -418,8 +418,11 @@ python ops/install_tasks.py --uninstall    # delete only the six tasks this scri
 
 Each task runs `ops/run.cmd`, which sets `PYTHONIOENCODING=utf-8`, `cd`s to
 the repo root and runs `python -m app <args>`, appending stdout+stderr to
-`logs\<first-arg>-<YYYYMMDD>.log` (gitignored, inbound-only -- never
-committed) and propagating the exit code. `python -m app health` (or
+`logs\<args>-<YYYYMMDD>.log` (the log name comes from the full argument
+list, not just the first one -- the three `run-once --source ...` collect
+tasks all start with `run-once` and would otherwise collide on one
+exclusively-locked file; gitignored, inbound-only -- never committed) and
+propagating the exit code. `python -m app health` (or
 `python -m app stats`, which includes the same HEALTH section) is the
 fastest way to check the appliance is actually alive without digging through
 logs.

@@ -25,7 +25,7 @@ import subprocess
 import sys
 import tempfile
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
 from xml.sax.saxutils import escape
 
@@ -99,17 +99,31 @@ def _trigger_xml(task):
     now = datetime.now().replace(microsecond=0)
     if task.trigger_kind == "daily":
         hour, minute = (int(p) for p in task.trigger_value.split(":"))
-        start = now.replace(hour=hour, minute=minute, second=0).isoformat()
+        start = now.replace(hour=hour, minute=minute, second=0)
+        if start <= now:
+            # Today's occurrence already elapsed -- with StartWhenAvailable,
+            # a past StartBoundary is a missed run Task Scheduler catches up
+            # on right after registration, firing an unscheduled extra
+            # digest. Roll to tomorrow instead.
+            start += timedelta(days=1)
         return f"""    <CalendarTrigger>
-      <StartBoundary>{start}</StartBoundary>
+      <StartBoundary>{start.isoformat()}</StartBoundary>
       <Enabled>true</Enabled>
       <ScheduleByDay>
         <DaysInterval>1</DaysInterval>
       </ScheduleByDay>
     </CalendarTrigger>"""
+    # Stagger each interval task's initial StartBoundary by its position in
+    # TASK_NAMES: two tasks sharing an interval (e.g. collect-web and
+    # collect-youtube, both 4h by default) would otherwise get an identical
+    # StartBoundary and fire in the same second on every occurrence --
+    # including every StartWhenAvailable catch-up -- and ops/run.cmd's
+    # per-task log file is exclusively locked for the whole run, so the
+    # second task to start silently never runs at all.
+    start = now + timedelta(minutes=7 * TASK_NAMES.index(task.name))
     interval = _iso8601_duration(task.trigger_value)
     return f"""    <TimeTrigger>
-      <StartBoundary>{now.isoformat()}</StartBoundary>
+      <StartBoundary>{start.isoformat()}</StartBoundary>
       <Enabled>true</Enabled>
       <Repetition>
         <Interval>{interval}</Interval>
@@ -184,25 +198,38 @@ def install(cfg, runner=None, dry_run=False):
     ok = True
     for task in build_tasks(cfg):
         xml = render_xml(task)
+        fd, path = tempfile.mkstemp(suffix=".xml", prefix=f"{task.name}-")
+        os.close(fd)
+        # schtasks /XML rejects some UTF-8 files; UTF-16 with BOM (the
+        # `"utf-16"` codec picks the native, little-endian order and writes
+        # the BOM) is what it wants.
+        Path(path).write_bytes(xml.encode("utf-16"))
+        cmd = ["schtasks", "/create", "/tn", task.name, "/xml", path, "/f"]
         if dry_run:
+            # The real path, not a placeholder -- this line has to be
+            # copy-pasteable to actually reproduce the registration.
             print(f"--- {task.name} ---")
             print(xml)
-            print(f'schtasks /create /tn "{task.name}" /xml "<generated>.xml" /f\n')
+            print(subprocess.list2cmdline(cmd) + "\n")
             continue
-        fd, path = tempfile.mkstemp(suffix=".xml")
-        os.close(fd)
         try:
-            # schtasks /XML rejects some UTF-8 files; UTF-16 with BOM (the
-            # `"utf-16"` codec picks the native, little-endian order and
-            # writes the BOM) is what it wants.
-            Path(path).write_bytes(xml.encode("utf-16"))
-            cmd = ["schtasks", "/create", "/tn", task.name, "/xml", path, "/f"]
             code, out, err = runner(cmd)
-            if code == 0:
+            if code != 0:
+                ok = False
+                print(f"{task.name}: FAILED: {(err or out).strip()}", file=sys.stderr)
+                continue
+            # Confirm the import actually landed rather than trusting
+            # schtasks' exit code alone.
+            vcode, vout, verr = runner(["schtasks", "/query", "/tn", task.name])
+            if vcode == 0:
                 print(f"{task.name}: installed")
             else:
                 ok = False
-                print(f"{task.name}: FAILED: {(err or out).strip()}", file=sys.stderr)
+                print(
+                    f"{task.name}: created but not found on verification query: "
+                    f"{(verr or vout).strip()}",
+                    file=sys.stderr,
+                )
         finally:
             try:
                 os.unlink(path)
