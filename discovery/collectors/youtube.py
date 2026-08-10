@@ -85,7 +85,7 @@ Search iteratively -- site:youtube.com queries and the open web both count
 (blogs, Reddit threads, conference pages that point at videos are all fair
 game). Refine your queries as you learn from each search's results, and stop
 early if this looks like a quiet period.
-
+{query_hints}
 Return AT MOST {max_candidates} entries as a JSON array, one object per video:
 [{{"url": "<YouTube video URL>",
    "estimate": <relevance estimate, 0-1>,
@@ -129,6 +129,13 @@ def collect(interest, cfg, provider, conn=None):
     overlap_seconds = int(opts.get("chunk_overlap_seconds", DEFAULT_OVERLAP_SECONDS))
     languages = opts.get("languages", DEFAULT_LANGUAGES)
     limit = int(opts.get("limit", cfg.max_items_per_source))
+    queries = [str(q).strip() for q in opts.get("queries", []) if str(q).strip()]
+    query_hints = ""
+    if queries:
+        query_hints = (
+            "\nStarting-point searches (owner-suggested; refine freely and go "
+            "beyond them):\n" + "\n".join(f"- {q}" for q in queries) + "\n"
+        )
 
     # Stage 1: discovery. No fallback path -- a failed conversation is a
     # logged skip and the next cycle simply tries again.
@@ -144,6 +151,7 @@ def collect(interest, cfg, provider, conn=None):
                 positive=", ".join(interest.positive_signals) or "(unspecified)",
                 negative=", ".join(interest.negative_signals) or "(unspecified)",
                 max_candidates=max_candidates,
+                query_hints=query_hints,
             )
         )
     except ProviderError as e:

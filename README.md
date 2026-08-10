@@ -224,12 +224,16 @@ video is processed exactly once — a video-level item is never later
     "max_transcript_fetches": 4,
     "recency_days": 14,
     "chunk_seconds": 360,
-    "chunk_overlap_seconds": 60
+    "chunk_overlap_seconds": 60,
+    "queries": ["orexin agonist clinical trial"]
   }
 }
 ```
 
-All knobs above are optional and shown at their defaults.
+All knobs above are optional and shown at their defaults (`queries` defaults
+to none). `queries` are owner-written starting-point searches injected into
+the discovery prompt as hints — the model still searches iteratively and may
+go beyond them.
 
 ```bash
 python -m app discover youtube
