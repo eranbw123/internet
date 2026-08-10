@@ -41,9 +41,9 @@ PREFIX = "internet-discovery-"
 # seconds/HH:MM value, ExecutionTimeLimit). Collect jobs get a longer time
 # limit than the rest -- they're the ones that can spend an LLM budget.
 _TASK_SPECS = [
-    ("collect-stocks", ["run-once", "--source", "stocks"], "interval", "interval_stocks_seconds", "PT30M"),
-    ("collect-web", ["run-once", "--source", "web_search"], "interval", "interval_web_seconds", "PT30M"),
-    ("collect-youtube", ["run-once", "--source", "youtube"], "interval", "interval_youtube_seconds", "PT30M"),
+    ("collect-stocks", ["run-once", "--source", "stocks"], "interval", "interval_stocks_seconds", "PT2H"),
+    ("collect-web", ["run-once", "--source", "web_search"], "interval", "interval_web_seconds", "PT2H"),
+    ("collect-youtube", ["run-once", "--source", "youtube"], "interval", "interval_youtube_seconds", "PT2H"),
     ("digest", ["digest"], "daily", "digest_time", "PT10M"),
     ("feedback", ["listen", "--drain"], "interval", 5 * 60, "PT10M"),
     ("health", ["health", "--notify"], "interval", 3 * 3600, "PT10M"),

@@ -1,7 +1,9 @@
 {
   "defaults": {
-    "min_score": 0.8,
-    "sources": []
+    "min_score": 0.7,
+    "sources": [
+      "web_search"
+    ]
   },
   "interests": [
     {
@@ -22,7 +24,7 @@
         "supplement marketing",
         "press release with no useful numbers"
       ],
-      "min_score": 0.74,
+      "min_score": 0.64,
       "sources": [
         "web_search",
         "youtube"
@@ -30,7 +32,7 @@
       "source_config": {
         "web_search": {
           "limit": 2,
-          "max_searches": 3
+          "max_searches": 2
         },
         "youtube": {
           "queries": [
@@ -67,8 +69,13 @@
         "generic orexin explainer",
         "sleep supplement orexin booster"
       ],
-      "min_score": 0.72,
-      "sources": []
+      "min_score": 0.62,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "hypersomnia-offlabel-pharmacology",
@@ -86,8 +93,13 @@
         "supplement wakefulness stack",
         "generic stimulant overview"
       ],
-      "min_score": 0.75,
-      "sources": []
+      "min_score": 0.65,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "wakefulness-drug-safety-interactions",
@@ -105,8 +117,13 @@
         "generic medication warning",
         "forum anecdote presented as evidence"
       ],
-      "min_score": 0.78,
-      "sources": []
+      "min_score": 0.68,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "sleep-diagnostics-biomarkers",
@@ -124,8 +141,13 @@
         "consumer sleep tracker review",
         "diagnostic marketing with no validation"
       ],
-      "min_score": 0.8,
-      "sources": []
+      "min_score": 0.7,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "cognitive-disengagement-attention",
@@ -144,7 +166,7 @@
         "personality explanation of attention",
         "unvalidated online ADHD test"
       ],
-      "min_score": 0.76,
+      "min_score": 0.66,
       "sources": [
         "web_search"
       ],
@@ -171,8 +193,13 @@
         "discipline productivity content",
         "dopamine detox"
       ],
-      "min_score": 0.8,
-      "sources": []
+      "min_score": 0.7,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "neurophysiology-attention-consciousness",
@@ -190,8 +217,13 @@
         "brainwave wellness product",
         "generic neuroscience explainer"
       ],
-      "min_score": 0.82,
-      "sources": []
+      "min_score": 0.72,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "interpersonal-microdynamics",
@@ -210,7 +242,7 @@
         "single gesture means",
         "pop psychology self-help"
       ],
-      "min_score": 0.79,
+      "min_score": 0.69,
       "sources": [
         "web_search"
       ],
@@ -238,8 +270,13 @@
         "zodiac attraction",
         "single cue proves attraction"
       ],
-      "min_score": 0.81,
-      "sources": []
+      "min_score": 0.71,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "mimicry-synchrony-suggestibility",
@@ -258,8 +295,13 @@
         "mirror body language advice",
         "hypnosis sensationalism"
       ],
-      "min_score": 0.8,
-      "sources": []
+      "min_score": 0.7,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "reinforcement-conditioning-relationships",
@@ -278,8 +320,13 @@
         "manipulation tips",
         "dark psychology hacks"
       ],
-      "min_score": 0.82,
-      "sources": []
+      "min_score": 0.72,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "status-dominance-negotiation",
@@ -297,8 +344,13 @@
         "office politics listicle",
         "power pose presented uncritically"
       ],
-      "min_score": 0.82,
-      "sources": []
+      "min_score": 0.72,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "social-measurement-replication",
@@ -316,8 +368,13 @@
         "generic statistics explainer",
         "culture-war treatment of psychology"
       ],
-      "min_score": 0.84,
-      "sources": []
+      "min_score": 0.74,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "trauma-emdr-processing",
@@ -335,7 +392,7 @@
         "therapy testimonial",
         "trauma healing influencer content"
       ],
-      "min_score": 0.8,
+      "min_score": 0.7,
       "sources": [
         "web_search"
       ],
@@ -363,7 +420,7 @@
         "productivity influencer study routine",
         "mnemonic marketing"
       ],
-      "min_score": 0.81,
+      "min_score": 0.71,
       "sources": [
         "web_search"
       ],
@@ -390,8 +447,13 @@
         "IQ hack",
         "generic memory tips"
       ],
-      "min_score": 0.82,
-      "sources": []
+      "min_score": 0.72,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "minimal-knowledge-representations",
@@ -409,8 +471,13 @@
         "aesthetic note-taking",
         "mind map template"
       ],
-      "min_score": 0.8,
-      "sources": []
+      "min_score": 0.7,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "ai-tutoring-learning",
@@ -428,8 +495,13 @@
         "prompt list for students",
         "AI cheating discourse with no learning data"
       ],
-      "min_score": 0.8,
-      "sources": []
+      "min_score": 0.7,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "personal-knowledge-graphs",
@@ -447,7 +519,7 @@
         "PKM productivity workflow",
         "second brain influencer content"
       ],
-      "min_score": 0.78,
+      "min_score": 0.68,
       "sources": [
         "web_search"
       ],
@@ -474,8 +546,13 @@
         "generic RAG tutorial",
         "CRM conversation summary"
       ],
-      "min_score": 0.76,
-      "sources": []
+      "min_score": 0.66,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "recommender-personalization-interest-models",
@@ -494,7 +571,7 @@
         "collaborative filtering 101",
         "marketing personalization article"
       ],
-      "min_score": 0.75,
+      "min_score": 0.65,
       "sources": [
         "web_search"
       ],
@@ -522,7 +599,7 @@
         "minor IDE feature",
         "thin wrapper product"
       ],
-      "min_score": 0.75,
+      "min_score": 0.65,
       "sources": [
         "web_search"
       ],
@@ -549,8 +626,13 @@
         "generic workflow automation",
         "agent framework comparison with no reliability data"
       ],
-      "min_score": 0.78,
-      "sources": []
+      "min_score": 0.68,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "context-engineering-long-term-memory",
@@ -568,8 +650,13 @@
         "generic RAG explainer",
         "context window marketing number"
       ],
-      "min_score": 0.78,
-      "sources": []
+      "min_score": 0.68,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "browser-computer-use-automation",
@@ -587,8 +674,13 @@
         "browser extension listicle",
         "basic Selenium tutorial"
       ],
-      "min_score": 0.78,
-      "sources": []
+      "min_score": 0.68,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "open-source-personal-tools-mobile-remote",
@@ -606,8 +698,13 @@
         "generic best apps list",
         "sponsored productivity tool"
       ],
-      "min_score": 0.82,
-      "sources": []
+      "min_score": 0.72,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "nbis-nebius",
@@ -626,7 +723,7 @@
         "technical analysis",
         "pump newsletter"
       ],
-      "min_score": 0.7,
+      "min_score": 0.6,
       "sources": [
         "web_search",
         "stocks"
@@ -634,7 +731,7 @@
       "source_config": {
         "web_search": {
           "limit": 2,
-          "max_searches": 3
+          "max_searches": 2
         },
         "stocks": {
           "tickers": [
@@ -663,7 +760,7 @@
         "datacenter REIT listicle",
         "stock recommendation with no operating model"
       ],
-      "min_score": 0.76,
+      "min_score": 0.66,
       "sources": [
         "web_search",
         "stocks"
@@ -715,7 +812,7 @@
         "memory market overview with no numbers",
         "PC memory product review"
       ],
-      "min_score": 0.78,
+      "min_score": 0.68,
       "sources": [
         "stocks"
       ],
@@ -747,7 +844,7 @@
         "fiber optic consumer product",
         "AI stock basket with no supply-chain detail"
       ],
-      "min_score": 0.78,
+      "min_score": 0.68,
       "sources": [
         "stocks"
       ],
@@ -794,7 +891,7 @@
         "concept render with no hardware",
         "generic humanoid market forecast"
       ],
-      "min_score": 0.78,
+      "min_score": 0.68,
       "sources": [
         "web_search"
       ],
@@ -821,7 +918,7 @@
         "generic sensor market forecast",
         "price target only"
       ],
-      "min_score": 0.72,
+      "min_score": 0.62,
       "sources": [
         "stocks"
       ],
@@ -854,8 +951,13 @@
         "cheap stock screen",
         "technical analysis"
       ],
-      "min_score": 0.82,
-      "sources": []
+      "min_score": 0.72,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "weird-science-cross-domain",
@@ -875,7 +977,7 @@
         "futurism speculation",
         "popular science explainer of established fact"
       ],
-      "min_score": 0.86,
+      "min_score": 0.76,
       "sources": [
         "web_search"
       ],
@@ -902,8 +1004,13 @@
         "systems thinking self-help",
         "metaphor with no model or data"
       ],
-      "min_score": 0.85,
-      "sources": []
+      "min_score": 0.75,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "psychological-film-documentary",
@@ -922,7 +1029,7 @@
         "streaming release roundup",
         "horror recommendation based only on gore"
       ],
-      "min_score": 0.84,
+      "min_score": 0.74,
       "sources": [
         "web_search"
       ],
@@ -950,8 +1057,13 @@
         "franchise news",
         "romance-first genre fiction"
       ],
-      "min_score": 0.86,
-      "sources": []
+      "min_score": 0.76,
+      "source_config": {
+        "web_search": {
+          "limit": 2,
+          "max_searches": 1
+        }
+      }
     },
     {
       "key": "social-work-clinical-training-israel",
@@ -969,7 +1081,7 @@
         "university marketing",
         "social worker career overview"
       ],
-      "min_score": 0.82,
+      "min_score": 0.72,
       "sources": [
         "web_search"
       ],
@@ -996,7 +1108,7 @@
         "degree marketing page",
         "broad career prospects article"
       ],
-      "min_score": 0.84,
+      "min_score": 0.74,
       "sources": [
         "web_search"
       ],
