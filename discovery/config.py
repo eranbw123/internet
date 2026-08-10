@@ -27,6 +27,7 @@ class Config:
     telegram_chat_id: str
     youtube_api_key: str = ""   # YouTube Data API v3 key; only the youtube collector needs it
     max_scores_per_cycle: int = 25   # hard ceiling on LLM scoring calls per run_once()
+    personal_state_path: str = ""    # ai repo's derived contract artifact; see discovery/personal_state.py
     # Per-job schedule (see scheduler.py).
     interval_stocks_seconds: int = 3600
     interval_web_seconds: int = 4 * 3600
@@ -56,6 +57,9 @@ def load():
         telegram_chat_id=os.environ.get("TELEGRAM_CHAT_ID", ""),
         youtube_api_key=os.environ.get("YOUTUBE_API_KEY", ""),
         max_scores_per_cycle=int(os.environ.get("DISCOVERY_MAX_SCORES", "25")),
+        personal_state_path=os.environ.get(
+            "DISCOVERY_PERSONAL_STATE", str(REPO_ROOT / "personal_state.json")
+        ),
         interval_stocks_seconds=int(os.environ.get("DISCOVERY_INTERVAL_STOCKS", "3600")),
         interval_web_seconds=int(os.environ.get("DISCOVERY_INTERVAL_WEB", str(4 * 3600))),
         interval_youtube_seconds=int(os.environ.get("DISCOVERY_INTERVAL_YOUTUBE", str(4 * 3600))),

@@ -14,6 +14,10 @@ discovery.db
 discovery.db-shm
 discovery.db-wal
 
+# Inbound derived artifact published by the ai repo's personal_state.py
+# (see discovery/personal_state.py). Never produced or committed here.
+personal_state.json
+
 __pycache__/
 *.pyc
 .venv/

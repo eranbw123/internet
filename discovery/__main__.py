@@ -16,16 +16,20 @@
     items         list recently scored items
     feedback      record feedback on an item, by item id
     stats         funnel, feedback and cost over a trailing window
+    personal-state  print the ai repo's personal-state contract artifact
 """
 import argparse
 import json
 import sys
 from collections import Counter
 
-from . import config, db, feedback_listener, interests, providers, scheduler, stats
+from datetime import datetime, timezone
+
+from . import config, db, feedback_listener, interests, personal_state, providers, scheduler, stats
 from .collectors import COLLECTORS
 from .models import CandidateItem
 from .notify import FEEDBACK_VERDICTS, print_safe
+from .personal_state import PersonalStateError
 from .pipeline import Budget, deliver, ingest, run_once, send_digest
 
 
@@ -71,6 +75,10 @@ def main(argv=None):
     fb.add_argument("--note", default="")
     st = sub.add_parser("stats", help="funnel, feedback rates and estimated cost")
     st.add_argument("--days", type=int, default=7, help="trailing window (default 7)")
+    ps = sub.add_parser(
+        "personal-state", help="print the ai repo's personal-state contract artifact"
+    )
+    ps.add_argument("--path", help="override DISCOVERY_PERSONAL_STATE / cfg.personal_state_path")
 
     args = parser.parse_args(argv)
     cfg = config.load()
@@ -148,6 +156,8 @@ def _dispatch(conn, cfg, args, provider):
         print(f"recorded {args.verdict} on item {args.item_id}")
     elif args.command == "stats":
         print_safe(stats.report(conn, args.days))
+    elif args.command == "personal-state":
+        return _personal_state(cfg, args)
     return 0
 
 
@@ -262,6 +272,31 @@ def _list_items(conn, limit, min_score):
         print_safe(f"[{row['final_score'] * 100:>3.0f}] #{row['id']} {row['interest']}: {row['title']}")
         print_safe(f"      {row['reason']}")
         print_safe(f"      {row['url']}")
+
+
+def _personal_state(cfg, args):
+    """Human-checkable probe: load the ai repo's contract artifact and print
+    what internet would see, without touching the pipeline."""
+    path = args.path or cfg.personal_state_path
+    try:
+        state = personal_state.load(path)
+    except PersonalStateError as e:
+        print(str(e), file=sys.stderr)
+        return 2
+
+    try:
+        generated = datetime.fromisoformat(state.generated_at.replace("Z", "+00:00"))
+        age_days = (datetime.now(timezone.utc) - generated).days
+        age = f"{age_days}d old"
+    except ValueError:
+        age = "age unknown"
+
+    print(f"{path}: contract_version={state.contract_version}")
+    print(f"generated_at={state.generated_at} ({age})")
+    print(f"{len(state.topics)} topic(s)")
+    for topic in state.topics[:10]:
+        print(f"  {topic.get('key')!r}  weight={topic.get('weight')}")
+    return 0
 
 
 if __name__ == "__main__":
