@@ -410,12 +410,17 @@ provider preflight in [Commands](#commands)); `DISCOVERY_CHROME_LAUNCH_CMD`
 can relaunch it once automatically, see [Configuration](#configuration).
 
 ```bash
-python ops/install_tasks.py --dry-run      # print every task's XML + schtasks command, register nothing
-python ops/install_tasks.py --install      # create/update all six tasks
-python ops/install_tasks.py --status       # state, last run, last result, next run
-python ops/install_tasks.py --uninstall    # delete only the six tasks this script created
-python ops/install_tasks.py --soak         # register the one-shot 24h soak checkpoint, see ops/SOAK.md
+python ops/install_tasks.py --dry-run              # print every task's XML + schtasks command, register nothing
+python ops/install_tasks.py --install              # create/update all six tasks
+python ops/install_tasks.py --status               # state, last run, last result, next run
+python ops/install_tasks.py --uninstall            # delete only the six tasks this script created
+python ops/install_tasks.py --uninstall --dry-run  # preview the deletion instead of running it
+python ops/install_tasks.py --soak                 # register the one-shot 24h soak checkpoint, see ops/SOAK.md
 ```
+
+`--dry-run` composes with `--install`, `--uninstall` and `--soak` (preview instead of
+touching `schtasks`); it has nothing to preview against `--status`, which is
+already read-only, so that combination is rejected.
 
 Each task runs `ops/run.cmd`, which sets `PYTHONIOENCODING=utf-8`, `cd`s to
 the repo root and runs `python -m app <args>`, appending stdout+stderr to
@@ -434,6 +439,6 @@ logs.
 python test_discovery.py
 ```
 
-215 tests, network fully stubbed — they never hit an LLM API, Telegram, or
+252 tests, network fully stubbed — they never hit an LLM API, Telegram, or
 Yahoo. The provider seam is the whole stub: a fake object with `complete_json`
 and `search_json`.
