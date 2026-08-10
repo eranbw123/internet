@@ -348,7 +348,7 @@ All timestamps UTC via `db.now()`/`db.ago()`. No token metering on
 claude_chat (calls only).
 
 ## Tests
-`python test_discovery.py` (309) + `python test_watch.py` (10), offline, both
+`python test_discovery.py` (314) + `python test_watch.py` (10), offline, both
 green; CI on push/PR.
 
 ## Known issues
@@ -364,3 +364,52 @@ python test_discovery.py && python test_watch.py
 python -m app run-once   |   python -m app run   |   python -m app digest
 python -m app listen     |   python -m app stats --days 7
 ```
+
+## product loop closure + anti-self-amplification guard (step-08)
+The personal_state seed path (step-07) was already reachable from the CLI --
+`apply_transitions()` itself calls `personal_state.load_optional()` and
+`interests --refresh` already calls `apply_transitions()` -- so no new
+wiring was needed. What was missing was provenance and a proven guard:
+
+**Provenance.** Every seed's origin -- `origin='personal_state'`,
+`artifact_sha256` (sha256 of the artifact file's bytes, read fresh at seed
+time), the artifact's own `generated_at`/`contract_version`, the `topic_key`,
+and `seeded_at` -- is now recorded on BOTH the interest's `provenance` JSON
+column and its `interest_events` seed row (`interest_state._write_transition`'s
+new `provenance_extra` param, threaded from `apply_transitions()`'s seed
+loop). `interests --why <key>` already prints every event's evidence JSON
+verbatim, so the seed origin shows up there with no CLI change needed. A
+documented SQL query walking notification → score → item → interest →
+interest_events → seed event (with the artifact hash) is in README.md's new
+"Provenance chain" section, and a test executes that exact query and asserts
+every hop resolves.
+
+**Leakage guard (the core of this step).** `interest_state._window_stats()`
+was a pure title-token count, blind to *why* an item exists -- it didn't
+distinguish genuine independent corpus evidence from an item whose only
+attribution (via `item_interests`) is the derived interest's own matching.
+Structurally this can't yet fire in production (a lower-than-`inferred`
+layer is never in `active_interests()`, so it can't have matched anything
+yet), but a directly-constructed fixture proved the evidence-gathering path
+itself would have counted it as promotion evidence once it could. Fixed:
+`_window_stats()` now keeps per-item hits (not pre-aggregated counts), and
+`apply_transitions()`'s step 3 (progression of already-tracked rows) excludes,
+per term, any item whose ONLY `item_interests` row is a match to that same
+derived interest (`_self_matched_item_ids()`). A test drives the real
+`apply_transitions()` over 3 cycles of self-referential-only evidence with no
+feedback: the row never leaves `exploratory`, no `promote` event appears, no
+owner row or score row changes, and it demotes/retires on schedule once idle.
+A companion test proves the positive path is untouched: independent
+owner-collector evidence (no `item_interests` involved at all) plus feedback
+via `db.add_feedback` promotes `exploratory` → `emerging` → `inferred`, one
+rung per pass, and an above-bar match on the now-`inferred` interest is
+delivered through the real pipeline (`pipeline.send_digest`).
+
+**Default-off safety.** `test_default_off_is_a_true_noop` (step-07,
+unmodified) still passes: with the flag off, `apply_transitions()` never
+even calls `personal_state.load_optional()` or reads `item_interests`.
+
+**Real-data posture.** This worktree has no `discovery.db`/`personal_state.json`
+-- every test above is a synthetic fixture. The live-session command
+sequence for the real loop is in README.md's "Real-data loop demo" section;
+it has not been run here.

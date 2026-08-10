@@ -11,6 +11,7 @@ already in the DB, decide() is a pure function, and apply_transitions() is a
 no-op (a zeroed summary) unless cfg.dynamic_interests is on. No new LLM or
 network call, ever -- see PROJECT_STATE.md.
 """
+import hashlib
 import json
 from collections import Counter
 from dataclasses import asdict, dataclass, field
@@ -93,12 +94,19 @@ def _select_candidates(window_stats, feedback_index, excluded, max_candidates):
 
 
 def _window_stats(conn, rules, now):
-    """Raw per-term observation stats from candidate_items titles within the
+    """Raw per-term observation hits from candidate_items titles within the
     evidence window -- unfiltered vocabulary, reused both by gather_evidence()
-    and by apply_transitions()'s re-evaluation of already-tracked terms."""
+    and by apply_transitions()'s re-evaluation of already-tracked terms.
+
+    Kept as a per-item hit list (not a pre-aggregated count) so a caller can
+    exclude specific item ids afterwards -- see _self_matched_item_ids() and
+    its use in apply_transitions()'s step 3, which excludes items whose only
+    matched interest is the very derived interest being re-evaluated, so a
+    term can never manufacture its own promotion evidence purely by having
+    matched an item (self-referential evidence)."""
     since = (now - timedelta(days=rules.evidence_window_days)).isoformat(timespec="seconds")
     rows = conn.execute(
-        "SELECT title, source, first_seen_at FROM candidate_items WHERE first_seen_at >= ?",
+        "SELECT id, title, source, first_seen_at FROM candidate_items WHERE first_seen_at >= ?",
         (since,),
     ).fetchall()
     acc = {}
@@ -106,19 +114,10 @@ def _window_stats(conn, rules, now):
         seen = row["first_seen_at"] or ""
         day = seen[:10]
         for term in matching._tokens(row["title"] or ""):
-            entry = acc.setdefault(
-                term, {"observations": 0, "days": set(), "first": None, "last": None, "sources": set()}
+            entry = acc.setdefault(term, {"hits": []})
+            entry["hits"].append(
+                {"item_id": row["id"], "day": day, "seen": seen, "source": row["source"]}
             )
-            entry["observations"] += 1
-            if day:
-                entry["days"].add(day)
-            if seen:
-                if entry["first"] is None or seen < entry["first"]:
-                    entry["first"] = seen
-                if entry["last"] is None or seen > entry["last"]:
-                    entry["last"] = seen
-            if row["source"]:
-                entry["sources"].add(row["source"])
     return acc
 
 
@@ -138,7 +137,10 @@ def _feedback_index(conn):
     ]
 
 
-def _evidence_for(term, window_stats, feedback_index):
+def _evidence_for(term, window_stats, feedback_index, exclude_item_ids=frozenset()):
+    """`exclude_item_ids` drops specific hits before aggregating -- see
+    _window_stats()'s docstring; empty (the default) for every caller except
+    apply_transitions()'s step 3."""
     pos = neg = 0
     for title, is_negative in feedback_index:
         if term not in title:
@@ -148,16 +150,20 @@ def _evidence_for(term, window_stats, feedback_index):
         else:
             pos += 1
     entry = window_stats.get(term)
-    if entry is None:
+    hits = [h for h in entry["hits"] if h["item_id"] not in exclude_item_ids] if entry else []
+    if not hits:
         return Evidence(positive_feedback=pos, negative_feedback=neg)
+    days = {h["day"] for h in hits if h["day"]}
+    seens = sorted(h["seen"] for h in hits if h["seen"])
+    sources = {h["source"] for h in hits if h["source"]}
     return Evidence(
-        observations=entry["observations"],
-        distinct_days=len(entry["days"]),
-        first_seen=entry["first"],
-        last_seen=entry["last"],
+        observations=len(hits),
+        distinct_days=len(days),
+        first_seen=seens[0] if seens else None,
+        last_seen=seens[-1] if seens else None,
         positive_feedback=pos,
         negative_feedback=neg,
-        sources=sorted(entry["sources"]),
+        sources=sorted(sources),
     )
 
 
@@ -200,6 +206,30 @@ def _current_layer(conn, term):
 def _owner_min_score_floor(conn):
     row = conn.execute("SELECT MIN(min_score) AS floor FROM interests WHERE layer = 'owner'").fetchone()
     return row["floor"] if row and row["floor"] is not None else 0.0
+
+
+def _self_matched_item_ids(conn, interest_id):
+    """Item ids whose ONLY row in item_interests is a match to this interest
+    -- i.e. matching attributes the item to nothing else. Excluded from a
+    derived interest's own progression evidence (apply_transitions() step 3)
+    so a term can never manufacture its own promotion evidence purely by
+    having matched an item itself; real progression needs evidence
+    independent of the interest's own matching. In production this can only
+    ever be non-empty for an already-'inferred' (active) interest -- a
+    lower-layer interest is never in the `active_interests()` list passed to
+    matching.match_interests(), so it can't yet have a row here at all."""
+    rows = conn.execute(
+        """
+        SELECT ii.item_id FROM item_interests ii
+        WHERE ii.interest_id = ?
+          AND NOT EXISTS (
+              SELECT 1 FROM item_interests ii2
+              WHERE ii2.item_id = ii.item_id AND ii2.interest_id != ?
+          )
+        """,
+        (interest_id, interest_id),
+    ).fetchall()
+    return {r["item_id"] for r in rows}
 
 
 # --- the ladder ----------------------------------------------------------------
@@ -301,24 +331,39 @@ def apply_transitions(conn, cfg, rules=None, now=None):
     # as idle since forever; it is only idle once decay_idle_days has
     # actually elapsed since it was last written/observed.
     tracked_rows = conn.execute(
-        "SELECT key, layer, last_observed_at FROM interests WHERE layer NOT IN ('owner', 'retired')"
+        "SELECT id, key, layer, last_observed_at FROM interests WHERE layer NOT IN ('owner', 'retired')"
     ).fetchall()
 
     # 1) Optional personal-state seeding: brand-new EXPLORATORY rows only,
     # zero observations -- can never by itself satisfy a promotion threshold
     # (see decide(): EXPLORATORY -> EMERGING needs promote_observations,
-    # which a seeded row starts at 0 for).
+    # which a seeded row starts at 0 for). Every seed's origin -- the
+    # artifact's own identity (hash of the bytes actually read, its
+    # generated_at, its contract_version) plus the topic key and the instant
+    # it was seeded -- is recorded on BOTH the interest's own provenance JSON
+    # and its interest_events seed row, so `interests --why` can show the
+    # full chain back to the artifact that suggested it.
     state = personal_state.load_optional(cfg.personal_state_path)
     if state is not None:
+        artifact_sha256 = _artifact_sha256(cfg.personal_state_path)
+        seeded_at = now.isoformat(timespec="seconds")
         seed_excluded = _owner_terms(conn) | _derived_terms(conn, include_retired=True)
         for raw in state.top_terms(rules.max_candidates):
             term = (raw or "").strip().lower()
             if not term or term in seed_excluded or term in blocked_terms:
                 continue
             transition = Transition(None, EXPLORATORY, "seed")
+            seed_origin = {
+                "origin": "personal_state",
+                "artifact_sha256": artifact_sha256,
+                "generated_at": state.generated_at,
+                "contract_version": state.contract_version,
+                "topic_key": term,
+                "seeded_at": seeded_at,
+            }
             inferred_count = _write_transition(
                 conn, cfg, term, transition, Evidence(), inferred_count, summary,
-                provenance_source="personal_state",
+                provenance_source="personal_state", provenance_extra=seed_origin,
             )
             seed_excluded.add(term)
 
@@ -339,7 +384,8 @@ def apply_transitions(conn, cfg, rules=None, now=None):
     # non-retired) BEFORE this pass -- see the `tracked_rows` snapshot above.
     for row in tracked_rows:
         term = _term_from_key(row["key"])
-        evidence = _evidence_for(term, window_stats, feedback_index)
+        exclude_ids = _self_matched_item_ids(conn, row["id"])
+        evidence = _evidence_for(term, window_stats, feedback_index, exclude_item_ids=exclude_ids)
         # No fresh observation this pass -> fall back to (or take the later
         # of) the row's own last_observed_at, so a term with real but
         # older-than-this-window evidence -- or none at all this pass --
@@ -360,9 +406,17 @@ def apply_transitions(conn, cfg, rules=None, now=None):
     return result
 
 
-def _write_transition(conn, cfg, term, transition, evidence, inferred_count, summary, provenance_source):
+def _write_transition(
+    conn, cfg, term, transition, evidence, inferred_count, summary, provenance_source,
+    provenance_extra=None,
+):
+    """`provenance_extra` (only ever set by the personal-state seed step) is
+    merged into both the interest's own provenance JSON and this
+    transition's interest_events row -- so the seed's origin (artifact hash,
+    generated_at, contract_version, topic_key, seeded_at) is recorded on
+    both, per PROJECT_STATE.md."""
     key = db.DERIVED_KEY_PREFIX + term
-    evidence_dict = asdict(evidence)
+    evidence_dict = {**asdict(evidence), **(provenance_extra or {})}
     to_layer, action = transition.to_layer, transition.action
     was_inferred = transition.from_layer == INFERRED
 
@@ -379,7 +433,8 @@ def _write_transition(conn, cfg, term, transition, evidence, inferred_count, sum
             positive_signals=[term], min_score=max(cfg.derived_min_score, floor),
             sources=[], layer=INFERRED,
         )
-        db.upsert_derived_interest(conn, interest, {"source": provenance_source, "term": term})
+        provenance = {"source": provenance_source, "term": term, **(provenance_extra or {})}
+        db.upsert_derived_interest(conn, interest, provenance)
         db.add_interest_event(conn, key, "automation", action, transition.from_layer, to_layer, evidence_dict)
         summary["promoted"] += 1
         return inferred_count + 1
@@ -390,13 +445,23 @@ def _write_transition(conn, cfg, term, transition, evidence, inferred_count, sum
             positive_signals=[term], min_score=cfg.derived_min_score,
             sources=[], layer=to_layer,
         )
-        db.upsert_derived_interest(conn, interest, {"source": provenance_source, "term": term})
+        provenance = {"source": provenance_source, "term": term, **(provenance_extra or {})}
+        db.upsert_derived_interest(conn, interest, provenance)
     else:
         db.set_interest_layer(conn, key, to_layer, evidence_dict)
 
     db.add_interest_event(conn, key, "automation", action, transition.from_layer, to_layer, evidence_dict)
     summary[_summary_key(action)] += 1
     return inferred_count - 1 if was_inferred else inferred_count
+
+
+def _artifact_sha256(path):
+    """sha256 of the personal-state artifact's bytes, read fresh at seed
+    time -- the artifact-identity half of a seeded interest's provenance
+    chain (paired with generated_at/contract_version, both already carried
+    by the loaded PersonalState)."""
+    with open(path, "rb") as fh:
+        return hashlib.sha256(fh.read()).hexdigest()
 
 
 def _summary_key(action):

@@ -7,6 +7,7 @@ the pipeline holds an LLMProvider, so a fake object with `complete_json` /
 `search_json` is the whole seam.
 """
 import dataclasses
+import hashlib
 import io
 import json
 import os
@@ -1450,6 +1451,227 @@ class InterestStateApplyTests(unittest.TestCase):
                 "topics": [{"key": t, "weight": 1.0} for t in terms],
             }, fh)
         return path
+
+    def test_personal_state_seed_records_full_provenance_on_the_row_and_the_event(self):
+        """Work item 1: the seed's origin -- artifact identity, contract
+        version, topic key, seeded_at -- lands on BOTH the interest's own
+        provenance JSON and its interest_events seed row, and seeding writes
+        no score row (zero LLM/network calls -- apply_transitions() doesn't
+        even take a provider argument)."""
+        term = "zzqleaktest"
+        path = self._personal_state_artifact([term])
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True, personal_state_path=path)
+        expected_hash = hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary["seeded"], 1)
+
+        row = self.conn.execute(
+            "SELECT provenance FROM interests WHERE key = ?", (f"derived:{term}",)
+        ).fetchone()
+        provenance = json.loads(row["provenance"])
+        self.assertEqual(provenance["origin"], "personal_state")
+        self.assertEqual(provenance["artifact_sha256"], expected_hash)
+        self.assertEqual(provenance["generated_at"], "2026-08-10T00:00:00Z")
+        self.assertEqual(provenance["contract_version"], 1)
+        self.assertEqual(provenance["topic_key"], term)
+        self.assertEqual(provenance["seeded_at"], NOW.isoformat(timespec="seconds"))
+
+        events = db.interest_events(self.conn, f"derived:{term}")
+        self.assertEqual([e["action"] for e in events], ["seed"])
+        seed_evidence = events[0]["evidence"]
+        self.assertEqual(seed_evidence["artifact_sha256"], expected_hash)
+        self.assertEqual(seed_evidence["generated_at"], "2026-08-10T00:00:00Z")
+        self.assertEqual(seed_evidence["contract_version"], 1)
+        self.assertEqual(seed_evidence["topic_key"], term)
+
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM scores").fetchone()["c"], 0)
+
+    def test_personal_state_seeded_term_never_promotes_on_self_referential_matching_alone(self):
+        """Work item 2 (the core of this step): the only legal influence
+        channel of personal_state on discovery is a zero-weight exploratory
+        seed (PROJECT_STATE.md's step-05 gate) -- prove the row can never
+        promote off evidence that is only attributable to its own matching
+        (an item whose ONLY row in item_interests points back at this very
+        derived interest), with no independent corpus signal and no human
+        feedback anywhere. Drives the real apply_transitions() over 3 cycles,
+        not a mock of decide()."""
+        term = "zzqleaktest"
+        key = f"derived:{term}"
+        cfg = dataclasses.replace(
+            self.cfg, dynamic_interests=True,
+            personal_state_path=self._personal_state_artifact([term]),
+        )
+        interest_state.apply_transitions(self.conn, cfg, now=NOW)  # pass 0: seeds
+        row = self.conn.execute("SELECT id, layer, active FROM interests WHERE key = ?", (key,)).fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("exploratory", 0))
+        # Pin last_observed_at to the fixed test clock (see
+        # test_personal_state_seed_never_promotes_by_itself for why).
+        self.conn.execute(
+            "UPDATE interests SET last_observed_at = ? WHERE key = ?",
+            (NOW.isoformat(timespec="seconds"), key),
+        )
+        self.conn.commit()
+        owner_before = [
+            dict(r) for r in self.conn.execute("SELECT * FROM interests WHERE layer = 'owner'").fetchall()
+        ]
+
+        for cycle in range(3):
+            derived_interest = db.interest_by_key(self.conn, key)
+            # Well past the ordinary observation/distinct-day bars by the
+            # last cycle, but every single item's ONLY matched interest (via
+            # item_interests -- the matching pipeline's own attribution) is
+            # the seeded interest itself: self-referential, not independent.
+            for day in range(cycle * 2, cycle * 2 + 2):
+                seen = (NOW - timedelta(days=day)).isoformat(timespec="seconds")
+                # Title is the term alone -- no second shared word, so this
+                # fixture can't accidentally promote some *other* incidental
+                # term (e.g. a repeated second word) instead of proving
+                # anything about the seeded one.
+                item = normalize.normalize(an_item(
+                    title=term, url=f"https://e.com/{term}-{cycle}-{day}"
+                ))
+                item.id = db.insert_item(self.conn, item)
+                self.conn.execute(
+                    "UPDATE candidate_items SET first_seen_at = ? WHERE id = ?", (seen, item.id)
+                )
+                self.conn.commit()
+                db.save_matches(self.conn, item.id, [(derived_interest, 0.5, [term])])
+
+            summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+            self.assertEqual(summary["promoted"], 0)
+            row = self.conn.execute("SELECT layer FROM interests WHERE key = ?", (key,)).fetchone()
+            self.assertEqual(row["layer"], "exploratory")
+
+        events = db.interest_events(self.conn, key)
+        self.assertNotIn("promote", [e["action"] for e in events])
+        self.assertEqual(
+            [dict(r) for r in self.conn.execute("SELECT * FROM interests WHERE layer = 'owner'").fetchall()],
+            owner_before,
+        )
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM scores").fetchone()["c"], 0)
+
+        # Now let it go genuinely idle (no fresh self-referential item this
+        # pass) past decay_idle_days -- must demote/retire per the ordinary
+        # decide() rules, exactly like any other exploratory row.
+        stale = (NOW - timedelta(days=interest_state.Rules().decay_idle_days + 1)).isoformat(timespec="seconds")
+        self.conn.execute("UPDATE interests SET last_observed_at = ? WHERE key = ?", (stale, key))
+        self.conn.commit()
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        # exploratory decays straight to retired (nothing below it); the
+        # summary bucket is "decayed" -- see _summary_key(), which only
+        # counts an explicit retire_* action (blocked/negative-feedback) as
+        # "retired".
+        self.assertEqual(summary["decayed"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = ?", (key,)).fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("retired", 0))
+
+    def _promote_seeded_term_to_inferred_and_notify(self, term):
+        """The companion, positive-path fixture to the leakage test above:
+        same seed, but with independent owner-collector corpus evidence (no
+        item_interests involved at all) plus positive human feedback
+        recorded through the existing db.add_feedback path -- promotes
+        exploratory -> emerging -> inferred, one rung per
+        apply_transitions() call, and then delivers an above-bar match on it
+        through the real pipeline. Returns (key, item_id, score_id,
+        notification_id)."""
+        key = f"derived:{term}"
+        cfg = dataclasses.replace(
+            self.cfg, dynamic_interests=True,
+            personal_state_path=self._personal_state_artifact([term]),
+        )
+        interest_state.apply_transitions(self.conn, cfg, now=NOW)  # pass 1: seeds
+        self.conn.execute(
+            "UPDATE interests SET last_observed_at = ? WHERE key = ?",
+            (NOW.isoformat(timespec="seconds"), key),
+        )
+        self.conn.commit()
+
+        # Independent corpus evidence: plain items, exactly as an owner
+        # collector would have stored them -- no item_interests row at all.
+        self._seed_items(term, 6, distinct_days=3)
+        pass2 = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(pass2["promoted"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = ?", (key,)).fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("emerging", 0))
+
+        # Positive human feedback, through the existing recording path.
+        self._positive_feedback(term, up=2)
+        pass3 = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(pass3["promoted"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = ?", (key,)).fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("inferred", 1))
+
+        events = db.interest_events(self.conn, key)
+        self.assertEqual([e["action"] for e in events], ["seed", "promote", "promote"])
+
+        active = db.active_interests(self.conn)
+        self.assertIn(key, [i.key for i in active])
+        provider = FakeProvider({f"{term} breaks through": 0.95})
+        item = an_item(
+            title=f"{term} breaks through", url=f"https://e.com/{term}-notify", text=BODY
+        )
+        outcome = pipeline.ingest(self.conn, provider, cfg, item, active, origin_interest=key)
+        self.assertEqual(outcome.stage, "scored")
+        sent = pipeline.send_digest(self.conn, cfg, dry_run=True)
+        self.assertEqual(sent, 1)
+        notification = self.conn.execute(
+            "SELECT n.id, n.ok FROM notifications n JOIN scores s ON s.id = n.score_id"
+            " WHERE s.item_id = ?",
+            (outcome.item.id,),
+        ).fetchone()
+        self.assertEqual(notification["ok"], 1)
+        return key, outcome.item.id, outcome.score.id, notification["id"]
+
+    def test_personal_state_seeded_term_promotes_on_independent_evidence_plus_feedback(self):
+        """Work item 3: the loop closes positively -- same seeded term as the
+        leakage test, but with real independent evidence. once inferred, an
+        above-bar match yields a notification through the real pipeline."""
+        self._promote_seeded_term_to_inferred_and_notify("zzqleaktest")
+
+    # The documented chain query from README.md's "Provenance chain" section
+    # -- kept byte-identical to what's published there so this test proves
+    # the exact query a human would copy-paste actually resolves every hop.
+    PROVENANCE_CHAIN_QUERY = """
+        SELECT
+          n.id                                            AS notification_id,
+          s.id                                            AS score_id,
+          s.final_score                                   AS score,
+          ci.id                                            AS item_id,
+          ci.title                                         AS item_title,
+          it.key                                           AS interest_key,
+          it.layer                                         AS interest_layer,
+          ev.id                                            AS seed_event_id,
+          json_extract(ev.evidence, '$.artifact_sha256')   AS artifact_sha256,
+          json_extract(ev.evidence, '$.generated_at')      AS artifact_generated_at,
+          json_extract(ev.evidence, '$.contract_version')  AS contract_version
+        FROM notifications n
+        JOIN scores s           ON s.id = n.score_id
+        JOIN candidate_items ci ON ci.id = s.item_id
+        JOIN interests it       ON it.id = s.interest_id
+        JOIN interest_events ev ON ev.interest_key = it.key AND ev.action = 'seed'
+        WHERE n.id = ?
+    """
+
+    def test_provenance_chain_query_resolves_every_hop(self):
+        """Work item 4: the documented SQL query walks notification -> score
+        -> item -> matched interest -> interest_events -> seed event with
+        the artifact hash, and every hop resolves non-empty against the
+        positive-path fixture."""
+        key, item_id, score_id, notification_id = self._promote_seeded_term_to_inferred_and_notify(
+            "zzqleaktest"
+        )
+        row = self.conn.execute(self.PROVENANCE_CHAIN_QUERY, (notification_id,)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["notification_id"], notification_id)
+        self.assertEqual(row["score_id"], score_id)
+        self.assertEqual(row["item_id"], item_id)
+        self.assertEqual(row["interest_key"], key)
+        self.assertEqual(row["interest_layer"], "inferred")
+        self.assertIsNotNone(row["seed_event_id"])
+        self.assertTrue(row["artifact_sha256"])
+        self.assertEqual(row["artifact_generated_at"], "2026-08-10T00:00:00Z")
+        self.assertEqual(row["contract_version"], 1)
 
 
 class ScoringTests(unittest.TestCase):
@@ -3536,6 +3758,43 @@ class CLITests(unittest.TestCase):
         )
         self.assertEqual(code, 2)
         self.assertIn("malformed interests file", err)
+
+    def test_interests_refresh_seeds_from_personal_state_without_ever_building_a_provider(self):
+        """Work items 1 + 4 at the CLI layer: `interests --refresh` seeds a
+        personal-state topic (already reachable -- apply_transitions() calls
+        personal_state.load_optional() itself, no separate wiring needed),
+        never touches the provider factory (zero LLM/network calls), and
+        `--why` on the seeded key prints the full seed origin."""
+        path = self._interests_file('{"interests": []}')
+        ps_path = os.path.join(self.tmp.name, "ps.json")
+        with open(ps_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "contract_version": 1, "generated_at": "2026-08-10T00:00:00Z",
+                    "topics": [{"key": "zzqleaktest", "weight": 1.0}],
+                },
+                fh,
+            )
+        self._main("init", env={"DISCOVERY_INTERESTS": path})
+
+        with mock.patch.object(providers, "get_provider", side_effect=AssertionError("provider built")):
+            code, out, _err = self._main(
+                "interests", "--refresh",
+                env={
+                    "DISCOVERY_DYNAMIC_INTERESTS": "1", "DISCOVERY_INTERESTS": path,
+                    "DISCOVERY_PERSONAL_STATE": ps_path,
+                },
+            )
+        self.assertEqual(code, 0)
+        self.assertIn('"seeded": 1', out)
+
+        code, out, _err = self._main("interests", "--why", "derived:zzqleaktest")
+        self.assertEqual(code, 0)
+        self.assertIn("seed", out)
+        self.assertIn("artifact_sha256", out)
+        self.assertIn('"generated_at": "2026-08-10T00:00:00Z"', out)
+        self.assertIn('"contract_version": 1', out)
+        self.assertIn('"topic_key": "zzqleaktest"', out)
 
 
 class TeachCLITests(unittest.TestCase):

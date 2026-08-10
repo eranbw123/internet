@@ -499,6 +499,69 @@ logs.
 python test_discovery.py
 ```
 
-315 tests, network fully stubbed — they never hit an LLM API, Telegram, or
+314 tests, network fully stubbed — they never hit an LLM API, Telegram, or
 Yahoo. The provider seam is the whole stub: a fake object with `complete_json`
 and `search_json`.
+
+## Provenance chain (step-08)
+
+A personal-state seed's origin isn't just visible in `interests --why` — it's
+walkable end to end in SQL, from a delivered notification back to the exact
+artifact bytes that suggested the interest:
+
+```sql
+SELECT
+  n.id                                            AS notification_id,
+  s.id                                            AS score_id,
+  s.final_score                                   AS score,
+  ci.id                                            AS item_id,
+  ci.title                                         AS item_title,
+  it.key                                           AS interest_key,
+  it.layer                                         AS interest_layer,
+  ev.id                                            AS seed_event_id,
+  json_extract(ev.evidence, '$.artifact_sha256')   AS artifact_sha256,
+  json_extract(ev.evidence, '$.generated_at')      AS artifact_generated_at,
+  json_extract(ev.evidence, '$.contract_version')  AS contract_version
+FROM notifications n
+JOIN scores s           ON s.id = n.score_id
+JOIN candidate_items ci ON ci.id = s.item_id
+JOIN interests it       ON it.id = s.interest_id
+JOIN interest_events ev ON ev.interest_key = it.key AND ev.action = 'seed'
+WHERE n.id = ?
+```
+
+`interest_events.evidence` is JSON, and every personal-state seed row (see
+[Layered interest state](#layered-interest-state)) carries
+`origin='personal_state'`, `artifact_sha256` (sha256 of the artifact file's
+bytes, read fresh at seed time), the artifact's own `generated_at` and
+`contract_version`, the `topic_key` that was seeded, and `seeded_at` — on
+BOTH the interest's `provenance` column and this event row, so the chain
+above resolves even after the interest itself has since promoted or decayed
+away from its seeded state. `test_provenance_chain_query_resolves_every_hop`
+in `test_discovery.py` runs this exact query against a fixture and asserts
+every hop is non-empty.
+
+### Real-data loop demo (live session only)
+
+This repo's own worktree/CI runs have no `discovery.db` and no
+`personal_state.json` — every seeding/leakage/promotion test above runs
+against synthetic in-memory fixtures, never real conversation or corpus
+data. The full loop, end to end, needs a live operator session (real
+Chrome/CDP, Telegram, and the `ai` repo checked out alongside this one):
+
+```bash
+# in the ai repo -- produces the contract artifact
+python personal_state.py --out personal_state.json
+
+# in this repo -- point at it, turn the flag on, run the loop
+set DISCOVERY_PERSONAL_STATE=C:\path\to\ai\personal_state.json
+set DISCOVERY_DYNAMIC_INTERESTS=1
+python -m app interests --refresh      # seeds top topics as derived:<term> exploratory rows
+python -m app run-once                 # collects, matches, scores against active interests
+python -m app digest                   # sends anything pending
+python -m app listen --drain           # picks up any feedback-button presses
+python -m app interests --why derived:<term>   # the full provenance chain, including the seed
+```
+
+Nothing here is run against production stores by this implementer session —
+the command sequence above is documented, not executed.
