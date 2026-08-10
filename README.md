@@ -58,6 +58,7 @@ a long-lived session.
 | `stats [--days N]` | Funnel, feedback rates, estimated cost and a HEALTH section — see [Stats](#stats) |
 | `health [--notify]` | Job staleness, provider reachability, pending/abandoned sends; `--notify` alerts on degraded/recovery, rate-limited |
 | `personal-state [--path]` | Print the sibling `ai` repo's personal-state artifact as this repo would read it — see [Personal-state contract](#personal-state-contract) |
+| `teach [--list\|--explain\|--send]` | Label the highest information-value scored-but-unlabeled items — see [Teach](#teach) |
 
 Run it from the repo root — the `stocks` collector imports `watch.py`.
 `python -m app` and `python -m discovery` are the same CLI. Global flags
@@ -460,6 +461,6 @@ logs.
 python test_discovery.py
 ```
 
-252 tests, network fully stubbed — they never hit an LLM API, Telegram, or
+271 tests, network fully stubbed — they never hit an LLM API, Telegram, or
 Yahoo. The provider seam is the whole stub: a fake object with `complete_json`
 and `search_json`.
