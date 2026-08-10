@@ -37,8 +37,11 @@ root, locale-proof date) appends, in order, to `logs\soak-<date>.txt`:
 
 1. `python -m app stats --days 1`
 2. `python -m app health`
-3. `schtasks /query /fo LIST /v` filtered to the `internet-discovery-`
-   prefix (every task's Status/Last Run Time/Last Result/Next Run Time)
+3. `python ops\install_tasks.py --status` (every task's Status/Last Run
+   Time/Last Result/Next Run Time -- a plain `schtasks /query /fo LIST /v`
+   filtered by `findstr` on the `internet-discovery-` prefix only matches
+   the TaskName/Comment lines of that output format, not the per-field
+   lines, so this reuses install_tasks.py's own block-aware reader instead)
 
 ## Resuming a later session
 

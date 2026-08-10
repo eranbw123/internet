@@ -24,13 +24,26 @@ one file, exit code propagated); `logs/` is gitignored, inbound-only.
 `--uninstall` deletes it if present) whose single `<TimeTrigger>` (no
 `<Repetition>`) fires once, `N` hours out (default 24); it shells to
 `ops/soak_check.cmd`, which appends `stats --days 1` + `health` +
-prefix-filtered `schtasks /query` to `logs\soak-<date>.txt`. `--soak` is
-composable with `--dry-run` (argparse's own group can't express "exclusive
-among these four, but not with dry-run", so `main()` checks mutual
-exclusivity by hand). `install()`'s per-task registration (tempfile write +
-`schtasks /create /XML` + `/query` verify) is factored into `_register_task`,
-shared by `install()` and `install_soak()` — one registration path, not two.
-Runbook + resume procedure: `ops/SOAK.md`.
+`install_tasks.py --status` to `logs\soak-<date>.txt` (repair: a
+`schtasks /query /fo LIST /v | findstr internet-discovery-` first cut only
+kept TaskName/Comment lines — `/fo LIST` puts the prefix on no other field —
+so reusing `--status`'s own block-aware reader is what actually gets
+Status/Last Run Time/Last Result/Next Run Time into the readout; the
+script's own exit code now reflects the `stats`/`--status` calls, not a
+`findstr` no-match, and no longer fails the task on `health`'s legitimate
+degraded=1). `--soak` is composable with `--dry-run` (argparse's own group
+can't express "exclusive among these four, but not with dry-run", so
+`main()` checks mutual exclusivity by hand; `--status --dry-run` is
+rejected outright since status has nothing to preview). `install()`'s
+per-task registration (tempfile write + `schtasks /create /XML` + `/query`
+verify) is factored into `_register_task`, shared by `install()` and
+`install_soak()` — one registration path, not two; `install_soak()` reports
+back the exact `<StartBoundary>` it registered (parsed from the rendered
+XML) rather than recomputing `datetime.now()` a second time.
+`main()`'s `--uninstall` now threads `--dry-run` through (repair: it was
+silently dropped, so `--uninstall --dry-run` performed a real delete of all
+seven tasks instead of previewing). Runbook + resume procedure:
+`ops/SOAK.md`.
 
 Live install, fault-injection drills and the live 24h wall-clock soak
 execution are still a separate, not-yet-done step — they need a live

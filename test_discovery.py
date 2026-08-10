@@ -3235,6 +3235,46 @@ class InstallTasksTests(unittest.TestCase):
         deleted = [args[args.index("/tn") + 1] for args in calls]
         self.assertIn(install_tasks.SOAK_TASK, deleted)
 
+    def test_main_routes_argv_to_the_right_function_with_dry_run_threaded(self):
+        # Regression: `--uninstall --dry-run` used to parse fine but dropped
+        # dry_run on the way to uninstall(), so a preview performed a real
+        # deletion of all seven tasks (including a live soak checkpoint).
+        cases = [
+            (["--install"], "install", False),
+            (["--install", "--dry-run"], "install", True),
+            (["--uninstall"], "uninstall", False),
+            (["--uninstall", "--dry-run"], "uninstall", True),
+            (["--soak"], "install_soak", False),
+            (["--soak", "--dry-run"], "install_soak", True),
+            (["--status"], "status", None),
+        ]
+        for argv, fn_name, expect_dry_run in cases:
+            with self.subTest(argv=argv):
+                with mock.patch.object(install_tasks, "install", return_value=0) as m_install, \
+                     mock.patch.object(install_tasks, "uninstall", return_value=0) as m_uninstall, \
+                     mock.patch.object(install_tasks, "install_soak", return_value=0) as m_soak, \
+                     mock.patch.object(install_tasks, "status", return_value=0) as m_status, \
+                     mock.patch.object(install_tasks.config, "load", return_value=CFG):
+                    code = install_tasks.main(argv)
+                self.assertEqual(code, 0)
+                mocks = {
+                    "install": m_install,
+                    "uninstall": m_uninstall,
+                    "install_soak": m_soak,
+                    "status": m_status,
+                }
+                mocks[fn_name].assert_called_once()
+                for other_name, other_mock in mocks.items():
+                    if other_name != fn_name:
+                        other_mock.assert_not_called()
+                if expect_dry_run is not None:
+                    self.assertEqual(mocks[fn_name].call_args.kwargs.get("dry_run"), expect_dry_run)
+
+    def test_main_rejects_status_with_dry_run(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):
+                install_tasks.main(["--status", "--dry-run"])
+
     def test_status_reports_soak_task_only_when_present(self):
         output_without_soak = (
             "TaskName:                             \\internet-discovery-health\r\n"

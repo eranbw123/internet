@@ -212,13 +212,23 @@ def _default_runner(args):
     return proc.returncode, proc.stdout, proc.stderr
 
 
-def _register_task(task, runner, dry_run):
+def _start_boundary(xml):
+    """Pull <StartBoundary> back out of already-rendered XML, so a caller
+    that needs to report the timestamp Task Scheduler actually holds uses
+    the exact string that was registered, instead of re-deriving it with a
+    second `datetime.now()` call that can drift by a second or two."""
+    return xml.split("<StartBoundary>")[1].split("</StartBoundary>")[0]
+
+
+def _register_task(task, runner, dry_run, xml=None):
     """Render, write and register ONE task via `schtasks /create /XML`, then
     verify with a `/query` follow-up. The single registration path for both
     the six recurring tasks (`install`) and the one-shot soak checkpoint
     (`install_soak`) -- there is no second, parallel way this script talks
-    to `schtasks /create`. Returns True on success."""
-    xml = render_xml(task)
+    to `schtasks /create`. Returns True on success. `xml` lets a caller
+    (install_soak) pass in the XML it already rendered, so the StartBoundary
+    it later reports matches the one actually registered."""
+    xml = xml if xml is not None else render_xml(task)
     fd, path = tempfile.mkstemp(suffix=".xml", prefix=f"{task.name}-")
     os.close(fd)
     # schtasks /XML rejects some UTF-8 files; UTF-16 with BOM (the
@@ -269,16 +279,17 @@ def install(cfg, runner=None, dry_run=False):
 def install_soak(cfg, runner=None, dry_run=False, hours=24):
     """Register the one-shot 24h soak checkpoint (objective C): fires once,
     `hours` after this call, running ops/soak_check.cmd (no `python -m app`
-    args) which appends a stats+health+schtasks readout to
+    args) which appends a stats+health+status readout to
     `logs\\soak-<date>.txt`. Not a `_TASK_SPECS` entry -- `--install` never
     creates, recreates or reschedules it; see SOAK_TASK. `cfg` is accepted
     for symmetry with `install()` and future cfg-derived settings; nothing
     here reads it yet."""
     runner = runner or _default_runner
     task = TaskDef(SOAK_TASK, [], "once", hours, "PT15M", script="soak_check.cmd")
-    ok = _register_task(task, runner, dry_run)
+    xml = render_xml(task)
+    ok = _register_task(task, runner, dry_run, xml=xml)
     if not dry_run:
-        start = _trigger_xml(task).split("<StartBoundary>")[1].split("</StartBoundary>")[0]
+        start = _start_boundary(xml)
         fire_date = (datetime.now() + timedelta(hours=hours)).strftime("%Y%m%d")
         readout = str(config.REPO_ROOT / "logs" / f"soak-{fire_date}.txt")
         print(f"soak checkpoint StartBoundary: {start}")
@@ -370,11 +381,16 @@ def main(argv=None):
     args = parser.parse_args(argv)
     if not (args.install or args.uninstall or args.status or args.soak or args.dry_run):
         parser.error("one of --install/--uninstall/--status/--soak/--dry-run is required")
+    if args.status and args.dry_run:
+        # --status is already read-only; unlike --install/--uninstall/--soak,
+        # --dry-run has nothing to preview there. Reject rather than silently
+        # ignoring the flag.
+        parser.error("--dry-run has no effect with --status")
 
     if args.status:
         return status()
     if args.uninstall:
-        return uninstall()
+        return uninstall(dry_run=args.dry_run)
     cfg = config.load()
     if args.soak:
         return install_soak(cfg, dry_run=args.dry_run, hours=args.soak_hours)
