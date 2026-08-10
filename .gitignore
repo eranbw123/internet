@@ -27,3 +27,7 @@ __pycache__/
 experiments/**/runs.jsonl
 experiments/**/state.json
 experiments/lab/artifacts/
+
+# Per-job stdout/stderr from the installed Scheduled Tasks (see
+# ops/install_tasks.py, ops/run.cmd). Inbound-only, never committed.
+logs/

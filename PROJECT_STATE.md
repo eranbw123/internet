@@ -3,11 +3,56 @@
 Updated 2026-08-10. Imported by `CLAUDE.md`. Current state only — not a log.
 
 ## service hardening (step-01): no more in-process scheduler
-`discovery/scheduler.py` and the `run` subcommand are DELETED — the
-SSH-session-child tick loop is gone; an OS scheduler must call `run-once
---source <name>` / `digest` / `listen --drain` / `health --notify` on their
-own cadence instead (installer not yet landed in this worktree). Every
-invocation is short-lived, idempotent and now overlap-safe:
+`discovery/scheduler.py` and `run` are DELETED; `ops/install_tasks.py` is the
+scheduler now: six Windows Scheduled Tasks (`internet-discovery-collect-
+stocks/-web/-youtube`, `-digest`, `-feedback`, `-health`) call `run-once
+--source <name>` / `digest` / `listen --drain` / `health --notify` on
+cadences read from `config.load()` (`.env` change + `--install`
+reschedules). Registered via generated Task Scheduler XML (UTF-16LE+BOM) +
+`schtasks /create /XML`, each creation verified with a `/query` follow-up;
+`StartWhenAvailable`, `IgnoreNew`, `RestartOnFailure`, `InteractiveToken`
+principal (Chrome/CDP only exists in that session), `StartBoundary`
+staggered per task so same-length intervals never coincide.
+`--dry-run`/`--install`/`--uninstall` (prefix-scoped)/`--status`. Tasks run
+`ops/run.cmd` (utf-8 stdout, `cd` to repo root, `python -m app %*`, log name
+built from the full arg list so the three `run-once` collectors don't share
+one file, exit code propagated); `logs/` is gitignored, inbound-only.
+
+`--soak [--soak-hours N] [--dry-run]` registers a seventh, one-shot task
+(`SOAK_TASK` = `internet-discovery-soak-check`, deliberately outside
+`_TASK_SPECS`/`build_tasks()` so `--install` never creates/reschedules it;
+`--uninstall` deletes it if present) whose single `<TimeTrigger>` (no
+`<Repetition>`) fires once, `N` hours out (default 24); it shells to
+`ops/soak_check.cmd`, which appends `stats --days 1` + `health` +
+`install_tasks.py --status` to `logs\soak-<date>.txt` (repair: a
+`schtasks /query /fo LIST /v | findstr internet-discovery-` first cut only
+kept TaskName/Comment lines — `/fo LIST` puts the prefix on no other field —
+so reusing `--status`'s own block-aware reader is what actually gets
+Status/Last Run Time/Last Result/Next Run Time into the readout; the
+script's own exit code now reflects the `stats`/`--status` calls, not a
+`findstr` no-match, and no longer fails the task on `health`'s legitimate
+degraded=1). `--soak` is composable with `--dry-run` (argparse's own group
+can't express "exclusive among these four, but not with dry-run", so
+`main()` checks mutual exclusivity by hand; `--status --dry-run` is
+rejected outright since status has nothing to preview). `install()`'s
+per-task registration (tempfile write + `schtasks /create /XML` + `/query`
+verify) is factored into `_register_task`, shared by `install()` and
+`install_soak()` — one registration path, not two; `install_soak()` reports
+back the exact `<StartBoundary>` it registered (parsed from the rendered
+XML) rather than recomputing `datetime.now()` a second time.
+`main()`'s `--uninstall` now threads `--dry-run` through (repair: it was
+silently dropped, so `--uninstall --dry-run` performed a real delete of all
+seven tasks instead of previewing). Runbook + resume procedure:
+`ops/SOAK.md`.
+
+Live install, fault-injection drills and the live 24h wall-clock soak
+execution are still a separate, not-yet-done step — they need a live
+operator session (real Chrome/CDP, Telegram, `schtasks`, and 24h wall-clock
+time), which an isolated-worktree implementer/repair session cannot
+provide; do not mark that part done without that session's evidence. The
+offline-implementable half (the soak-checkpoint scheduling artifact +
+runbook above) is done and tested. Every invocation is short-lived,
+idempotent and overlap-safe:
 `db.connect` sets `PRAGMA busy_timeout=5000`, and a new `service_state`
 key/value table (`db.state_get`/`state_set`) persists job heartbeats
 (`job:<name>:last_ok`/`last_fail`), the Telegram `getUpdates` offset, and
@@ -191,7 +236,7 @@ All timestamps UTC via `db.now()`/`db.ago()`. No token metering on
 claude_chat (calls only).
 
 ## Tests
-`python test_discovery.py` (160) + `python test_watch.py` (10), offline, both
+`python test_discovery.py` (228) + `python test_watch.py` (10), offline, both
 green; CI on push/PR.
 
 ## Known issues

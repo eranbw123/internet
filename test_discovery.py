@@ -43,6 +43,12 @@ from discovery.providers.anthropic_provider import AnthropicProvider
 from discovery.providers.base import LLMProvider, ProviderError, UnsupportedCapability
 from discovery.providers.openai_provider import OpenAIProvider
 
+# ops/install_tasks.py is a flat script (like app/, not a package) run as
+# `python ops/install_tasks.py`, so it's imported here the same way that
+# invocation would resolve it: `ops/` on sys.path, then a bare import.
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "ops"))
+import install_tasks  # noqa: E402
+
 CFG = config.Config(
     db_path=":memory:",
     interests_path="interests.json",
@@ -2970,6 +2976,324 @@ class MainJobTests(unittest.TestCase):
             code = _digest_cmd(self.conn, CFG, True)
         self.assertEqual(code, 0)
         self.assertIn("sent 5", out.getvalue())
+
+
+class InstallTasksTests(unittest.TestCase):
+    """ops/install_tasks.py, entirely offline: a FakeRunner stands in for
+    subprocess so no test here ever registers, deletes or queries a real
+    Scheduled Task."""
+
+    def test_triggers_are_derived_from_config_not_hardcoded(self):
+        cfg = dataclasses.replace(
+            CFG, interval_stocks_seconds=111, interval_web_seconds=222,
+            interval_youtube_seconds=333, digest_time="13:45",
+        )
+        by_name = {t.name: t for t in install_tasks.build_tasks(cfg)}
+        self.assertEqual(
+            by_name["internet-discovery-collect-stocks"].trigger_value, 111
+        )
+        self.assertEqual(
+            by_name["internet-discovery-collect-web"].trigger_value, 222
+        )
+        self.assertEqual(
+            by_name["internet-discovery-collect-youtube"].trigger_value, 333
+        )
+        self.assertEqual(by_name["internet-discovery-digest"].trigger_value, "13:45")
+        # Not derived from Config by design (see the plan): fixed cadences.
+        self.assertEqual(by_name["internet-discovery-feedback"].trigger_value, 5 * 60)
+        self.assertEqual(by_name["internet-discovery-health"].trigger_value, 3 * 3600)
+
+    def test_six_tasks_share_the_prefix_and_carry_the_right_app_args(self):
+        names = [t.name for t in install_tasks.build_tasks(CFG)]
+        self.assertEqual(len(names), 6)
+        self.assertTrue(all(n.startswith("internet-discovery-") for n in names))
+        by_name = {t.name: t for t in install_tasks.build_tasks(CFG)}
+        self.assertEqual(
+            by_name["internet-discovery-collect-stocks"].app_args,
+            ["run-once", "--source", "stocks"],
+        )
+        self.assertEqual(by_name["internet-discovery-digest"].app_args, ["digest"])
+        self.assertEqual(
+            by_name["internet-discovery-feedback"].app_args, ["listen", "--drain"]
+        )
+        self.assertEqual(
+            by_name["internet-discovery-health"].app_args, ["health", "--notify"]
+        )
+
+    def test_rendered_xml_uses_the_d_flag_and_run_cmd(self):
+        task = install_tasks.build_tasks(CFG)[0]
+        xml = install_tasks.render_xml(task)
+        self.assertIn("/d /c", xml)
+        self.assertIn("run.cmd", xml)
+        self.assertIn("StartWhenAvailable>true<", xml)
+        self.assertIn("InteractiveToken", xml)
+        self.assertIn("IgnoreNew", xml)
+
+    def test_dry_run_install_spawns_no_process(self):
+        calls = []
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = install_tasks.install(CFG, runner=lambda args: calls.append(args), dry_run=True)
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [])
+
+    def test_dry_run_prints_a_copy_pasteable_command_with_a_real_path(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = install_tasks.install(CFG, runner=lambda args: (0, "", ""), dry_run=True)
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        self.assertNotIn("<generated>.xml", text)
+        self.assertIn("schtasks /create /tn internet-discovery-collect-stocks", text)
+        self.assertIn(".xml /f", text)
+
+    def test_install_calls_schtasks_create_then_verifies_with_a_query(self):
+        calls = []
+
+        def fake_runner(args):
+            calls.append(args)
+            return 0, "SUCCESS", ""
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = install_tasks.install(CFG, runner=fake_runner, dry_run=False)
+        self.assertEqual(code, 0)
+        # One /create + one /query per task -- install() no longer trusts
+        # /create's exit code alone to mean the task actually exists.
+        self.assertEqual(len(calls), 12)
+        creates = [a for a in calls if "/create" in a]
+        queries = [a for a in calls if "/query" in a]
+        self.assertEqual(len(creates), 6)
+        self.assertEqual(len(queries), 6)
+        for args in creates:
+            self.assertEqual(args[0], "schtasks")
+            self.assertIn("/xml", args)
+        for args in queries:
+            self.assertEqual(args, ["schtasks", "/query", "/tn", args[-1]])
+
+    def test_install_fails_when_the_verification_query_cannot_find_the_task(self):
+        def fake_runner(args):
+            if "/create" in args:
+                return 0, "SUCCESS", ""
+            return 1, "", "ERROR: The system cannot find the file specified."
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO), \
+             mock.patch("sys.stderr", new_callable=io.StringIO):
+            code = install_tasks.install(CFG, runner=fake_runner, dry_run=False)
+        self.assertEqual(code, 1)
+
+    def test_install_reports_failure_without_raising(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO), \
+             mock.patch("sys.stderr", new_callable=io.StringIO):
+            code = install_tasks.install(CFG, runner=lambda args: (1, "", "denied"), dry_run=False)
+        self.assertEqual(code, 1)
+
+    def test_installed_xml_file_is_written_utf16le_with_bom(self):
+        # install() unlinks its temp XML file once /create + /query finish,
+        # so read it from inside the fake runner, while it still exists.
+        captured = {}
+
+        def fake_runner(args):
+            if "/create" in args:
+                path = args[args.index("/xml") + 1]
+                captured["bytes"] = open(path, "rb").read()
+            return 0, "SUCCESS", ""
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            install_tasks.install(CFG, runner=fake_runner, dry_run=False)
+        data = captured["bytes"]
+        self.assertEqual(data[:2], b"\xff\xfe")   # UTF-16LE BOM
+        self.assertIn("<Task", data.decode("utf-16"))
+
+    def test_collect_tasks_do_not_share_a_start_boundary(self):
+        tasks = install_tasks.build_tasks(CFG)
+        collect = [t for t in tasks if t.name.startswith("internet-discovery-collect-")]
+        starts = set()
+        for task in collect:
+            xml = install_tasks.render_xml(task)
+            start = xml.split("<StartBoundary>")[1].split("</StartBoundary>")[0]
+            starts.add(start)
+        self.assertEqual(len(starts), len(collect))
+
+    def test_daily_trigger_rolls_forward_when_todays_time_has_passed(self):
+        cfg = dataclasses.replace(CFG, digest_time="00:00")
+        task = next(t for t in install_tasks.build_tasks(cfg) if t.trigger_kind == "daily")
+        xml = install_tasks.render_xml(task)
+        start = xml.split("<StartBoundary>")[1].split("</StartBoundary>")[0]
+        start_dt = datetime.fromisoformat(start)
+        # 00:00 has already elapsed by the time any test runs; the rendered
+        # boundary must be in the future, not today's already-missed slot.
+        self.assertGreater(start_dt, datetime.now())
+
+    def test_uninstall_is_scoped_to_the_six_task_names_plus_soak(self):
+        calls = []
+        install_tasks.uninstall(runner=lambda args: calls.append(args) or (0, "", ""))
+        deleted = [args[args.index("/tn") + 1] for args in calls]
+        self.assertEqual(
+            sorted(deleted), sorted(install_tasks.TASK_NAMES + [install_tasks.SOAK_TASK])
+        )
+        self.assertTrue(all(name.startswith("internet-discovery-") for name in deleted))
+        self.assertTrue(all(not name.startswith("ec-") for name in deleted))
+
+    def test_status_parses_schtasks_query_output_for_our_prefix(self):
+        output = (
+            "HostName:                             HOST\r\n"
+            "TaskName:                             \\internet-discovery-health\r\n"
+            "Next Run Time:                        8/10/2026 11:00:00 PM\r\n"
+            "Status:                               Ready\r\n"
+            "Last Run Time:                        8/10/2026 8:00:00 PM\r\n"
+            "Last Result:                          0\r\n"
+            "\r\n"
+            "TaskName:                             \\some-other-task\r\n"
+            "Status:                               Ready\r\n"
+        )
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            code = install_tasks.status(runner=lambda args: (0, output, ""))
+        self.assertEqual(code, 0)
+        text = out.getvalue()
+        self.assertIn("internet-discovery-health:", text)
+        self.assertIn("Ready", text)
+        self.assertIn("internet-discovery-collect-stocks: not installed", text)
+        self.assertNotIn("some-other-task", text)
+
+    def test_soak_task_is_not_one_of_the_six_build_tasks(self):
+        # SOAK_TASK must stay out of _TASK_SPECS/build_tasks -- otherwise
+        # --install would create it (seven tasks) and recreate/reschedule it
+        # on every reinstall.
+        names = [t.name for t in install_tasks.build_tasks(CFG)]
+        self.assertEqual(len(names), 6)
+        self.assertNotIn(install_tasks.SOAK_TASK, names)
+
+    def test_soak_trigger_is_a_single_time_trigger_with_no_repetition(self):
+        task = install_tasks.TaskDef(
+            install_tasks.SOAK_TASK, [], "once", 24, "PT15M", script="soak_check.cmd"
+        )
+        xml = install_tasks.render_xml(task)
+        self.assertIn("<TimeTrigger>", xml)
+        self.assertNotIn("<Repetition>", xml)
+        self.assertIn("StartWhenAvailable>true<", xml)
+        start = xml.split("<StartBoundary>")[1].split("</StartBoundary>")[0]
+        start_dt = datetime.fromisoformat(start)
+        self.assertGreater(start_dt, datetime.now() + timedelta(hours=23))
+        self.assertLess(start_dt, datetime.now() + timedelta(hours=25))
+
+    def test_soak_action_points_at_soak_check_cmd_not_run_cmd(self):
+        task = install_tasks.TaskDef(
+            install_tasks.SOAK_TASK, [], "once", 24, "PT15M", script="soak_check.cmd"
+        )
+        xml = install_tasks.render_xml(task)
+        self.assertIn("soak_check.cmd", xml)
+        self.assertNotIn("run.cmd", xml)
+
+    def test_install_soak_creates_and_verifies_one_task(self):
+        calls = []
+
+        def fake_runner(args):
+            calls.append(args)
+            return 0, "SUCCESS", ""
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = install_tasks.install_soak(CFG, runner=fake_runner, dry_run=False, hours=24)
+        self.assertEqual(code, 0)
+        creates = [a for a in calls if "/create" in a]
+        queries = [a for a in calls if "/query" in a]
+        self.assertEqual(len(creates), 1)
+        self.assertEqual(len(queries), 1)
+        self.assertEqual(creates[0][creates[0].index("/tn") + 1], install_tasks.SOAK_TASK)
+
+    def test_install_soak_dry_run_spawns_no_process(self):
+        calls = []
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = install_tasks.install_soak(
+                CFG, runner=lambda args: calls.append(args), dry_run=True, hours=24
+            )
+        self.assertEqual(code, 0)
+        self.assertEqual(calls, [])
+
+    def test_install_soak_prints_start_boundary_and_readout_path(self):
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            install_tasks.install_soak(
+                CFG, runner=lambda args: (0, "SUCCESS", ""), dry_run=False, hours=24
+            )
+        text = out.getvalue()
+        self.assertIn("StartBoundary:", text)
+        self.assertIn("readout path", text)
+        self.assertIn("logs", text)
+
+    def test_uninstall_deletes_soak_task_even_if_never_registered(self):
+        # schtasks /delete on a name that was never created just fails --
+        # uninstall() still tries it and reports the miss, same as any other
+        # not-installed name; it must not skip it or raise.
+        calls = []
+
+        def fake_runner(args):
+            calls.append(args)
+            if install_tasks.SOAK_TASK in args:
+                return 1, "", "ERROR: The system cannot find the file specified."
+            return 0, "", ""
+
+        with mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = install_tasks.uninstall(runner=fake_runner)
+        self.assertEqual(code, 0)
+        deleted = [args[args.index("/tn") + 1] for args in calls]
+        self.assertIn(install_tasks.SOAK_TASK, deleted)
+
+    def test_main_routes_argv_to_the_right_function_with_dry_run_threaded(self):
+        # Regression: `--uninstall --dry-run` used to parse fine but dropped
+        # dry_run on the way to uninstall(), so a preview performed a real
+        # deletion of all seven tasks (including a live soak checkpoint).
+        cases = [
+            (["--install"], "install", False),
+            (["--install", "--dry-run"], "install", True),
+            (["--uninstall"], "uninstall", False),
+            (["--uninstall", "--dry-run"], "uninstall", True),
+            (["--soak"], "install_soak", False),
+            (["--soak", "--dry-run"], "install_soak", True),
+            (["--status"], "status", None),
+        ]
+        for argv, fn_name, expect_dry_run in cases:
+            with self.subTest(argv=argv):
+                with mock.patch.object(install_tasks, "install", return_value=0) as m_install, \
+                     mock.patch.object(install_tasks, "uninstall", return_value=0) as m_uninstall, \
+                     mock.patch.object(install_tasks, "install_soak", return_value=0) as m_soak, \
+                     mock.patch.object(install_tasks, "status", return_value=0) as m_status, \
+                     mock.patch.object(install_tasks.config, "load", return_value=CFG):
+                    code = install_tasks.main(argv)
+                self.assertEqual(code, 0)
+                mocks = {
+                    "install": m_install,
+                    "uninstall": m_uninstall,
+                    "install_soak": m_soak,
+                    "status": m_status,
+                }
+                mocks[fn_name].assert_called_once()
+                for other_name, other_mock in mocks.items():
+                    if other_name != fn_name:
+                        other_mock.assert_not_called()
+                if expect_dry_run is not None:
+                    self.assertEqual(mocks[fn_name].call_args.kwargs.get("dry_run"), expect_dry_run)
+
+    def test_main_rejects_status_with_dry_run(self):
+        with mock.patch("sys.stderr", new_callable=io.StringIO):
+            with self.assertRaises(SystemExit):
+                install_tasks.main(["--status", "--dry-run"])
+
+    def test_status_reports_soak_task_only_when_present(self):
+        output_without_soak = (
+            "TaskName:                             \\internet-discovery-health\r\n"
+            "Status:                               Ready\r\n"
+            "\r\n"
+        )
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            install_tasks.status(runner=lambda args: (0, output_without_soak, ""))
+        self.assertNotIn(install_tasks.SOAK_TASK, out.getvalue())
+
+        output_with_soak = output_without_soak + (
+            f"TaskName:                             \\{install_tasks.SOAK_TASK}\r\n"
+            "Status:                               Ready\r\n"
+            "Next Run Time:                        8/11/2026 8:00:00 PM\r\n"
+            "\r\n"
+        )
+        with mock.patch("sys.stdout", new_callable=io.StringIO) as out:
+            install_tasks.status(runner=lambda args: (0, output_with_soak, ""))
+        self.assertIn(f"{install_tasks.SOAK_TASK}:", out.getvalue())
 
 
 if __name__ == "__main__":
