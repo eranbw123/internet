@@ -39,7 +39,7 @@ from discovery import (
 from discovery.personal_state import PersonalState, PersonalStateError
 from discovery.collectors import COLLECTORS, stocks, web_search, youtube
 from discovery.models import CandidateItem, Interest, ScoreResult
-from discovery.providers import PROVIDERS, claude_chat
+from discovery.providers import PROVIDERS, chatgpt_browser, claude_chat
 from discovery.providers.anthropic_provider import AnthropicProvider
 from discovery.providers.base import LLMProvider, ProviderError, UnsupportedCapability
 from discovery.providers.openai_provider import OpenAIProvider
@@ -2384,6 +2384,45 @@ def completion_reply(text):
     return json.dumps({"text": text})
 
 
+class FakeChatGPTConnection:
+    """Stands in for cdp.CDPConnection for the chatgpt.com provider. The whole
+    send is one evaluate() (session + sentinel + PoW + conversation SSE), so a
+    completion reply is a JSON string/dict `{text, conversation_id}` (or an
+    Exception to raise); the follow-up hide is a second evaluate. Dispatch is on
+    the JS the provider actually builds, and every js string is kept so a test
+    can assert the reverse-engineered contract stays in the payload."""
+
+    def __init__(self, replies, hide_error=None):
+        self.replies = list(replies)
+        self.calls = []
+        self.js = []
+        self.closed = False
+        self.hide_error = hide_error
+
+    def evaluate(self, js, timeout=None, **_kw):
+        self.js.append(js)
+        if "is_visible" in js:
+            self.calls.append("hide")
+            if self.hide_error is not None:
+                raise self.hide_error
+            return True
+        if "text/event-stream" in js:
+            self.calls.append("completion")
+            reply = self.replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+        self.calls.append("other")
+        return True
+
+    def close(self):
+        self.closed = True
+
+
+def chatgpt_reply(text, conversation_id="c1"):
+    return json.dumps({"text": text, "conversation_id": conversation_id})
+
+
 class ClaudeChatProviderTests(unittest.TestCase):
     """The claude.ai-over-CDP provider, with the browser faked out entirely."""
 
@@ -2549,6 +2588,196 @@ class ClaudeChatProviderTests(unittest.TestCase):
         provider = claude_chat.ClaudeChatProvider("claude-opus-5", org_id="org", port=9222)
         with mock.patch.object(
             claude_chat.cdp, "find_claude_tab", return_value={"id": "1"}
+        ):
+            self.assertEqual(provider.preflight(), (True, ""))
+
+
+class ChatGPTBrowserProviderTests(unittest.TestCase):
+    """The chatgpt.com-over-CDP provider, with the browser faked out entirely.
+    The novel core it shares with no other provider -- the sentinel proof-of-
+    work handshake and the delta-encoded SSE accumulation -- runs as JS inside
+    the page, so it's verified separately at execution level; here the seam is
+    the same as claude_chat's: the Python orchestration around evaluate()."""
+
+    SCHEMA = {
+        "type": "object",
+        "properties": {
+            "a": {"type": "number"},
+            "kind": {"type": "string", "enum": ["x", "y"]},
+        },
+        "required": ["a"],
+        "additionalProperties": False,
+    }
+
+    def _provider(self, *replies, connections=None, hide_error=None):
+        conns = connections if connections is not None else [
+            FakeChatGPTConnection(replies, hide_error=hide_error)
+        ]
+        remaining = list(conns)
+        self.connections = conns
+        return chatgpt_browser.ChatGPTBrowserProvider(
+            "auto", port=9222, connect=lambda: remaining.pop(0),
+        )
+
+    def test_registered_and_constructable_without_touching_chrome(self):
+        self.assertIn("chatgpt_browser", PROVIDERS)
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
+        self.assertEqual(provider.name, "chatgpt_browser")  # lazy: no connection yet
+
+    def test_complete_json_parses_a_clean_reply_and_hides_the_conversation(self):
+        provider = self._provider(chatgpt_reply('{"a": 0.5, "kind": "x"}'))
+        data = provider.complete_json("sys", "prompt", self.SCHEMA)
+        self.assertEqual(data, {"a": 0.5, "kind": "x"})
+        (conn,) = self.connections
+        self.assertEqual(conn.calls, ["completion", "hide"])
+        self.assertEqual(provider.usage["calls"], 1)
+        self.assertEqual(provider.usage["input_tokens"], 0)  # not reported, never guessed
+
+    def test_complete_json_survives_prose_and_fences_around_the_object(self):
+        provider = self._provider(
+            chatgpt_reply('Sure! Here it is:\n```json\n{"a": 1.0}\n```\nHope that helps.')
+        )
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 1.0})
+
+    def test_a_malformed_reply_is_retried_once_then_succeeds(self):
+        provider = self._provider(
+            chatgpt_reply("I cannot answer in JSON, sorry."),
+            chatgpt_reply('{"a": 0.25}'),
+        )
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 0.25})
+        (conn,) = self.connections
+        self.assertEqual(conn.calls.count("completion"), 2)
+
+    def test_two_malformed_replies_fail_gracefully(self):
+        provider = self._provider(
+            chatgpt_reply('{"wrong": true}'),        # missing required "a"
+            chatgpt_reply('{"a": "not a number"}'),
+        )
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("attempt 2", str(ctx.exception))
+
+    def test_an_enum_violation_counts_as_malformed(self):
+        provider = self._provider(
+            chatgpt_reply('{"a": 1, "kind": "zebra"}'),
+            chatgpt_reply('{"a": 1, "kind": "zebra"}'),
+        )
+        with self.assertRaises(ProviderError):
+            provider.complete_json("s", "p", self.SCHEMA)
+
+    def test_search_json_returns_the_embedded_array_and_garbage_becomes_empty(self):
+        provider = self._provider(
+            chatgpt_reply('I searched.\n[{"title": "T", "url": "https://e.com"}]\nDone.'),
+            chatgpt_reply("no array here at all"),
+        )
+        self.assertEqual(
+            provider.search_json("find things"),
+            [{"title": "T", "url": "https://e.com"}],
+        )
+        self.assertEqual(provider.search_json("find things"), [])
+
+    def test_search_json_asks_for_the_search_tool_but_complete_json_does_not(self):
+        provider = self._provider(
+            chatgpt_reply("[]"), chatgpt_reply('{"a": 1}'),
+        )
+        provider.search_json("find things")
+        provider.complete_json("s", "p", self.SCHEMA)
+        (conn,) = self.connections
+        search_js, complete_js = conn.js[0], conn.js[2]  # [0]=search, [1]=its hide, [2]=complete
+        self.assertIn('system_hints: ["search"]', search_js)
+        self.assertIn("system_hints: []", complete_js)
+
+    def test_the_completion_js_carries_the_sentinel_and_pow_contract(self):
+        provider = self._provider(chatgpt_reply('{"a": 1}'))
+        provider.complete_json("s", "p", self.SCHEMA)
+        js = self.connections[0].js[0]
+        for token in ("sha3_512_hex", "/sentinel/chat-requirements",
+                      "OpenAI-Sentinel-Chat-Requirements-Token",
+                      "OpenAI-Sentinel-Proof-Token",
+                      "OpenAI-Sentinel-Turnstile-Token",  # forwarded, not thrown on
+                      "/api/auth/session"):
+            self.assertIn(token, js, f"completion JS lost {token!r}")
+        # turnstile.required must NOT abort the send -- echoing dx works live
+        self.assertNotIn("throw new Error('chatgpt.com demanded", js)
+
+    def test_no_chrome_endpoint_is_a_clean_provider_error(self):
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
+        with mock.patch.object(
+            chatgpt_browser.cdp, "find_chatgpt_tab", side_effect=ConnectionRefusedError("refused")
+        ):
+            with self.assertRaises(ProviderError) as ctx:
+                provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("Chrome DevTools endpoint", str(ctx.exception))
+
+    def test_no_chatgpt_tab_is_a_clean_provider_error(self):
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
+        with mock.patch.object(chatgpt_browser.cdp, "find_chatgpt_tab", return_value=None):
+            with self.assertRaises(ProviderError) as ctx:
+                provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("chatgpt.com tab", str(ctx.exception))
+
+    def test_a_js_exception_in_the_tab_is_a_provider_error_not_a_crash(self):
+        provider = self._provider(RuntimeError("JS exception: conversation HTTP 429"))
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("HTTP 429", str(ctx.exception))
+
+    def test_a_dropped_connection_reconnects_once_and_recovers(self):
+        dead = FakeChatGPTConnection([ConnectionError("websocket closed")])
+        alive = FakeChatGPTConnection([chatgpt_reply('{"a": 0.75}')])
+        provider = self._provider(connections=[dead, alive])
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 0.75})
+        self.assertTrue(dead.closed)     # reset closed the dead connection
+        self.assertFalse(alive.closed)
+
+    def test_a_connection_that_keeps_dropping_fails_gracefully(self):
+        dead1 = FakeChatGPTConnection([ConnectionError("closed")])
+        dead2 = FakeChatGPTConnection([ConnectionError("closed again")])
+        provider = self._provider(connections=[dead1, dead2])
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("twice", str(ctx.exception))
+
+    def test_a_null_completion_result_blames_the_tab(self):
+        provider = self._provider(None)
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("no text", str(ctx.exception))
+
+    def test_a_dict_reply_from_cdp_is_accepted_as_is(self):
+        # Some Chrome/CDP combinations hand back the JS return value already
+        # deserialized; no conversation_id here, so no hide fires.
+        provider = self._provider({"text": '{"a": 2}', "conversation_id": None})
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 2})
+        self.assertEqual(self.connections[0].calls, ["completion"])
+
+    def test_a_hide_failure_never_breaks_the_reply(self):
+        provider = self._provider(
+            chatgpt_reply('{"a": 3}'), hide_error=RuntimeError("hide blew up")
+        )
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 3})
+        self.assertIn("hide", self.connections[0].calls)
+
+    def test_preflight_fails_cleanly_with_no_chrome_endpoint(self):
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
+        with mock.patch.object(
+            chatgpt_browser.cdp, "find_chatgpt_tab", side_effect=ConnectionRefusedError("refused")
+        ):
+            ok, detail = provider.preflight()
+        self.assertFalse(ok)
+        self.assertIn("Chrome DevTools endpoint", detail)
+
+    def test_preflight_fails_cleanly_with_no_chatgpt_tab(self):
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
+        with mock.patch.object(chatgpt_browser.cdp, "find_chatgpt_tab", return_value=None):
+            ok, detail = provider.preflight()
+        self.assertFalse(ok)
+        self.assertIn("chatgpt.com tab", detail)
+
+    def test_preflight_succeeds_when_the_tab_is_open(self):
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
+        with mock.patch.object(
+            chatgpt_browser.cdp, "find_chatgpt_tab", return_value={"id": "1"}
         ):
             self.assertEqual(provider.preflight(), (True, ""))
 
