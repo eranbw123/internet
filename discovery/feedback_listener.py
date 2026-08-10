@@ -71,10 +71,17 @@ def listen(conn, cfg):
 
 def drain(conn, cfg):
     """One bounded getUpdates pass: handles every pending callback, advances
-    and persists the offset, and returns how many callbacks were processed.
-    A transport failure (Telegram down, network down) is not fatal -- it is
-    printed, counted as a failed run, and swallowed rather than raised, so a
-    scheduled drain never crashes its task."""
+    and persists the offset, and returns how many callbacks resulted in
+    actual recorded feedback (not merely acked -- a garbage payload or a
+    score id that's no longer tracked is acked but must not count, or
+    `feedback_recorded` overstates what actually happened).
+
+    A transport failure (Telegram down, network down) is not fatal to the
+    process -- it is printed and counted, and `None` is returned instead of
+    raising so a scheduled drain never crashes its task. `None` is a
+    distinct sentinel from `0` ("polled fine, nothing to do") so the caller
+    (__main__._drain_cmd) can tell a failed run from an empty one and not
+    record it as a job success."""
     token = cfg.telegram_bot_token
     chat_id = str(cfg.telegram_chat_id)
     if not token or not chat_id:
@@ -87,7 +94,7 @@ def drain(conn, cfg):
     except Exception as e:  # noqa: BLE001
         print(f"feedback drain: poll failed ({e})", file=sys.stderr)
         db.bump(conn, {"run_failed": 1})
-        return 0
+        return None
 
     count = 0
     for update in updates:
@@ -96,8 +103,8 @@ def drain(conn, cfg):
         if not callback or str(callback["message"]["chat"]["id"]) != chat_id:
             continue
         try:
-            _handle_callback(conn, token, callback)
-            count += 1
+            if _handle_callback(conn, token, callback):
+                count += 1
         except Exception as e:  # noqa: BLE001
             print(f"feedback callback failed: {e}", file=sys.stderr)
 
@@ -108,11 +115,14 @@ def drain(conn, cfg):
 
 
 def _handle_callback(conn, token, callback):
-    """callback_data is `fb:<verdict>:<score_id>` from feedback_keyboard()."""
+    """callback_data is `fb:<verdict>:<score_id>` from feedback_keyboard().
+    Returns True if feedback was actually recorded, False for a garbage
+    payload or an untracked score id -- both are acked either way, but only
+    a real recording should count towards `feedback_recorded`."""
     parts = callback.get("data", "").split(":")
     if len(parts) != 3 or parts[0] != "fb" or parts[1] not in FEEDBACK_VERDICTS:
         api_call(token, "answerCallbackQuery", {"callback_query_id": callback["id"]})
-        return
+        return False
 
     _, verdict, score_id = parts
     row = db.score_by_id(conn, int(score_id))
@@ -121,10 +131,11 @@ def _handle_callback(conn, token, callback):
             token, "answerCallbackQuery",
             {"callback_query_id": callback["id"], "text": "That item is no longer tracked."},
         )
-        return
+        return False
 
     db.add_feedback(conn, row["item_id"], row["interest_id"], verdict, original_score=row["final_score"])
     api_call(
         token, "answerCallbackQuery",
         {"callback_query_id": callback["id"], "text": f"Recorded: {FEEDBACK_VERDICTS[verdict]}"},
     )
+    return True

@@ -58,9 +58,20 @@ def preflight_gate(conn, provider, cfg, job_name):
         print_safe(f"job '{job_name}': provider down ({detail}); launching Chrome once")
         try:
             # cmd /d /c -- this machine has a cmd AutoRun hook that breaks
-            # shell=True's cwd handling; /d suppresses AutoRun.
-            subprocess.run(["cmd", "/d", "/c", cfg.chrome_launch_cmd], check=False)
-        except OSError as e:
+            # shell=True's cwd handling; /d suppresses AutoRun. `timeout`
+            # bounds how long we wait on the launcher command itself:
+            # cfg.chrome_launch_cmd must be a detached form (e.g. `start ""
+            # chrome.exe ...`) so it returns immediately, but if it isn't,
+            # this is what stops it from hanging run-once until the
+            # scheduled task's own ExecutionTimeLimit kills the whole
+            # process -- reuses chrome_launch_wait_seconds rather than
+            # adding another knob, since that's already "how long we're
+            # willing to wait for Chrome to come up".
+            subprocess.run(
+                ["cmd", "/d", "/c", cfg.chrome_launch_cmd],
+                check=False, timeout=cfg.chrome_launch_wait_seconds,
+            )
+        except (OSError, subprocess.TimeoutExpired) as e:
             print_safe(f"job '{job_name}': chrome_launch_cmd failed to start: {e}")
         time.sleep(cfg.chrome_launch_wait_seconds)
         ok, detail = provider.preflight()
@@ -123,10 +134,19 @@ def check(conn, cfg, provider=None):
             provider_ok, provider_detail = False, f"preflight raised: {e}"
 
     pending_count, pending_oldest = db.pending_notification_stats(conn)
+    # Reported, but deliberately NOT a degraded-gating signal: the retry
+    # policy is designed to eventually abandon a send after enough failed
+    # attempts (5 attempts x 30-min cool-off by default), so an abandoned
+    # row is an expected steady-state artifact of an outage that has already
+    # passed, not evidence the system is currently broken. There is also no
+    # ack/clear path for these rows (only `score --force` removes one), so
+    # gating on an unbounded, all-time count would latch `degraded` forever
+    # the first time an outage outlasts the retry window -- `health` would
+    # never report OK again, `--notify` would re-alert every cooldown
+    # indefinitely, and the required one-time recovery message could never
+    # fire.
     abandoned = db.abandoned_notifications(conn, cfg.send_max_attempts)
-    degraded = bool(
-        any(job["stale"] for job in jobs) or provider_ok is False or abandoned > 0
-    )
+    degraded = bool(any(job["stale"] for job in jobs) or provider_ok is False)
     return {
         "jobs": jobs,
         "provider_ok": provider_ok,

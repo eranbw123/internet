@@ -215,7 +215,15 @@ def _digest_cmd(conn, cfg, dry_run):
 
 
 def _drain_cmd(conn, cfg):
-    print(f"drained {feedback_listener.drain(conn, cfg)} feedback update(s)")
+    count = feedback_listener.drain(conn, cfg)
+    if count is None:
+        # A transport failure -- drain() already printed/counted it. Report
+        # it as a job failure too so `job:feedback:last_ok` isn't stamped
+        # (and run_ok isn't bumped) for an invocation that never actually
+        # reached Telegram.
+        print("feedback drain failed", file=sys.stderr)
+        return 1
+    print(f"drained {count} feedback update(s)")
     return 0
 
 

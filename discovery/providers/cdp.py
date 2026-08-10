@@ -22,20 +22,24 @@ import urllib.request
 from urllib.parse import urlparse
 
 
-def list_tabs(port=9222):
-    with urllib.request.urlopen(f"http://localhost:{port}/json") as resp:
+def list_tabs(port=9222, timeout=None):
+    # timeout=None keeps this call blocking indefinitely, same as before --
+    # health.py's preflight() is the one caller that needs a bound (a
+    # port that accepts connections but never answers must not hang a
+    # "free" reachability check forever) and passes one explicitly.
+    with urllib.request.urlopen(f"http://localhost:{port}/json", timeout=timeout) as resp:
         return json.loads(resp.read().decode("utf-8"))
 
 
-def find_tab(url_prefix, port=9222):
-    for tab in list_tabs(port):
+def find_tab(url_prefix, port=9222, timeout=None):
+    for tab in list_tabs(port, timeout=timeout):
         if tab.get("type") == "page" and tab.get("url", "").startswith(url_prefix):
             return tab
     return None
 
 
-def find_claude_tab(port=9222):
-    return find_tab("https://claude.ai", port)
+def find_claude_tab(port=9222, timeout=None):
+    return find_tab("https://claude.ai", port, timeout=timeout)
 
 
 class CDPConnection:

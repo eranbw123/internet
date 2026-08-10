@@ -678,7 +678,13 @@ class HealthTests(unittest.TestCase):
         self.assertEqual(result["provider_detail"], "no CDP endpoint")
         self.assertTrue(result["degraded"])
 
-    def test_check_flags_abandoned_notifications(self):
+    def test_check_reports_abandoned_notifications_without_gating_degraded(self):
+        # Abandoned sends are an expected artifact of an outage that already
+        # passed (the retry policy is designed to eventually give up), and
+        # there is no ack/clear path for them -- gating `degraded` on an
+        # unbounded, all-time count would latch it forever the first time an
+        # outage outlasts the retry window, so it must be reported but not
+        # count towards degraded.
         db.upsert_interest(self.conn, an_interest())
         (interest,) = db.active_interests(self.conn)
         item = stored_item(self.conn)
@@ -687,7 +693,7 @@ class HealthTests(unittest.TestCase):
             db.record_notification(self.conn, score_id, "telegram", False)
         result = health.check(self.conn, CFG)
         self.assertEqual(result["abandoned"], 1)
-        self.assertTrue(result["degraded"])
+        self.assertFalse(result["degraded"])
 
     def test_format_report_is_plain_text_and_mentions_every_job(self):
         text = health.format_report(health.check(self.conn, CFG))
@@ -718,9 +724,26 @@ class HealthTests(unittest.TestCase):
         with mock.patch("discovery.health.subprocess.run") as run, \
              mock.patch("discovery.health.time.sleep") as sleep:
             self.assertTrue(health.preflight_gate(self.conn, provider, cfg, "stocks"))
-        run.assert_called_once_with(["cmd", "/d", "/c", "chrome.cmd"], check=False)
+        run.assert_called_once_with(["cmd", "/d", "/c", "chrome.cmd"], check=False, timeout=0)
         sleep.assert_called_once_with(0)
         self.assertEqual(db.today_counts(self.conn), {})  # recovered -- no provider_down
+
+    def test_preflight_gate_survives_a_launch_command_that_never_returns(self):
+        # A non-detached chrome_launch_cmd (still running Chrome itself when
+        # the timeout hits) must not hang run-once forever.
+        import subprocess
+
+        provider = FakeProvider()
+        provider.preflight = lambda: (False, "down")
+        cfg = dataclasses.replace(
+            CFG, chrome_launch_cmd="chrome.cmd", chrome_launch_wait_seconds=0
+        )
+        with mock.patch(
+            "discovery.health.subprocess.run",
+            side_effect=subprocess.TimeoutExpired(cmd="chrome.cmd", timeout=0),
+        ), mock.patch("discovery.health.time.sleep"):
+            self.assertFalse(health.preflight_gate(self.conn, provider, cfg, "stocks"))
+        self.assertEqual(db.today_counts(self.conn), {"provider_down": 1})
 
     def test_notify_if_needed_sends_once_while_degraded_then_respects_cooldown(self):
         cfg = dataclasses.replace(CFG, health_alert_cooldown_seconds=3600)
@@ -2220,7 +2243,10 @@ class FeedbackListenerTests(unittest.TestCase):
 
     def test_a_recognized_button_records_feedback_and_acks_with_the_label(self):
         with mock.patch.object(feedback_listener, "api_call") as api_call:
-            feedback_listener._handle_callback(self.conn, "tok", self._callback(f"fb:fire:{self.score_id}"))
+            recorded = feedback_listener._handle_callback(
+                self.conn, "tok", self._callback(f"fb:fire:{self.score_id}")
+            )
+        self.assertTrue(recorded)
         row = self.conn.execute("SELECT * FROM feedback WHERE item_id = ?", (self.item.id,)).fetchone()
         self.assertEqual(row["verdict"], "fire")
         self.assertAlmostEqual(row["original_score"], 0.8)
@@ -2232,13 +2258,17 @@ class FeedbackListenerTests(unittest.TestCase):
 
     def test_garbage_callback_data_is_acked_but_records_nothing(self):
         with mock.patch.object(feedback_listener, "api_call") as api_call:
-            feedback_listener._handle_callback(self.conn, "tok", self._callback("not-a-real-payload"))
+            recorded = feedback_listener._handle_callback(
+                self.conn, "tok", self._callback("not-a-real-payload")
+            )
+        self.assertFalse(recorded)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 0)
         api_call.assert_called_once_with("tok", "answerCallbackQuery", {"callback_query_id": "cb1"})
 
     def test_a_score_id_that_no_longer_exists_is_acked_without_a_crash(self):
         with mock.patch.object(feedback_listener, "api_call") as api_call:
-            feedback_listener._handle_callback(self.conn, "tok", self._callback("fb:up:999999"))
+            recorded = feedback_listener._handle_callback(self.conn, "tok", self._callback("fb:up:999999"))
+        self.assertFalse(recorded)
         self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 0)
         api_call.assert_called_once()
 
@@ -2257,12 +2287,14 @@ class FeedbackListenerTests(unittest.TestCase):
 
         with mock.patch.object(feedback_listener, "api_call", side_effect=fake_api_call) as api_call:
             count = feedback_listener.drain(self.conn, self._cfg())
-        self.assertEqual(count, 2)  # both callbacks were handled (one garbage, acked and dropped)
+        # The garbage update is acked but must not count -- feedback_recorded
+        # is evidence of real feedback, not "how many updates were seen".
+        self.assertEqual(count, 1)
         self.assertEqual(db.state_get(self.conn, "telegram_offset"), "12")
         api_call.assert_any_call("tok", "getUpdates", {"offset": 0, "timeout": 0}, timeout=15)
         self.assertEqual(
             dict(self.conn.execute("SELECT name, count FROM metrics").fetchall()),
-            {"feedback_recorded": 2},
+            {"feedback_recorded": 1},
         )
         self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1)
 
@@ -2280,8 +2312,11 @@ class FeedbackListenerTests(unittest.TestCase):
         api_call.assert_not_called()
 
     def test_drain_swallows_a_transport_failure_and_counts_it(self):
+        # None, not 0 -- a distinct sentinel so the caller (__main__._drain_cmd)
+        # can tell a failed poll from "polled fine, nothing pending" and not
+        # record the job as a success.
         with mock.patch.object(feedback_listener, "api_call", side_effect=OSError("down")):
-            self.assertEqual(feedback_listener.drain(self.conn, self._cfg()), 0)
+            self.assertIsNone(feedback_listener.drain(self.conn, self._cfg()))
         self.assertEqual(
             dict(self.conn.execute("SELECT name, count FROM metrics").fetchall()),
             {"run_failed": 1},
@@ -2907,6 +2942,25 @@ class MainJobTests(unittest.TestCase):
             code = _drain_cmd(self.conn, CFG)
         self.assertEqual(code, 0)
         self.assertIn("drained 2", out.getvalue())
+
+    def test_drain_cmd_reports_failure_when_drain_returns_the_none_sentinel(self):
+        from discovery.__main__ import _drain_cmd
+
+        with mock.patch.object(feedback_listener, "drain", return_value=None):
+            code = _drain_cmd(self.conn, CFG)
+        self.assertEqual(code, 1)
+
+    def test_run_job_does_not_record_last_ok_for_a_failed_drain(self):
+        # End-to-end through _run_job: a transport failure must not stamp
+        # job:feedback:last_ok or bump run_ok alongside run_failed.
+        from discovery.__main__ import _drain_cmd, _run_job
+
+        with mock.patch.object(feedback_listener, "drain", return_value=None):
+            code = _run_job(self.conn, "feedback", lambda: _drain_cmd(self.conn, CFG))
+        self.assertEqual(code, 1)
+        self.assertEqual(db.today_counts(self.conn), {"run_failed": 1})
+        self.assertIsNone(db.state_get(self.conn, "job:feedback:last_ok"))
+        self.assertIsNotNone(db.state_get(self.conn, "job:feedback:last_fail"))
 
     def test_digest_cmd_reports_the_count(self):
         from discovery.__main__ import _digest_cmd

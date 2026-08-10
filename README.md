@@ -369,6 +369,8 @@ day, so a window is just a date filter.
 | --- | --- | --- |
 | `CLAUDE_ORG_ID` | *(none)* | **Required** for the default provider — your claude.ai organization id |
 | `CLAUDE_BROWSER_PORT` | `9222` | Chrome DevTools port the default provider attaches to |
+| `DISCOVERY_CHROME_LAUNCH_CMD` | *(none)* | Optional `cmd /d /c` command `run-once` runs ONCE if the provider preflight check finds Chrome/CDP down. Empty ⇒ never spawn anything. **Must be a detached form** (e.g. `start "" "C:\...\chrome.exe" --remote-debugging-port=9222`) — a non-detached command blocks run-once until the wait below is hit |
+| `DISCOVERY_CHROME_LAUNCH_WAIT_SECONDS` | `15` | How long to wait after `DISCOVERY_CHROME_LAUNCH_CMD` before re-checking preflight (also bounds how long the launch command itself is allowed to run) |
 | `ANTHROPIC_API_KEY` | *(none)* | Required only when `DISCOVERY_PROVIDER=anthropic` |
 | `OPENAI_API_KEY` | *(none)* | Required only when `DISCOVERY_PROVIDER=openai` |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | *(none)* | Unset ⇒ pushes print to stdout |
@@ -379,10 +381,10 @@ day, so a window is just a date filter.
 | `DISCOVERY_MAX_ITEMS` | `8` | Items per source per cycle |
 | `DISCOVERY_MAX_SCORES` | `25` | Hard cap on LLM scoring calls per cycle. Anything over waits for the next cycle |
 | `DISCOVERY_PERSONAL_STATE` | `personal_state.json` | Path to the `ai` repo's personal-state artifact — see [Personal-state contract](#personal-state-contract) |
-| `DISCOVERY_INTERVAL_STOCKS` | `3600` | `run`'s stocks job cadence, seconds |
-| `DISCOVERY_INTERVAL_WEB` | `14400` | `run`'s web_search job cadence, seconds |
-| `DISCOVERY_INTERVAL_YOUTUBE` | `14400` | `run`'s youtube job cadence, seconds |
-| `DISCOVERY_DIGEST_TIME` | `08:00` | Local time-of-day `run` sends the Discovery digest |
+| `DISCOVERY_INTERVAL_STOCKS` | `3600` | `run-once --source stocks` cadence, seconds (read by the OS scheduler) |
+| `DISCOVERY_INTERVAL_WEB` | `14400` | `run-once --source web_search` cadence, seconds |
+| `DISCOVERY_INTERVAL_YOUTUBE` | `14400` | `run-once --source youtube` cadence, seconds |
+| `DISCOVERY_DIGEST_TIME` | `08:00` | Local time-of-day the `digest` job sends the Discovery digest |
 | `DISCOVERY_DIGEST_MAX` | `10` | Discovery items per digest, highest score first |
 | `DISCOVERY_MIN_MATCH` | `0.25` | Pre-filter: weakest interest match worth scoring |
 | `DISCOVERY_MIN_TEXT_CHARS` | `120` | Pre-filter: least text worth sending to an LLM |
