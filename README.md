@@ -514,7 +514,7 @@ logs.
 python test_discovery.py
 ```
 
-351 tests, network fully stubbed — they never hit an LLM API, Telegram, or
+370 tests, network fully stubbed — they never hit an LLM API, Telegram, or
 Yahoo. The provider seam is the whole stub: a fake object with `complete_json`
 and `search_json`.
 
