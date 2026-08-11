@@ -7,7 +7,16 @@
                   collection to one collector; Alerts still send immediately,
                   Discovery items still just queue for `digest`). Gated by a
                   provider preflight (health.py) -- a dead Chrome/CDP exits 3
-                  before touching a single collector or LLM call.
+                  before touching a single collector or LLM call. stocks and
+                  youtube still run here; web discovery no longer does (see
+                  web-tick) -- `--source web_search` still works standalone.
+    web-tick      the continuous Council-driven web discovery tick (see
+                  discovery/council.py, discovery/missions.py): replenish at
+                  most one interest's mission queue, lease+execute a fair
+                  slice of pending missions, feed discoveries through the
+                  same pipeline. Meant to run every interval_web_seconds
+                  (default 60s); gated on the mission provider's own
+                  preflight, exit 3 on failure, same as run-once.
     discover      run one collector across all active interests, print
                   candidates and scores, never sends (e.g. `discover web_search`)
     score         push one candidate through the pipeline and print the verdict
@@ -38,7 +47,7 @@ from collections import Counter
 
 from datetime import datetime, timezone
 
-from . import config, db, feedback_listener, health, interests, personal_state, providers, stats, teach
+from . import config, db, feedback_listener, health, interests, missions, personal_state, providers, stats, teach
 from .collectors import COLLECTORS
 from .models import CandidateItem
 from .notify import FEEDBACK_VERDICTS, print_safe
@@ -61,6 +70,9 @@ def main(argv=None):
     ro = sub.add_parser("run-once", help="one cycle")
     ro.add_argument(
         "--source", choices=sorted(COLLECTORS), help="collect only this collector's items"
+    )
+    sub.add_parser(
+        "web-tick", help="one continuous Council-driven web discovery tick (see PROJECT_STATE.md)"
     )
     sub.add_parser("digest", help="send the pending Discovery digest now")
     disc = sub.add_parser(
@@ -176,6 +188,8 @@ def _dispatch(conn, cfg, args, provider):
         return _run_job(
             conn, job_name, lambda: _run_once_cmd(conn, provider(), cfg, sources, args.dry_run, job_name)
         )
+    elif args.command == "web-tick":
+        return _run_job(conn, "web", lambda: _web_tick_cmd(conn, provider(), cfg, args.dry_run))
     elif args.command == "discover":
         return _discover(conn, provider(), cfg, args)
     elif args.command == "score":
@@ -235,6 +249,19 @@ def _run_once_cmd(conn, provider, cfg, sources, dry_run, job_name):
     if not health.preflight_gate(conn, provider, cfg, job_name):
         return 3
     print(run_once(conn, provider, cfg, sources=sources, dry_run=dry_run))
+    return 0
+
+
+def _web_tick_cmd(conn, provider, cfg, dry_run):
+    """`provider` here is the scoring provider (built from cfg.provider by
+    the CLI's shared provider() closure, same as run-once) -- web_tick()
+    builds its own search-capable mission provider internally from
+    cfg.mission_provider and gates on that provider's own preflight, so
+    there is no separate health.preflight_gate() call here."""
+    result = missions.web_tick(conn, cfg, provider=provider, dry_run=dry_run)
+    if not result["preflight_ok"]:
+        return 3
+    print(result)
     return 0
 
 

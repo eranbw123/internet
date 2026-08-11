@@ -23,6 +23,7 @@ from unittest import mock
 
 from discovery import (
     config,
+    council,
     db,
     dedup,
     feedback_listener,
@@ -30,6 +31,7 @@ from discovery import (
     interest_state,
     interests,
     matching,
+    missions,
     models,
     normalize,
     notify,
@@ -5614,6 +5616,589 @@ class ChatGPTBrowserProviderTests(unittest.TestCase):
             chatgpt_browser.cdp, "find_chatgpt_tab", return_value={"id": "1"}
         ):
             self.assertEqual(provider.preflight(), (True, ""))
+
+
+# --- step-12 task 2: continuous Council-driven web discovery ------------------
+
+def mission_batch(*labels):
+    """Council response shape: {"missions": [{label, rationale, prompt}, ...]}.
+    Each mission's prompt embeds its own label so FakeCouncilProvider's
+    search_results dict can key a canned search result off it."""
+    return {"missions": [
+        {"label": label, "rationale": f"why {label}", "prompt": f"research {label} thoroughly"}
+        for label in labels
+    ]}
+
+
+def search_hits(*urls, title_prefix="Result"):
+    return [
+        {"title": f"{title_prefix} {n}", "url": url, "summary": "Enough body text. " * 10}
+        for n, url in enumerate(urls, 1)
+    ]
+
+
+class FakeCouncilProvider(LLMProvider):
+    """Fake search-capable provider standing in for cfg.mission_provider.
+    complete_json serves queued Council mission batches, one consumed per
+    call (queue exhaustion raises -- proves at most one generation call
+    happened); search_json serves a canned result keyed by a needle in the
+    executor prompt (which always embeds the mission's own prompt text)."""
+
+    name = "fake_mission"
+
+    def __init__(self, mission_batches=None, search_results=None, preflight_ok=True,
+                 model="fake-mission-1"):
+        super().__init__(model)
+        self.mission_batches = list(mission_batches or [])
+        self.search_results = dict(search_results or {})
+        self._preflight_ok = preflight_ok
+        self.complete_prompts = []
+        self.search_prompts = []
+
+    def complete_json(self, system, prompt, schema, max_tokens=8000):
+        self.complete_prompts.append(prompt)
+        if not self.mission_batches:
+            raise AssertionError("FakeCouncilProvider ran out of queued mission batches")
+        batch = self.mission_batches.pop(0)
+        if isinstance(batch, Exception):
+            raise batch
+        return batch
+
+    def search_json(self, prompt, max_searches=5, max_tokens=16000):
+        self.search_prompts.append(prompt)
+        for needle, value in self.search_results.items():
+            if needle in prompt:
+                if isinstance(value, Exception):
+                    raise value
+                return value
+        raise AssertionError(f"FakeCouncilProvider got an unexpected search prompt:\n{prompt}")
+
+    def preflight(self):
+        return (self._preflight_ok, "" if self._preflight_ok else "mission provider down")
+
+
+class CouncilTests(unittest.TestCase):
+    """discovery/council.py: mission planning + validation + the Goodhart
+    firewall, independent of the tick that drives it."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.interest = an_interest(
+            key="narcolepsy", title="Narcolepsy research",
+            description="Orexin agonists and MWT trial results.",
+            positive_signals=["orexin agonist", "MWT"], negative_signals=["sleep hygiene listicle"],
+            min_score=0.78,
+        )
+        db.upsert_interest(self.conn, self.interest)
+        self.interest = db.interest_by_key(self.conn, "narcolepsy")
+
+    def _context(self):
+        return council.build_context(self.conn, self.interest, CFG)
+
+    def test_plan_missions_returns_validated_missions(self):
+        provider = FakeCouncilProvider(mission_batches=[mission_batch("trial-registries", "patent-filings")])
+        missions_out = council.plan_missions(provider, self.interest, self._context(), 2)
+        self.assertEqual([m["label"] for m in missions_out], ["trial-registries", "patent-filings"])
+        for m in missions_out:
+            self.assertTrue(m["rationale"])
+            self.assertTrue(m["prompt"])
+        self.assertEqual(len(provider.complete_prompts), 1)   # exactly one call
+
+    def test_plan_missions_truncates_extras_past_count_without_failing(self):
+        provider = FakeCouncilProvider(mission_batches=[mission_batch("a", "b", "c")])
+        missions_out = council.plan_missions(provider, self.interest, self._context(), 2)
+        self.assertEqual([m["label"] for m in missions_out], ["a", "b"])
+
+    def test_plan_missions_raises_on_missing_missions_key(self):
+        provider = FakeCouncilProvider(mission_batches=[{"nope": []}])
+        with self.assertRaises(council.CouncilError):
+            council.plan_missions(provider, self.interest, self._context(), 2)
+
+    def test_plan_missions_raises_on_non_dict_response(self):
+        provider = FakeCouncilProvider(mission_batches=[["not", "a", "dict"]])
+        with self.assertRaises(council.CouncilError):
+            council.plan_missions(provider, self.interest, self._context(), 2)
+
+    def test_plan_missions_raises_on_empty_prompt(self):
+        provider = FakeCouncilProvider(mission_batches=[
+            {"missions": [{"label": "x", "rationale": "r", "prompt": "   "}]}
+        ])
+        with self.assertRaises(council.CouncilError):
+            council.plan_missions(provider, self.interest, self._context(), 1)
+
+    def test_plan_missions_raises_on_missing_field(self):
+        provider = FakeCouncilProvider(mission_batches=[
+            {"missions": [{"label": "x", "prompt": "do the thing"}]}
+        ])
+        with self.assertRaises(council.CouncilError):
+            council.plan_missions(provider, self.interest, self._context(), 1)
+
+    def test_plan_missions_raises_on_duplicate_labels_case_insensitive(self):
+        provider = FakeCouncilProvider(mission_batches=[mission_batch("Angle-One", "angle-one")])
+        with self.assertRaises(council.CouncilError):
+            council.plan_missions(provider, self.interest, self._context(), 2)
+
+    def test_plan_missions_raises_on_zero_missions(self):
+        provider = FakeCouncilProvider(mission_batches=[{"missions": []}])
+        with self.assertRaises(council.CouncilError):
+            council.plan_missions(provider, self.interest, self._context(), 2)
+
+    def test_build_context_is_bounded_by_cfg(self):
+        for n in range(5):
+            item = stored_item(
+                self.conn, source="web_search", title=f"Frontier item {n}",
+                url=f"https://e.com/f{n}", origin_interest="narcolepsy",
+            )
+        cfg = dataclasses.replace(CFG, council_frontier_items=2)
+        ctx = council.build_context(self.conn, self.interest, cfg)
+        self.assertEqual(len(ctx["frontier"]), 2)
+
+    def test_build_context_includes_feedback_and_history(self):
+        item = stored_item(self.conn, title="Some item", url="https://e.com/x")
+        db.add_feedback(self.conn, item.id, self.interest.id, "up", note="great find")
+        gen_id = db.insert_generation(self.conn, "narcolepsy", "fake_mission", "m1", 1)
+        db.insert_missions(self.conn, gen_id, "narcolepsy", [
+            {"label": "past-angle", "rationale": "worked before", "prompt": "do it"}
+        ])
+        ctx = council.build_context(self.conn, self.interest, CFG)
+        self.assertEqual(ctx["feedback"][0]["verdict"], "up")
+        self.assertEqual(ctx["history"][0]["label"], "past-angle")
+
+    def test_goodhart_firewall_prompt_has_no_scoring_machinery(self):
+        """The rendered planning prompt (system + user) must never leak
+        downstream scoring machinery to the Council."""
+        ctx = self._context()
+        system = council.COUNCIL_INSTRUCTIONS.format(count=4)
+        prompt = council.render_prompt(ctx, 4)
+        rendered = system + "\n" + prompt
+
+        self.assertNotIn(str(self.interest.min_score), rendered)
+        self.assertNotIn("min_score", rendered)
+        self.assertNotIn("derived_min_score", rendered)
+        self.assertNotIn("final_score", rendered)
+        self.assertNotIn("confidence", rendered)
+        self.assertNotIn("notification", rendered.lower())
+        for weight_name in models.WEIGHTS:
+            self.assertNotIn(weight_name, rendered)
+        for dim in models.DIMENSIONS:
+            self.assertNotIn(dim, rendered)
+
+
+class MissionDbTests(unittest.TestCase):
+    """discovery/db.py's search_generations/search_missions helpers, in
+    isolation from council.py and missions.py."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def _seed_mission(self, interest_key="k", label="m1"):
+        gen_id = db.insert_generation(self.conn, interest_key, "fake_mission", "m1", 1)
+        db.insert_missions(self.conn, gen_id, interest_key, [
+            {"label": label, "rationale": "r", "prompt": f"do {label}"}
+        ])
+        row = self.conn.execute(
+            "SELECT id FROM search_missions WHERE interest_key = ? AND label = ?",
+            (interest_key, label),
+        ).fetchone()
+        return gen_id, row["id"]
+
+    def test_lease_missions_claims_only_pending_and_is_atomic(self):
+        _, mid = self._seed_mission()
+        leased = db.lease_missions(self.conn, [mid], 900)
+        self.assertEqual(leased, [mid])
+        row = db.mission_by_id(self.conn, mid)
+        self.assertEqual(row["status"], "RUNNING")
+        self.assertEqual(row["attempts"], 1)
+        self.assertIsNotNone(row["started_at"])
+        self.assertIsNotNone(row["lease_expires_at"])
+
+        # Already RUNNING -- a second overlapping lease attempt claims nothing.
+        self.assertEqual(db.lease_missions(self.conn, [mid], 900), [])
+
+    def test_lease_missions_returns_only_the_actually_claimed_subset(self):
+        _, mid1 = self._seed_mission(label="m1")
+        _, mid2 = self._seed_mission(label="m2")
+        db.lease_missions(self.conn, [mid1], 900)   # mid1 already RUNNING
+        leased = db.lease_missions(self.conn, [mid1, mid2], 900)
+        self.assertEqual(leased, [mid2])
+
+    def test_recover_stale_missions_reclaims_expired_lease_to_pending(self):
+        _, mid = self._seed_mission()
+        db.lease_missions(self.conn, [mid], -1)   # already-expired lease
+        db.recover_stale_missions(self.conn, max_attempts=3)
+        row = db.mission_by_id(self.conn, mid)
+        self.assertEqual(row["status"], "PENDING")
+        self.assertIsNone(row["leased_at"])
+        self.assertEqual(row["attempts"], 1)   # preserved, not reset
+
+        # No longer RUNNING, so it can be leased again -- no duplicate concurrent execution.
+        self.assertEqual(db.lease_missions(self.conn, [mid], 900), [mid])
+
+    def test_recover_stale_missions_retires_exhausted_attempts_to_failed(self):
+        _, mid = self._seed_mission()
+        db.lease_missions(self.conn, [mid], -1)
+        db.recover_stale_missions(self.conn, max_attempts=1)   # attempts already at 1
+        row = db.mission_by_id(self.conn, mid)
+        self.assertEqual(row["status"], "FAILED")
+
+    def test_fail_mission_retries_then_retires_at_max_attempts(self):
+        _, mid = self._seed_mission()
+        db.lease_missions(self.conn, [mid], 900)   # attempts -> 1
+        db.fail_mission(self.conn, mid, "boom", max_attempts=2, retry_seconds=1800)
+        row = db.mission_by_id(self.conn, mid)
+        self.assertEqual(row["status"], "PENDING")
+        self.assertIsNotNone(row["next_attempt_at"])
+
+        db.lease_missions(self.conn, [mid], 900)   # attempts -> 2
+        db.fail_mission(self.conn, mid, "boom again", max_attempts=2, retry_seconds=1800)
+        row = db.mission_by_id(self.conn, mid)
+        self.assertEqual(row["status"], "FAILED")
+        self.assertEqual(row["last_error"], "boom again")
+
+    def test_pending_mission_count_recent_missions_mission_by_id(self):
+        self._seed_mission(label="m1")
+        self._seed_mission(label="m2")
+        self.assertEqual(db.pending_mission_count(self.conn, "k"), 2)
+        history = db.recent_missions(self.conn, "k", 10)
+        self.assertEqual([r["label"] for r in history], ["m2", "m1"])   # newest first
+
+
+class WebTickTests(unittest.TestCase):
+    """discovery/missions.py's web_tick(): the whole continuous
+    Council-driven web discovery tick, offline (fake mission provider +
+    fake scoring provider, no Chrome/CDP/network)."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.cfg = dataclasses.replace(
+            CFG,
+            mission_provider="fake_mission",
+            mission_low_water=1,
+            missions_per_tick=2,
+            council_missions_per_generation=2,
+            mission_max_attempts=2,
+            mission_retry_seconds=1800,
+            council_max_consecutive_failures=2,
+        )
+
+    def _interest(self, key):
+        db.upsert_interest(self.conn, an_interest(key=key, title=key, sources=["web_search"]))
+        return db.interest_by_key(self.conn, key)
+
+    def _tick(self, mission_provider, scoring_provider=None, cfg=None, dry_run=False):
+        scoring_provider = scoring_provider or FakeProvider({"Result": 0.9})
+        with mock.patch.object(providers, "get_provider", return_value=mission_provider):
+            return missions.web_tick(self.conn, cfg or self.cfg, provider=scoring_provider, dry_run=dry_run)
+
+    def _seed_mission(self, interest_key, label, generation_id=None):
+        db.insert_missions(self.conn, generation_id, interest_key, [
+            {"label": label, "rationale": "seeded directly", "prompt": f"research {label}"}
+        ])
+        return self.conn.execute(
+            "SELECT id FROM search_missions WHERE interest_key = ? AND label = ?",
+            (interest_key, label),
+        ).fetchone()["id"]
+
+    def _generation_statuses(self, interest_key):
+        return [
+            r["status"] for r in self.conn.execute(
+                "SELECT status FROM search_generations WHERE interest_key = ? ORDER BY id",
+                (interest_key,),
+            ).fetchall()
+        ]
+
+    # --- replenish: at most one interest per tick, only below low water -------
+
+    def test_empty_startup_refill_plans_one_interest_per_tick_never_bursts(self):
+        # missions_per_tick=0 -- this test is only about *how many interests
+        # get a Council call per tick*, not mission execution.
+        cfg = dataclasses.replace(self.cfg, missions_per_tick=0)
+        self._interest("alpha")
+        self._interest("bravo")
+        self._interest("charlie")
+
+        mp1 = FakeCouncilProvider(mission_batches=[mission_batch("a1", "a2")])
+        self._tick(mp1, cfg=cfg)
+        self.assertEqual(len(mp1.complete_prompts), 1)
+        self.assertEqual(self._generation_statuses("alpha"), ["DONE"])
+        self.assertEqual(self._generation_statuses("bravo"), [])
+        self.assertEqual(self._generation_statuses("charlie"), [])
+
+        mp2 = FakeCouncilProvider(mission_batches=[mission_batch("b1", "b2")])
+        self._tick(mp2, cfg=cfg)
+        self.assertEqual(len(mp2.complete_prompts), 1)
+        self.assertEqual(self._generation_statuses("bravo"), ["DONE"])
+        self.assertEqual(self._generation_statuses("charlie"), [])
+
+        mp3 = FakeCouncilProvider(mission_batches=[mission_batch("c1", "c2")])
+        self._tick(mp3, cfg=cfg)
+        self.assertEqual(len(mp3.complete_prompts), 1)
+        self.assertEqual(self._generation_statuses("charlie"), ["DONE"])
+
+    def test_replenish_only_triggers_below_low_water_mark(self):
+        cfg = dataclasses.replace(self.cfg, mission_low_water=2, missions_per_tick=0)
+        self._interest("alpha")
+        gen_id = db.insert_generation(self.conn, "alpha", "fake_mission", "m1", 1)
+        self._seed_mission("alpha", "already-queued", generation_id=gen_id)
+        db.finish_generation(self.conn, gen_id, "DONE", 1)
+        # 1 PENDING mission, low_water=2 -- still under water, so a fresh
+        # generation is still due.
+        mp = FakeCouncilProvider(mission_batches=[mission_batch("x1")])
+        self._tick(mp, cfg=cfg)
+        self.assertEqual(len(mp.complete_prompts), 1)
+
+        # Now at/above the low-water mark -- no further Council call.
+        cfg2 = dataclasses.replace(cfg, mission_low_water=2)
+        mp2 = FakeCouncilProvider(mission_batches=[])
+        result = self._tick(mp2, cfg=cfg2)
+        self.assertEqual(len(mp2.complete_prompts), 0)
+        self.assertTrue(result["preflight_ok"])
+
+    # --- fair selection ----------------------------------------------------
+
+    def test_round_robin_fairness_across_interests_with_lopsided_queue(self):
+        cfg = dataclasses.replace(self.cfg, missions_per_tick=2)
+        self._interest("alpha")
+        self._interest("bravo")
+        for n in range(5):
+            self._seed_mission("alpha", f"alpha-{n}")
+        self._seed_mission("bravo", "bravo-0")
+
+        mp = FakeCouncilProvider(search_results={
+            "alpha-0": search_hits("https://e.com/a0"),
+            "bravo-0": search_hits("https://e.com/b0"),
+        })
+        self._tick(mp, cfg=cfg)
+
+        # missions_per_tick=2: one from each interest, not two from alpha --
+        # bravo's single mission is never starved by alpha's queue of 5.
+        alpha_done = self.conn.execute(
+            "SELECT COUNT(*) c FROM search_missions WHERE interest_key='alpha' AND status='DONE'"
+        ).fetchone()["c"]
+        bravo_done = self.conn.execute(
+            "SELECT COUNT(*) c FROM search_missions WHERE interest_key='bravo' AND status='DONE'"
+        ).fetchone()["c"]
+        self.assertEqual((alpha_done, bravo_done), (1, 1))
+
+    # --- crash / recovery ----------------------------------------------------
+
+    def test_crash_recovery_mission_resumes_and_executes_exactly_once(self):
+        cfg = dataclasses.replace(self.cfg, missions_per_tick=1, mission_lease_seconds=-1)
+        self._interest("alpha")
+        self._seed_mission("alpha", "m1")
+
+        mp = FakeCouncilProvider(search_results={"m1": search_hits("https://e.com/m1")})
+        with mock.patch.object(providers, "get_provider", return_value=mp), \
+             mock.patch.object(missions, "_execute_mission", side_effect=RuntimeError("simulated crash")):
+            with self.assertRaises(RuntimeError):
+                missions.web_tick(self.conn, cfg, provider=FakeProvider({"Result": 0.9}))
+
+        row = self.conn.execute("SELECT status FROM search_missions WHERE label='m1'").fetchone()
+        self.assertEqual(row["status"], "RUNNING")   # leased before the simulated crash
+        self.assertEqual(len(mp.search_prompts), 0)   # never actually executed
+
+        # Fresh tick, same conn: the expired lease is reclaimed and this
+        # time the mission actually runs -- exactly once.
+        self._tick(mp, cfg=dataclasses.replace(cfg, mission_lease_seconds=900))
+        row = self.conn.execute("SELECT status, items_returned FROM search_missions WHERE label='m1'").fetchone()
+        self.assertEqual(row["status"], "DONE")
+        self.assertEqual(row["items_returned"], 1)
+        self.assertEqual(len(mp.search_prompts), 1)   # executed exactly once total
+
+    def test_stale_lease_recovery_reclaims_running_mission_no_duplicate_execution(self):
+        self._interest("alpha")
+        mid = self._seed_mission("alpha", "m1")
+        leased = db.lease_missions(self.conn, [mid], -1)   # already expired the moment it's leased
+        self.assertEqual(leased, [mid])
+
+        db.recover_stale_missions(self.conn, self.cfg.mission_max_attempts)
+        row = self.conn.execute("SELECT status FROM search_missions WHERE id=?", (mid,)).fetchone()
+        self.assertEqual(row["status"], "PENDING")
+
+        # Reclaimed -- can be leased again; a second concurrent lease attempt
+        # on the still-RUNNING copy (before recovery) would have claimed nothing.
+        self.assertEqual(db.lease_missions(self.conn, [mid], 900), [mid])
+        self.assertEqual(db.lease_missions(self.conn, [mid], 900), [])   # no duplicate claim
+
+    # --- failure isolation ---------------------------------------------------
+
+    def test_planner_failure_on_one_interest_leaves_others_executing(self):
+        cfg = dataclasses.replace(self.cfg, missions_per_tick=1, mission_low_water=1)
+        self._interest("alpha")   # will fail to plan
+        self._interest("bravo")   # already has pending work
+        self._seed_mission("bravo", "bravo-0")
+
+        mp = FakeCouncilProvider(
+            mission_batches=[providers.ProviderError("planner exploded")],
+            search_results={"bravo-0": search_hits("https://e.com/b0")},
+        )
+        self._tick(mp, cfg=cfg)
+
+        self.assertEqual(self._generation_statuses("alpha"), ["FAILED"])
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT status FROM search_missions WHERE interest_key='alpha'"
+            ).fetchall(),
+            [],
+        )
+        bravo_row = self.conn.execute(
+            "SELECT status FROM search_missions WHERE interest_key='bravo'"
+        ).fetchone()
+        self.assertEqual(bravo_row["status"], "DONE")
+
+    def test_malformed_council_output_records_failed_generation_and_enqueues_nothing(self):
+        self._interest("alpha")
+        mp = FakeCouncilProvider(mission_batches=[{"missions": "not-a-list"}])
+        self._tick(mp)
+        self.assertEqual(self._generation_statuses("alpha"), ["FAILED"])
+        self.assertEqual(db.pending_mission_count(self.conn, "alpha"), 0)
+
+    def test_executor_failure_on_one_mission_does_not_abort_others(self):
+        cfg = dataclasses.replace(self.cfg, missions_per_tick=2)
+        self._interest("alpha")
+        self._seed_mission("alpha", "bad-mission")
+        self._seed_mission("alpha", "good-mission")
+
+        mp = FakeCouncilProvider(search_results={
+            "bad-mission": RuntimeError("search blew up"),
+            "good-mission": search_hits("https://e.com/good"),
+        })
+        self._tick(mp, cfg=cfg)
+
+        bad = self.conn.execute("SELECT status FROM search_missions WHERE label='bad-mission'").fetchone()
+        good = self.conn.execute("SELECT status FROM search_missions WHERE label='good-mission'").fetchone()
+        self.assertIn(bad["status"], ("PENDING", "FAILED"))   # never DONE
+        self.assertEqual(good["status"], "DONE")
+
+    def test_duplicate_discoveries_across_missions_dedup(self):
+        cfg = dataclasses.replace(self.cfg, missions_per_tick=2)
+        self._interest("alpha")
+        self._seed_mission("alpha", "m1")
+        self._seed_mission("alpha", "m2")
+
+        same_hit = search_hits("https://e.com/same")
+        mp = FakeCouncilProvider(search_results={"m1": same_hit, "m2": same_hit})
+        self._tick(mp, cfg=cfg)
+
+        rows = self.conn.execute(
+            "SELECT COUNT(*) c FROM candidate_items WHERE url = ?", ("https://e.com/same",)
+        ).fetchone()
+        self.assertEqual(rows["c"], 1)   # one stored item
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("duplicate"), 1)
+
+    # --- provenance ------------------------------------------------------------
+
+    def test_provenance_resolves_generation_mission_label_prompt(self):
+        interest = self._interest("alpha")
+        mp = FakeCouncilProvider(
+            mission_batches=[mission_batch("provenance-check")],
+            search_results={"provenance-check": search_hits("https://e.com/prov")},
+        )
+        self._tick(mp, cfg=dataclasses.replace(self.cfg, council_missions_per_generation=1, missions_per_tick=1))
+
+        item_row = self.conn.execute(
+            "SELECT metadata FROM candidate_items WHERE url = ?", ("https://e.com/prov",)
+        ).fetchone()
+        metadata = json.loads(item_row["metadata"])
+        mission = db.mission_by_id(self.conn, metadata["mission_id"])
+        self.assertEqual(mission["label"], "provenance-check")
+        self.assertEqual(metadata["mission_label"], "provenance-check")
+        self.assertEqual(metadata["prompt_sha256"], mission["prompt_sha256"])
+        self.assertEqual(
+            hashlib.sha256(mission["prompt"].encode("utf-8")).hexdigest(), mission["prompt_sha256"]
+        )
+        generation = self.conn.execute(
+            "SELECT interest_key FROM search_generations WHERE id = ?", (metadata["generation_id"],)
+        ).fetchone()
+        self.assertEqual(generation["interest_key"], "alpha")
+
+    # --- provider outage -----------------------------------------------------
+
+    def test_provider_outage_leases_nothing_and_spends_nothing(self):
+        self._interest("alpha")
+        self._seed_mission("alpha", "m1")
+        mp = FakeCouncilProvider(preflight_ok=False)
+        result = self._tick(mp)
+        self.assertFalse(result["preflight_ok"])
+        self.assertEqual(len(mp.complete_prompts), 0)
+        self.assertEqual(len(mp.search_prompts), 0)
+        row = self.conn.execute("SELECT status FROM search_missions WHERE label='m1'").fetchone()
+        self.assertEqual(row["status"], "PENDING")   # never leased
+
+    # --- end to end + fallback + default-behaviour ----------------------------
+
+    def test_stubbed_end_to_end_web_tick_through_the_real_pipeline(self):
+        self._interest("alpha")
+        mp = FakeCouncilProvider(
+            mission_batches=[mission_batch("e2e")],
+            search_results={"e2e": search_hits("https://e.com/e2e")},
+        )
+        scoring = FakeProvider({"Result": 0.95})
+        cfg = dataclasses.replace(self.cfg, council_missions_per_generation=1, missions_per_tick=1)
+        self._tick(mp, scoring_provider=scoring, cfg=cfg, dry_run=True)
+
+        # web_tick(), like run_once(), only *delivers* immediate ALERT-type
+        # items here -- this default "article" item is DISCOVERY-lane and
+        # stays pending for the digest, so the real assertion is that it
+        # made it all the way to notification_ready() through the real
+        # pipeline (matched -> scored -> above its interest's bar).
+        ready = pipeline.notification_ready(self.conn, cfg)
+        self.assertEqual(len(ready), 1)
+        self.assertEqual(ready[0][1].url, "https://e.com/e2e")
+        score_row = self.conn.execute(
+            "SELECT final_score FROM scores s JOIN candidate_items i ON i.id = s.item_id"
+            " WHERE i.url = ?", ("https://e.com/e2e",)
+        ).fetchone()
+        self.assertAlmostEqual(score_row["final_score"], 0.95)
+
+    def test_static_fallback_enqueued_only_after_consecutive_council_failures(self):
+        cfg = dataclasses.replace(
+            self.cfg, council_max_consecutive_failures=2, mission_low_water=1, missions_per_tick=0,
+        )
+        interest = self._interest("alpha")
+
+        # 1st failure: not enough yet -- no fallback.
+        mp1 = FakeCouncilProvider(mission_batches=[providers.ProviderError("down")])
+        self._tick(mp1, cfg=cfg)
+        self.assertEqual(db.pending_mission_count(self.conn, "alpha"), 0)
+
+        # 2nd consecutive failure: threshold reached -- fallback enqueued.
+        mp2 = FakeCouncilProvider(mission_batches=[providers.ProviderError("still down")])
+        self._tick(mp2, cfg=cfg)
+        fallback = self.conn.execute(
+            "SELECT label, generation_id FROM search_missions WHERE interest_key='alpha' AND status='PENDING'"
+        ).fetchone()
+        self.assertEqual(fallback["label"], missions.FALLBACK_LABEL)
+        self.assertIsNone(fallback["generation_id"])
+
+    def test_run_once_budgets_refactor_is_behavior_preserving(self):
+        """budgets_for() is the only refactor pipeline.py permits itself
+        this step -- run_once() for stocks/youtube-shaped collectors stays
+        byte-identical to before it existed."""
+        budget, explore_budget = pipeline.budgets_for(CFG)
+        self.assertEqual(budget.remaining, CFG.max_scores_per_cycle)
+        self.assertEqual(explore_budget.remaining, 0)   # dynamic_interests off by default
+
+        db.upsert_interest(self.conn, an_interest(key="k", sources=["fake"]))
+
+        def collector(interest, cfg, provider, conn=None):
+            return [an_item(source="fake", title="Good stuff here", url="https://e.com/1")]
+
+        provider = FakeProvider({"Good stuff": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            summary = pipeline.run_once(self.conn, provider, CFG, dry_run=True)
+        self.assertEqual(
+            summary,
+            {"collected": 1, "duplicate": 0, "filtered": 0, "already_scored": 0,
+             "scored": 1, "deferred": 0, "errors": 0, "notified": 0},   # "article" isn't an ALERT type
+        )
 
 
 if __name__ == "__main__":

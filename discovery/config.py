@@ -41,7 +41,10 @@ class Config:
     # health.py/__main__.py's "run" removal) -- the OS scheduler's triggers
     # are derived from these same fields instead.
     interval_stocks_seconds: int = 3600
-    interval_web_seconds: int = 4 * 3600
+    # Continuous Council-driven web discovery (see below) runs as a 1-minute
+    # tick, not a periodic batch collector -- collect-web's Scheduled Task
+    # cadence follows this field down to 60s (see ops/install_tasks.py).
+    interval_web_seconds: int = 60
     interval_youtube_seconds: int = 4 * 3600
     digest_time: str = "08:00"      # local HH:MM, once per day
     digest_max_items: int = 10      # Discovery items per digest; Alerts are unbounded and immediate
@@ -67,6 +70,22 @@ class Config:
     # whose best interest match is non-owner (derived). No new threshold --
     # derived_min_score above already bars notification; see PROJECT_STATE.md.
     explore_max_scores_per_cycle: int = 5
+    # Continuous Council-driven web discovery (discovery/council.py,
+    # discovery/missions.py). See PROJECT_STATE.md for the tick's shape.
+    council_missions_per_generation: int = 6    # missions requested per Council call
+    mission_low_water: int = 3                  # replenish an interest below this many PENDING
+    missions_per_tick: int = 2                   # missions leased+executed per web_tick()
+    mission_max_searches: int = 6                # search_json's own max_searches, per mission
+    mission_max_results: int = 6                 # CandidateItems kept per mission
+    council_frontier_items: int = 15             # recent candidate_items shown to the Council
+    council_feedback_items: int = 10             # recent feedback rows shown to the Council
+    council_history_missions: int = 12           # recent missions (label+rationale) shown back
+    mission_lease_seconds: int = 900             # RUNNING lease before recover_stale_missions() reclaims it
+    mission_max_attempts: int = 3                # attempts before a mission is retired to FAILED
+    mission_retry_seconds: int = 1800            # cool-off before a failed mission is retried
+    council_max_consecutive_failures: int = 3    # generation failures before the static fallback kicks in
+    mission_provider: str = "chatgpt_browser"    # search-capable provider the tick executes missions with
+    mission_model: str = ""                      # resolved from DEFAULT_MODELS at load() time
 
 
 def load():
@@ -76,6 +95,7 @@ def load():
 
     load_dotenv(str(REPO_ROOT / ".env"))
     provider = os.environ.get("DISCOVERY_PROVIDER", "claude_chat")
+    mission_provider = os.environ.get("DISCOVERY_MISSION_PROVIDER", "chatgpt_browser")
     return Config(
         db_path=os.environ.get("DISCOVERY_DB", str(REPO_ROOT / "discovery.db")),
         interests_path=os.environ.get(
@@ -94,7 +114,7 @@ def load():
             "DISCOVERY_PERSONAL_STATE", str(REPO_ROOT / "personal_state.json")
         ),
         interval_stocks_seconds=int(os.environ.get("DISCOVERY_INTERVAL_STOCKS", "3600")),
-        interval_web_seconds=int(os.environ.get("DISCOVERY_INTERVAL_WEB", str(4 * 3600))),
+        interval_web_seconds=int(os.environ.get("DISCOVERY_INTERVAL_WEB", "60")),
         interval_youtube_seconds=int(os.environ.get("DISCOVERY_INTERVAL_YOUTUBE", str(4 * 3600))),
         digest_time=os.environ.get("DISCOVERY_DIGEST_TIME", "08:00"),
         digest_max_items=int(os.environ.get("DISCOVERY_DIGEST_MAX", "10")),
@@ -113,4 +133,24 @@ def load():
         derived_max_active=int(os.environ.get("DISCOVERY_DERIVED_MAX_ACTIVE", "5")),
         derived_min_score=float(os.environ.get("DISCOVERY_DERIVED_MIN_SCORE", "0.80")),
         explore_max_scores_per_cycle=int(os.environ.get("DISCOVERY_EXPLORE_MAX_SCORES", "5")),
+        council_missions_per_generation=int(
+            os.environ.get("DISCOVERY_COUNCIL_MISSIONS_PER_GENERATION", "6")
+        ),
+        mission_low_water=int(os.environ.get("DISCOVERY_MISSION_LOW_WATER", "3")),
+        missions_per_tick=int(os.environ.get("DISCOVERY_MISSIONS_PER_TICK", "2")),
+        mission_max_searches=int(os.environ.get("DISCOVERY_MISSION_MAX_SEARCHES", "6")),
+        mission_max_results=int(os.environ.get("DISCOVERY_MISSION_MAX_RESULTS", "6")),
+        council_frontier_items=int(os.environ.get("DISCOVERY_COUNCIL_FRONTIER_ITEMS", "15")),
+        council_feedback_items=int(os.environ.get("DISCOVERY_COUNCIL_FEEDBACK_ITEMS", "10")),
+        council_history_missions=int(os.environ.get("DISCOVERY_COUNCIL_HISTORY_MISSIONS", "12")),
+        mission_lease_seconds=int(os.environ.get("DISCOVERY_MISSION_LEASE_SECONDS", "900")),
+        mission_max_attempts=int(os.environ.get("DISCOVERY_MISSION_MAX_ATTEMPTS", "3")),
+        mission_retry_seconds=int(os.environ.get("DISCOVERY_MISSION_RETRY_SECONDS", "1800")),
+        council_max_consecutive_failures=int(
+            os.environ.get("DISCOVERY_COUNCIL_MAX_CONSECUTIVE_FAILURES", "3")
+        ),
+        mission_provider=mission_provider,
+        mission_model=os.environ.get(
+            "DISCOVERY_MISSION_MODEL", DEFAULT_MODELS.get(mission_provider, "")
+        ),
     )

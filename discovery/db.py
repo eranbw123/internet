@@ -3,6 +3,7 @@
 JSON-shaped columns (signals, metadata, source_config, matched_terms) are
 stored as text and decoded here so callers only ever see Python values.
 """
+import hashlib
 import json
 import re
 import sqlite3
@@ -63,6 +64,14 @@ def now():
 def ago(seconds):
     return (
         datetime.now(timezone.utc) - timedelta(seconds=seconds)
+    ).isoformat(timespec="seconds")
+
+
+def future(seconds):
+    """The `ago()` mirror -- a timestamp `seconds` from now, for lease
+    expiries and retry cool-offs."""
+    return (
+        datetime.now(timezone.utc) + timedelta(seconds=seconds)
     ).isoformat(timespec="seconds")
 
 
@@ -627,3 +636,191 @@ def record_usage(conn, provider):
     )
     conn.commit()
     usage.clear()
+
+
+# --- Council-driven search missions (discovery/council.py, discovery/missions.py) --
+
+def insert_generation(conn, interest_key, provider, model, missions_requested):
+    """One row per Council planning attempt, opened before the call is even
+    made so a crash mid-call still leaves a PENDING row rather than no
+    record at all. finish_generation() closes it out either way."""
+    cur = conn.execute(
+        """
+        INSERT INTO search_generations
+            (interest_key, created_at, status, provider, model, missions_requested,
+             missions_returned, error)
+        VALUES (?, ?, 'PENDING', ?, ?, ?, 0, NULL)
+        """,
+        (interest_key, now(), provider, model, missions_requested),
+    )
+    conn.commit()
+    return cur.lastrowid
+
+
+def finish_generation(conn, generation_id, status, missions_returned=0, error=None):
+    conn.execute(
+        "UPDATE search_generations SET status = ?, missions_returned = ?, error = ? WHERE id = ?",
+        (status, missions_returned, error, generation_id),
+    )
+    conn.commit()
+
+
+def insert_missions(conn, generation_id, interest_key, missions):
+    """`missions`: [{label, rationale, prompt}, ...] (council.plan_missions()'s
+    validated shape, or a single hand-built static-fallback entry -- see
+    missions.py). `generation_id` is NULL for the fallback: it isn't a
+    Council planning attempt, so it has no search_generations row."""
+    ts = now()
+    rows = [
+        (
+            generation_id, interest_key, m["label"], m.get("rationale", ""),
+            m["prompt"], hashlib.sha256(m["prompt"].encode("utf-8")).hexdigest(), ts,
+        )
+        for m in missions
+    ]
+    conn.executemany(
+        """
+        INSERT INTO search_missions
+            (generation_id, interest_key, label, rationale, prompt, prompt_sha256,
+             status, attempts, created_at)
+        VALUES (?, ?, ?, ?, ?, ?, 'PENDING', 0, ?)
+        """,
+        rows,
+    )
+    conn.commit()
+    return len(rows)
+
+
+def pending_mission_count(conn, interest_key):
+    row = conn.execute(
+        "SELECT COUNT(*) AS c FROM search_missions WHERE interest_key = ? AND status = 'PENDING'",
+        (interest_key,),
+    ).fetchone()
+    return row["c"]
+
+
+def recover_stale_missions(conn, max_attempts):
+    """Reclaim leases past their lease_expires_at. attempts was already
+    incremented at lease time, so a mission that keeps timing out is retired
+    to FAILED once it hits max_attempts instead of being handed out forever;
+    everything else goes back to PENDING for the next tick to pick up."""
+    ts = now()
+    conn.execute(
+        """
+        UPDATE search_missions
+        SET status = 'FAILED', finished_at = ?, last_error = 'stale lease: exceeded max attempts'
+        WHERE status = 'RUNNING' AND lease_expires_at < ? AND attempts >= ?
+        """,
+        (ts, ts, max_attempts),
+    )
+    conn.execute(
+        """
+        UPDATE search_missions
+        SET status = 'PENDING', leased_at = NULL, lease_expires_at = NULL
+        WHERE status = 'RUNNING' AND lease_expires_at < ?
+        """,
+        (ts,),
+    )
+    conn.commit()
+
+
+def lease_missions(conn, mission_ids, lease_seconds):
+    """Atomically claim whichever of `mission_ids` are still PENDING, inside
+    one BEGIN IMMEDIATE transaction -- two overlapping ticks (separate
+    connections/processes on the same discovery.db) can never both claim the
+    same mission. The PENDING check happens inside the same transaction as
+    the UPDATE (not re-derived from a post-UPDATE SELECT keyed on the leased_
+    at timestamp -- two leases within the same wall-clock second would
+    otherwise be indistinguishable and wrongly re-claim an already-RUNNING
+    row from an earlier call). Returns the subset of `mission_ids` actually
+    leased, in the same order."""
+    if not mission_ids:
+        return []
+    ts = now()
+    expires = future(lease_seconds)
+    placeholders = ",".join("?" * len(mission_ids))
+    conn.execute("BEGIN IMMEDIATE")
+    try:
+        pending_ids = {
+            r["id"] for r in conn.execute(
+                f"SELECT id FROM search_missions WHERE id IN ({placeholders}) AND status = 'PENDING'",
+                mission_ids,
+            ).fetchall()
+        }
+        if pending_ids:
+            claim_placeholders = ",".join("?" * len(pending_ids))
+            cur = conn.execute(
+                f"""
+                UPDATE search_missions
+                SET status = 'RUNNING', leased_at = ?, lease_expires_at = ?,
+                    attempts = attempts + 1, started_at = ?
+                WHERE id IN ({claim_placeholders})
+                """,
+                (ts, expires, ts, *pending_ids),
+            )
+            assert cur.rowcount == len(pending_ids)   # the atomicity contract, made explicit
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    return [mid for mid in mission_ids if mid in pending_ids]
+
+
+def finish_mission(conn, mission_id, items_returned):
+    conn.execute(
+        """
+        UPDATE search_missions
+        SET status = 'DONE', finished_at = ?, items_returned = ?, last_error = NULL
+        WHERE id = ?
+        """,
+        (now(), items_returned, mission_id),
+    )
+    conn.commit()
+
+
+def fail_mission(conn, mission_id, error, max_attempts, retry_seconds):
+    """Records a failed execution attempt. `attempts` was already incremented
+    by lease_missions(), so once it reaches max_attempts the mission is
+    retired to FAILED; otherwise it goes back to PENDING with
+    next_attempt_at set retry_seconds out, so the tick's fairness selection
+    doesn't just re-pick the same failing mission next tick."""
+    row = conn.execute(
+        "SELECT attempts FROM search_missions WHERE id = ?", (mission_id,)
+    ).fetchone()
+    attempts = row["attempts"] if row else max_attempts
+    if attempts >= max_attempts:
+        conn.execute(
+            """
+            UPDATE search_missions SET status = 'FAILED', finished_at = ?, last_error = ?
+            WHERE id = ?
+            """,
+            (now(), error, mission_id),
+        )
+    else:
+        conn.execute(
+            """
+            UPDATE search_missions SET status = 'PENDING', next_attempt_at = ?, last_error = ?
+            WHERE id = ?
+            """,
+            (future(retry_seconds), error, mission_id),
+        )
+    conn.commit()
+
+
+def recent_missions(conn, interest_key, limit):
+    """Previous generated missions for one interest, newest first -- fed to
+    the Council as planning history (label + rationale only) so it doesn't
+    repeat an angle."""
+    return conn.execute(
+        """
+        SELECT label, rationale FROM search_missions
+        WHERE interest_key = ? ORDER BY id DESC LIMIT ?
+        """,
+        (interest_key, limit),
+    ).fetchall()
+
+
+def mission_by_id(conn, mission_id):
+    return conn.execute(
+        "SELECT * FROM search_missions WHERE id = ?", (mission_id,)
+    ).fetchone()

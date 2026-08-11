@@ -16,6 +16,53 @@ is still `claude_chat`, `DEFAULT_MODELS['claude_chat']` unchanged. 25 ported
 tests (`ChatGPTBrowserProviderTests`, offline, fake CDP connection seam)
 appended to `test_discovery.py` (345 -> 370, all green).
 
+## continuous Council-driven web discovery (step-12 task 2)
+Web discovery's scheduled path is now a durable mission queue, not a
+periodic static-prompt batch. `discovery/council.py` (stdlib-only): the
+Council's reasoning architecture (5 advisor personas -> anonymized Stage-2
+peer review -> Chairman synthesis) is ported verbatim in substance from
+`ai`'s `council_bot.py` (`internet` never imports/execs/shells to `ai`); the
+ai-specific context paragraph and prose output are dropped in favor of N
+strict-JSON missions. `plan_missions()` makes one `complete_json` call,
+validates strictly (`CouncilError` on bad shape/empty prompt/<1
+mission/case-insensitive duplicate labels), truncates extras past N.
+`build_context()` feeds the Council the owner interest verbatim + recent
+frontier/feedback/mission-history, each bounded by a cfg value -- Goodhart
+firewall asserted by test: never `min_score`, a `models.WEIGHTS`
+name/dimension, `final_score` or `confidence`.
+
+Durable state: `search_generations`/`search_missions` (schema.sql, additive)
++ thin db.py helpers, most notably `lease_missions()` (atomic `BEGIN
+IMMEDIATE` claim, PENDING-check inside the same transaction -- a post-UPDATE
+SELECT keyed on `leased_at` would misfire on two leases in the same
+wall-clock second) and `recover_stale_missions()` (expired `RUNNING` ->
+PENDING, or FAILED once `attempts` >= `mission_max_attempts`).
+`discovery/missions.py`'s `web_tick()` (`python -m app web-tick`, scheduled
+as `collect-web` every `interval_web_seconds`, now 60s default): recover
+stale leases -> replenish AT MOST ONE owner interest below
+`mission_low_water` (one Council call/tick -- self-populates an empty DB one
+interest at a time, never a burst) -> lease a fair round-robin slice
+(`missions_per_tick`) across owner interests -> execute each independently
+via `mission_provider` (default `chatgpt_browser`)'s `search_json`, framed
+as an iterative research mission, `_search.to_items()` -> stamp provenance
+(`generation_id`/`mission_id`/`mission_label`/`prompt_sha256`) into
+`item.metadata` -> `pipeline.ingest()`/`deliver()`, the same path every
+other collector uses (dedup/matching/scoring/budgets/Telegram untouched).
+One mission's failure never aborts another; a dead mission provider fails
+preflight and leases/spends nothing (scoring still uses `cfg.provider`,
+unchanged). `_score_backlog()` deliberately not called here (would spend
+`max_scores_per_cycle` every minute). `discovery/collectors/web_search.py`
+survives only as manual `discover`/`run-once --source web_search` plus a
+bounded fallback: one `static-fallback` mission queued after
+`council_max_consecutive_failures` Council failures in a row for an
+interest. `pipeline.budgets_for(cfg)` factors the exploit/explore `Budget`
+pair out of `run_once()`, now shared with `web_tick()` -- the one refactor
+this step allows itself. 14 new cfg knobs (`council_*`/`mission_*`,
+`DISCOVERY_*` env-backed), plus `interval_web_seconds` default 4h -> 60s.
+31 new offline tests (`CouncilTests`, `MissionDbTests`, `WebTickTests` --
+fake mission + fake scoring providers, no Chrome/CDP/network), 370 -> 401,
+all green.
+
 ## service hardening (step-01): no more in-process scheduler
 `discovery/scheduler.py` and `run` are DELETED; `ops/install_tasks.py` is the
 scheduler now: six Windows Scheduled Tasks (`internet-discovery-collect-
