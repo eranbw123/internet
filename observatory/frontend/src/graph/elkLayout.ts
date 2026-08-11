@@ -5,7 +5,6 @@
 // so this module lets ELK own x (and a within-lane ordering hint) and then
 // remaps y into fixed swimlane bands as a post-pass -- a standard technique
 // for swimlane graphs on top of a layered layout engine.
-import type ELK from "elkjs/lib/elk.bundled.js";
 import type { DisplayGraph } from "./assemble";
 import { swimlaneRank } from "./assemble";
 import type { ID, NodeSummary } from "../types";
@@ -115,8 +114,13 @@ export async function computeLayout(graph: DisplayGraph, elk: ElkLike): Promise<
 let _defaultElk: ElkLike | null = null;
 export async function defaultElk(): Promise<ElkLike> {
   if (!_defaultElk) {
-    const ELKCtor = (await import("elkjs/lib/elk.bundled.js")).default as unknown as new () => ELK;
-    _defaultElk = new ELKCtor() as unknown as ElkLike;
+    // elkjs's bundled entry ships as a plain JS UMD module with no bundled
+    // .d.ts on this exact subpath -- imported untyped (`as unknown as ...`)
+    // and immediately narrowed to our own minimal ElkLike shape (above)
+    // rather than trusting elkjs's own (unverified in this sandbox, see
+    // PROJECT_STATE.md) type surface.
+    const mod = (await import("elkjs/lib/elk.bundled.js")) as unknown as { default: new () => ElkLike };
+    _defaultElk = new mod.default();
   }
   return _defaultElk;
 }

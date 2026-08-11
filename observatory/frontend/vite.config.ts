@@ -1,4 +1,10 @@
-import { defineConfig } from "vite";
+// defineConfig comes from "vitest/config", not "vite" -- it re-exports
+// vite's own defineConfig merged with the `test` option's types. Importing
+// from plain "vite" type-checks fine at runtime (Vite silently ignores an
+// unknown `test` key) but fails `tsc -b` (part of `npm run build`, see
+// package.json) with an excess-property error on this file's own object
+// literal, since `test` isn't part of vite's UserConfig.
+import { defineConfig } from "vitest/config";
 import react from "@vitejs/plugin-react";
 
 // Built output is committed (observatory/static/) and served by the task-2

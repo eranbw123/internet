@@ -643,6 +643,29 @@ filenames and `emptyOutDir: true`, and `index.html`'s script tag points at
 suites (458 + 10 + 65) are unaffected by this task and still green --
 nothing here touches `discovery/`.
 
+**Repair (still npm-blocked):** this repair session re-confirmed the same
+sandbox restriction (`npm`/`npx`/`corepack`/`yarn` all refused before
+reaching a shell, no interactive approval available) -- still no build, no
+`tsc`, no `vitest` run, `observatory/static/` is still task 2's placeholder.
+Since npm itself can't be exercised, this pass instead did a manual
+type-correctness review of the unbuilt TypeScript and fixed two concrete,
+`tsc -b`-breaking defects found that way: `vite.config.ts` imported
+`defineConfig` from `"vite"` instead of `"vitest/config"`, so its `test`
+option (required for `vitest run` to pick up `environment`/`setupFiles`)
+would have failed strict type-checking as an excess property the moment
+`npm run build`'s `tsc -b` step actually ran; and `graph/elkLayout.ts`'s
+`import("elkjs/lib/elk.bundled.js")` had no matching declaration file on
+that exact subpath, which `tsc -b` (strict mode, no implicit any) would
+also have rejected -- fixed with a small ambient `src/elkjs-bundled.d.ts`
+shim typed `any`, since `elkLayout.ts` already narrows every real elkjs
+value down to this repo's own minimal `ElkLike` interface immediately after
+import and never otherwise relies on elkjs's shipped types. Both fixes are
+inert until a session with npm access actually runs the build to find out
+whether further errors remain -- they are the two defects reachable by
+manual review, not a guarantee of a clean build. Canonical Python suites
+re-verified green (458 + 10 + 65) after these changes, which touch nothing
+in `discovery/`.
+
 ## chatgpt_browser provider reconciliation (step-12 task 1)
 Ported verbatim from owner `main` (which predates steps 06-10, so was reconciled
 by hand, file by file, not merged): `discovery/providers/chatgpt_browser.py`
