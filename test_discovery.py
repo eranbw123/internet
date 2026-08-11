@@ -6685,7 +6685,7 @@ class TracePlantedSecretTests(unittest.TestCase):
     def test_planted_secrets_are_redacted_everywhere_they_could_land(self):
         secrets = {
             "TELEGRAM_BOT_TOKEN": "tg-planted-secret-001",
-            "ANTHROPIC_API_KEY": "sk-ant-planted-secret-002",
+            "ANTHROPIC_API_KEY": "anthropic-planted-secret-002",
             "FIXTURE_SESSION_COOKIE": "cookie-planted-secret-003",
         }
         with mock.patch.dict(os.environ, secrets, clear=False):
