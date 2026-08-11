@@ -47,7 +47,8 @@ a long-lived session.
 | Command | What it does |
 | --- | --- |
 | `init` | Create/upgrade `discovery.db` and load `interests.json` |
-| `run-once [--source X]` | One collect → score → notify cycle. Gated by a provider preflight — exits 3 without touching a collector/LLM if Chrome/CDP is down |
+| `run-once [--source X]` | One collect → score → notify cycle (stocks/youtube; web discovery is scheduled via `web-tick` instead, see below). Gated by a provider preflight — exits 3 without touching a collector/LLM if Chrome/CDP is down |
+| `web-tick` | One continuous Council-driven web discovery tick — replenish, lease and execute a fair slice of pending research missions through the real pipeline. Gated by the mission provider's own preflight, same exit-3 convention — see [Continuous web discovery](#continuous-web-discovery-council-missions) |
 | `listen` | Long-polls Telegram for feedback buttons, blocking — interactive use |
 | `listen --drain` | One bounded feedback pass instead of blocking — for a scheduled task |
 | `digest` | Send the pending Discovery digest now |
@@ -212,7 +213,7 @@ above is the only way to see what this repo would read.
 
 | Source | Status | What it does |
 | --- | --- | --- |
-| `web_search` | working | The provider's server-side web search returns candidate articles |
+| `web_search` | working | The provider's server-side web search returns candidate articles. Scheduled discovery no longer calls this directly -- see [Continuous web discovery](#continuous-web-discovery-council-missions); `discover web_search` / `run-once --source web_search` still work standalone |
 | `stocks` | working | Notable price moves via `watch.py`'s Yahoo fetch |
 | `youtube` | working | Recent uploads/search results; transcript available → one candidate **per segment**, otherwise one **video-level** candidate (title + description) |
 
@@ -223,6 +224,46 @@ logged and skipped; the rest of the cycle still runs. `conn` is read-only and
 exists for one job: checking what's already stored so a collector can skip work
 it would otherwise *pay* for (`stocks`' catalyst explanation, `youtube`'s
 transcript fetch) only for dedup to discard it a moment later.
+
+## Continuous web discovery (Council missions)
+
+`python -m app web-tick` replaces the old periodic `run-once --source
+web_search` batch as the scheduled path for web discovery (see [Running it
+as an appliance](#running-it-as-an-appliance) -- the `collect-web` task now
+runs this every `DISCOVERY_INTERVAL_WEB` seconds, default 60). Instead of one
+static prompt per interest every few hours, a durable queue of
+Council-generated research missions is continuously replenished and drained:
+
+1. `discovery/council.py` simulates an "LLM Council" (five independent
+   advisor personas → anonymized peer review → Chairman synthesis, ported
+   from the sibling `ai` repo's `council_bot.py`) in one `complete_json`
+   call, returning N genuinely distinct research missions for one interest
+   (label + rationale + a complete, self-contained executor prompt). The
+   Council only ever sees the interest's own definition, recent discovery
+   frontier, recent feedback and mission history -- never `min_score`,
+   scoring dimensions, or anything else it could be tempted to game.
+2. Each tick reclaims stale mission leases, replenishes **at most one**
+   owner interest whose `PENDING` mission count is below
+   `DISCOVERY_MISSION_LOW_WATER`, then leases and executes a fair slice
+   (`DISCOVERY_MISSIONS_PER_TICK`) of pending missions across owner
+   interests -- round-robin, so one interest's queue never starves another.
+   An interest whose most recent planning call just failed is skipped by
+   replenish for `DISCOVERY_MISSION_RETRY_SECONDS`, so a broken Council
+   can't burn a real provider call on it every single tick.
+3. Every leased mission runs independently via the search-capable
+   `DISCOVERY_MISSION_PROVIDER` (default `chatgpt_browser`); a failure in
+   one mission is recorded and never stops the others. Discoveries flow
+   through the exact same `pipeline.ingest()`/`deliver()` as every other
+   collector -- same dedup, matching, scoring, budgets and Telegram format.
+4. If Council generation fails `DISCOVERY_COUNCIL_MAX_CONSECUTIVE_FAILURES`
+   times in a row for an interest, one `static-fallback` mission (the old
+   `web_search.PROMPT`) is queued so that interest keeps producing while the
+   Council is down.
+
+All state lives in `search_generations`/`search_missions` (SQLite) -- a
+tick is short-lived, idempotent and safe to overlap; a crash mid-tick just
+leaves a mission `RUNNING` until its lease expires, at which point the next
+tick reclaims it. There is still no in-process scheduler.
 
 ### `youtube`
 
@@ -415,6 +456,10 @@ is worth keeping. It reports:
   means the bar is too low.
 - **Notifications per interest** — which interests are actually producing, and
   what share of their scored items clear their own `min_score`.
+- **Missions** — [Council mission](#continuous-web-discovery-council-missions)
+  generation done/failed counts in the window, plus the mission queue's
+  all-time status breakdown (pending/running/done/failed) — whether the
+  Council is actually planning and whether missions are draining or piling up.
 - **Feedback rates** — 🔥 / 👍 / 👎 / 🗑 as a share of what you rated, plus how
   much of what was sent you bothered to rate at all.
 - **Average score per feedback verdict** — the one number that says whether the
@@ -440,7 +485,7 @@ day, so a window is just a date filter.
 | `CLAUDE_ORG_ID` | *(none)* | **Required** for the default provider — your claude.ai organization id |
 | `CLAUDE_BROWSER_PORT` | `9222` | Chrome DevTools port the browser providers attach to |
 | `CHATGPT_BROWSER_PORT` | *(CLAUDE_BROWSER_PORT)* | Chrome DevTools port for `chatgpt_browser`; falls back to `CLAUDE_BROWSER_PORT`, then 9222 |
-| `DISCOVERY_CHROME_LAUNCH_CMD` | *(none)* | Optional `cmd /d /c` command `run-once` runs ONCE if the provider preflight check finds Chrome/CDP down. Empty ⇒ never spawn anything. **Must be a detached form** (e.g. `start "" "C:\...\chrome.exe" --remote-debugging-port=9222`) — a non-detached command blocks run-once until the wait below is hit |
+| `DISCOVERY_CHROME_LAUNCH_CMD` | *(none)* | Optional `cmd /d /c` command `run-once`/`web-tick` run ONCE if the provider preflight check finds Chrome/CDP down. Empty ⇒ never spawn anything. **Must be a detached form** (e.g. `start "" "C:\...\chrome.exe" --remote-debugging-port=9222`) — a non-detached command blocks run-once until the wait below is hit |
 | `DISCOVERY_CHROME_LAUNCH_WAIT_SECONDS` | `15` | How long to wait after `DISCOVERY_CHROME_LAUNCH_CMD` before re-checking preflight (also bounds how long the launch command itself is allowed to run) |
 | `ANTHROPIC_API_KEY` | *(none)* | Required only when `DISCOVERY_PROVIDER=anthropic` |
 | `OPENAI_API_KEY` | *(none)* | Required only when `DISCOVERY_PROVIDER=openai` |
@@ -456,13 +501,27 @@ day, so a window is just a date filter.
 | `DISCOVERY_DERIVED_MAX_ACTIVE` | `5` | Max derived interests promoted to `inferred` (active, scored) at once |
 | `DISCOVERY_DERIVED_MIN_SCORE` | `0.80` | Floor `min_score` a derived interest is held to, at or above today's owner bars |
 | `DISCOVERY_INTERVAL_STOCKS` | `3600` | `run-once --source stocks` cadence, seconds (read by the OS scheduler) |
-| `DISCOVERY_INTERVAL_WEB` | `14400` | `run-once --source web_search` cadence, seconds |
+| `DISCOVERY_INTERVAL_WEB` | `60` | `web-tick` cadence, seconds — see [Continuous web discovery](#continuous-web-discovery-council-missions) |
 | `DISCOVERY_INTERVAL_YOUTUBE` | `14400` | `run-once --source youtube` cadence, seconds |
 | `DISCOVERY_DIGEST_TIME` | `08:00` | Local time-of-day the `digest` job sends the Discovery digest |
 | `DISCOVERY_DIGEST_MAX` | `10` | Discovery items per digest, highest score first |
 | `DISCOVERY_MIN_MATCH` | `0.25` | Pre-filter: weakest interest match worth scoring |
 | `DISCOVERY_MIN_TEXT_CHARS` | `120` | Pre-filter: least text worth sending to an LLM |
 | `DISCOVERY_EXPLORE_MAX_SCORES` | `5` | Separate per-cycle LLM score cap for exploration (derived/inferred-interest) items — see [Exploration lane](#exploration-lane-step-10) |
+| `DISCOVERY_MISSION_PROVIDER` | `chatgpt_browser` | Search-capable provider `web-tick` executes missions with (and plans missions with, via the Council) |
+| `DISCOVERY_MISSION_MODEL` | per `DISCOVERY_MISSION_PROVIDER` | Model for the mission provider — same forms as `DISCOVERY_MODEL` |
+| `DISCOVERY_COUNCIL_MISSIONS_PER_GENERATION` | `6` | Missions requested per Council planning call |
+| `DISCOVERY_MISSION_LOW_WATER` | `3` | Replenish an interest's mission queue once its `PENDING` count drops below this |
+| `DISCOVERY_MISSIONS_PER_TICK` | `2` | Missions leased + executed per `web-tick`, round-robined fairly across owner interests |
+| `DISCOVERY_MISSION_MAX_SEARCHES` | `6` | `search_json`'s own max searches, per mission |
+| `DISCOVERY_MISSION_MAX_RESULTS` | `6` | CandidateItems kept per mission |
+| `DISCOVERY_COUNCIL_FRONTIER_ITEMS` | `15` | Recent candidate items shown to the Council as planning context |
+| `DISCOVERY_COUNCIL_FEEDBACK_ITEMS` | `10` | Recent feedback rows shown to the Council |
+| `DISCOVERY_COUNCIL_HISTORY_MISSIONS` | `12` | Recent past missions (label + rationale) shown to the Council, so it doesn't repeat an angle |
+| `DISCOVERY_MISSION_LEASE_SECONDS` | `900` | How long a leased (`RUNNING`) mission holds its lease before a future tick reclaims it as stale |
+| `DISCOVERY_MISSION_MAX_ATTEMPTS` | `3` | Attempts before a mission is retired to `FAILED` |
+| `DISCOVERY_MISSION_RETRY_SECONDS` | `1800` | Cool-off before a failed mission is retried; also how long an interest whose latest Council planning call just failed is skipped by replenish |
+| `DISCOVERY_COUNCIL_MAX_CONSECUTIVE_FAILURES` | `3` | Consecutive Council planning failures for one interest before the static fallback mission is queued |
 
 `--provider`, `--model` and `--db` override the environment for one run.
 
@@ -474,7 +533,10 @@ There is no in-process scheduler (see [How a cycle works](#how-a-cycle-works))
 (`internet-discovery-collect-stocks/-web/-youtube`, `-digest`, `-feedback`,
 `-health`), one XML task per job, trigger intervals read straight from
 `config.load()` so a `.env` change and a re-`--install` is all it takes to
-reschedule.
+reschedule. `collect-web` runs `web-tick` (see [Continuous web
+discovery](#continuous-web-discovery-council-missions)) on
+`DISCOVERY_INTERVAL_WEB`'s cadence, default every 60 seconds -- not a
+periodic batch collect.
 
 **One manual prerequisite:** Chrome has to be running, in the same
 interactive Windows session the tasks run in, launched with
@@ -514,7 +576,7 @@ logs.
 python test_discovery.py
 ```
 
-370 tests, network fully stubbed — they never hit an LLM API, Telegram, or
+405 tests, network fully stubbed — they never hit an LLM API, Telegram, or
 Yahoo. The provider seam is the whole stub: a fake object with `complete_json`
 and `search_json`.
 

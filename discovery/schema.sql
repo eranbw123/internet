@@ -171,3 +171,56 @@ CREATE TABLE IF NOT EXISTS service_state (
     value       TEXT NOT NULL,
     updated_at  TEXT NOT NULL
 );
+
+-- Continuous Council-driven web discovery (discovery/council.py,
+-- discovery/missions.py). One row per Council planning attempt for one
+-- interest, success or failure -- the web tick reads this to decide both
+-- whether an interest still needs replenishing and (via a run of
+-- consecutive 'FAILED' rows) whether the static fallback query should kick
+-- in for that interest.
+CREATE TABLE IF NOT EXISTS search_generations (
+    id                  INTEGER PRIMARY KEY,
+    interest_key        TEXT NOT NULL,
+    created_at          TEXT NOT NULL,
+    status              TEXT NOT NULL,             -- PENDING | DONE | FAILED
+    provider            TEXT NOT NULL DEFAULT '',
+    model               TEXT NOT NULL DEFAULT '',
+    missions_requested  INTEGER NOT NULL DEFAULT 0,
+    missions_returned   INTEGER NOT NULL DEFAULT 0,
+    error               TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_generations_interest
+    ON search_generations(interest_key, created_at);
+
+-- One row per research mission -- either Council-planned (generation_id set)
+-- or the bounded static fallback (generation_id NULL, label
+-- 'static-fallback'). Durable runtime state: after a process death, machine
+-- sleep, provider crash or restart, a fresh web_tick() resumes from these
+-- rows alone -- there is no in-memory carry-over and no in-process
+-- scheduler. See discovery/db.py's lease_missions()/recover_stale_missions()
+-- for the atomicity/staleness contract.
+CREATE TABLE IF NOT EXISTS search_missions (
+    id                 INTEGER PRIMARY KEY,
+    generation_id      INTEGER REFERENCES search_generations(id),
+    interest_key       TEXT NOT NULL,
+    label              TEXT NOT NULL,
+    rationale          TEXT NOT NULL DEFAULT '',
+    prompt             TEXT NOT NULL,
+    prompt_sha256      TEXT NOT NULL,
+    status             TEXT NOT NULL DEFAULT 'PENDING',   -- PENDING|RUNNING|DONE|FAILED
+    attempts           INTEGER NOT NULL DEFAULT 0,
+    created_at         TEXT NOT NULL,
+    leased_at          TEXT,
+    lease_expires_at   TEXT,
+    started_at         TEXT,
+    finished_at        TEXT,
+    next_attempt_at    TEXT,           -- retry cool-off after a failed attempt
+    items_returned     INTEGER NOT NULL DEFAULT 0,
+    last_error         TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_search_missions_interest_status
+    ON search_missions(interest_key, status);
+CREATE INDEX IF NOT EXISTS idx_search_missions_status_lease
+    ON search_missions(status, lease_expires_at);

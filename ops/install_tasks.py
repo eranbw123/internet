@@ -42,7 +42,10 @@ PREFIX = "internet-discovery-"
 # limit than the rest -- they're the ones that can spend an LLM budget.
 _TASK_SPECS = [
     ("collect-stocks", ["run-once", "--source", "stocks"], "interval", "interval_stocks_seconds", "PT30M"),
-    ("collect-web", ["run-once", "--source", "web_search"], "interval", "interval_web_seconds", "PT30M"),
+    # Continuous Council-driven web discovery (discovery/missions.py) --
+    # `web-tick` runs every interval_web_seconds (default 60s), not a
+    # periodic full-interest batch collect.
+    ("collect-web", ["web-tick"], "interval", "interval_web_seconds", "PT30M"),
     ("collect-youtube", ["run-once", "--source", "youtube"], "interval", "interval_youtube_seconds", "PT30M"),
     ("digest", ["digest"], "daily", "digest_time", "PT10M"),
     ("feedback", ["listen", "--drain"], "interval", 5 * 60, "PT10M"),

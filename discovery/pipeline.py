@@ -89,8 +89,7 @@ def run_once(conn, provider, cfg, sources=None, dry_run=False):
     ones are left pending for send_digest() to batch."""
     interests = db.active_interests(conn)
     counts = Counter()
-    budget = Budget(cfg.max_scores_per_cycle)
-    explore_budget = Budget(cfg.explore_max_scores_per_cycle if cfg.dynamic_interests else 0)
+    budget, explore_budget = budgets_for(cfg)
 
     for interest in interests:
         for item in _collect(conn, interest, cfg, provider, sources):
@@ -130,6 +129,16 @@ def outcome_metric(outcome):
     """The db.bump() name for one Outcome -- explore_<stage> for the
     exploration lane, <stage> unprefixed for exploit (today's behavior)."""
     return f"explore_{outcome.stage}" if outcome.lane == "explore" else outcome.stage
+
+
+def budgets_for(cfg):
+    """The (exploit, explore) Budget pair for one cycle -- shared by
+    run_once() and missions.web_tick() so both draw from the same cfg knobs
+    instead of duplicating this two-line construction."""
+    return (
+        Budget(cfg.max_scores_per_cycle),
+        Budget(cfg.explore_max_scores_per_cycle if cfg.dynamic_interests else 0),
+    )
 
 
 class Budget:
