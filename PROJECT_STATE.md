@@ -363,7 +363,7 @@ All timestamps UTC via `db.now()`/`db.ago()`. No token metering on
 claude_chat (calls only).
 
 ## Tests
-`python test_discovery.py` (323) + `python test_watch.py` (10), offline, both
+`python test_discovery.py` (345) + `python test_watch.py` (10), offline, both
 green; CI on push/PR.
 
 ## Known issues
