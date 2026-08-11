@@ -61,7 +61,7 @@ a long-lived session.
 | `health [--notify]` | Job staleness, provider reachability, pending/abandoned sends; `--notify` alerts on degraded/recovery, rate-limited |
 | `personal-state [--path]` | Print the sibling `ai` repo's personal-state artifact as this repo would read it — see [Personal-state contract](#personal-state-contract) |
 | `teach [--list\|--explain\|--send]` | Label the highest information-value scored-but-unlabeled items — see [Teach](#teach) |
-| `trace-fixture` | Build the deterministic trace acceptance fixture (offline, fake providers) at `--db PATH` — see [Trace backbone](#trace-backbone) |
+| `trace-fixture --db PATH` | Build the deterministic trace acceptance fixture (offline, fake providers) at `PATH`. `--db` is required — refuses (exit 2) rather than defaulting to the production `discovery.db`, since the fixture writes real interests/items/scores/feedback through production code paths — see [Trace backbone](#trace-backbone) |
 
 Run it from the repo root — the `stocks` collector imports `watch.py`.
 `python -m app` and `python -m discovery` are the same CLI. Global flags
@@ -536,7 +536,7 @@ this get notified?") can be answered by reading, not by adding print
 statements:
 
 - **`trace_runs`** — one row per command invocation (`kind`: `web-tick`,
-  `run-once`, `feedback`, `fixture`, ...).
+  `run-once`, `digest`, `feedback`, `fixture`, ...).
 - **`trace_nodes`** — one row per step (a candidate, a match, a score, a
   Council advisor, a mission, a Telegram send, ...). Nodes that correspond to
   a DB row carry `entity_type`/`entity_id` (`candidate_items`, `scores`,
@@ -561,10 +561,12 @@ they were at scoring time** — a later change to an interest's bar never
 rewrites what an old trace says happened.
 
 Redaction (`discovery/trace.py`'s `redact`/`redact_json`): every environment
-variable whose name matches `(?i)(token|secret|key|password|cookie|auth)` has
-its literal *value* substituted with `[REDACTED:<VARNAME>]` everywhere it
-would otherwise appear in a trace row (config snapshots, prompts, responses).
-Everything else — prompt/interest content — is stored byte-exact.
+variable whose name matches `(?i)(token|secret|key|password|cookie|auth)` and
+whose value is at least 8 characters has its literal *value* substituted with
+`[REDACTED:<VARNAME>]` everywhere it would otherwise appear in a trace row
+(config snapshots, prompts, responses) — the length floor keeps a short
+secret-shaped value (e.g. `AUTH_MODE=on`) from substring-rewriting unrelated
+stored text. Everything else — prompt/interest content — is stored byte-exact.
 
 **Council deliberation and scoring reasoning** ride the SAME `complete_json`
 call the missions/score already needed — no extra spend. The Council's
@@ -581,7 +583,9 @@ deterministic fixture (one interest, one Council generation with three
 missions, a duplicate, a prefilter rejection, a scoring failure + retry, a
 below-bar score, and one delivered + feedback-rated discovery) against fake
 providers — offline, for the Datasette plugin/React UI in the next two steps
-to build and test against without a live Chrome/CDP session.
+to build and test against without a live Chrome/CDP session. `--db` is
+required; the command exits 2 rather than silently writing this fixture
+data — including a real feedback row — into the production `discovery.db`.
 
 ## Running it as an appliance
 
@@ -634,7 +638,7 @@ logs.
 python test_discovery.py
 ```
 
-427 tests, network fully stubbed — they never hit an LLM API, Telegram, or
+445 tests, network fully stubbed — they never hit an LLM API, Telegram, or
 Yahoo. The provider seam is the whole stub: a fake object with `complete_json`
 and `search_json`.
 
