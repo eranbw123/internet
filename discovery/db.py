@@ -102,6 +102,8 @@ def init(conn):
         ("interests", "layer", "TEXT NOT NULL DEFAULT 'owner'"),
         ("interests", "provenance", "TEXT NOT NULL DEFAULT '{}'"),
         ("interests", "last_observed_at", "TEXT"),
+        ("candidate_items", "duplicate_of", "INTEGER REFERENCES candidate_items(id)"),
+        ("candidate_items", "dup_reason", "TEXT"),
     ):
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
@@ -400,6 +402,36 @@ def mark_score_attempt(conn, item_id):
     conn.commit()
 
 
+def near_dup_pool(conn, since, exclude_id=None, limit=2000):
+    """Recently stored articles the near-dup judge may compare against:
+    newest first, never items already linked as duplicates (a story chains to
+    its first telling, not to another repeat). `since` bounds cost, not
+    correctness -- see dedup.llm_near_duplicate()."""
+    return conn.execute(
+        """
+        SELECT id, title, substr(text, 1, 400) AS snippet, published_at,
+               first_seen_at, source, metadata
+        FROM candidate_items
+        WHERE type = 'article' AND first_seen_at >= ? AND duplicate_of IS NULL
+          AND id != ?
+        ORDER BY id DESC LIMIT ?
+        """,
+        (since, exclude_id or 0, limit),
+    ).fetchall()
+
+
+def mark_near_duplicate(conn, item_id, original_id, reason):
+    """Link a stored item to the earlier item that already tells its story.
+    The link, not deletion, is the suppression: linked items are excluded from
+    backlog scoring, delivery and the judge's own pool by SQL, and a count of
+    links onto one item is its corroboration record."""
+    conn.execute(
+        "UPDATE candidate_items SET duplicate_of = ?, dup_reason = ? WHERE id = ?",
+        (original_id, reason, item_id),
+    )
+    conn.commit()
+
+
 # --- interest matches --------------------------------------------------------
 
 def save_matches(conn, item_id, matches):
@@ -475,8 +507,10 @@ def pending_notifications(conn, max_attempts=MAX_SEND_ATTEMPTS, retry_after_seco
                s.created_at AS score_created_at
         FROM scores s
         JOIN interests n ON n.id = s.interest_id
+        JOIN candidate_items i ON i.id = s.item_id
         WHERE s.final_score >= n.min_score
           AND n.active = 1
+          AND i.duplicate_of IS NULL
           AND NOT EXISTS (
               SELECT 1 FROM notifications x
               WHERE x.score_id = s.id

@@ -2,6 +2,34 @@
 
 Updated 2026-08-11. Imported by `CLAUDE.md`. Current state only — not a log.
 
+## LLM-confirmed near-duplicate dedup
+The three exact-hash layers miss the same story RE-TOLD (prod double-sends:
+items 11↔173, 22↔174 differ only by a title suffix; owner complaint: "VPG
+down 25%" delivered 3×). New fourth layer in `ingest()` after the prefilter,
+before scoring, article-type only (`market_event` is structurally deduped by
+`ticker:date`; youtube is cross-medium, out of scope): `dedup.find_suspects()`
+— free token-overlap (≥3 shared, overlap coeff ≥0.4, over title + 300-char
+snippet via `normalize._comparable`, stopword-stripped so numbers like "25"
+count) plus shared `metadata.ticker` (stocks explanation articles), pool =
+stored articles from the last `dedup_window_days`, capped `POOL_MAX_ROWS`
+newest, never already-linked rows. A non-empty suspect list buys ONE
+`provider.complete_json` (`NEAR_DUP_SCHEMA` `{duplicate_of, reason}`,
+max_tokens 1000, dates shown — the window is a cost bound, NOT the dedup
+rule). Confirmed: `candidate_items.duplicate_of`/`dup_reason` set (schema.sql
++ additive ALTERs in `db.init`), `Outcome`/metric stage `near_duplicate`, item
+never scored — the judge call replaces the strictly larger scoring call it
+saves. Linked items are SQL-excluded from `db.pending_notifications` (new
+`candidate_items` join) and `_score_backlog`. Fail-open on judge error;
+`force=True` (`score --force`) bypasses. Knobs: `dedup_llm`
+(`DISCOVERY_DEDUP_LLM`, default ON), `dedup_window_days=30`,
+`dedup_max_candidates=6`. Test seam: `FakeProvider` gained
+`dup_answers`/`dedup_prompts` (judge prompts recognised by the
+`<already_stored>` marker, unmatched → null verdict; `LaneProvider` defers
+the same way), so `len(provider.prompts)` still counts scoring spend only.
+9 new `NearDupTests` incl. frozen Nebius regression titles. Prod-copy
+measurement (2026-08-11, 496 articles): both Nebius repeats retrieve their
+originals; 10% of articles would consult the judge at all.
+
 ## chatgpt_browser provider reconciliation (step-12 task 1)
 Ported verbatim from owner `main` (which predates steps 06-10, so was reconciled
 by hand, file by file, not merged): `discovery/providers/chatgpt_browser.py`
@@ -444,7 +472,7 @@ All timestamps UTC via `db.now()`/`db.ago()`. No token metering on
 claude_chat (calls only).
 
 ## Tests
-`python test_discovery.py` (345) + `python test_watch.py` (10), offline, both
+`python test_discovery.py` (429) + `python test_watch.py` (10), offline, both
 green; CI on push/PR.
 
 ## Known issues
