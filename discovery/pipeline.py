@@ -305,10 +305,11 @@ def _score(conn, provider, item, matches, detail="", lane="exploit", tracer=None
         score_node, status="ok", summary=score.reason,
         output_json={"final_score": score.final_score, "confidence": score.confidence},
     )
-    tracer.node(
+    debug_node = tracer.node(
         tracer.run_id, "score-debug", entity_type="scores", entity_id=score.id,
         label="reasoning", output_json=score.debug,
     )
+    tracer.edge(score_node, debug_node, "generated")
     # Threshold snapshot: the interest + bar IN FORCE AT THIS MOMENT, so a
     # later change to interests.min_score never rewrites what this trace
     # says happened (trace_nodes/trace_edges are append-only).
@@ -470,13 +471,21 @@ def _send_one(conn, cfg, row, item, interest, dry_run, lane_counts=None, tracer=
     )
     if prior_render_node is not None:
         tracer.edge(prior_render_node, render_node, "retried_as")
+    else:
+        # First attempt: connect the render back to the score that cleared
+        # the bar -- 'threshold' is the node entity-linked to entity_type
+        # 'scores' (see pipeline._score()'s own comment on why 'score-attempt'
+        # can't be). Only on the first attempt: a retry already has its own
+        # retried_as chain back to the same threshold node transitively.
+        threshold_node = tracer.find_entity_node("scores", row["score_id"], node_type="threshold")
+        tracer.edge(threshold_node, render_node, "rendered")
 
     ok = notify.send(cfg, text, reply_markup=notify.feedback_keyboard(row["score_id"]), dry_run=dry_run)
     # Recorded either way: a failed send stays recorded as not-ok rather
     # than being retried forever on every cycle.
-    db.record_notification(conn, row["score_id"], "telegram", ok)
+    notification_id = db.record_notification(conn, row["score_id"], "telegram", ok)
     outcome_node = tracer.node(
-        tracer.run_id, "notification", entity_type="notifications", entity_id=row["score_id"],
+        tracer.run_id, "notification", entity_type="notifications", entity_id=notification_id,
         label="telegram", status="ok" if ok else "error",
     )
     tracer.edge(render_node, outcome_node, "sent" if ok else "failed")

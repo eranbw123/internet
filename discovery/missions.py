@@ -93,12 +93,12 @@ def _web_tick(conn, cfg, provider, dry_run, tracer):
 
     all_interests = db.active_interests(conn)
     owner_interests = [i for i in all_interests if i.layer == "owner"]
-    tracer.node(
+    interest_state_node = tracer.node(
         tracer.run_id, "interest-state", label="active owner interests",
         input_json={"owner_interests": [i.key for i in owner_interests]},
     )
 
-    _replenish(conn, cfg, mission_provider, owner_interests, tracer)
+    _replenish(conn, cfg, mission_provider, owner_interests, tracer, interest_state_node)
 
     mission_ids = _select_fair(conn, cfg, owner_interests)
     leased_ids = db.lease_missions(conn, mission_ids, cfg.mission_lease_seconds)
@@ -126,7 +126,7 @@ def _web_tick(conn, cfg, provider, dry_run, tracer):
 
 # --- step 2: replenish at most one interest -----------------------------------
 
-def _replenish(conn, cfg, mission_provider, owner_interests, tracer):
+def _replenish(conn, cfg, mission_provider, owner_interests, tracer, interest_state_node=None):
     """One Council call per tick, at most: the owner interest with the
     fewest PENDING missions below cfg.mission_low_water, tie-broken by
     longest-since-last-generation (never-generated sorts first), then by key
@@ -152,7 +152,7 @@ def _replenish(conn, cfg, mission_provider, owner_interests, tracer):
         return
     candidates.sort(key=lambda c: (c[0], c[1], c[2].key))
     _, _, interest = candidates[0]
-    _generate_for(conn, cfg, mission_provider, interest, tracer)
+    _generate_for(conn, cfg, mission_provider, interest, tracer, interest_state_node)
 
 
 def _last_generation_at(conn, interest_key):
@@ -173,7 +173,7 @@ def _generation_in_cooldown(conn, interest_key, retry_seconds):
     return row["created_at"] > db.ago(retry_seconds)
 
 
-def _generate_for(conn, cfg, mission_provider, interest, tracer):
+def _generate_for(conn, cfg, mission_provider, interest, tracer, interest_state_node=None):
     """The generation row is inserted before build_context()/plan_missions()
     run, and the try/except wraps both -- any exception either can raise
     (CouncilError, a ProviderError, or something a live provider's own
@@ -183,12 +183,13 @@ def _generate_for(conn, cfg, mission_provider, interest, tracer):
     and so this generation is always finalized rather than left orphaned at
     PENDING.
 
-    Trace shape: one 'generation' node (entity-linked to search_generations)
-    -> 'council-context' node (build_context()'s own output) -> 'council'
-    node, which is what the Council's one complete_json() call is attributed
-    to via tracer.calls() -- so its model_calls row (exact prompt, raw reply)
-    lands there -- -> deliberation nodes (see _persist_deliberation) ->
-    per-mission nodes, edge 'generated', ordinal = mission order."""
+    Trace shape: 'interest-state' node -> (edge 'selected') -> one
+    'generation' node (entity-linked to search_generations) -> 'council-context'
+    node (build_context()'s own output) -> 'council' node, which is what the
+    Council's one complete_json() call is attributed to via tracer.calls() --
+    so its model_calls row (exact prompt, raw reply) lands there -- ->
+    deliberation nodes (see _persist_deliberation) -> per-mission nodes, edge
+    'generated', ordinal = mission order."""
     generation_id = db.insert_generation(
         conn, interest.key, mission_provider.name, mission_provider.model,
         cfg.council_missions_per_generation,
@@ -197,6 +198,7 @@ def _generate_for(conn, cfg, mission_provider, interest, tracer):
         tracer.run_id, "generation", entity_type="search_generations", entity_id=generation_id,
         label=f"generation:{interest.key}", input_json={"interest_key": interest.key},
     )
+    tracer.edge(interest_state_node, generation_node, "selected")
     try:
         context = council.build_context(conn, interest, cfg)
         context_node = tracer.node(
@@ -412,6 +414,13 @@ def _execute_mission(conn, cfg, mission_provider, scoring_provider, interests,
         tracer.run_id, "mission-execution", entity_type="search_missions", entity_id=mission_id,
         label=mission["label"], summary=mission["rationale"],
     )
+    # Links this execution back to the 'mission' node _generate_for() wrote
+    # at planning time, when resolvable -- a mission leased on a LATER tick
+    # than the one that generated it (or the static-fallback path, which
+    # writes no 'mission' node) has none to find, and the execution simply
+    # stands alone.
+    planned_node = tracer.find_entity_node("search_missions", mission_id, node_type="mission")
+    tracer.edge(planned_node, mission_node, "executed")
     try:
         prompt = RESEARCH_FRAMING.format(
             max_searches=cfg.mission_max_searches,
@@ -430,21 +439,29 @@ def _execute_mission(conn, cfg, mission_provider, scoring_provider, interests,
 
     # One node per RAW returned result, before dedup/normalization, so a
     # duplicate-rejected or junk (no-url) raw result still has a persistent
-    # branch -- to_items() silently drops both. Correlated back to the
-    # CandidateItem that survives (if any) by url, since to_items() copies
-    # raw['url'] into item.url verbatim before normalize.normalize() runs.
-    raw_node_by_url = {}
+    # branch -- to_items() silently drops both.
+    raw_nodes = []
     for ordinal, raw in enumerate(raw_items):
         raw_node = tracer.node(
             tracer.run_id, "raw-result", label=_raw_label(raw, ordinal),
             input_json=raw if isinstance(raw, dict) else {"value": raw},
         )
         tracer.edge(mission_node, raw_node, "returned", ordinal=ordinal)
-        url = raw.get("url") if isinstance(raw, dict) else None
-        if url and url.strip() and url.strip() not in raw_node_by_url:
-            raw_node_by_url[url.strip()] = raw_node
+        raw_nodes.append(raw_node)
 
-    for item in items:
+    # Paired POSITIONALLY with `items`, not by url: to_items() keeps
+    # raw_items[:limit] in order, dropping only non-dict/no-url entries, so
+    # mirroring that exact filter here gives a 1:1, order-preserving mapping
+    # even when two raw results share a url (the duplicate case) -- a url
+    # keyed lookup would collapse both onto the first raw-result node,
+    # leaving the second (the one actually rejected as a duplicate) with no
+    # outcome edge at all.
+    source_nodes = [
+        raw_node for raw, raw_node in zip(raw_items[: cfg.mission_max_results], raw_nodes)
+        if isinstance(raw, dict) and (raw.get("url") or "").strip()
+    ]
+
+    for item, source_node in zip(items, source_nodes):
         item.origin_interest = mission["interest_key"]
         item.metadata.update(
             generation_id=mission["generation_id"],
@@ -452,7 +469,6 @@ def _execute_mission(conn, cfg, mission_provider, scoring_provider, interests,
             mission_label=mission["label"],
             prompt_sha256=mission["prompt_sha256"],
         )
-        source_node = raw_node_by_url.get(item.url)
         outcome = pipeline.ingest(
             conn, scoring_provider, cfg, item, interests,
             origin_interest=mission["interest_key"], budget=budget, explore_budget=explore_budget,

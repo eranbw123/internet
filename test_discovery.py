@@ -6876,6 +6876,81 @@ class TraceFixtureTests(unittest.TestCase):
         # tracing off is not exercised by the fixture itself -- it always
         # runs with cfg.trace_enabled True (see _build()).
 
+    def test_the_trace_graph_is_a_single_connected_component(self):
+        """Repair regression: interest-state -> generation, mission ->
+        mission-execution, score-attempt -> score-debug and threshold ->
+        render edges were all missing, leaving the fixture's 54 nodes in 8
+        disconnected islands -- a UI could never draw one connected graph
+        from a candidate/score/notification back to the Council that
+        planned it."""
+        conn, _result = self._build()
+        self.addCleanup(conn.close)
+        node_ids = [r["id"] for r in conn.execute("SELECT id FROM trace_nodes")]
+        adjacency = {n: set() for n in node_ids}
+        for row in conn.execute("SELECT from_node_id, to_node_id FROM trace_edges"):
+            adjacency[row["from_node_id"]].add(row["to_node_id"])
+            adjacency[row["to_node_id"]].add(row["from_node_id"])
+
+        seen = set()
+        stack = [node_ids[0]]
+        while stack:
+            node = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            stack.extend(adjacency[node] - seen)
+        self.assertEqual(seen, set(node_ids))
+
+    def test_both_raw_results_sharing_a_url_get_their_own_outcome_edge(self):
+        """Repair regression: raw_node_by_url was first-wins, so BOTH raw
+        results with the same (duplicate) url resolved to the first raw
+        node -- the second (the one actually flagged as a duplicate) had no
+        normalized_to edge of its own at all."""
+        conn, _result = self._build()
+        self.addCleanup(conn.close)
+        raw_rows = conn.execute(
+            "SELECT id, label FROM trace_nodes "
+            "WHERE node_type = 'raw-result' AND label LIKE 'Duplicate Topic Finding%'"
+        ).fetchall()
+        self.assertEqual(len(raw_rows), 2)
+        for row in raw_rows:
+            outgoing = conn.execute(
+                "SELECT relationship FROM trace_edges WHERE from_node_id = ? AND relationship = 'normalized_to'",
+                (row["id"],),
+            ).fetchall()
+            self.assertEqual(len(outgoing), 1, row["label"])
+
+    def test_notification_node_entity_id_is_the_notifications_row_not_the_score(self):
+        conn, _result = self._build()
+        self.addCleanup(conn.close)
+        node = conn.execute(
+            "SELECT entity_id FROM trace_nodes WHERE node_type = 'notification'"
+        ).fetchone()
+        notification_row = conn.execute("SELECT id, score_id FROM notifications").fetchone()
+        self.assertEqual(int(node["entity_id"]), notification_row["id"])
+        self.assertNotEqual(notification_row["id"], notification_row["score_id"])
+
+
+class TraceDigestCmdTests(unittest.TestCase):
+    """Repair regression: the CLI's `digest` command called send_digest()
+    with no tracer/begin_run at all -- the only production path that ever
+    delivers a DISCOVERY item was completely untraced, unlike run-once and
+    web-tick which wrap themselves internally."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def test_digest_cmd_opens_and_closes_a_trace_run(self):
+        from discovery.__main__ import _digest_cmd
+
+        cfg = dataclasses.replace(CFG, trace_enabled=True)
+        code = _digest_cmd(self.conn, cfg, True)
+        self.assertEqual(code, 0)
+        row = self.conn.execute("SELECT kind, status FROM trace_runs").fetchone()
+        self.assertEqual((row["kind"], row["status"]), ("digest", "done"))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

@@ -47,7 +47,7 @@ from collections import Counter
 
 from datetime import datetime, timezone
 
-from . import config, db, feedback_listener, health, interests, missions, personal_state, providers, stats, teach
+from . import config, db, feedback_listener, health, interests, missions, personal_state, providers, stats, teach, trace
 from .collectors import COLLECTORS
 from .models import CandidateItem
 from .notify import FEEDBACK_VERDICTS, print_safe
@@ -274,7 +274,21 @@ def _web_tick_cmd(conn, provider, cfg, dry_run):
 
 
 def _digest_cmd(conn, cfg, dry_run):
-    print(f"sent {send_digest(conn, cfg, dry_run=dry_run)} digest item(s)")
+    """Same run-level trace_runs wrapping run-once/web-tick get (kind='digest',
+    a no-op end to end when cfg.trace_enabled is off) -- this is the only
+    production path that ever sends a DISCOVERY item, so without it the
+    render/notification trace nodes real feedback would need to link back to
+    (see feedback_listener._handle_callback) never existed outside the
+    fixture's own hand-rolled run."""
+    tracer = trace.Tracer(conn, cfg)
+    run_id = tracer.begin_run("digest", provider=cfg.provider, model=cfg.model)
+    try:
+        sent = send_digest(conn, cfg, dry_run=dry_run, tracer=tracer)
+    except Exception as e:  # noqa: BLE001 -- re-raised as-is right after
+        tracer.finish_run(run_id, status="error", error=str(e))
+        raise
+    tracer.finish_run(run_id, status="done")
+    print(f"sent {sent} digest item(s)")
     return 0
 
 

@@ -155,7 +155,8 @@ def _handle_callback(conn, token, callback, cfg=None):
     # trace node's entity link can't be changed after the fact).
     score_node = tracer.find_entity_node("scores", score_id, node_type="threshold")
     tracer.edge(feedback_node, score_node, "feedback_on")
-    notification_node = tracer.find_entity_node("notifications", score_id, node_type="notification")
+    notification_id = db.notification_id_for_score(conn, int(score_id))
+    notification_node = tracer.find_entity_node("notifications", notification_id, node_type="notification")
     tracer.edge(feedback_node, notification_node, "feedback_on")
     api_call(
         token, "answerCallbackQuery",
