@@ -32,6 +32,7 @@ import sys
 import tempfile
 import time
 import unittest
+import urllib.request
 from pathlib import Path
 
 REPO_ROOT = Path(__file__).resolve().parent
@@ -96,16 +97,53 @@ def _wait_cdp_ready(port, timeout=20):
     raise TimeoutError("headless Chrome never exposed a page tab over CDP")
 
 
+def _grant_clipboard_permission(cdp_port, origin):
+    # Headless Chrome never resolves the native clipboard permission prompt
+    # navigator.clipboard.writeText() would otherwise trigger (there's no UI
+    # to answer it in --headless=new) -- the promise just hangs forever
+    # instead of rejecting, which then wedges the tab's own message queue
+    # for every later Runtime.evaluate/Page.navigate call too. Browser.grant
+    # Permissions (a browser-level command, hence the separate connection to
+    # /json/version's browserWebSocketDebuggerUrl rather than the page tab's
+    # own websocket) pre-grants it before any test runs, the same fix
+    # Playwright/Puppeteer apply for clipboard automation.
+    with urllib.request.urlopen(f"http://localhost:{cdp_port}/json/version", timeout=10) as resp:
+        browser_ws_url = json.loads(resp.read().decode("utf-8"))["webSocketDebuggerUrl"]
+    conn = cdp.CDPConnection(browser_ws_url)
+    try:
+        conn.send(
+            "Browser.grantPermissions",
+            {"origin": origin, "permissions": ["clipboardReadWrite", "clipboardSanitizedWrite"]},
+        )
+    finally:
+        conn.close()
+
+
 CHROME_PATH = _find_chrome()
 
 
-@unittest.skipUnless(CHROME_PATH, "no Chrome/Chromium binary found on this machine -- set DISCOVERY_UI_E2E_CHROME")
-class ObservatoryE2ETests(unittest.TestCase):
+class _E2EFixture:
     """One long-lived fixture db + one `ui` server + one headless Chrome
-    instance shared by every test method (each test drives it independently
-    via fresh Page.navigate calls) -- starting all three per test would make
-    an already-slow browser suite far slower for no isolation benefit, since
-    every method only reads."""
+    instance shared by every test method IN ONE TestCase class (each test
+    drives it independently via fresh Page.navigate calls) -- starting all
+    three per test would make an already-slow browser suite far slower for
+    no isolation benefit, since every method only reads.
+
+    Split across two TestCase classes (see below), each with its own
+    fixture, rather than one shared instance for every test method: this
+    sandbox's single-worker `python -m app ui` dev server (Datasette +
+    uvicorn on Windows) was found, live, to wedge permanently -- stops
+    accepting connections at all, confirmed via direct HTTP probes bypassing
+    Chrome entirely -- after roughly 40-42 total HTTP requests land on one
+    server process, regardless of event-loop policy or Datasette's
+    `num_sql_threads` pool size (both tried and ruled out); the trigger is
+    pure cumulative request count on this exact environment, not anything
+    about a specific route, payload, or viewport. All 7 tests against one
+    shared server cross that line (each hard `navigate()` alone re-fetches
+    the HTML shell + 3 static bundles + the interest list); two independent
+    fixtures of ~3-4 tests each stay comfortably under it. This is a
+    resource ceiling of this sandboxed worker, not a defect reachable from
+    `observatory/` app code -- worth re-verifying on an unrestricted machine."""
 
     @classmethod
     def setUpClass(cls):
@@ -138,9 +176,34 @@ class ObservatoryE2ETests(unittest.TestCase):
             "--disable-dev-shm-usage", "--no-first-run", "about:blank",
         ])
         cls.page_tab = _wait_cdp_ready(cls.cdp_port, timeout=30)
+        _grant_clipboard_permission(cls.cdp_port, f"http://{cls.host}:{cls.port}")
         cls.conn = cdp.CDPConnection(cls.page_tab["webSocketDebuggerUrl"])
         cls.conn.send("Page.enable")
         cls.conn.send("Runtime.enable")
+
+        # Some worker sessions (this one included, confirmed live) run Chrome
+        # without an interactive desktop/window station, so there is no real
+        # OS clipboard for Chrome to write to -- both the Async Clipboard API
+        # and the legacy execCommand('copy') fallback fail with a permission
+        # error even after Browser.grantPermissions above. That's a property
+        # of the machine/session, not of the app or this test's approach, so
+        # it's probed once here (execCommand doesn't need a secure-context
+        # navigation first) and test_05 skips its clipboard-content assertion
+        # specifically -- and only -- when this probe says the OS clipboard
+        # itself is unreachable, same "skip only for a genuine environment
+        # absence, always with an explicit reason" policy as the Chrome-binary
+        # check above.
+        cls.clipboard_available = bool(cls.conn.evaluate(
+            "(() => {"
+            "  const ta = document.createElement('textarea');"
+            "  ta.value = 'observatory-e2e-clipboard-probe';"
+            "  document.body.appendChild(ta);"
+            "  ta.select();"
+            "  const ok = document.execCommand('copy');"
+            "  document.body.removeChild(ta);"
+            "  return ok;"
+            "})()"
+        ))
 
     @classmethod
     def tearDownClass(cls):
@@ -233,7 +296,12 @@ class ObservatoryE2ETests(unittest.TestCase):
         conn.row_factory = sqlite3.Row
         return conn
 
-    # -- desktop pass --------------------------------------------------------
+
+@unittest.skipUnless(CHROME_PATH, "no Chrome/Chromium binary found on this machine -- set DISCOVERY_UI_E2E_CHROME")
+class ObservatoryE2EDesktopTests(_E2EFixture, unittest.TestCase):
+    """Desktop-viewport pass: list/graph render, group expand/collapse,
+    pan/zoom, inspector byte-exact prompt -- its own fixture (see
+    _E2EFixture's docstring for why)."""
 
     def test_01_desktop_list_and_graph(self):
         self.set_viewport(DESKTOP_VIEWPORT)
@@ -319,6 +387,13 @@ class ObservatoryE2ETests(unittest.TestCase):
         )
         self.assertIn(expected_prompt, shown, "displayed prompt is not byte-equal to the fixture's stored prompt")
 
+
+@unittest.skipUnless(CHROME_PATH, "no Chrome/Chromium binary found on this machine -- set DISCOVERY_UI_E2E_CHROME")
+class ObservatoryE2EMobileTests(_E2EFixture, unittest.TestCase):
+    """Copy button + iPhone-viewport drawer/sheet + deep-link -- its own
+    fixture, independent from ObservatoryE2EDesktopTests (see _E2EFixture's
+    docstring for why)."""
+
     def test_05_copy_button(self):
         self.set_viewport(DESKTOP_VIEWPORT)
         self.navigate("/observatory/")
@@ -327,10 +402,18 @@ class ObservatoryE2ETests(unittest.TestCase):
         self.wait_for("document.querySelectorAll('.node-card').length > 0")
         self.click(".node-card")
         self.wait_for("!!document.querySelector('[data-testid=\"inspector\"]')")
-        # jsdom-free real Chrome has a real (permission-gated in headless,
-        # but same-origin + user-gesture-simulated click still succeeds)
-        # clipboard API -- exercise the button and just prove it didn't throw.
+        # jsdom-free real Chrome has a real clipboard API -- exercise the
+        # button for real. Whether the button's own UI feedback (flips to
+        # "Copied") is asserted depends on this session's own OS clipboard
+        # reachability, probed once in setUpClass -- see that probe's comment
+        # for why this worker session specifically can't reach it.
         self.click_text("button", "Copy")
+        if not self.clipboard_available:
+            self.skipTest(
+                "this browser session has no reachable OS clipboard (see the "
+                "execCommand('copy') probe in setUpClass) -- the Copy button "
+                "was clicked and did not throw, but its result can't be observed here"
+            )
         copied = self.wait_for(
             "!![...document.querySelectorAll('button')].find(b => b.textContent.trim() === 'Copied')",
             timeout=5, message="Copy button flipped to Copied",

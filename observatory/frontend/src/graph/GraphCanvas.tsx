@@ -32,7 +32,11 @@ function NodeCard({ data }: NodeProps) {
       data-node-id={n.id}
       data-node-type={n.node_type}
     >
-      <div className="node-type">{isGroup ? `group: ${n.child_node_type}` : n.node_type}</div>
+      {/* Group pseudo-nodes carry no `child_node_type` field of their own --
+          db.py's graph() stamps that info into the node's `label` instead
+          ("N <child_node_type>", see db.py's group-node construction), which
+          is already rendered below, so the type row just says "group" here. */}
+      <div className="node-type">{isGroup ? "group" : n.node_type}</div>
       <div className="node-label">{n.label || "(untitled)"}</div>
       {n.summary && <div className="node-summary">{n.summary}</div>}
       <div className="node-meta">
