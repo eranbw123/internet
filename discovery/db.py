@@ -488,12 +488,18 @@ def pending_notifications(conn, max_attempts=MAX_SEND_ATTEMPTS, retry_after_seco
     ).fetchall()
 
 
-def successful_notifications_since(conn, ts):
+def successful_notifications_since(conn, ts, channel=None):
     """How many notifications were sent OK at/after `ts` -- the rolling-window
     count pipeline.deliver() debits the immediate-discovery per-day cap against
-    so a busy run can't flood the owner's phone."""
+    so a busy run can't flood the owner's phone. `channel`, if given, restricts
+    the count to that channel (so the immediate cap ignores digest/alert sends)."""
+    if channel is None:
+        return conn.execute(
+            "SELECT COUNT(*) FROM notifications WHERE ok = 1 AND sent_at > ?", (ts,)
+        ).fetchone()[0]
     return conn.execute(
-        "SELECT COUNT(*) FROM notifications WHERE ok = 1 AND sent_at > ?", (ts,)
+        "SELECT COUNT(*) FROM notifications WHERE ok = 1 AND sent_at > ? AND channel = ?",
+        (ts, channel),
     ).fetchone()[0]
 
 
