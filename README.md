@@ -247,6 +247,9 @@ Council-generated research missions is continuously replenished and drained:
    `DISCOVERY_MISSION_LOW_WATER`, then leases and executes a fair slice
    (`DISCOVERY_MISSIONS_PER_TICK`) of pending missions across owner
    interests -- round-robin, so one interest's queue never starves another.
+   An interest whose most recent planning call just failed is skipped by
+   replenish for `DISCOVERY_MISSION_RETRY_SECONDS`, so a broken Council
+   can't burn a real provider call on it every single tick.
 3. Every leased mission runs independently via the search-capable
    `DISCOVERY_MISSION_PROVIDER` (default `chatgpt_browser`); a failure in
    one mission is recorded and never stops the others. Discoveries flow
@@ -453,6 +456,10 @@ is worth keeping. It reports:
   means the bar is too low.
 - **Notifications per interest** — which interests are actually producing, and
   what share of their scored items clear their own `min_score`.
+- **Missions** — [Council mission](#continuous-web-discovery-council-missions)
+  generation done/failed counts in the window, plus the mission queue's
+  all-time status breakdown (pending/running/done/failed) — whether the
+  Council is actually planning and whether missions are draining or piling up.
 - **Feedback rates** — 🔥 / 👍 / 👎 / 🗑 as a share of what you rated, plus how
   much of what was sent you bothered to rate at all.
 - **Average score per feedback verdict** — the one number that says whether the
@@ -513,7 +520,7 @@ day, so a window is just a date filter.
 | `DISCOVERY_COUNCIL_HISTORY_MISSIONS` | `12` | Recent past missions (label + rationale) shown to the Council, so it doesn't repeat an angle |
 | `DISCOVERY_MISSION_LEASE_SECONDS` | `900` | How long a leased (`RUNNING`) mission holds its lease before a future tick reclaims it as stale |
 | `DISCOVERY_MISSION_MAX_ATTEMPTS` | `3` | Attempts before a mission is retired to `FAILED` |
-| `DISCOVERY_MISSION_RETRY_SECONDS` | `1800` | Cool-off before a failed mission is retried |
+| `DISCOVERY_MISSION_RETRY_SECONDS` | `1800` | Cool-off before a failed mission is retried; also how long an interest whose latest Council planning call just failed is skipped by replenish |
 | `DISCOVERY_COUNCIL_MAX_CONSECUTIVE_FAILURES` | `3` | Consecutive Council planning failures for one interest before the static fallback mission is queued |
 
 `--provider`, `--model` and `--db` override the environment for one run.
@@ -569,7 +576,7 @@ logs.
 python test_discovery.py
 ```
 
-370 tests, network fully stubbed — they never hit an LLM API, Telegram, or
+405 tests, network fully stubbed — they never hit an LLM API, Telegram, or
 Yahoo. The provider seam is the whole stub: a fake object with `complete_json`
 and `search_json`.
 
