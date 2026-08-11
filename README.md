@@ -277,9 +277,10 @@ The pipeline only ever holds an `LLMProvider` (`complete_json` / `search_json`),
 so swapping vendors is a config change:
 
 ```bash
-DISCOVERY_PROVIDER=claude_chat # default, model claude-opus-5 -- claude.ai session, no API key
-DISCOVERY_PROVIDER=anthropic   # direct Anthropic API, needs ANTHROPIC_API_KEY
-DISCOVERY_PROVIDER=openai      # model gpt-5, needs OPENAI_API_KEY and `pip install openai`
+DISCOVERY_PROVIDER=claude_chat     # default, model claude-opus-5 -- claude.ai session, no API key
+DISCOVERY_PROVIDER=chatgpt_browser # model latest-high -- chatgpt.com session, no API key
+DISCOVERY_PROVIDER=anthropic       # direct Anthropic API, needs ANTHROPIC_API_KEY
+DISCOVERY_PROVIDER=openai          # model gpt-5, needs OPENAI_API_KEY and `pip install openai`
 ```
 
 `claude_chat` rides your claude.ai subscription instead of an API key: it runs
@@ -291,13 +292,25 @@ change), a claude.ai tab logged in inside that window, and `CLAUDE_ORG_ID` in
 `.env`. Each call creates a scratch conversation, reads the streamed reply,
 and deletes it. Two caveats: the endpoints are internal and undocumented (they
 can drift), and heavy automated use of claude.ai sits uneasily with its terms
+
+`chatgpt_browser` drives chatgpt.com the same way -- no API key, no
+`CLAUDE_ORG_ID`, just a logged-in chatgpt.com tab in the same Chrome
+(`CHATGPT_BROWSER_PORT`, falling back to `CLAUDE_BROWSER_PORT`, default 9222).
+Its default model is the sentinel `latest-high`, resolved live per call to
+chatgpt.com's newest version at its High (max-reasoning) preset, so a new
+model generation needs no code change; pin explicitly with a bare slug or
+`slug:effort`. Sending a message is more involved than Claude's because
+chatgpt.com gates its send behind a "sentinel" proof-of-work challenge the
+read endpoints don't require -- solved in-page with an embedded SHA3-512.
+Same caveats as `claude_chat` (undocumented endpoints, ToS-gray automated use).
 -- the per-cycle score budget keeps volume modest.
 
 No vendor SDK is imported outside `discovery/providers/`. A capability a
 provider lacks — OpenAI has no equivalent of Claude's server-side web search —
 raises `UnsupportedCapability` and that collector is skipped like any other
-failure, so `web_search` needs a Claude provider (`claude_chat` uses
-claude.ai's own web_search tool; `anthropic` uses the API's).
+failure, so `web_search` needs a provider with search: `claude_chat` (claude.ai's
+own web_search tool), `chatgpt_browser` (chatgpt.com's search, requested per
+message) or `anthropic` (the API's) — not the direct `openai` provider.
 
 ## Telegram
 
@@ -425,14 +438,15 @@ day, so a window is just a date filter.
 | Variable | Default | Meaning |
 | --- | --- | --- |
 | `CLAUDE_ORG_ID` | *(none)* | **Required** for the default provider — your claude.ai organization id |
-| `CLAUDE_BROWSER_PORT` | `9222` | Chrome DevTools port the default provider attaches to |
+| `CLAUDE_BROWSER_PORT` | `9222` | Chrome DevTools port the browser providers attach to |
+| `CHATGPT_BROWSER_PORT` | *(CLAUDE_BROWSER_PORT)* | Chrome DevTools port for `chatgpt_browser`; falls back to `CLAUDE_BROWSER_PORT`, then 9222 |
 | `DISCOVERY_CHROME_LAUNCH_CMD` | *(none)* | Optional `cmd /d /c` command `run-once` runs ONCE if the provider preflight check finds Chrome/CDP down. Empty ⇒ never spawn anything. **Must be a detached form** (e.g. `start "" "C:\...\chrome.exe" --remote-debugging-port=9222`) — a non-detached command blocks run-once until the wait below is hit |
 | `DISCOVERY_CHROME_LAUNCH_WAIT_SECONDS` | `15` | How long to wait after `DISCOVERY_CHROME_LAUNCH_CMD` before re-checking preflight (also bounds how long the launch command itself is allowed to run) |
 | `ANTHROPIC_API_KEY` | *(none)* | Required only when `DISCOVERY_PROVIDER=anthropic` |
 | `OPENAI_API_KEY` | *(none)* | Required only when `DISCOVERY_PROVIDER=openai` |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | *(none)* | Unset ⇒ pushes print to stdout |
-| `DISCOVERY_PROVIDER` | `claude_chat` | `claude_chat`, `anthropic` or `openai` |
-| `DISCOVERY_MODEL` | per provider | `claude-opus-5` / `gpt-5` |
+| `DISCOVERY_PROVIDER` | `claude_chat` | `claude_chat`, `chatgpt_browser`, `anthropic` or `openai` |
+| `DISCOVERY_MODEL` | per provider | `claude-opus-5` / `latest-high` (chatgpt.com: newest version at its High/max-reasoning preset, resolved live; or a bare slug / `slug:effort` to pin) / `gpt-5` |
 | `DISCOVERY_DB` | `discovery.db` | SQLite file (gitignored; rebuildable) |
 | `DISCOVERY_INTERESTS` | `interests.json` | Interests file |
 | `DISCOVERY_MAX_ITEMS` | `8` | Items per source per cycle |
