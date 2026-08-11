@@ -2813,6 +2813,21 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(pipeline.deliver(self.conn, cfg, dry_run=True), 0)
         self.assertEqual([r["item_id"] for r in db.pending_notifications(self.conn)], [old.id])
 
+    def test_immediate_day_cap_counts_only_immediate_sends(self):
+        # A busy digest/alert day must not zero the immediate per-day budget:
+        # the cap counts only prior immediate-channel sends, so the feature keeps
+        # firing regardless of how many digest items already went out today.
+        db.upsert_interest(self.conn, an_interest())
+        (interest,) = db.active_interests(self.conn)
+        for i in range(50):  # 50 prior NON-immediate (digest/alert) sends today
+            it = stored_item(self.conn, url=f"https://e.com/old{i}", title=f"Old{i}")
+            sid = db.save_score(self.conn, a_score(it.id, interest.id, 0.9))
+            db.record_notification(self.conn, sid, "telegram", True)
+        fresh = stored_item(self.conn, url="https://e.com/fresh", title="Fresh")
+        db.save_score(self.conn, a_score(fresh.id, interest.id, 0.9))
+        cfg = dataclasses.replace(CFG, immediate_discovery=True, immediate_max_per_day=40)
+        self.assertEqual(pipeline.deliver(self.conn, cfg, dry_run=True), 1)
+
     def test_send_digest_sorts_by_score_and_caps_leaving_the_rest_pending(self):
         db.upsert_interest(self.conn, an_interest())
         (interest,) = db.active_interests(self.conn)

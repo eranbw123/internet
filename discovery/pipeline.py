@@ -28,6 +28,11 @@ STAGES = (
     "scored", "deferred", "errors", "notified",
 )
 
+# Notification channel tag for immediate discovery sends. Distinct from plain
+# "telegram" so the per-day immediate cap counts only immediate traffic, not
+# digest/alert sends (both still record as "telegram").
+IMMEDIATE_CHANNEL = "telegram_immediate"
+
 
 @dataclass
 class Outcome:
@@ -339,9 +344,12 @@ def deliver(conn, cfg, dry_run=False, lane_counts=None):
     leaves it None and gets the old plain int back, unchanged."""
     sent = 0
     cycle_left = cfg.immediate_max_per_cycle if cfg.immediate_discovery else 0
+    # The per-day cap counts ONLY prior immediate sends (IMMEDIATE_CHANNEL), not
+    # digest/alert traffic -- otherwise a busy digest day would zero the budget
+    # and the feature would silently never fire.
     day_left = (
-        max(0, cfg.immediate_max_per_day
-            - db.successful_notifications_since(conn, db.ago(24 * 3600)))
+        max(0, cfg.immediate_max_per_day - db.successful_notifications_since(
+            conn, db.ago(24 * 3600), channel=IMMEDIATE_CHANNEL))
         if cfg.immediate_discovery else 0
     )
     fresh_cutoff = db.ago(cfg.immediate_fresh_seconds)
@@ -350,7 +358,8 @@ def deliver(conn, cfg, dry_run=False, lane_counts=None):
             sent += _send_one(conn, cfg, row, item, interest, dry_run, lane_counts)
         elif (cycle_left > 0 and day_left > 0
               and row["score_created_at"] > fresh_cutoff):
-            n = _send_one(conn, cfg, row, item, interest, dry_run, lane_counts)
+            n = _send_one(conn, cfg, row, item, interest, dry_run, lane_counts,
+                          channel=IMMEDIATE_CHANNEL)
             sent += n
             cycle_left -= n
             day_left -= n
@@ -377,7 +386,8 @@ def send_digest(conn, cfg, dry_run=False, lane_counts=None):
     return sent
 
 
-def _send_one(conn, cfg, row, item, interest, dry_run, lane_counts=None):
+def _send_one(conn, cfg, row, item, interest, dry_run, lane_counts=None,
+              channel="telegram"):
     text = notify.format_message(
         interest,
         item,
@@ -389,7 +399,7 @@ def _send_one(conn, cfg, row, item, interest, dry_run, lane_counts=None):
     ok = notify.send(cfg, text, reply_markup=notify.feedback_keyboard(row["score_id"]), dry_run=dry_run)
     # Recorded either way: a failed send stays recorded as not-ok rather
     # than being retried forever on every cycle.
-    db.record_notification(conn, row["score_id"], "telegram", ok)
+    db.record_notification(conn, row["score_id"], channel, ok)
     if not ok:
         db.bump(conn, {"send_failed": 1})
     if lane_counts is not None:
