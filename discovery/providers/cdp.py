@@ -42,6 +42,14 @@ def find_claude_tab(port=9222, timeout=None):
     return find_tab("https://claude.ai", port, timeout=timeout)
 
 
+def find_chatgpt_tab(port=9222, timeout=None):
+    # chatgpt.com is the live origin; some sessions still land on
+    # chat.openai.com, so accept either -- same pair the ai repo's exporter
+    # checks (chatgpt_export_cdp.connect).
+    return (find_tab("https://chatgpt.com", port, timeout=timeout)
+            or find_tab("https://chat.openai.com", port, timeout=timeout))
+
+
 class CDPConnection:
     def __init__(self, ws_url):
         parsed = urlparse(ws_url)

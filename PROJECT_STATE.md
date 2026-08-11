@@ -1,6 +1,20 @@
 # PROJECT_STATE.md — `internet`
 
-Updated 2026-08-10. Imported by `CLAUDE.md`. Current state only — not a log.
+Updated 2026-08-11. Imported by `CLAUDE.md`. Current state only — not a log.
+
+## chatgpt_browser provider reconciliation (step-12 task 1)
+Ported verbatim from owner `main` (which predates steps 06-10, so was reconciled
+by hand, file by file, not merged): `discovery/providers/chatgpt_browser.py`
+(new — chatgpt.com via CDP, same "authenticated browser tab, no API key" shape
+as `claude_chat`; default model `latest-high`, a sentinel resolved live to
+chatgpt.com's newest version at its High/max-reasoning preset; sentinel
+proof-of-work solved in-page via an embedded pure-JS SHA3-512). `cdp.py` gained
+`find_chatgpt_tab` (checks `chatgpt.com` then `chat.openai.com`); registered in
+`discovery/providers/__init__.py` PROVIDERS and `config.DEFAULT_MODELS`
+(`"chatgpt_browser": "latest-high"`). Port is additive only — default provider
+is still `claude_chat`, `DEFAULT_MODELS['claude_chat']` unchanged. 25 ported
+tests (`ChatGPTBrowserProviderTests`, offline, fake CDP connection seam)
+appended to `test_discovery.py` (345 -> 370, all green).
 
 ## service hardening (step-01): no more in-process scheduler
 `discovery/scheduler.py` and `run` are DELETED; `ops/install_tasks.py` is the
