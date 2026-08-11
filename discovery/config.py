@@ -47,6 +47,18 @@ class Config:
     interval_youtube_seconds: int = 4 * 3600
     digest_time: str = "08:00"      # local HH:MM, once per day
     digest_max_items: int = 10      # Discovery items per digest; Alerts are unbounded and immediate
+    # Immediate discovery delivery (opt-in). Off by default: DISCOVERY items
+    # wait for the daily digest, exactly as before. On (DISCOVERY_IMMEDIATE=1),
+    # deliver() also pushes freshly-scored above-bar discoveries the moment a
+    # cycle finds them -- bounded three ways so a backlog or a burst can't flood
+    # the owner: only scores newer than `immediate_fresh_seconds` (the existing
+    # backlog is never immediately sent), at most `immediate_max_per_cycle` per
+    # deliver() call, and at most `immediate_max_per_day` successful sends in a
+    # rolling 24h. Anything skipped by a cap still reaches the daily digest.
+    immediate_discovery: bool = False
+    immediate_max_per_cycle: int = 3
+    immediate_max_per_day: int = 40
+    immediate_fresh_seconds: int = 1800   # only discoveries scored in the last 30 min go out immediately
     # Failed-send retry policy (see db.pending_notifications); raised from the
     # smaller db.py module constants, which stay as that function's own
     # defaults so a call site that doesn't pass cfg still gets a sane policy.
@@ -117,6 +129,11 @@ def load():
         interval_youtube_seconds=int(os.environ.get("DISCOVERY_INTERVAL_YOUTUBE", str(4 * 3600))),
         digest_time=os.environ.get("DISCOVERY_DIGEST_TIME", "08:00"),
         digest_max_items=int(os.environ.get("DISCOVERY_DIGEST_MAX", "10")),
+        immediate_discovery=os.environ.get("DISCOVERY_IMMEDIATE", "").strip().lower()
+        in ("1", "true"),
+        immediate_max_per_cycle=int(os.environ.get("DISCOVERY_IMMEDIATE_MAX_PER_CYCLE", "3")),
+        immediate_max_per_day=int(os.environ.get("DISCOVERY_IMMEDIATE_MAX_PER_DAY", "40")),
+        immediate_fresh_seconds=int(os.environ.get("DISCOVERY_IMMEDIATE_FRESH_SECONDS", str(30 * 60))),
         send_max_attempts=int(os.environ.get("DISCOVERY_SEND_MAX_ATTEMPTS", "5")),
         send_retry_seconds=int(os.environ.get("DISCOVERY_SEND_RETRY_SECONDS", str(30 * 60))),
         chrome_launch_cmd=os.environ.get("DISCOVERY_CHROME_LAUNCH_CMD", ""),

@@ -2786,6 +2786,33 @@ class PipelineTests(unittest.TestCase):
         pending = [r["item_id"] for r in db.pending_notifications(self.conn)]
         self.assertEqual(pending, [discovery.id])
 
+    def test_immediate_discovery_delivers_fresh_discoveries_bounded_by_cycle(self):
+        # With cfg.immediate_discovery on, deliver() also pushes freshly-scored
+        # discoveries -- but no more than immediate_max_per_cycle per call, so a
+        # big batch trickles out rather than flooding the owner.
+        db.upsert_interest(self.conn, an_interest())
+        (interest,) = db.active_interests(self.conn)
+        for i in range(3):
+            d = stored_item(self.conn, url=f"https://e.com/d{i}", title=f"D{i}")
+            db.save_score(self.conn, a_score(d.id, interest.id, 0.9))
+        cfg = dataclasses.replace(CFG, immediate_discovery=True, immediate_max_per_cycle=2)
+        self.assertEqual(pipeline.deliver(self.conn, cfg, dry_run=True), 2)
+        self.assertEqual(len(db.pending_notifications(self.conn)), 1)
+
+    def test_immediate_discovery_skips_the_stale_backlog(self):
+        # The existing pre-enable backlog must never be dumped immediately: only
+        # scores newer than immediate_fresh_seconds go out; older ones stay
+        # pending for the digest exactly as before.
+        db.upsert_interest(self.conn, an_interest())
+        (interest,) = db.active_interests(self.conn)
+        old = stored_item(self.conn, url="https://e.com/old", title="Old")
+        sid = db.save_score(self.conn, a_score(old.id, interest.id, 0.9))
+        self.conn.execute("UPDATE scores SET created_at = ? WHERE id = ?", (db.ago(10_000), sid))
+        self.conn.commit()
+        cfg = dataclasses.replace(CFG, immediate_discovery=True)
+        self.assertEqual(pipeline.deliver(self.conn, cfg, dry_run=True), 0)
+        self.assertEqual([r["item_id"] for r in db.pending_notifications(self.conn)], [old.id])
+
     def test_send_digest_sorts_by_score_and_caps_leaving_the_rest_pending(self):
         db.upsert_interest(self.conn, an_interest())
         (interest,) = db.active_interests(self.conn)
