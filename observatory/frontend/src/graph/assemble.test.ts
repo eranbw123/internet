@@ -48,7 +48,7 @@ describe("mergeExpansion", () => {
     expect(merged.edges).toHaveLength(3);
   });
 
-  it("replaces the group placeholder with fetched children and wires parent edges", () => {
+  it("adds fetched children alongside the group placeholder (kept as the collapse target) and wires parent edges", () => {
     const g = fixture();
     const children: NodeSummary[] = [
       node({ id: 101, node_type: "raw-result", swimlane: "mission", label: "result 1" }),
@@ -56,14 +56,17 @@ describe("mergeExpansion", () => {
     ];
     const merged = mergeExpansion(g, { "10:returned:raw-result": children });
     const ids = merged.nodes.map((n) => n.id);
-    expect(ids).not.toContain("10:returned:raw-result");
+    // the group card itself is still on screen -- it's the only double-click
+    // target GraphCanvas has to collapse back via collapseGroup()
+    expect(ids).toContain("10:returned:raw-result");
     expect(ids).toEqual(expect.arrayContaining([1, 2, 101, 102, 20]));
     // parent (mission id 2) -> each child, using the group's own relationship
     const newEdges = merged.edges.filter((e) => e.from === 2 && (e.to === 101 || e.to === 102));
     expect(newEdges).toHaveLength(2);
     expect(newEdges.every((e) => e.relationship === "returned")).toBe(true);
-    // nothing from the original graph was dropped
+    // nothing from the original graph was dropped, only added to
     expect(merged.edges).toHaveLength(g.edges.length + 2);
+    expect(merged.nodes).toHaveLength(g.nodes.length + 2);
   });
 
   it("collapsing back (omitting the group from `expanded`) reproduces the original graph", () => {

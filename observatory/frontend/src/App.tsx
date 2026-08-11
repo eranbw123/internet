@@ -5,7 +5,7 @@ import { Inspector } from "./inspector/Inspector";
 import { CompareView } from "./compare/CompareView";
 import { readBootstrap } from "./deepLink";
 import type { GraphSeed } from "./graph/useGraphData";
-import type { ID } from "./types";
+import type { ID, Tab } from "./types";
 
 const MOBILE_BREAKPOINT = 480; // iPhone-width class of device
 
@@ -32,10 +32,26 @@ export function App() {
   const [sheetOpen, setSheetOpen] = useState(false);
   const isMobile = useIsMobile();
 
-  function selectDiscovery(row: Record<string, unknown>) {
-    if (row.item_id != null) {
+  function selectDiscovery(row: Record<string, unknown>, tab: Tab) {
+    // Each explorer tab's row.id is a primary key from a DIFFERENT table
+    // (interests.id, search_generations.id, search_missions.id, ...) --
+    // entity_id is only unique WITHIN one entity_type (see db.py's
+    // _seed_node_ids / PROJECT_STATE.md's task-2 repair pass 1 for the
+    // server-side version of this same bug class), so the seed's
+    // entity_type must be chosen per-tab, never inferred from row shape
+    // alone. The "failed" tab's rows already carry their own resolved
+    // entity_type/entity_id (see db.py's _FAILED_UNION) -- use those as-is.
+    if (tab === "failed") {
+      if (row.entity_type != null && row.entity_id != null) {
+        setSeed({ entity_type: row.entity_type as string, entity_id: row.entity_id as string | number });
+      }
+    } else if (tab === "discoveries" && row.item_id != null) {
       setSeed({ entity_type: "candidate_items", entity_id: row.item_id as string | number });
-    } else if (row.id != null) {
+    } else if (tab === "interests" && row.id != null) {
+      setSeed({ entity_type: "interests", entity_id: row.id as string | number });
+    } else if (tab === "generations" && row.id != null) {
+      setSeed({ entity_type: "search_generations", entity_id: row.id as string | number });
+    } else if (tab === "missions" && row.id != null) {
       setSeed({ entity_type: "search_missions", entity_id: row.id as string | number });
     }
     setSelectedNodeId(null);

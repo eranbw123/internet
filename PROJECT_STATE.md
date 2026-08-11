@@ -666,6 +666,45 @@ manual review, not a guarantee of a clean build. Canonical Python suites
 re-verified green (458 + 10 + 65) after these changes, which touch nothing
 in `discovery/`.
 
+**Repair (still npm-blocked, three source-level defects fixed by review):**
+this session re-confirmed the identical sandbox restriction one more time
+(`npm --version` under both Bash and PowerShell, plain and via the resolved
+`npm-cli.js` path, all refused before reaching a shell) -- `observatory/static/`
+is still task 2's placeholder, `tsc -b`/`vitest`/`test_observatory_e2e.py`
+still have never run. Fixed three concrete defects a reviewer found by
+reading the unbuilt TypeScript against its own React/hook semantics (not by
+running it):
+`graph/useGraphData.ts`'s `merged`/`focused` were bare object literals
+recomputed every render with no `useMemo`; `GraphCanvas.tsx`'s layout effect
+keys on `display`'s object identity, so this was a guaranteed infinite
+layout/render loop once the app actually mounted -- now memoized on
+`[base, expanded]`/`[base, merged, focusMode]`.
+`graph/assemble.ts`'s `mergeExpansion` dropped the group placeholder node
+entirely on expand (`continue` after pushing children), leaving no
+`node_type === 'group'` card on screen for `GraphCanvas.tsx`'s double-click
+toggle to ever collapse back -- `collapseGroup` was dead code from the UI.
+Fixed by keeping the group's own card alongside its fetched children
+(same id, so it stays the collapse target); `assemble.test.ts` updated to
+match (group card now present post-expand, node count `+2` not just
+children). `App.tsx`'s `selectDiscovery` inferred a row's graph seed from
+its shape alone (`item_id` -> discoveries, else assume `search_missions`),
+but `interests`/`generations`/`missions` tabs all key their rows by a bare
+`row.id` from three DIFFERENT tables (`interests.id`/`search_generations.id`/
+`search_missions.id`) -- the same entity_id-collides-across-entity_type bug
+class task 2's own repair pass 1 fixed server-side (see that section above),
+reintroduced client-side: selecting an Interests or Council-generations row
+silently loaded an unrelated mission's graph whenever the ids happened to
+collide. `Explorer` now passes its active `tab` to `onSelectDiscovery`, and
+`selectDiscovery` picks `entity_type` per tab (`interests`/
+`search_generations`/`search_missions`/`candidate_items`); the `failed` tab
+already carries its own resolved `entity_type`/`entity_id` per row (from
+db.py's `_FAILED_UNION`) and now uses those directly instead of falling
+through to the `search_missions` guess. All three fixes are inert (same as
+the prior pass's two) until a session with npm access can actually build
+and run `vitest`/`tsc -b`/`test_observatory_e2e.py` against them. Canonical
+Python suites re-verified green (458 + 10 + 65); nothing in `discovery/`
+touched.
+
 ## chatgpt_browser provider reconciliation (step-12 task 1)
 Ported verbatim from owner `main` (which predates steps 06-10, so was reconciled
 by hand, file by file, not merged): `discovery/providers/chatgpt_browser.py`

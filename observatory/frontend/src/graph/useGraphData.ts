@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fetchChildren, fetchGraph } from "../api";
 import type { GraphResponse, ID } from "../types";
 import { applyFocus, mergeExpansion, type ExpandedGroups } from "./assemble";
@@ -78,8 +78,19 @@ export function useGraphData(seed: GraphSeed | null) {
     await Promise.all(base.groups.map((g) => expandGroup(g.group)));
   }, [base, expandGroup]);
 
-  const merged = base ? mergeExpansion(base, expanded) : { nodes: [], edges: [] };
-  const focused = base ? applyFocus(merged, base.emphasized_path, focusMode) : { nodes: [], edges: [], hiddenCount: 0 };
+  // Memoized on the actual inputs, not recomputed as a fresh object every
+  // render -- GraphCanvas's layout effect keys off `display`'s identity, so
+  // a bare object literal here would give it a new reference every render
+  // and re-trigger the ELK layout (and the setLayout()-driven re-render it
+  // causes) forever.
+  const merged = useMemo(
+    () => (base ? mergeExpansion(base, expanded) : { nodes: [], edges: [] }),
+    [base, expanded],
+  );
+  const focused = useMemo(
+    () => (base ? applyFocus(merged, base.emphasized_path, focusMode) : { nodes: [], edges: [], hiddenCount: 0 }),
+    [base, merged, focusMode],
+  );
 
   return {
     base, loading, error, expanded, focusMode, setFocusMode,

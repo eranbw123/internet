@@ -16,17 +16,22 @@ export interface DisplayGraph {
 }
 
 /** Merge lazily-fetched group children into the base graph. A group node
- * that has been expanded is replaced by its real children (their own
- * further descendants stay collapsed/hidden until independently expanded --
- * /api/children only ever returns one level, matching the API). Groups the
- * caller hasn't expanded are left exactly as the API returned them -- this
- * function never drops or invents data, only adds what's been fetched. */
+ * that has been expanded keeps its own card on screen (still `node_type
+ * === 'group'`, so it stays the double-click target GraphCanvas uses to
+ * collapse back -- there would otherwise be no on-screen affordance left to
+ * re-collapse it once its children replaced it) alongside its real children
+ * (their own further descendants stay collapsed/hidden until independently
+ * expanded -- /api/children only ever returns one level, matching the API).
+ * Groups the caller hasn't expanded are left exactly as the API returned
+ * them -- this function never drops or invents data, only adds what's been
+ * fetched. */
 export function mergeExpansion(base: GraphResponse, expanded: ExpandedGroups): DisplayGraph {
   const groupsById = new Map(base.groups.map((g) => [g.group, g]));
   const nodes: NodeSummary[] = [];
   const edges: GraphEdge[] = [...base.edges];
   for (const n of base.nodes) {
     const key = String(n.id);
+    nodes.push(n);
     if (n.node_type === "group" && expanded[key]) {
       const group = groupsById.get(key);
       for (const child of expanded[key]) {
@@ -35,9 +40,7 @@ export function mergeExpansion(base: GraphResponse, expanded: ExpandedGroups): D
           edges.push({ from: group.parent_node_id, to: child.id, relationship: group.relationship, ordinal: null });
         }
       }
-      continue; // the group placeholder itself is replaced, not kept alongside its children
     }
-    nodes.push(n);
   }
   return { nodes, edges };
 }

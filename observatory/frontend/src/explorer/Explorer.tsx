@@ -11,7 +11,7 @@ const TABS: { key: Tab; label: string }[] = [
 ];
 
 interface Props {
-  onSelectDiscovery: (row: Record<string, unknown>) => void;
+  onSelectDiscovery: (row: Record<string, unknown>, tab: Tab) => void;
   onOpenRawDb: () => void;
 }
 
@@ -77,7 +77,7 @@ export function Explorer({ onSelectDiscovery, onOpenRawDb }: Props) {
       {error && <div className="explorer-status error">{error}</div>}
       <ul className="explorer-rows">
         {result?.rows.map((row, i) => (
-          <li key={i} className="explorer-row" onClick={() => onSelectDiscovery(row)}>
+          <li key={i} className="explorer-row" onClick={() => onSelectDiscovery(row, tab)}>
             <RowSummary tab={tab} row={row} />
           </li>
         ))}
