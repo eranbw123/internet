@@ -328,18 +328,32 @@ def notification_ready(conn, cfg):
 
 
 def deliver(conn, cfg, dry_run=False, lane_counts=None):
-    """ALERT-type items only, sent the moment they clear the bar. DISCOVERY
-    items are left pending -- send_digest() is what clears those.
+    """ALERT-type items the moment they clear the bar. DISCOVERY items are
+    normally left pending for send_digest() -- unless cfg.immediate_discovery
+    is on, in which case freshly-scored discoveries also go out here, bounded
+    so a backlog or a burst can't flood the owner (see cfg.immediate_*).
 
     `lane_counts`, if given, is a Counter bumped with 'exploit'/'explore' per
     attempt (owner vs. derived interest) -- run_once() uses it to bump
     notified/explore_notified separately; every other caller (CLI, tests)
     leaves it None and gets the old plain int back, unchanged."""
     sent = 0
+    cycle_left = cfg.immediate_max_per_cycle if cfg.immediate_discovery else 0
+    day_left = (
+        max(0, cfg.immediate_max_per_day
+            - db.successful_notifications_since(conn, db.ago(24 * 3600)))
+        if cfg.immediate_discovery else 0
+    )
+    fresh_cutoff = db.ago(cfg.immediate_fresh_seconds)
     for row, item, interest in notification_ready(conn, cfg):
-        if not notify.is_alert(item):
-            continue
-        sent += _send_one(conn, cfg, row, item, interest, dry_run, lane_counts)
+        if notify.is_alert(item):
+            sent += _send_one(conn, cfg, row, item, interest, dry_run, lane_counts)
+        elif (cycle_left > 0 and day_left > 0
+              and row["score_created_at"] > fresh_cutoff):
+            n = _send_one(conn, cfg, row, item, interest, dry_run, lane_counts)
+            sent += n
+            cycle_left -= n
+            day_left -= n
     return sent
 
 

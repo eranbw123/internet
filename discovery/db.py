@@ -471,7 +471,8 @@ def pending_notifications(conn, max_attempts=MAX_SEND_ATTEMPTS, retry_after_seco
     return conn.execute(
         """
         SELECT s.id AS score_id, s.item_id, s.interest_id, s.final_score,
-               s.confidence, s.reason, s.why_better_than_generic
+               s.confidence, s.reason, s.why_better_than_generic,
+               s.created_at AS score_created_at
         FROM scores s
         JOIN interests n ON n.id = s.interest_id
         WHERE s.final_score >= n.min_score
@@ -485,6 +486,15 @@ def pending_notifications(conn, max_attempts=MAX_SEND_ATTEMPTS, retry_after_seco
         """,
         (max_attempts, ago(retry_after_seconds)),
     ).fetchall()
+
+
+def successful_notifications_since(conn, ts):
+    """How many notifications were sent OK at/after `ts` -- the rolling-window
+    count pipeline.deliver() debits the immediate-discovery per-day cap against
+    so a busy run can't flood the owner's phone."""
+    return conn.execute(
+        "SELECT COUNT(*) FROM notifications WHERE ok = 1 AND sent_at > ?", (ts,)
+    ).fetchone()[0]
 
 
 def record_notification(conn, score_id, channel, ok):
