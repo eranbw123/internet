@@ -456,15 +456,29 @@ def _execute_mission(conn, cfg, mission_provider, scoring_provider, interests,
 
     # Paired POSITIONALLY with `items`, not by url: to_items() keeps
     # raw_items[:limit] in order, dropping only non-dict/no-url entries, so
-    # mirroring that exact filter here gives a 1:1, order-preserving mapping
-    # even when two raw results share a url (the duplicate case) -- a url
-    # keyed lookup would collapse both onto the first raw-result node,
-    # leaving the second (the one actually rejected as a duplicate) with no
-    # outcome edge at all.
-    source_nodes = [
-        raw_node for raw, raw_node in zip(raw_items[: cfg.mission_max_results], raw_nodes)
-        if isinstance(raw, dict) and (raw.get("url") or "").strip()
-    ]
+    # reapplying that exact filter here (same three conditions, in the same
+    # order) gives a 1:1, order-preserving mapping even when two raw results
+    # share a url (the duplicate case) -- a url keyed lookup would collapse
+    # both onto the first raw-result node, leaving the second (the one
+    # actually rejected as a duplicate) with no outcome edge at all. Every
+    # raw result NOT kept gets an explicit 'rejected' edge below instead, so
+    # nothing is left dangling with only the inbound 'returned' edge.
+    source_nodes = []
+    for ordinal, (raw, raw_node) in enumerate(zip(raw_items, raw_nodes)):
+        if ordinal >= cfg.mission_max_results:
+            reason = f"past mission_max_results ({cfg.mission_max_results})"
+        elif not isinstance(raw, dict):
+            reason = "not a JSON object"
+        elif not (raw.get("url") or "").strip():
+            reason = "missing url"
+        else:
+            source_nodes.append(raw_node)
+            continue
+        # to_items() silently drops this raw result -- give it a terminal
+        # node/edge too, so every raw result maps to SOME outcome branch,
+        # not just the ones that survive the filter.
+        dropped_node = tracer.node(tracer.run_id, "raw-result-dropped", label="dropped", summary=reason)
+        tracer.edge(raw_node, dropped_node, "rejected")
 
     for item, source_node in zip(items, source_nodes):
         item.origin_interest = mission["interest_key"]

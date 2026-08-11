@@ -142,9 +142,20 @@ def main(argv=None):
     # subcommand (e.g. `python -m app --db PATH trace-fixture`). SUPPRESS
     # means "leave the namespace alone unless this flag is actually passed",
     # so both `--db PATH trace-fixture` and `trace-fixture --db PATH` work.
-    tf.add_argument("--db", default=argparse.SUPPRESS, help="override DISCOVERY_DB")
+    tf.add_argument(
+        "--db", default=argparse.SUPPRESS,
+        help="required -- path to a fresh/fixture-only db, never the production default",
+    )
 
     args = parser.parse_args(argv)
+    if args.command == "trace-fixture" and not args.db:
+        # trace_fixture.build() inserts fixture interests/items/scores/a real
+        # feedback row through the real production code paths -- refusing to
+        # fall back to cfg.db_path's default (REPO_ROOT/discovery.db) is what
+        # stops an unflagged invocation from writing fixture rows into the
+        # real database.
+        print("trace-fixture requires --db PATH -- refusing to default to the production db", file=sys.stderr)
+        return 2
     cfg = config.load()
     if args.db:
         cfg.db_path = args.db

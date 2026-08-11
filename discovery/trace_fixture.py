@@ -22,7 +22,9 @@ Produces, against a fresh (or at least fixture-untouched) `conn`:
       * the retried item's above-bar score, delivered through send_digest()
         and given one piece of feedback through feedback_listener's own
         callback handler
-  - `python -m app trace-fixture --db PATH` is the CLI entry point.
+  - `python -m app trace-fixture --db PATH` is the CLI entry point --
+    `--db` is required (refuses to run without it) so an unflagged
+    invocation can never fall back to cfg.db_path's real default.
 
 Structurally deterministic (fixed labels, fixed content, fixed call order --
 same node/edge/model_call COUNTS and LABELS on every call against a fresh

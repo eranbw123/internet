@@ -155,6 +155,30 @@ gained a real `discovery.__main__.main()` invocation for both `--db` orders,
 asserting the fixture actually landed in the overridden path (not the
 default `REPO_ROOT/discovery.db`). 439 tests, all green.
 
+Repair (review pass 4): review pass 3's `required`-only fix still left
+`_validate()` (claude_chat/chatgpt_browser's only schema enforcement)
+type-checking every PRESENT property, required or not -- an optional debug/
+deliberation field with the *right key but wrong shape* (`uncertainties:
+None`, `evidence_used` as a list, `dimension_rationale` as a plain string,
+`deliberation: null`/`"none to report"`/`[]`) still raised `ProviderError`
+and burned a retry, breaking the "never fatal" contract on the two default
+providers. `_validate()` now runs type checks only for keys in `required`;
+enum checks stay unconditional on any present key (no optional field
+declares one, so this only guards fixed-vocabulary production fields).
+Three smaller findings from the same pass: `trace-fixture --db` is now
+required -- `__main__.main()` refuses (exit 2) rather than defaulting to
+`cfg.db_path`'s real `REPO_ROOT/discovery.db`, since `build()` writes
+fixture interests/items/scores/a real feedback row through production code
+paths. `missions._execute_mission`'s raw-result nodes that `to_items()`
+silently drops (non-dict, no url, past `mission_max_results`) now get a
+`raw-result-dropped` node + `rejected` edge instead of dead-ending on just
+the inbound `returned` edge. `pipeline._run_once()` now opens a
+`collector-item` node per collected item and passes it as `ingest()`'s
+`source_node_id` -- previously `None`, so `normalized_to`/`duplicate_of`
+edges were silently skipped (`Tracer.edge()` no-ops on a `None` endpoint)
+and every run-once candidate's subtree was reachable only via `run_id`, not
+via any edge. 8 new tests (445 total), all green.
+
 ## chatgpt_browser provider reconciliation (step-12 task 1)
 Ported verbatim from owner `main` (which predates steps 06-10, so was reconciled
 by hand, file by file, not merged): `discovery/providers/chatgpt_browser.py`

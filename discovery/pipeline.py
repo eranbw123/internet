@@ -111,10 +111,21 @@ def _run_once(conn, provider, cfg, sources, dry_run, tracer):
     for interest in interests:
         for item in _collect(conn, interest, cfg, provider, sources):
             counts["collected"] += 1
+            # A root node per collected item -- missions.py's web-tick path
+            # roots each candidate's subtree at a 'raw-result' node; without
+            # an equivalent here, ingest()'s normalized_to/duplicate_of edges
+            # get source_node_id=None and are silently skipped (trace.Tracer.
+            # edge() no-ops on a None endpoint), leaving each candidate a
+            # disconnected island sharing only run_id.
+            source_node = tracer.node(
+                tracer.run_id, "collector-item", label=item.title,
+                summary=f"{item.source} via {interest.key}",
+                input_json={"url": item.url, "source": item.source},
+            )
             outcome = ingest(
                 conn, provider, cfg, item, interests,
                 origin_interest=interest.key, budget=budget, explore_budget=explore_budget,
-                tracer=tracer,
+                tracer=tracer, source_node_id=source_node,
             )
             counts[outcome.stage] += 1
             # Flushed per item, not once at the end of the whole cycle: this

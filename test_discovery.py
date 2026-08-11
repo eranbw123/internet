@@ -3987,6 +3987,33 @@ class SchemaContractTests(unittest.TestCase):
         good = {"missions": [{"label": "a", "rationale": "b", "prompt": "c"}]}
         claude_chat._validate(good, council.MISSION_SCHEMA)  # must not raise
 
+    def test_default_provider_validate_tolerates_wrong_typed_debug_fields(self):
+        """The 'never fatal' contract's other half: a PRESENT-but-wrong-typed
+        optional debug/deliberation field must not raise either. scoring.
+        _debug_payload()/council._extract_deliberation() already tolerate
+        None/wrong shapes on these fields (turning them into an
+        {'unavailable': True, ...} marker) -- but that tolerant code is only
+        reached if _validate() lets the reply through. Before this fix,
+        _validate() type-checked every PRESENT property regardless of
+        `required`, so a model returning e.g. uncertainties=None or
+        dimension_rationale as a plain string burned a retry attempt (and a
+        repeat on retry raised ProviderError outright)."""
+        good_score = {
+            "interest_key": "x",
+            **{name: 0.5 for name in models.DIMENSIONS},
+            "confidence": 0.5, "reason": "r", "why_better_than_generic": "w",
+            "uncertainties": None,
+            "evidence_used": ["a", "b"],
+            "dimension_rationale": "mostly on topic",
+        }
+        claude_chat._validate(good_score, scoring.SCORE_SCHEMA)  # must not raise
+
+        good_missions = {
+            "missions": [{"label": "a", "rationale": "b", "prompt": "c"}],
+            "deliberation": "none to report",
+        }
+        claude_chat._validate(good_missions, council.MISSION_SCHEMA)  # must not raise
+
     def test_openai_strict_transport_still_requires_every_property(self):
         """The inverse guarantee: OpenAI's structured-outputs API 400s unless
         every object in the schema has `required` == all of its properties.
@@ -4113,6 +4140,22 @@ class CLITests(unittest.TestCase):
             line.split("'")[1] for line in out.splitlines() if line.strip().startswith("'t")
         ]
         self.assertEqual(listed_keys, [f"t{i}" for i in range(10)])
+
+    def test_trace_fixture_without_db_refuses_to_run(self):
+        # trace_fixture.build() writes fixture interests/items/scores and a
+        # real feedback row through the production code paths -- without
+        # this guard, an unflagged `trace-fixture` would silently fall back
+        # to cfg.db_path's default (REPO_ROOT/discovery.db, the real db).
+        import contextlib
+        import io
+
+        from discovery.__main__ import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(["trace-fixture"])
+        self.assertEqual(code, 2)
+        self.assertIn("--db", err.getvalue())
 
     def test_trace_fixture_db_override_works_before_and_after_the_subcommand(self):
         # Repair-2 regression: `tf.add_argument("--db")` on the trace-fixture
@@ -6933,6 +6976,75 @@ class TraceMissionToolEventTests(unittest.TestCase):
         self.assertEqual([r["label"] for r in rows], ["server_tool_use"])
 
 
+class TraceMissionJunkResultTests(unittest.TestCase):
+    """A raw mission result that to_items() silently drops (non-dict,
+    missing url, or past mission_max_results) still gets a terminal
+    outcome node/edge, not just the inbound 'returned' edge."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.cfg = dataclasses.replace(
+            CFG, trace_enabled=True, mission_provider="fake_mission",
+            council_missions_per_generation=1, missions_per_tick=1, mission_low_water=1,
+        )
+        db.upsert_interest(self.conn, an_interest(key="alpha", title="alpha", sources=["web_search"]))
+
+    def _tick(self, raw_results):
+        mp = FakeCouncilProvider(
+            mission_batches=[mission_batch("solo")],
+            search_results={"solo": raw_results},
+        )
+        with mock.patch.object(providers, "get_provider", return_value=mp):
+            missions.web_tick(self.conn, self.cfg, provider=FakeProvider({"Result": 0.9}), dry_run=True)
+
+    def test_a_no_url_result_gets_a_rejected_edge_not_a_dead_end(self):
+        self._tick([
+            {"title": "no url here", "url": "", "summary": "x" * 40},
+            {"title": "Good", "url": "https://e.com/g", "summary": "x" * 40},
+        ])
+        dropped = self.conn.execute(
+            "SELECT id, summary FROM trace_nodes WHERE node_type = 'raw-result-dropped'"
+        ).fetchone()
+        self.assertIsNotNone(dropped)
+        self.assertEqual(dropped["summary"], "missing url")
+
+        raw_node = self.conn.execute(
+            "SELECT id FROM trace_nodes WHERE node_type = 'raw-result' AND label = 'no url here'"
+        ).fetchone()
+        edge = self.conn.execute(
+            "SELECT relationship, to_node_id FROM trace_edges WHERE from_node_id = ?",
+            (raw_node["id"],),
+        ).fetchone()
+        self.assertEqual(edge["relationship"], "rejected")
+        self.assertEqual(edge["to_node_id"], dropped["id"])
+
+    def test_a_non_dict_result_gets_a_rejected_edge(self):
+        self._tick(["just a string, not an object"])
+        dropped = self.conn.execute(
+            "SELECT summary FROM trace_nodes WHERE node_type = 'raw-result-dropped'"
+        ).fetchone()
+        self.assertEqual(dropped["summary"], "not a JSON object")
+
+    def test_a_result_past_mission_max_results_gets_a_rejected_edge(self):
+        cfg = dataclasses.replace(self.cfg, mission_max_results=1)
+        mp = FakeCouncilProvider(
+            mission_batches=[mission_batch("solo")],
+            search_results={"solo": [
+                {"title": "Kept", "url": "https://e.com/kept", "summary": "x" * 40},
+                {"title": "Overflow", "url": "https://e.com/overflow", "summary": "x" * 40},
+            ]},
+        )
+        with mock.patch.object(providers, "get_provider", return_value=mp):
+            missions.web_tick(self.conn, cfg, provider=FakeProvider({"Result": 0.9}), dry_run=True)
+
+        dropped = self.conn.execute(
+            "SELECT summary FROM trace_nodes WHERE node_type = 'raw-result-dropped'"
+        ).fetchone()
+        self.assertIn("mission_max_results", dropped["summary"])
+
+
 class TraceFixtureTests(unittest.TestCase):
     """(h) the fixture is structurally deterministic: two builds against
     fresh DBs produce the same node/edge/model_call counts and labels."""
@@ -7068,6 +7180,45 @@ class TraceDigestCmdTests(unittest.TestCase):
         self.assertEqual(code, 0)
         row = self.conn.execute("SELECT kind, status FROM trace_runs").fetchone()
         self.assertEqual((row["kind"], row["status"]), ("digest", "done"))
+
+
+class TraceRunOnceCollectorItemRootTests(unittest.TestCase):
+    """Repair regression: _run_once() called ingest() with no source_node_id,
+    so candidate_node's 'normalized_to' edge had a None from-endpoint and
+    Tracer.edge() silently skipped it (no-ops on a None endpoint) -- every
+    candidate's subtree was reachable only by run_id, not by any edge. A
+    'collector-item' root node per collected item, passed through as
+    source_node_id, is what the ingest wiring spec means by 'the raw-result
+    (or collector-item) node'."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.cfg = dataclasses.replace(CFG, trace_enabled=True)
+        db.upsert_interest(self.conn, an_interest(key="k", sources=["fake"]))
+
+    def test_candidate_node_is_reachable_from_a_collector_item_node(self):
+        def collector(interest, cfg, provider, conn=None):
+            return [an_item(source="fake", title="Good stuff here", url="https://e.com/1")]
+
+        provider = FakeProvider({"Good stuff": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            pipeline.run_once(self.conn, provider, self.cfg, dry_run=True)
+
+        source_node = self.conn.execute(
+            "SELECT id FROM trace_nodes WHERE node_type = 'collector-item' AND label = 'Good stuff here'"
+        ).fetchone()
+        self.assertIsNotNone(source_node)
+        edge = self.conn.execute(
+            "SELECT to_node_id FROM trace_edges WHERE from_node_id = ? AND relationship = 'normalized_to'",
+            (source_node["id"],),
+        ).fetchone()
+        self.assertIsNotNone(edge, "collector-item node has no outgoing normalized_to edge")
+        candidate_node = self.conn.execute(
+            "SELECT node_type FROM trace_nodes WHERE id = ?", (edge["to_node_id"],)
+        ).fetchone()
+        self.assertEqual(candidate_node["node_type"], "candidate")
 
 
 if __name__ == "__main__":

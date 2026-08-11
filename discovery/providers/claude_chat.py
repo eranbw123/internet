@@ -279,17 +279,31 @@ def _trace_parse_object(text, schema):
 def _validate(data, schema):
     """Just enough JSON-schema checking to catch a malformed reply before it
     poisons the pipeline: required keys, primitive types, enums. Anything the
-    check can't express is left to the callers' own clamping/parsing."""
-    for key in schema.get("required", []):
+    check can't express is left to the callers' own clamping/parsing.
+
+    Type checks apply only to REQUIRED properties. SCORE_SCHEMA/MISSION_SCHEMA
+    carry optional debug/deliberation fields that callers (scoring.
+    _debug_payload, council._extract_deliberation) already parse tolerantly --
+    absent or wrong-shaped becomes an 'unavailable' marker, never fatal.
+    Type-checking an optional field here would turn that tolerance into a
+    hard ProviderError before the tolerant code ever runs, on claude_chat/
+    chatgpt_browser -- the two providers whose only schema enforcement this
+    function is. Enum checks stay unconditional (present -> checked) --
+    none of the optional debug/deliberation fields declare an enum, only
+    fixed-vocabulary production fields do, and those should still reject a
+    value outside the vocabulary even when merely present-not-required."""
+    required = schema.get("required", [])
+    for key in required:
         if key not in data:
             raise ProviderError(f"missing required key '{key}'")
     for key, spec in schema.get("properties", {}).items():
         if key not in data:
             continue
         value = data[key]
-        check = _TYPE_CHECKS.get(spec.get("type"))
-        if check and not check(value):
-            raise ProviderError(f"key '{key}' has wrong type {type(value).__name__}")
+        if key in required:
+            check = _TYPE_CHECKS.get(spec.get("type"))
+            if check and not check(value):
+                raise ProviderError(f"key '{key}' has wrong type {type(value).__name__}")
         if "enum" in spec and value not in spec["enum"]:
             raise ProviderError(f"key '{key}' value {value!r} not in {spec['enum']}")
 
