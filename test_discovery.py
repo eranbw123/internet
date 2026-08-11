@@ -41,6 +41,8 @@ from discovery import (
     scoring,
     stats,
     teach,
+    trace,
+    trace_fixture,
 )
 from discovery.personal_state import PersonalState, PersonalStateError
 from discovery.collectors import COLLECTORS, stocks, web_search, youtube
@@ -153,14 +155,21 @@ class FakeProvider(LLMProvider):
         for needle, value in self.scores.items():
             if needle in prompt:
                 if isinstance(value, Exception):
+                    self._emit_call(None, 1, system, prompt, schema, None, None, None,
+                                     "error", str(value), "t0", "t1")
                     raise value
-                return self._payload(value)
+                payload = self._payload(value)
+                self._emit_call(None, 1, system, prompt, schema, None, json.dumps(payload),
+                                 payload, "valid", None, "t0", "t1")
+                return payload
         raise AssertionError(f"FakeProvider got an unexpected prompt:\n{prompt}")
 
     def search_json(self, prompt, max_searches=5, max_tokens=8000):
         self.search_prompts.append(prompt)
         if self.search_results is None:
             raise UnsupportedCapability("fake provider has no search")
+        self._emit_call(None, 1, None, prompt, None, None, json.dumps(self.search_results),
+                         self.search_results, "array", None, "t0", "t1")
         return self.search_results
 
     @staticmethod
@@ -5720,16 +5729,20 @@ class CouncilTests(unittest.TestCase):
 
     def test_plan_missions_returns_validated_missions(self):
         provider = FakeCouncilProvider(mission_batches=[mission_batch("trial-registries", "patent-filings")])
-        missions_out = council.plan_missions(provider, self.interest, self._context(), 2)
+        missions_out, deliberation = council.plan_missions(provider, self.interest, self._context(), 2)
         self.assertEqual([m["label"] for m in missions_out], ["trial-registries", "patent-filings"])
         for m in missions_out:
             self.assertTrue(m["rationale"])
             self.assertTrue(m["prompt"])
         self.assertEqual(len(provider.complete_prompts), 1)   # exactly one call
+        # No "deliberation" object in mission_batch()'s fixture response --
+        # lenient, every section marked unavailable, never fatal.
+        for name in council.DELIBERATION_SECTIONS:
+            self.assertTrue(deliberation[name].get("unavailable"))
 
     def test_plan_missions_truncates_extras_past_count_without_failing(self):
         provider = FakeCouncilProvider(mission_batches=[mission_batch("a", "b", "c")])
-        missions_out = council.plan_missions(provider, self.interest, self._context(), 2)
+        missions_out, _deliberation = council.plan_missions(provider, self.interest, self._context(), 2)
         self.assertEqual([m["label"] for m in missions_out], ["a", "b"])
 
     def test_plan_missions_raises_on_missing_missions_key(self):
@@ -6292,6 +6305,576 @@ class WebTickTests(unittest.TestCase):
             {"collected": 1, "duplicate": 0, "filtered": 0, "already_scored": 0,
              "scored": 1, "deferred": 0, "errors": 0, "notified": 0},   # "article" isn't an ALERT type
         )
+
+
+# --- step-13 task 1: trace backbone -------------------------------------------
+
+class TraceRedactionTests(unittest.TestCase):
+    def test_redact_replaces_only_matching_env_values(self):
+        with mock.patch.dict(os.environ, {"MY_SECRET_TOKEN": "abc123"}, clear=False):
+            text = trace.redact("token is abc123 but the interest text stays intact")
+        self.assertNotIn("abc123", text)
+        self.assertIn("[REDACTED:MY_SECRET_TOKEN]", text)
+        self.assertIn("the interest text stays intact", text)
+
+    def test_redact_is_a_noop_without_matching_env_vars(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(trace.redact("nothing secret here"), "nothing secret here")
+
+    def test_redact_json_recurses_through_nested_structures(self):
+        with mock.patch.dict(os.environ, {"THE_API_KEY": "sekrit-value"}, clear=False):
+            out = trace.redact_json({"a": ["sekrit-value", {"b": "sekrit-value"}], "c": 1})
+        self.assertEqual(out["a"][0], "[REDACTED:THE_API_KEY]")
+        self.assertEqual(out["a"][1]["b"], "[REDACTED:THE_API_KEY]")
+        self.assertEqual(out["c"], 1)
+
+    def test_non_string_input_is_returned_unchanged(self):
+        self.assertIsNone(trace.redact(None))
+        self.assertEqual(trace.redact_json(42), 42)
+
+    def test_longest_matching_value_wins_when_one_is_a_substring_of_another(self):
+        with mock.patch.dict(
+            os.environ, {"SHORT_KEY": "sek", "LONG_KEY": "sekrit-full"}, clear=False
+        ):
+            text = trace.redact("value: sekrit-full")
+        self.assertEqual(text, "value: [REDACTED:LONG_KEY]")
+
+
+class _ProxyConn:
+    """Forwards to a real sqlite3 connection, except that any statement
+    containing `fail_on` raises -- used to prove Tracer._guard's fail-soft
+    behavior without depending on whether sqlite3.Connection itself can be
+    monkeypatched."""
+
+    def __init__(self, real, fail_on):
+        self._real = real
+        self._fail_on = fail_on
+
+    def execute(self, sql, *a, **kw):
+        if self._fail_on in sql:
+            raise sqlite3.OperationalError("disk full")
+        return self._real.execute(sql, *a, **kw)
+
+    def executemany(self, sql, *a, **kw):
+        if self._fail_on in sql:
+            raise sqlite3.OperationalError("disk full")
+        return self._real.executemany(sql, *a, **kw)
+
+    def commit(self):
+        return self._real.commit()
+
+
+class TraceEnableSwitchTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def test_disabled_tracer_writes_nothing_and_returns_none(self):
+        cfg = dataclasses.replace(CFG, trace_enabled=False)
+        tracer = trace.Tracer(self.conn, cfg)
+        run_id = tracer.begin_run("test")
+        self.assertIsNone(run_id)
+        node_id = tracer.node(run_id, "x", label="y")
+        self.assertIsNone(node_id)
+        self.assertIsNone(tracer.edge(1, 2, "generated"))
+        tracer.finish_node(node_id, status="ok")
+        tracer.finish_run(run_id)
+        for table in ("trace_runs", "trace_nodes", "trace_edges", "model_calls"):
+            self.assertEqual(self.conn.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"], 0)
+
+    def test_enabled_tracer_writes_a_run_and_a_node(self):
+        cfg = dataclasses.replace(CFG, trace_enabled=True)
+        tracer = trace.Tracer(self.conn, cfg)
+        run_id = tracer.begin_run("test")
+        self.assertIsNotNone(run_id)
+        node_id = tracer.node(run_id, "x", label="y")
+        self.assertIsNotNone(node_id)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM trace_runs").fetchone()["c"], 1)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM trace_nodes").fetchone()["c"], 1)
+
+    def test_a_trace_write_failure_is_swallowed_and_bumps_a_metric(self):
+        cfg = dataclasses.replace(CFG, trace_enabled=True)
+        proxy = _ProxyConn(self.conn, "INSERT INTO trace_nodes")
+        tracer = trace.Tracer(proxy, cfg)
+        run_id = tracer.begin_run("test")
+        node_id = tracer.node(run_id, "x", label="y")   # the write that fails
+        self.assertIsNone(node_id)
+        self.assertEqual(
+            dict(self.conn.execute("SELECT name, count FROM metrics").fetchall()),
+            {"trace_write_failed": 1},
+        )
+        # And the tick itself is untouched -- no exception escaped.
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM trace_runs").fetchone()["c"], 1)
+
+
+class TraceModelCallsTests(unittest.TestCase):
+    """(a) byte-exact prompts including retry-suffix framing, and
+    (b) a scoring failure + retry yields two model_calls rows, the failed
+    one intact -- both via claude_chat's real provider/attempt machinery,
+    not a hand-rolled stand-in."""
+
+    SCHEMA = {
+        "type": "object",
+        "properties": {"a": {"type": "number"}},
+        "required": ["a"],
+        "additionalProperties": False,
+    }
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.cfg = dataclasses.replace(CFG, trace_enabled=True)
+        self.tracer = trace.Tracer(self.conn, self.cfg)
+        self.run_id = self.tracer.begin_run("test")
+        self.node_id = self.tracer.node(self.run_id, "score-attempt", label="x")
+
+    def _provider(self, *replies):
+        conn = FakeCDPConnection(list(replies))
+        return claude_chat.ClaudeChatProvider(
+            "claude-opus-5", org_id="org-123", port=9222, connect=lambda: conn,
+        )
+
+    def test_model_calls_store_the_byte_exact_prompt_including_retry_suffix(self):
+        provider = self._provider(
+            completion_reply("not json at all"), completion_reply('{"a": 1}'),
+        )
+        provider.trace_sink = self.tracer.sink
+        with self.tracer.calls("scoring", self.node_id):
+            provider.complete_json("SYS", "PROMPT", self.SCHEMA)
+
+        rows = self.conn.execute(
+            "SELECT attempt, exact_user_prompt, raw_response_text, validation_result "
+            "FROM model_calls WHERE trace_node_id = ? ORDER BY attempt",
+            (self.node_id,),
+        ).fetchall()
+        self.assertEqual(len(rows), 2)
+        expected_base = "SYS\n\nPROMPT" + claude_chat.STRICT_JSON_SUFFIX.format(
+            schema=json.dumps(self.SCHEMA)
+        )
+        self.assertEqual(rows[0]["exact_user_prompt"], expected_base)
+        self.assertEqual(rows[1]["exact_user_prompt"], expected_base + claude_chat.RETRY_SUFFIX)
+
+    def test_a_scoring_failure_and_retry_yields_two_rows_the_failed_one_intact(self):
+        provider = self._provider(
+            completion_reply("garbage, not an object"), completion_reply('{"a": 1}'),
+        )
+        provider.trace_sink = self.tracer.sink
+        with self.tracer.calls("scoring", self.node_id):
+            provider.complete_json("SYS", "PROMPT", self.SCHEMA)
+
+        rows = self.conn.execute(
+            "SELECT attempt, raw_response_text, validation_result, parsed_response_json, error "
+            "FROM model_calls WHERE trace_node_id = ? ORDER BY attempt",
+            (self.node_id,),
+        ).fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["raw_response_text"], "garbage, not an object")
+        self.assertIn("invalid", rows[0]["validation_result"])
+        self.assertIsNone(rows[0]["parsed_response_json"])
+        self.assertEqual(rows[1]["raw_response_text"], '{"a": 1}')
+        self.assertEqual(rows[1]["validation_result"], "valid")
+        self.assertEqual(json.loads(rows[1]["parsed_response_json"]), {"a": 1})
+
+    def test_call_role_comes_from_the_tracer_context_not_the_provider(self):
+        provider = self._provider(completion_reply('{"a": 1}'))
+        provider.trace_sink = self.tracer.sink
+        with self.tracer.calls("mission_search", self.node_id):
+            provider.complete_json("SYS", "PROMPT", self.SCHEMA)
+        row = self.conn.execute(
+            "SELECT call_role FROM model_calls WHERE trace_node_id = ?", (self.node_id,)
+        ).fetchone()
+        self.assertEqual(row["call_role"], "mission_search")
+
+    def test_a_provider_call_outside_any_calls_context_is_simply_unattributed(self):
+        provider = self._provider(completion_reply('{"a": 1}'))
+        provider.trace_sink = self.tracer.sink
+        provider.complete_json("SYS", "PROMPT", self.SCHEMA)   # no tracer.calls() active
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM model_calls").fetchone()["c"], 0)
+
+
+class TraceOnOffParityTests(unittest.TestCase):
+    """(c) tracing ON vs OFF changes zero provider calls / production rows."""
+
+    def _run(self, trace_enabled):
+        conn = db.connect(":memory:")
+        db.init(conn)
+        cfg = dataclasses.replace(
+            CFG, trace_enabled=trace_enabled, telegram_bot_token="", telegram_chat_id="",
+        )
+        db.upsert_interest(conn, an_interest(min_score=0.5))
+        interests = db.active_interests(conn)
+        provider = FakeProvider({"Good": 0.9, "Meh": 0.2})
+        tracer = trace.Tracer(conn, cfg)
+        provider.trace_sink = tracer.sink
+        run_id = tracer.begin_run("test")
+
+        items = [
+            an_item(title="Good", url="https://e.com/good"),
+            an_item(title="Good", url="https://e.com/good"),   # duplicate
+            an_item(title="Meh", url="https://e.com/meh"),      # below threshold
+            an_item(title="x", url="https://e.com/short", text="short"),   # filtered
+        ]
+        for item in items:
+            node = tracer.node(run_id, "raw-result", label=item.title)
+            outcome = pipeline.ingest(
+                conn, provider, cfg, item, interests, origin_interest="k",
+                tracer=tracer, source_node_id=node,
+            )
+            db.bump(conn, {"collected": 1, pipeline.outcome_metric(outcome): 1})
+        pipeline.send_digest(conn, cfg, dry_run=True, tracer=tracer)
+        tracer.finish_run(run_id)
+        return conn, provider
+
+    def test_tracing_on_or_off_changes_nothing_about_pipeline_behavior(self):
+        conn_on, provider_on = self._run(True)
+        conn_off, provider_off = self._run(False)
+
+        self.assertEqual(len(provider_on.prompts), len(provider_off.prompts))
+        self.assertGreater(len(provider_on.prompts), 0)
+
+        volatile = ("created_at", "sent_at", "first_seen_at", "score_attempted_at")
+        for table in ("candidate_items", "scores", "notifications", "feedback"):
+            rows_on = [dict(r) for r in conn_on.execute(f"SELECT * FROM {table}")]
+            rows_off = [dict(r) for r in conn_off.execute(f"SELECT * FROM {table}")]
+            for row in rows_on + rows_off:
+                for key in volatile:
+                    row.pop(key, None)
+            self.assertEqual(rows_on, rows_off, table)
+
+        metrics_on = dict(conn_on.execute(
+            "SELECT name, count FROM metrics WHERE name != 'trace_write_failed'"
+        ).fetchall())
+        metrics_off = dict(conn_off.execute(
+            "SELECT name, count FROM metrics WHERE name != 'trace_write_failed'"
+        ).fetchall())
+        self.assertEqual(metrics_on, metrics_off)
+
+        self.assertEqual(conn_off.execute("SELECT COUNT(*) c FROM trace_runs").fetchone()["c"], 0)
+        self.assertEqual(conn_off.execute("SELECT COUNT(*) c FROM trace_nodes").fetchone()["c"], 0)
+        self.assertEqual(conn_off.execute("SELECT COUNT(*) c FROM trace_edges").fetchone()["c"], 0)
+        self.assertEqual(conn_off.execute("SELECT COUNT(*) c FROM model_calls").fetchone()["c"], 0)
+        self.assertGreater(conn_on.execute("SELECT COUNT(*) c FROM trace_nodes").fetchone()["c"], 0)
+        self.assertGreater(conn_on.execute("SELECT COUNT(*) c FROM model_calls").fetchone()["c"], 0)
+        conn_on.close()
+        conn_off.close()
+
+
+class TracePlantedSecretTests(unittest.TestCase):
+    """(d) planted secret values never appear in any trace table."""
+
+    def test_planted_secrets_are_redacted_everywhere_they_could_land(self):
+        secrets = {
+            "TELEGRAM_BOT_TOKEN": "tg-planted-secret-001",
+            "ANTHROPIC_API_KEY": "sk-ant-planted-secret-002",
+            "FIXTURE_SESSION_COOKIE": "cookie-planted-secret-003",
+        }
+        with mock.patch.dict(os.environ, secrets, clear=False):
+            conn = db.connect(":memory:")
+            db.init(conn)
+            self.addCleanup(conn.close)
+            cfg = dataclasses.replace(CFG, trace_enabled=True, telegram_bot_token=secrets["TELEGRAM_BOT_TOKEN"])
+            tracer = trace.Tracer(conn, cfg)
+            run_id = tracer.begin_run(
+                "test", config_json={"telegram_bot_token": secrets["TELEGRAM_BOT_TOKEN"]},
+            )
+            node_id = tracer.node(
+                run_id, "note", label=secrets["ANTHROPIC_API_KEY"],
+                summary=f"contains {secrets['FIXTURE_SESSION_COOKIE']}",
+                input_json={"k": secrets["TELEGRAM_BOT_TOKEN"]},
+                output_json={"k": secrets["ANTHROPIC_API_KEY"]},
+                exact_text=f"{secrets['TELEGRAM_BOT_TOKEN']} and {secrets['FIXTURE_SESSION_COOKIE']}",
+            )
+            tracer.finish_node(
+                node_id, summary=f"done, saw {secrets['ANTHROPIC_API_KEY']}",
+                error=f"failed with {secrets['FIXTURE_SESSION_COOKIE']}",
+            )
+            tracer.set_call_context("scoring", node_id)
+            tracer.sink(
+                attempt=1, provider="fake", model="fake-1",
+                system=f"sys {secrets['ANTHROPIC_API_KEY']}",
+                prompt=f"prompt {secrets['TELEGRAM_BOT_TOKEN']}",
+                schema=None, params=None,
+                raw_text=f"raw {secrets['FIXTURE_SESSION_COOKIE']}",
+                parsed={"a": secrets["ANTHROPIC_API_KEY"]}, validation="valid",
+                error=None, started="t1", finished="t2",
+            )
+            tracer.finish_run(run_id, error=f"run failed: {secrets['TELEGRAM_BOT_TOKEN']}")
+
+        checks = (
+            ("trace_runs", ("config_json", "error")),
+            ("trace_nodes", ("label", "summary", "input_json", "output_json", "exact_text", "error")),
+            ("model_calls", (
+                "exact_system_prompt", "exact_user_prompt", "raw_response_text",
+                "parsed_response_json", "error",
+            )),
+        )
+        for table, cols in checks:
+            for row in conn.execute(f"SELECT * FROM {table}").fetchall():
+                for col in cols:
+                    value = row[col]
+                    if value is None:
+                        continue
+                    for secret_value in secrets.values():
+                        self.assertNotIn(secret_value, value, f"{table}.{col}: {value!r}")
+
+
+class TracePipelineWiringTests(unittest.TestCase):
+    """(e) duplicate persistence + duplicate_of edge, (i) threshold snapshot."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.cfg = dataclasses.replace(CFG, trace_enabled=True)
+        db.upsert_interest(self.conn, an_interest(min_score=0.5))
+        self.interests = db.active_interests(self.conn)
+        self.tracer = trace.Tracer(self.conn, self.cfg)
+        self.run_id = self.tracer.begin_run("test")
+
+    def test_a_duplicate_raw_result_gets_a_persistent_node_and_duplicate_of_edge(self):
+        provider = FakeProvider({"Good": 0.9})
+        first_source = self.tracer.node(self.run_id, "raw-result", label="first")
+        pipeline.ingest(
+            self.conn, provider, self.cfg, an_item(title="Good", url="https://e.com/g"),
+            self.interests, origin_interest="k", tracer=self.tracer, source_node_id=first_source,
+        )
+        second_source = self.tracer.node(self.run_id, "raw-result", label="second")
+        outcome = pipeline.ingest(
+            self.conn, provider, self.cfg, an_item(title="Good", url="https://e.com/g"),
+            self.interests, origin_interest="k", tracer=self.tracer, source_node_id=second_source,
+        )
+        self.assertEqual(outcome.stage, "duplicate")
+
+        dup_node = self.conn.execute(
+            "SELECT id FROM trace_nodes WHERE node_type = 'duplicate'"
+        ).fetchone()
+        self.assertIsNotNone(dup_node)
+        edges = self.conn.execute(
+            "SELECT relationship FROM trace_edges WHERE from_node_id = ?", (dup_node["id"],)
+        ).fetchall()
+        self.assertIn("duplicate_of", [r["relationship"] for r in edges])
+        # And the raw-result -> duplicate branch itself survives (normalized_to).
+        normalized = self.conn.execute(
+            "SELECT COUNT(*) c FROM trace_edges WHERE from_node_id = ? AND relationship = 'normalized_to'",
+            (second_source,),
+        ).fetchone()["c"]
+        self.assertEqual(normalized, 1)
+
+    def test_threshold_snapshot_survives_a_later_interest_bar_change(self):
+        provider = FakeProvider({"Good": 0.6})   # clears 0.5, would NOT clear 0.9
+        source = self.tracer.node(self.run_id, "raw-result", label="src")
+        pipeline.ingest(
+            self.conn, provider, self.cfg, an_item(title="Good", url="https://e.com/g"),
+            self.interests, origin_interest="k", tracer=self.tracer, source_node_id=source,
+        )
+        threshold_node = self.conn.execute(
+            "SELECT output_json FROM trace_nodes WHERE node_type = 'threshold'"
+        ).fetchone()
+        before = json.loads(threshold_node["output_json"])
+        self.assertAlmostEqual(before["threshold"], 0.5)
+        self.assertAlmostEqual(before["final_score"], 0.6)
+
+        # Raise the bar well past the score that already cleared it.
+        self.conn.execute("UPDATE interests SET min_score = 0.9 WHERE key = 'k'")
+        self.conn.commit()
+
+        after_node = self.conn.execute(
+            "SELECT output_json FROM trace_nodes WHERE node_type = 'threshold'"
+        ).fetchone()
+        after = json.loads(after_node["output_json"])
+        self.assertEqual(before, after)   # untouched -- append-only, no live re-query
+        edge = self.conn.execute(
+            "SELECT relationship FROM trace_edges WHERE relationship IN ('cleared_threshold', 'rejected')"
+        ).fetchone()
+        self.assertEqual(edge["relationship"], "cleared_threshold")   # true at the time it was scored
+
+
+class TraceCouncilDeliberationTests(unittest.TestCase):
+    """(f) deliberation nodes persisted when well-formed; missions stay
+    strict and every section reads 'unavailable' when malformed."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.cfg = dataclasses.replace(
+            CFG, trace_enabled=True, mission_provider="fake_mission",
+            council_missions_per_generation=2, missions_per_tick=0, mission_low_water=1,
+        )
+        db.upsert_interest(self.conn, an_interest(key="alpha", title="alpha", sources=["web_search"]))
+
+    def _tick(self, mission_provider):
+        scoring_provider = FakeProvider()
+        with mock.patch.object(providers, "get_provider", return_value=mission_provider):
+            missions.web_tick(self.conn, self.cfg, provider=scoring_provider, dry_run=True)
+
+    def test_well_formed_deliberation_is_persisted_as_trace_nodes(self):
+        batch = mission_batch("a", "b")
+        batch["deliberation"] = {
+            "advisors": [{"name": f"Advisor {i}", "persona": "p", "analysis": "x"} for i in range(1, 6)],
+            "peer_review": [{"reviewer": f"Advisor {i}", "critiques": "c", "ranking": ["A"]} for i in range(1, 6)],
+            "aggregate_ranking": ["A", "B"],
+            "disagreements": "none material",
+            "rejected_angles": [{"angle": "social-sentiment", "reason": "too noisy"}],
+            "chairman_synthesis": "go with A and B",
+            "selection_rationale": "A generalizes best",
+        }
+        self._tick(FakeCouncilProvider(mission_batches=[batch]))
+
+        counts = dict(self.conn.execute(
+            "SELECT node_type, COUNT(*) c FROM trace_nodes GROUP BY node_type"
+        ).fetchall())
+        self.assertEqual(counts.get("advisor"), 5)
+        self.assertEqual(counts.get("peer-review"), 5)
+        self.assertEqual(counts.get("aggregate-ranking"), 1)
+        self.assertEqual(counts.get("rejected-angle"), 1)
+        self.assertEqual(counts.get("chairman"), 1)
+        chairman = self.conn.execute(
+            "SELECT output_json FROM trace_nodes WHERE node_type = 'chairman'"
+        ).fetchone()
+        self.assertIn("go with A and B", json.loads(chairman["output_json"])["chairman_synthesis"])
+        # Missions themselves: strict, exactly what the batch specified.
+        labels = [r["label"] for r in self.conn.execute(
+            "SELECT label FROM search_missions ORDER BY id"
+        ).fetchall()]
+        self.assertEqual(labels, ["a", "b"])
+
+    def test_malformed_deliberation_marks_every_section_unavailable_missions_stay_strict(self):
+        batch = mission_batch("a", "b")
+        batch["deliberation"] = {"advisors": "not-a-list"}   # everything else missing too
+        self._tick(FakeCouncilProvider(mission_batches=[batch]))
+
+        labels = [r["label"] for r in self.conn.execute(
+            "SELECT label FROM search_missions ORDER BY id"
+        ).fetchall()]
+        self.assertEqual(labels, ["a", "b"])   # strict validation untouched by deliberation
+
+        for node_type in ("advisor", "peer-review", "aggregate-ranking", "rejected-angle"):
+            row = self.conn.execute(
+                "SELECT output_json FROM trace_nodes WHERE node_type = ?", (node_type,)
+            ).fetchone()
+            self.assertIsNotNone(row, node_type)
+            payload = json.loads(row["output_json"])
+            self.assertTrue(payload.get("unavailable"), (node_type, payload))
+        chairman = self.conn.execute(
+            "SELECT output_json FROM trace_nodes WHERE node_type = 'chairman'"
+        ).fetchone()
+        chairman_payload = json.loads(chairman["output_json"])
+        self.assertTrue(chairman_payload["chairman_synthesis"]["unavailable"])
+
+
+class TraceMissionToolEventTests(unittest.TestCase):
+    """(g) 'not exposed by provider' node when the mission provider surfaces
+    no tool events for a search_json call."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.cfg = dataclasses.replace(
+            CFG, trace_enabled=True, mission_provider="fake_mission",
+            council_missions_per_generation=1, missions_per_tick=1, mission_low_water=1,
+        )
+        db.upsert_interest(self.conn, an_interest(key="alpha", title="alpha", sources=["web_search"]))
+
+    def test_no_events_from_the_provider_writes_one_explicit_node(self):
+        mp = FakeCouncilProvider(
+            mission_batches=[mission_batch("solo")],
+            search_results={"solo": search_hits("https://e.com/solo")},
+        )
+        self.assertIsNone(mp.last_events)   # FakeCouncilProvider never sets it
+        with mock.patch.object(providers, "get_provider", return_value=mp):
+            missions.web_tick(self.conn, self.cfg, provider=FakeProvider({"Result": 0.9}), dry_run=True)
+
+        node = self.conn.execute(
+            "SELECT label FROM trace_nodes WHERE node_type = 'tool-event'"
+        ).fetchone()
+        self.assertEqual(node["label"], "not exposed by provider")
+
+    def test_events_the_provider_does_expose_become_one_node_each(self):
+        mp = FakeCouncilProvider(
+            mission_batches=[mission_batch("solo")],
+            search_results={"solo": search_hits("https://e.com/solo")},
+        )
+        real_search_json = mp.search_json
+
+        def search_json_with_events(prompt, **kw):
+            result = real_search_json(prompt, **kw)
+            mp.last_events = [{"type": "server_tool_use", "name": "web_search"}]
+            return result
+
+        mp.search_json = search_json_with_events
+        with mock.patch.object(providers, "get_provider", return_value=mp):
+            missions.web_tick(self.conn, self.cfg, provider=FakeProvider({"Result": 0.9}), dry_run=True)
+
+        rows = self.conn.execute(
+            "SELECT label FROM trace_nodes WHERE node_type = 'tool-event'"
+        ).fetchall()
+        self.assertEqual([r["label"] for r in rows], ["server_tool_use"])
+
+
+class TraceFixtureTests(unittest.TestCase):
+    """(h) the fixture is structurally deterministic: two builds against
+    fresh DBs produce the same node/edge/model_call counts and labels."""
+
+    def _build(self):
+        conn = db.connect(":memory:")
+        db.init(conn)
+        cfg = dataclasses.replace(CFG, trace_enabled=True)
+        result = trace_fixture.build(conn, cfg)
+        return conn, result
+
+    def test_two_builds_produce_the_same_shape(self):
+        conn1, result1 = self._build()
+        conn2, result2 = self._build()
+        self.addCleanup(conn1.close)
+        self.addCleanup(conn2.close)
+
+        self.assertEqual(result1, result2)
+
+        def shape(conn):
+            node_counts = dict(conn.execute(
+                "SELECT node_type, COUNT(*) c FROM trace_nodes GROUP BY node_type"
+            ).fetchall())
+            edge_counts = dict(conn.execute(
+                "SELECT relationship, COUNT(*) c FROM trace_edges GROUP BY relationship"
+            ).fetchall())
+            call_role_counts = dict(conn.execute(
+                "SELECT call_role, COUNT(*) c FROM model_calls GROUP BY call_role"
+            ).fetchall())
+            labels = sorted(r["label"] for r in conn.execute(
+                "SELECT label FROM trace_nodes"
+            ).fetchall())
+            return node_counts, edge_counts, call_role_counts, labels
+
+        self.assertEqual(shape(conn1), shape(conn2))
+
+    def test_fixture_exercises_every_required_branch(self):
+        conn, result = self._build()
+        self.addCleanup(conn.close)
+        self.assertEqual(result["missions_generated"], 3)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) c FROM trace_nodes WHERE node_type = 'duplicate'").fetchone()["c"], 1,
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) c FROM trace_nodes WHERE node_type = 'prefilter' AND status = 'ok'"
+            ).fetchone()["c"],
+            1,
+        )
+        scoring_calls = conn.execute(
+            "SELECT COUNT(*) c FROM model_calls WHERE call_role = 'scoring'"
+        ).fetchone()["c"]
+        self.assertEqual(scoring_calls, 4)   # 3 score-attempts, one retried once
+        self.assertEqual(result["digest_sent"], 1)
+        self.assertTrue(result["feedback_recorded"])
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1,
+        )
+        # tracing off is not exercised by the fixture itself -- it always
+        # runs with cfg.trace_enabled True (see _build()).
 
 
 if __name__ == "__main__":

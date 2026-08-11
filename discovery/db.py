@@ -506,7 +506,7 @@ def record_notification(conn, score_id, channel, ok):
 
 
 def add_feedback(conn, item_id, interest_id, verdict, note="", original_score=None):
-    conn.execute(
+    cur = conn.execute(
         """
         INSERT INTO feedback (item_id, interest_id, verdict, note, original_score, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -514,6 +514,7 @@ def add_feedback(conn, item_id, interest_id, verdict, note="", original_score=No
         (item_id, interest_id, verdict, note, original_score, now()),
     )
     conn.commit()
+    return cur.lastrowid
 
 
 def score_by_id(conn, score_id):

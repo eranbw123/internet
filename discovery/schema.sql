@@ -224,3 +224,85 @@ CREATE INDEX IF NOT EXISTS idx_search_missions_interest_status
     ON search_missions(interest_key, status);
 CREATE INDEX IF NOT EXISTS idx_search_missions_status_lease
     ON search_missions(status, lease_expires_at);
+
+-- Trace backbone (discovery/trace.py, step-13 task 1). Append-only: rows are
+-- INSERTed; the only permitted UPDATE is stamping status/finished_at/error/
+-- output on the same row's own open run/node (finishing something already
+-- started). model_calls is strictly insert-only -- every retry attempt is a
+-- new row. No DELETE anywhere. See discovery/trace.py's module docstring for
+-- the write API and the redaction discipline applied before anything here is
+-- persisted.
+
+CREATE TABLE IF NOT EXISTS trace_runs (
+    id           INTEGER PRIMARY KEY,
+    kind         TEXT NOT NULL,        -- 'web-tick' | 'run-once' | 'digest' | 'fixture' | ...
+    provider     TEXT NOT NULL DEFAULT '',
+    model        TEXT NOT NULL DEFAULT '',
+    config_json  TEXT,                 -- redacted Config snapshot
+    started_at   TEXT NOT NULL,
+    finished_at  TEXT,
+    status       TEXT NOT NULL DEFAULT 'running',
+    error        TEXT
+);
+
+CREATE TABLE IF NOT EXISTS trace_nodes (
+    id           INTEGER PRIMARY KEY,
+    run_id       INTEGER NOT NULL REFERENCES trace_runs(id),
+    node_type    TEXT NOT NULL,
+    -- Deep-link back to the DB row this node corresponds to, e.g.
+    -- entity_type='scores', entity_id=<scores.id> -- 'trace/score/<id>'
+    -- resolves via the index below.
+    entity_type  TEXT,
+    entity_id    TEXT,
+    label        TEXT NOT NULL DEFAULT '',
+    status       TEXT NOT NULL DEFAULT 'ok',
+    summary      TEXT NOT NULL DEFAULT '',
+    input_json   TEXT,
+    output_json  TEXT,
+    exact_text   TEXT,                 -- byte-exact prompt/response/message text, redacted
+    started_at   TEXT NOT NULL,
+    finished_at  TEXT,
+    error        TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_trace_nodes_run ON trace_nodes(run_id);
+CREATE INDEX IF NOT EXISTS idx_trace_nodes_entity ON trace_nodes(entity_type, entity_id);
+
+-- Relationship vocabulary (also a module constant in trace.py, used
+-- verbatim): generated, selected, executed, returned, normalized_to,
+-- duplicate_of, matched, rejected, deferred, scored, cleared_threshold,
+-- rendered, sent, failed, retried_as, feedback_on.
+CREATE TABLE IF NOT EXISTS trace_edges (
+    from_node_id  INTEGER NOT NULL,
+    to_node_id    INTEGER NOT NULL,
+    relationship  TEXT NOT NULL,
+    ordinal       INTEGER NOT NULL DEFAULT 0
+);
+
+CREATE INDEX IF NOT EXISTS idx_trace_edges_from ON trace_edges(from_node_id);
+CREATE INDEX IF NOT EXISTS idx_trace_edges_to ON trace_edges(to_node_id);
+
+-- One row per provider call ATTEMPT (a retry is a new row, never an update),
+-- attached to the trace_node it was made on behalf of.
+CREATE TABLE IF NOT EXISTS model_calls (
+    id                       INTEGER PRIMARY KEY,
+    trace_node_id            INTEGER NOT NULL REFERENCES trace_nodes(id),
+    call_role                TEXT NOT NULL DEFAULT '',  -- council|mission_search|scoring|value_distillation
+    attempt                  INTEGER NOT NULL DEFAULT 1,
+    provider                 TEXT NOT NULL DEFAULT '',
+    model                    TEXT NOT NULL DEFAULT '',
+    exact_system_prompt      TEXT,
+    exact_user_prompt        TEXT,
+    exact_schema_json        TEXT,
+    exact_parameters_json    TEXT,
+    raw_response_text        TEXT,
+    parsed_response_json     TEXT,
+    validation_result        TEXT,
+    usage_json                TEXT,
+    provider_request_id      TEXT,
+    started_at               TEXT NOT NULL,
+    finished_at               TEXT,
+    error                     TEXT
+);
+
+CREATE INDEX IF NOT EXISTS idx_model_calls_node ON model_calls(trace_node_id);

@@ -61,6 +61,7 @@ a long-lived session.
 | `health [--notify]` | Job staleness, provider reachability, pending/abandoned sends; `--notify` alerts on degraded/recovery, rate-limited |
 | `personal-state [--path]` | Print the sibling `ai` repo's personal-state artifact as this repo would read it — see [Personal-state contract](#personal-state-contract) |
 | `teach [--list\|--explain\|--send]` | Label the highest information-value scored-but-unlabeled items — see [Teach](#teach) |
+| `trace-fixture` | Build the deterministic trace acceptance fixture (offline, fake providers) at `--db PATH` — see [Trace backbone](#trace-backbone) |
 
 Run it from the repo root — the `stocks` collector imports `watch.py`.
 `python -m app` and `python -m discovery` are the same CLI. Global flags
@@ -522,8 +523,65 @@ day, so a window is just a date filter.
 | `DISCOVERY_MISSION_MAX_ATTEMPTS` | `3` | Attempts before a mission is retired to `FAILED` |
 | `DISCOVERY_MISSION_RETRY_SECONDS` | `1800` | Cool-off before a failed mission is retried; also how long an interest whose latest Council planning call just failed is skipped by replenish |
 | `DISCOVERY_COUNCIL_MAX_CONSECUTIVE_FAILURES` | `3` | Consecutive Council planning failures for one interest before the static fallback mission is queued |
+| `DISCOVERY_TRACE` | `1` (on) | Enables the trace backbone (`discovery/trace.py`) — see [Trace backbone](#trace-backbone). `0`/`false` is the rollback lever: every Tracer method becomes a no-op and no `trace_*` table is written |
+| `DISCOVERY_OBSERVATORY_BASE_URL` | *(empty)* | Base URL for a future Datasette/UI surface over the trace tables (steps 2-3 of this feature); unused by this step's storage/instrumentation |
 
 `--provider`, `--model` and `--db` override the environment for one run.
+
+## Trace backbone
+
+Every `run-once`/`web-tick` cycle is recorded, at the same seams the pipeline
+already has, into four append-only tables so a later question ("why didn't
+this get notified?") can be answered by reading, not by adding print
+statements:
+
+- **`trace_runs`** — one row per command invocation (`kind`: `web-tick`,
+  `run-once`, `feedback`, `fixture`, ...).
+- **`trace_nodes`** — one row per step (a candidate, a match, a score, a
+  Council advisor, a mission, a Telegram send, ...). Nodes that correspond to
+  a DB row carry `entity_type`/`entity_id` (`candidate_items`, `scores`,
+  `search_missions`, `search_generations`, `interests`, `notifications`,
+  `feedback`) so a UI can deep-link straight to it.
+- **`trace_edges`** — `from_node_id -> to_node_id`, one of a fixed
+  relationship vocabulary (`generated`, `selected`, `executed`, `returned`,
+  `normalized_to`, `duplicate_of`, `matched`, `rejected`, `deferred`,
+  `scored`, `cleared_threshold`, `rendered`, `sent`, `failed`, `retried_as`,
+  `feedback_on`).
+- **`model_calls`** — one row per provider call **attempt** (a JSON-retry or
+  a connection-level reconnect each get their own row; nothing is ever
+  overwritten), with the exact final prompt actually sent (after every
+  framing/schema/retry suffix), the raw reply, the parsed result, and the
+  validation outcome. Central: every provider funnels through
+  `LLMProvider._emit_call()` (`discovery/providers/base.py`), so
+  council.py/missions.py/scoring.py never write their own logging — they only
+  set which node a provider call belongs to, via `tracer.calls(role, node_id)`.
+
+A threshold node snapshots `final_score` and the interest's `min_score` **as
+they were at scoring time** — a later change to an interest's bar never
+rewrites what an old trace says happened.
+
+Redaction (`discovery/trace.py`'s `redact`/`redact_json`): every environment
+variable whose name matches `(?i)(token|secret|key|password|cookie|auth)` has
+its literal *value* substituted with `[REDACTED:<VARNAME>]` everywhere it
+would otherwise appear in a trace row (config snapshots, prompts, responses).
+Everything else — prompt/interest content — is stored byte-exact.
+
+**Council deliberation and scoring reasoning** ride the SAME `complete_json`
+call the missions/score already needed — no extra spend. The Council's
+five-advisor analysis, anonymized peer review, aggregate ranking, rejected
+angles and Chairman synthesis are requested alongside the missions array; the
+missions array itself stays strictly validated exactly as before this step,
+and a missing/malformed deliberation section is recorded as
+`{"unavailable": true, "reason": ...}` rather than invented or treated as an
+error. Scoring similarly returns (and stores, never scores on) its evidence,
+alternative interpretation, and uncertainties.
+
+`python -m app trace-fixture --db PATH` builds a small, structurally
+deterministic fixture (one interest, one Council generation with three
+missions, a duplicate, a prefilter rejection, a scoring failure + retry, a
+below-bar score, and one delivered + feedback-rated discovery) against fake
+providers — offline, for the Datasette plugin/React UI in the next two steps
+to build and test against without a live Chrome/CDP session.
 
 ## Running it as an appliance
 
@@ -576,7 +634,7 @@ logs.
 python test_discovery.py
 ```
 
-405 tests, network fully stubbed — they never hit an LLM API, Telegram, or
+427 tests, network fully stubbed — they never hit an LLM API, Telegram, or
 Yahoo. The provider seam is the whole stub: a fake object with `complete_json`
 and `search_json`.
 

@@ -26,9 +26,15 @@ in the environment / .env.
 import json
 import os
 import uuid
+from datetime import datetime, timezone
 
 from . import cdp
 from .base import LLMProvider, ProviderError, parse_json_array, parse_json_object
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
+
 
 DEFAULT_PORT = 9222
 
@@ -78,6 +84,12 @@ class ClaudeChatProvider(LLMProvider):
         # injectable so tests never open a socket.
         self._connect = connect or self._connect_chrome
         self._connection = None
+        # Numbers model_calls rows within one top-level complete_json()/
+        # search_json() call -- reset at the start of each, so a JSON-retry
+        # attempt and a connection-level reconnect-and-retry inside
+        # _completion() both get their own row, numbered in the order they
+        # actually happened.
+        self._attempt_seq = 0
 
     # --- preflight ------------------------------------------------------------
 
@@ -105,9 +117,14 @@ class ClaudeChatProvider(LLMProvider):
         # max_tokens is part of the provider contract but claude.ai's endpoint
         # has no output cap parameter; it is accepted and ignored.
         base = f"{system}\n\n{prompt}" + STRICT_JSON_SUFFIX.format(schema=json.dumps(schema))
+        self._attempt_seq = 0
+        self.last_events = None
         last_error = None
         for attempt in range(2):
-            text = self._completion(base if attempt == 0 else base + RETRY_SUFFIX, tools=[])
+            text = self._completion(
+                base if attempt == 0 else base + RETRY_SUFFIX, tools=[],
+                trace_parse=lambda t: _trace_parse_object(t, schema), schema=schema,
+            )
             try:
                 data = parse_json_object(_extract_object(text))
                 _validate(data, schema)
@@ -119,12 +136,17 @@ class ClaudeChatProvider(LLMProvider):
     def search_json(self, prompt, max_searches=5, max_tokens=16000):
         # No hard search cap on this endpoint -- state it in the prompt instead.
         full = f"{prompt}\n\nUse web search (at most {max_searches} searches)."
-        text = self._completion(full, tools=WEB_SEARCH_TOOLS, timeout=420)
+        self._attempt_seq = 0
+        self.last_events = None
+        text = self._completion(
+            full, tools=WEB_SEARCH_TOOLS, timeout=420,
+            trace_parse=lambda t: (parse_json_array(t), "array"),
+        )
         return parse_json_array(text)
 
     # --- one claude.ai round trip -------------------------------------------
 
-    def _completion(self, prompt, tools, timeout=240):
+    def _completion(self, prompt, tools, timeout=240, trace_parse=None, schema=None):
         """One scratch-conversation round trip; text of the reply.
 
         A dropped Chrome connection gets one reconnect-and-retry (the tab
@@ -133,16 +155,26 @@ class ClaudeChatProvider(LLMProvider):
         is a ProviderError the pipeline treats like any other scoring failure.
         """
         try:
-            return self._attempt(prompt, tools, timeout)
+            return self._attempt(prompt, tools, timeout, trace_parse, schema)
         except (ConnectionError, OSError) as e:
             self._reset()
             try:
-                return self._attempt(prompt, tools, timeout)
+                return self._attempt(prompt, tools, timeout, trace_parse, schema)
             except (ConnectionError, OSError) as e2:
                 self._reset()
                 raise ProviderError(f"claude.ai connection failed twice: {e2}") from e2
 
-    def _attempt(self, prompt, tools, timeout):
+    def _attempt(self, prompt, tools, timeout, trace_parse=None, schema=None):
+        started = _now_iso()
+        self._attempt_seq += 1
+        attempt_no = self._attempt_seq
+
+        def emit(raw_text=None, error=None, parsed=None, validation=None, events=None):
+            self._emit_call(
+                None, attempt_no, None, prompt, schema, None,
+                raw_text, parsed, validation, error, started, _now_iso(), events=events,
+            )
+
         conn = self._conn()
         conv_id = str(uuid.uuid4())
         try:
@@ -154,7 +186,9 @@ class ClaudeChatProvider(LLMProvider):
         except RuntimeError as e:
             # JS exception inside the tab (claude.ai HTTP error, auth expiry).
             # The CDP connection itself is fine, so no reset.
-            raise ProviderError(f"claude.ai call failed: {e}") from e
+            error = f"claude.ai call failed: {e}"
+            emit(error=error)
+            raise ProviderError(error) from e
 
         try:
             conn.evaluate(_js_delete_conversation(self.org_id, conv_id), timeout=15)
@@ -163,16 +197,32 @@ class ClaudeChatProvider(LLMProvider):
 
         self.record_usage()  # calls only; this transport reports no token counts
         if raw is None:
-            raise ProviderError(
+            error = (
                 "claude.ai returned no text -- the Chrome tab was likely "
                 "navigated/reloaded mid-request; leave the claude.ai tab alone"
             )
+            emit(error=error)
+            raise ProviderError(error)
         result = raw if isinstance(raw, dict) else json.loads(raw)
         if not isinstance(result, dict):
-            raise ProviderError(f"unexpected completion payload from claude.ai: {result!r}")
+            error = f"unexpected completion payload from claude.ai: {result!r}"
+            emit(error=error)
+            raise ProviderError(error)
         text = result.get("text") or ""
+        events = result.get("events") or None
+        self.last_events = events or []
         if not text.strip():
-            raise ProviderError("empty completion from claude.ai")
+            error = "empty completion from claude.ai"
+            emit(error=error, events=events)
+            raise ProviderError(error)
+
+        parsed, validation = None, None
+        if trace_parse is not None:
+            try:
+                parsed, validation = trace_parse(text)
+            except Exception:  # noqa: BLE001 -- tracing must never break a real call
+                validation = "trace_parse_error"
+        emit(raw_text=text, parsed=parsed, validation=validation, events=events)
         return text
 
     # --- session --------------------------------------------------------------
@@ -211,6 +261,20 @@ class ClaudeChatProvider(LLMProvider):
 
 
 # --- schema validation (claude.ai has no structured outputs) -------------------
+
+def _trace_parse_object(text, schema):
+    """Best-effort parse+validate purely for the trace row -- mirrors what
+    complete_json() does right after, but never affects control flow (it is
+    called from inside _attempt(), swallowed on any exception by the caller).
+    Kept as its own function (not a lambda) so chatgpt_browser.py can reuse
+    the same shape via its own schema."""
+    try:
+        data = parse_json_object(_extract_object(text))
+        _validate(data, schema)
+        return data, "valid"
+    except ProviderError as e:
+        return None, f"invalid: {e}"
+
 
 def _validate(data, schema):
     """Just enough JSON-schema checking to catch a malformed reply before it
@@ -299,6 +363,12 @@ def _js_send_completion(org_id, conv_id, prompt, model, tools):
   const decoder = new TextDecoder();
   let buf = '';
   let text = '';
+  // Best-effort retention of observable search/tool activity in the SSE
+  // stream (server_tool_use start, its result block, errors) -- never
+  // fabricated: absent from the stream means an empty list, which the
+  // Python side turns into one explicit "not exposed by provider" node
+  // rather than inventing anything.
+  const events = [];
   while (true) {{
     const {{ done, value }} = await reader.read();
     if (done) break;
@@ -315,10 +385,20 @@ def _js_send_completion(org_id, conv_id, prompt, model, tools):
         text += evt.delta.text;
       }} else if (typeof evt.completion === 'string') {{
         text = evt.completion;
+      }} else if (evt.type === 'content_block_start' && evt.content_block &&
+                  (evt.content_block.type === 'server_tool_use' ||
+                   evt.content_block.type === 'web_search_tool_result')) {{
+        events.push({{
+          type: evt.content_block.type,
+          name: evt.content_block.name || null,
+          input: evt.content_block.input || null,
+        }});
+      }} else if (evt.type === 'error') {{
+        events.push({{ type: 'error', error: evt.error || evt }});
       }}
     }}
   }}
-  return JSON.stringify({{ text }});
+  return JSON.stringify({{ text, events }});
 }})()
 """
 

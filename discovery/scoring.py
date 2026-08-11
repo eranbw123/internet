@@ -58,6 +58,16 @@ actually see of the item
 naming the specific thing that earned the score
 - why_better_than_generic: one sentence on what this has that generic coverage \
 of the same topic does not. Empty string if it has nothing.
+
+Finally, show your work -- the same judgement above, made explicit:
+- evidence_used: the specific facts/passages in the item you actually relied on
+- why_this_interest: why you chose that interest over the others on the shortlist
+- dimension_rationale: one short phrase per dimension (personal_relevance, novelty, \
+depth, specificity, importance, surprise) explaining that dimension's rating
+- alternative_interpretation: the next most plausible reading of this item, and why you \
+didn't score it that way instead
+- why_not_higher: what's missing that would have earned a higher rating
+- uncertainties: what you couldn't verify or don't have enough evidence for
 """
 
 SCORE_SCHEMA = {
@@ -68,10 +78,26 @@ SCORE_SCHEMA = {
         "confidence": {"type": "number"},
         "reason": {"type": "string"},
         "why_better_than_generic": {"type": "string"},
+        "evidence_used": {"type": "string"},
+        "why_this_interest": {"type": "string"},
+        "dimension_rationale": {"type": "object"},
+        "alternative_interpretation": {"type": "string"},
+        "why_not_higher": {"type": "string"},
+        "uncertainties": {"type": "string"},
     },
     "required": ["interest_key", *DIMENSIONS, "confidence", "reason", "why_better_than_generic"],
     "additionalProperties": False,
 }
+
+# Debug/reasoning-contract fields (see PROMPT above) -- parsed tolerantly by
+# _debug_payload(): absent or malformed becomes {'unavailable': True, ...} in
+# that field's place, never an error. Never affects final_score, confidence,
+# reason, why_better_than_generic or models.WEIGHTS -- those stay exactly as
+# scored above.
+DEBUG_FIELDS = (
+    "evidence_used", "why_this_interest", "dimension_rationale",
+    "alternative_interpretation", "why_not_higher", "uncertainties",
+)
 
 
 class ScoringError(Exception):
@@ -101,6 +127,7 @@ def score_candidate(provider, item, matches, feedback=()):
         interest_id=interest.id,
         interest_key=interest.key,
         dimensions=dimensions,
+        debug=_debug_payload(data),
         final_score=final_score(dimensions),
         confidence=clamp01(data.get("confidence")),
         reason=str(data.get("reason") or "").strip(),
@@ -109,6 +136,18 @@ def score_candidate(provider, item, matches, feedback=()):
         model=provider.model,
         prompt_hash=prompt_fingerprint(),
     )
+
+
+def _debug_payload(data):
+    """Tolerant extraction of DEBUG_FIELDS from the same scoring response:
+    absent or wrong-typed becomes {'unavailable': True, ...} for that field
+    alone, never an error -- this is a debugging trail for the tracer, not
+    something any production code branches on."""
+    out = {}
+    for name in DEBUG_FIELDS:
+        value = data.get(name) if isinstance(data, dict) else None
+        out[name] = value if value is not None else {"unavailable": True, "reason": f"'{name}' missing from scoring response"}
+    return out
 
 
 def _resolve_interest(key, matches):

@@ -19,7 +19,7 @@ import sys
 from collections import Counter
 from dataclasses import dataclass, field
 
-from . import db, dedup, matching, normalize, notify, scoring
+from . import db, dedup, matching, normalize, notify, scoring, trace
 from .collectors import COLLECTORS
 from .models import CandidateItem, ScoreResult
 
@@ -86,7 +86,24 @@ def run_once(conn, provider, cfg, sources=None, dry_run=False):
     funnel/quality numbers in stats.py never include them.
 
     Always ends by delivering ALERT-type notifications immediately; DISCOVERY
-    ones are left pending for send_digest() to batch."""
+    ones are left pending for send_digest() to batch.
+
+    Wrapped in one trace_runs row (kind='run-once'; a no-op end to end when
+    cfg.trace_enabled is off) -- same run-level wrapping missions.web_tick()
+    gets. An exception is recorded on the run and re-raised unchanged."""
+    tracer = trace.Tracer(conn, cfg)
+    run_id = tracer.begin_run("run-once", provider=provider.name, model=provider.model)
+    provider.trace_sink = tracer.sink
+    try:
+        result = _run_once(conn, provider, cfg, sources, dry_run, tracer)
+    except Exception as e:  # noqa: BLE001 -- re-raised as-is right after
+        tracer.finish_run(run_id, status="error", error=str(e))
+        raise
+    tracer.finish_run(run_id, status="done")
+    return result
+
+
+def _run_once(conn, provider, cfg, sources, dry_run, tracer):
     interests = db.active_interests(conn)
     counts = Counter()
     budget, explore_budget = budgets_for(cfg)
@@ -97,6 +114,7 @@ def run_once(conn, provider, cfg, sources=None, dry_run=False):
             outcome = ingest(
                 conn, provider, cfg, item, interests,
                 origin_interest=interest.key, budget=budget, explore_budget=explore_budget,
+                tracer=tracer,
             )
             counts[outcome.stage] += 1
             # Flushed per item, not once at the end of the whole cycle: this
@@ -111,10 +129,10 @@ def run_once(conn, provider, cfg, sources=None, dry_run=False):
     # score (the run died, the API was down, the budget ran out) -- scored with
     # whatever budget this cycle's own candidates (of the matching lane) left
     # over.
-    backlog = _score_backlog(conn, provider, interests, budget, explore_budget)
+    backlog = _score_backlog(conn, provider, interests, budget, explore_budget, tracer=tracer)
     counts["scored"] += backlog["exploit"] + backlog["explore"]
     lane_notified = Counter()
-    counts["notified"] = deliver(conn, cfg, dry_run, lane_counts=lane_notified)
+    counts["notified"] = deliver(conn, cfg, dry_run, lane_counts=lane_notified, tracer=tracer)
     db.bump(conn, {
         "scored": backlog["exploit"],
         "explore_scored": backlog["explore"],
@@ -187,12 +205,16 @@ def classify_lane(matches):
 
 
 def ingest(conn, provider, cfg, item, interests, origin_interest=None, force=False,
-           budget=None, explore_budget=None):
+           budget=None, explore_budget=None, tracer=None, source_node_id=None):
     """Normalize, dedup, persist, match, filter, score. Returns an Outcome.
 
     `explore_budget` defaults to None so every existing caller (score --,
     teach.py, tests) keeps ingest()'s old single-budget behavior untouched --
-    only run_once()/`_discover` pass both."""
+    only run_once()/`_discover`/missions.py pass both. `tracer` defaults to
+    a no-op (trace.NULL_TRACER) so every existing caller stays untouched too;
+    `source_node_id`, if given (missions.py's raw-result node), is what the
+    normalized_to/duplicate_of edges below hang off."""
+    tracer = tracer or trace.NULL_TRACER
     normalize.normalize(item, origin_interest)
     # Computed before dedup/insert -- match_interests() is a pure function of
     # item + interests (no item.id involved), so the lane a duplicate would
@@ -202,37 +224,74 @@ def ingest(conn, provider, cfg, item, interests, origin_interest=None, force=Fal
 
     duplicate = dedup.find_duplicate(conn, item)
     if duplicate is not None and not force:
+        dup_node = tracer.node(
+            tracer.run_id, "duplicate", label=item.title, summary=duplicate.reason,
+            input_json={"dedup_key": item.dedup_key, "url": item.url},
+        )
+        tracer.edge(source_node_id, dup_node, "normalized_to")
+        earlier_node = tracer.find_entity_node("candidate_items", duplicate.existing.id, node_type="candidate")
+        tracer.edge(dup_node, earlier_node, "duplicate_of")
         return Outcome("duplicate", duplicate.existing, duplicate.reason, lane=lane)
 
     item.id = db.insert_item(conn, item)
+    candidate_node = tracer.node(
+        tracer.run_id, "candidate", entity_type="candidate_items", entity_id=item.id,
+        label=item.title, input_json={"url": item.url, "source": item.source},
+    )
+    tracer.edge(source_node_id, candidate_node, "normalized_to")
     db.save_matches(conn, item.id, matches)
+    for m_interest, m_score, m_terms in matches:
+        match_node = tracer.node(
+            tracer.run_id, "match", entity_type="interests", entity_id=m_interest.id,
+            label=f"{m_interest.key}: {m_score:.2f}", output_json={"terms": m_terms},
+        )
+        tracer.edge(candidate_node, match_node, "matched")
 
     ok, reason = matching.prefilter(item, matches, cfg)
     db.set_prefilter(conn, item.id, ok, reason)
     if not ok:
+        filtered_node = tracer.node(tracer.run_id, "prefilter", label="filtered", summary=reason)
+        tracer.edge(candidate_node, filtered_node, "rejected")
         return Outcome("filtered", item, reason, matches, lane=lane)
 
     if db.is_scored(conn, item.id):
         if not force:
+            deferred_node = tracer.node(
+                tracer.run_id, "prefilter", label="already scored", summary="scored on an earlier run",
+            )
+            tracer.edge(candidate_node, deferred_node, "deferred")
             return Outcome("already_scored", item, "scored on an earlier run", matches, lane=lane)
         db.delete_score(conn, item.id)
 
     lane_budget = explore_budget if lane == "explore" else budget
     if lane_budget is not None and not lane_budget.spend():
+        budget_node = tracer.node(tracer.run_id, "prefilter", label="budget", summary="cycle score budget spent")
+        tracer.edge(candidate_node, budget_node, "deferred")
         return Outcome("deferred", item, "cycle score budget spent", matches, lane=lane)
 
-    return _score(conn, provider, item, matches, reason, lane=lane)
+    return _score(conn, provider, item, matches, reason, lane=lane, tracer=tracer, candidate_node=candidate_node)
 
 
-def _score(conn, provider, item, matches, detail="", lane="exploit"):
+def _score(conn, provider, item, matches, detail="", lane="exploit", tracer=None, candidate_node=None):
+    tracer = tracer or trace.NULL_TRACER
     feedback = db.recent_feedback(conn, matches[0][0].id)
+    # entity-linked to candidate_items, not scores -- score.id doesn't exist
+    # until db.save_score() below succeeds, and a node's entity link can't
+    # change after creation. The "threshold" node further down is what's
+    # entity-linked to entity_type='scores' once the row exists.
+    score_node = tracer.node(
+        tracer.run_id, "score-attempt", entity_type="candidate_items", entity_id=item.id, label=item.title,
+    )
+    tracer.edge(candidate_node, score_node, "scored")
     try:
-        score = scoring.score_candidate(provider, item, matches, feedback)
+        with tracer.calls("scoring", score_node):
+            score = scoring.score_candidate(provider, item, matches, feedback)
     except Exception as e:  # noqa: BLE001
         print(f"scoring item {item.id} failed: {e}", file=sys.stderr)
         # Stamp the failure so _score_backlog() waits out a cool-off instead
         # of re-failing this item on every cycle while the provider is down.
         db.mark_score_attempt(conn, item.id)
+        tracer.finish_node(score_node, status="error", error=str(e))
         return Outcome("errors", item, str(e), matches, lane=lane)
     # Mirrors item.id = db.insert_item(conn, item) above: the caller gets a
     # ScoreResult whose id actually reflects the row just written, the same
@@ -242,10 +301,33 @@ def _score(conn, provider, item, matches, detail="", lane="exploit"):
     # -- exactly the kind of stale-id bug that bites the next caller who
     # reasonably assumes it works like item.id.
     score.id = db.save_score(conn, score)
+    tracer.finish_node(
+        score_node, status="ok", summary=score.reason,
+        output_json={"final_score": score.final_score, "confidence": score.confidence},
+    )
+    tracer.node(
+        tracer.run_id, "score-debug", entity_type="scores", entity_id=score.id,
+        label="reasoning", output_json=score.debug,
+    )
+    # Threshold snapshot: the interest + bar IN FORCE AT THIS MOMENT, so a
+    # later change to interests.min_score never rewrites what this trace
+    # says happened (trace_nodes/trace_edges are append-only).
+    by_key = {i.key: i for i, _s, _t in matches}
+    scored_interest = by_key.get(score.interest_key, matches[0][0])
+    cleared = score.final_score >= scored_interest.min_score
+    threshold_node = tracer.node(
+        tracer.run_id, "threshold", entity_type="scores", entity_id=score.id,
+        label=f"{score.final_score:.3f} vs {scored_interest.min_score:.3f}",
+        output_json={
+            "final_score": score.final_score, "threshold": scored_interest.min_score,
+            "interest_key": scored_interest.key,
+        },
+    )
+    tracer.edge(score_node, threshold_node, "cleared_threshold" if cleared else "rejected")
     return Outcome("scored", item, detail, matches, score, lane=lane)
 
 
-def _score_backlog(conn, provider, interests, budget, explore_budget=None):
+def _score_backlog(conn, provider, interests, budget, explore_budget=None, tracer=None):
     """Newest first, paged in batches sized to whatever budget each lane has
     left this cycle. Without a cap a persistent scoring failure would
     re-attempt every unscored item ever stored, on every cycle, forever.
@@ -268,6 +350,7 @@ def _score_backlog(conn, provider, interests, budget, explore_budget=None):
     Returns a Counter of items actually scored per lane. One lane running
     out never stops the other from draining: an exhausted lane's items are
     skipped (`continue`), not a `break` of the whole pass."""
+    tracer = tracer or trace.NULL_TRACER
     scored = Counter()
     cursor_id = None
     while budget.remaining > 0 or (explore_budget is not None and explore_budget.remaining > 0):
@@ -297,7 +380,9 @@ def _score_backlog(conn, provider, interests, budget, explore_budget=None):
             lane_budget = explore_budget if lane == "explore" else budget
             if lane_budget is not None and not lane_budget.spend():
                 continue  # this lane is out for the cycle -- let the other lane keep draining
-            if _score(conn, provider, item, matches, lane=lane).stage == "scored":
+            candidate_node = tracer.find_entity_node("candidate_items", item.id, node_type="candidate")
+            if _score(conn, provider, item, matches, lane=lane, tracer=tracer,
+                      candidate_node=candidate_node).stage == "scored":
                 scored[lane] += 1
         if len(rows) < batch_limit:
             break  # fewer rows than asked for -- the eligible backlog is exhausted
@@ -327,7 +412,7 @@ def notification_ready(conn, cfg):
     return ready
 
 
-def deliver(conn, cfg, dry_run=False, lane_counts=None):
+def deliver(conn, cfg, dry_run=False, lane_counts=None, tracer=None):
     """ALERT-type items only, sent the moment they clear the bar. DISCOVERY
     items are left pending -- send_digest() is what clears those.
 
@@ -335,15 +420,16 @@ def deliver(conn, cfg, dry_run=False, lane_counts=None):
     attempt (owner vs. derived interest) -- run_once() uses it to bump
     notified/explore_notified separately; every other caller (CLI, tests)
     leaves it None and gets the old plain int back, unchanged."""
+    tracer = tracer or trace.NULL_TRACER
     sent = 0
     for row, item, interest in notification_ready(conn, cfg):
         if not notify.is_alert(item):
             continue
-        sent += _send_one(conn, cfg, row, item, interest, dry_run, lane_counts)
+        sent += _send_one(conn, cfg, row, item, interest, dry_run, lane_counts, tracer)
     return sent
 
 
-def send_digest(conn, cfg, dry_run=False, lane_counts=None):
+def send_digest(conn, cfg, dry_run=False, lane_counts=None, tracer=None):
     """DISCOVERY items only, sorted by final_score (already
     notification_ready()'s order), capped at cfg.digest_max_items. Anything
     past the cap simply stays pending for tomorrow's digest -- it was never
@@ -353,17 +439,19 @@ def send_digest(conn, cfg, dry_run=False, lane_counts=None):
     step), so a digest send never increments notified/explore_notified; the
     parameter exists so a future caller that does want that split doesn't
     need a signature change to get it."""
+    tracer = tracer or trace.NULL_TRACER
     sent = 0
     for row, item, interest in notification_ready(conn, cfg):
         if notify.is_alert(item):
             continue
         if sent >= cfg.digest_max_items:
             break
-        sent += _send_one(conn, cfg, row, item, interest, dry_run, lane_counts)
+        sent += _send_one(conn, cfg, row, item, interest, dry_run, lane_counts, tracer)
     return sent
 
 
-def _send_one(conn, cfg, row, item, interest, dry_run, lane_counts=None):
+def _send_one(conn, cfg, row, item, interest, dry_run, lane_counts=None, tracer=None):
+    tracer = tracer or trace.NULL_TRACER
     text = notify.format_message(
         interest,
         item,
@@ -372,10 +460,26 @@ def _send_one(conn, cfg, row, item, interest, dry_run, lane_counts=None):
         row["why_better_than_generic"],
         row["confidence"],
     )
+    # A prior send attempt on this same score, if any -- retried_as links
+    # this attempt back to it. Looked up BEFORE this attempt's own node
+    # exists, so it never finds itself.
+    prior_render_node = tracer.find_entity_node("scores", row["score_id"], node_type="render")
+    render_node = tracer.node(
+        tracer.run_id, "render", entity_type="scores", entity_id=row["score_id"],
+        label="telegram message", exact_text=text,
+    )
+    if prior_render_node is not None:
+        tracer.edge(prior_render_node, render_node, "retried_as")
+
     ok = notify.send(cfg, text, reply_markup=notify.feedback_keyboard(row["score_id"]), dry_run=dry_run)
     # Recorded either way: a failed send stays recorded as not-ok rather
     # than being retried forever on every cycle.
     db.record_notification(conn, row["score_id"], "telegram", ok)
+    outcome_node = tracer.node(
+        tracer.run_id, "notification", entity_type="notifications", entity_id=row["score_id"],
+        label="telegram", status="ok" if ok else "error",
+    )
+    tracer.edge(render_node, outcome_node, "sent" if ok else "failed")
     if not ok:
         db.bump(conn, {"send_failed": 1})
     if lane_counts is not None:

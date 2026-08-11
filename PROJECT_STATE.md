@@ -2,6 +2,91 @@
 
 Updated 2026-08-11. Imported by `CLAUDE.md`. Current state only — not a log.
 
+## trace backbone (step-13 task 1)
+Append-only observability, pure stdlib, off by one env flag. `discovery/schema.sql`
+gained `trace_runs`/`trace_nodes`/`trace_edges`/`model_calls` (indexes on
+run_id, entity_type+entity_id, trace_node_id). `discovery/trace.py`'s `Tracer`
+(bound to conn+cfg) is the only writer: `begin_run`/`node`/`edge`/`finish_node`/
+`finish_run`, plus `calls(role, node_id)` (a context manager) and `sink()` (the
+callable installed as `provider.trace_sink`). `cfg.trace_enabled` (`DISCOVERY_TRACE`,
+default on) is read once at construction; off makes every method a same-line
+no-op -- zero SQL, not just filtered writes. Every write goes through `_guard`,
+which swallows exceptions and bumps `trace_write_failed` via `db.bump` --
+tracing can never abort a tick. `redact`/`redact_json` substitute literal
+env-var VALUES (name matches `(?i)(token|secret|key|password|cookie|auth)`)
+with `[REDACTED:<VARNAME>]`, applied to config snapshots, prompts/responses,
+and node labels/summaries/errors; JSON payloads go through `redact_json`.
+`trace.NULL_TRACER` (a real, permanently-disabled Tracer) lets pipeline.py/
+missions.py default `tracer=None -> tracer or NULL_TRACER` instead of an
+`if tracer:` guard at every call site.
+
+Central instrumentation: `LLMProvider` gained `trace_sink`/`last_events`
+attributes and `_emit_call()` (`providers/base.py`); `claude_chat.py`/
+`chatgpt_browser.py`'s `_attempt()` call it once per attempt (JSON-retry AND
+connection-reconnect both count), with the literal framed prompt actually
+sent and a best-effort parse+validate done purely for the trace row (doesn't
+affect the real parse/raise in `complete_json`). `anthropic_provider.py`/
+`openai_provider.py` emit once per call around their SDK request. Council/
+missions/scoring/pipeline never log a provider call themselves -- they set
+`(role, node_id)` via `tracer.calls()` and the sink attributes it. Browser
+providers also retain observable tool/search SSE events into `last_events`
+(claude.ai `server_tool_use`/`web_search_tool_result` blocks; chatgpt.com
+tool-role/non-'all'-recipient messages) -- **JS-side capture is best-effort
+and unverified against live traffic** (no Chrome in this worktree); Python-side
+wiring and the "no events -> one 'not exposed by provider' node" fallback
+(`missions._trace_tool_events`) are tested via the `last_events` attribute
+directly, decoupled from the JS.
+
+Reasoning contracts, no extra spend: `council.MISSION_SCHEMA` gained an
+optional `deliberation` object (advisors/peer_review/aggregate_ranking/
+disagreements/rejected_angles/chairman_synthesis/selection_rationale);
+`_validate_missions` (missions array) is unchanged/strict; `_extract_deliberation`
+grades each section independently -- missing OR wrong-shaped becomes
+`{'unavailable': True, 'reason': ...}`, never fatal, never invented.
+`plan_missions()` now returns `(missions, deliberation)` (call-site + test
+signature change, not just an attached attribute). `missions._persist_deliberation`
+turns it into nodes (advisor/peer-review/aggregate-ranking/rejected-angle/chairman)
+under the council node. `scoring.SCORE_SCHEMA` gained six optional debug fields
+(`scoring.DEBUG_FIELDS`); `ScoreResult.debug` (new field, not persisted to
+`scores`) carries them tolerantly parsed, handed to a `score-debug` trace node.
+
+Pipeline wiring (no behavior change): `missions.web_tick`/`pipeline.run_once`
+each open one `trace_runs` row; `ingest()`/`_score()` gained `tracer`/
+`source_node_id` params (default None/NULL_TRACER) producing candidate/match/
+prefilter/score-attempt/threshold nodes -- the threshold node snapshots
+`final_score` + the interest's `min_score` AT SCORING TIME (append-only, so a
+later bar change never rewrites an old trace). A "score" node can't be
+entity-linked to `scores` until `save_score()` returns an id it doesn't have
+yet, so `_score()`'s pre-call node is `score-attempt` (entity=candidate_items)
+and `threshold` (entity=scores) is the canonical scores-entity node --
+`feedback_listener._handle_callback` (now takes `cfg`, opens its own tiny
+run) looks up `node_type="threshold"` for its `feedback_on` edge, not "score".
+`_send_one` writes a `render` node (exact Telegram text) with `sent`/`failed`
+edges and `retried_as` back to a prior attempt found via `find_entity_node`.
+`db.add_feedback` now returns the new row id (was previously discarded by
+every caller; additive).
+
+`discovery/trace_fixture.py`'s `build(conn, cfg)` drives the REAL
+`missions.web_tick`/`pipeline.send_digest`/`feedback_listener._handle_callback`
+against fake providers (`providers.get_provider` patched, same seam
+`WebTickTests` uses) to produce one interest, one Council generation (5
+advisors/peer review/chairman), 3 missions, a duplicate, a prefilter
+rejection, a scoring failure+retry (2 model_calls), a below-bar score, and
+one delivered+feedback-rated item. **Structurally deterministic** (same
+node/edge/model_call counts+labels on a fresh DB) not byte-for-byte on
+timestamps -- no injectable clock seam exists in db.py/trace.py today.
+`python -m app trace-fixture --db PATH` (new CLI command, `__main__.py`).
+
+22 new tests (405 -> 427): redaction, enable-switch + fail-soft, byte-exact
+prompt/retry model_calls rows, on/off parity (identical provider-call counts
+and `candidate_items`/`scores`/`notifications`/`feedback` rows minus
+timestamps), planted-secret non-leakage, duplicate node+edge, threshold
+snapshot survives a bar change, deliberation persistence (well-formed and
+malformed), tool-event fallback, fixture determinism. `FakeProvider` in
+test_discovery.py now also calls `_emit_call` (no-op unless `trace_sink` is
+set, so every pre-existing test is untouched) so trace parity tests can
+assert on `model_calls` through the same fake every other test already uses.
+
 ## chatgpt_browser provider reconciliation (step-12 task 1)
 Ported verbatim from owner `main` (which predates steps 06-10, so was reconciled
 by hand, file by file, not merged): `discovery/providers/chatgpt_browser.py`
