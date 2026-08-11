@@ -657,6 +657,27 @@ class StatsTests(unittest.TestCase):
         self.assertIn("candidates collected", text)
         self.assertIn("nothing rated yet", text)
         self.assertIn("no usage recorded", text)
+        self.assertNotIn("MISSIONS", text)   # nothing in search_generations/search_missions yet
+
+    def test_missions_section_shows_generation_and_queue_status(self):
+        gen_id = db.insert_generation(self.conn, "k", "fake_mission", "m1", 2)
+        db.insert_missions(self.conn, gen_id, "k", [
+            {"label": "a", "rationale": "r", "prompt": "do a"},
+            {"label": "b", "rationale": "r", "prompt": "do b"},
+        ])
+        db.finish_generation(self.conn, gen_id, "DONE", 2)
+        bad_gen = db.insert_generation(self.conn, "k", "fake_mission", "m1", 1)
+        db.finish_generation(self.conn, bad_gen, "FAILED", 0, "boom")
+        mission_id = self.conn.execute(
+            "SELECT id FROM search_missions WHERE label = 'a'"
+        ).fetchone()["id"]
+        db.lease_missions(self.conn, [mission_id], 900)
+        db.finish_mission(self.conn, mission_id, 3)
+
+        text = stats.report(self.conn, days=7)
+        self.assertIn("MISSIONS (continuous web discovery)", text)
+        self.assertIn("generations in window: done=1 failed=1", text)
+        self.assertIn("missions (all time): pending=1 running=0 done=1 failed=0", text)
 
     def test_funnel_shows_survivors_and_what_reached_the_llm(self):
         db.bump(self.conn, {"collected": 100, "duplicate": 40, "filtered": 30,
@@ -6052,6 +6073,77 @@ class WebTickTests(unittest.TestCase):
         ).fetchone()
         self.assertEqual(bravo_row["status"], "DONE")
 
+    def test_planner_failure_with_a_non_provider_exception_leaves_others_executing(self):
+        """A live provider's own response parsing can raise something other
+        than CouncilError/ProviderError (e.g. TypeError/JSONDecodeError on a
+        malformed non-dict reply) -- that must be isolated exactly like a
+        ProviderError, not propagate out of web_tick() and abort every
+        other interest's execution for the tick."""
+        cfg = dataclasses.replace(self.cfg, missions_per_tick=1, mission_low_water=1)
+        self._interest("alpha")   # will fail to plan, with a bare exception
+        self._interest("bravo")   # already has pending work
+        self._seed_mission("bravo", "bravo-0")
+
+        mp = FakeCouncilProvider(
+            mission_batches=[TypeError("unexpected non-dict CDP reply")],
+            search_results={"bravo-0": search_hits("https://e.com/b0")},
+        )
+        self._tick(mp, cfg=cfg)
+
+        self.assertEqual(self._generation_statuses("alpha"), ["FAILED"])
+        bravo_row = self.conn.execute(
+            "SELECT status FROM search_missions WHERE interest_key='bravo'"
+        ).fetchone()
+        self.assertEqual(bravo_row["status"], "DONE")
+
+    def test_build_context_failure_still_finalizes_the_generation_and_others_execute(self):
+        """A failure in council.build_context() itself (before plan_missions
+        is even called) must not leave an orphan PENDING search_generations
+        row, and must not abort other interests' execution either."""
+        cfg = dataclasses.replace(self.cfg, missions_per_tick=1, mission_low_water=1)
+        self._interest("alpha")
+        self._interest("bravo")
+        self._seed_mission("bravo", "bravo-0")
+
+        mp = FakeCouncilProvider(search_results={"bravo-0": search_hits("https://e.com/b0")})
+        with mock.patch.object(council, "build_context", side_effect=RuntimeError("db blew up")):
+            self._tick(mp, cfg=cfg)
+
+        self.assertEqual(self._generation_statuses("alpha"), ["FAILED"])   # never orphaned at PENDING
+        bravo_row = self.conn.execute(
+            "SELECT status FROM search_missions WHERE interest_key='bravo'"
+        ).fetchone()
+        self.assertEqual(bravo_row["status"], "DONE")
+
+    def test_replenish_backs_off_after_a_recent_council_failure(self):
+        """A Council that keeps failing must not burn one real provider call
+        every single tick -- only cfg.mission_retry_seconds after the most
+        recent failure is a retry due."""
+        cfg = dataclasses.replace(self.cfg, mission_low_water=1, missions_per_tick=0,
+                                   mission_retry_seconds=1800)
+        self._interest("alpha")
+
+        mp1 = FakeCouncilProvider(mission_batches=[providers.ProviderError("down")])
+        self._tick(mp1, cfg=cfg)
+        self.assertEqual(len(mp1.complete_prompts), 1)
+        self.assertEqual(self._generation_statuses("alpha"), ["FAILED"])
+
+        # Still within the cool-off -- no second Council call this tick.
+        mp2 = FakeCouncilProvider(mission_batches=[mission_batch("should-not-be-requested")])
+        self._tick(mp2, cfg=cfg)
+        self.assertEqual(len(mp2.complete_prompts), 0)
+        self.assertEqual(self._generation_statuses("alpha"), ["FAILED"])
+
+        # Cool-off elapsed -- back-date the failed generation and retry succeeds.
+        self.conn.execute(
+            "UPDATE search_generations SET created_at = ? WHERE interest_key = 'alpha'",
+            (db.ago(cfg.mission_retry_seconds + 60),),
+        )
+        mp3 = FakeCouncilProvider(mission_batches=[mission_batch("recovered")])
+        self._tick(mp3, cfg=cfg)
+        self.assertEqual(len(mp3.complete_prompts), 1)
+        self.assertEqual(self._generation_statuses("alpha"), ["FAILED", "DONE"])
+
     def test_malformed_council_output_records_failed_generation_and_enqueues_nothing(self):
         self._interest("alpha")
         mp = FakeCouncilProvider(mission_batches=[{"missions": "not-a-list"}])
@@ -6161,6 +6253,7 @@ class WebTickTests(unittest.TestCase):
     def test_static_fallback_enqueued_only_after_consecutive_council_failures(self):
         cfg = dataclasses.replace(
             self.cfg, council_max_consecutive_failures=2, mission_low_water=1, missions_per_tick=0,
+            mission_retry_seconds=0,   # no replenish cooldown between these back-to-back ticks
         )
         interest = self._interest("alpha")
 

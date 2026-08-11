@@ -54,6 +54,7 @@ def report(conn, days=7, cfg=None):
     lines += _funnel(conn, since, days)
     lines += _per_interest(conn, since)
     lines += _exploration(conn, since, cfg)
+    lines += _missions(conn, since)
     lines += _feedback(conn, since)
     lines += _score_by_verdict(conn, since)
     lines += _cost(conn, since, days)
@@ -182,6 +183,47 @@ def _exploration(conn, since, cfg):
         lines.append(_row(f"explore: {stage}", m.get(f"explore_{stage}", 0), None))
     lines.append("")
     lines += _per_interest_rows(conn, since, owner=False)
+    return lines
+
+
+# --- missions (step-12 task 2: continuous Council-driven web discovery) -----
+
+def _missions(conn, since):
+    """The one part of discovery/council.py + discovery/missions.py not
+    already visible via FUNNEL/COST above (mission-sourced items feed the
+    same collected/scored/notified counters every other source does): queue
+    health -- how many Council planning attempts failed, and what's sitting
+    in the search_missions queue right now. Printed only when there is a
+    search_generations/search_missions row to show; a report before this
+    subsystem exists (or ever runs) is byte-identical to before this
+    section existed."""
+    gen_rows = conn.execute(
+        "SELECT status, COUNT(*) n FROM search_generations WHERE created_at >= ? GROUP BY status",
+        (since,),
+    ).fetchall()
+    # Missions, unlike generations, are worth showing by their CURRENT status
+    # regardless of window -- a stuck RUNNING/FAILED row from before `since`
+    # is exactly the kind of thing this section exists to surface.
+    mission_rows = conn.execute(
+        "SELECT status, COUNT(*) n FROM search_missions GROUP BY status"
+    ).fetchall()
+    if not gen_rows and not mission_rows:
+        return []
+
+    gens = {r["status"]: r["n"] for r in gen_rows}
+    missions = {r["status"]: r["n"] for r in mission_rows}
+    lines = ["MISSIONS (continuous web discovery)"]
+    lines.append(
+        f"generations in window: done={gens.get('DONE', 0)} failed={gens.get('FAILED', 0)}"
+    )
+    lines.append(
+        "missions (all time): "
+        + " ".join(
+            f"{status.lower()}={missions.get(status, 0)}"
+            for status in ("PENDING", "RUNNING", "DONE", "FAILED")
+        )
+    )
+    lines.append("")
     return lines
 
 

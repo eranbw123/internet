@@ -59,9 +59,29 @@ interest. `pipeline.budgets_for(cfg)` factors the exploit/explore `Budget`
 pair out of `run_once()`, now shared with `web_tick()` -- the one refactor
 this step allows itself. 14 new cfg knobs (`council_*`/`mission_*`,
 `DISCOVERY_*` env-backed), plus `interval_web_seconds` default 4h -> 60s.
-31 new offline tests (`CouncilTests`, `MissionDbTests`, `WebTickTests` --
-fake mission + fake scoring providers, no Chrome/CDP/network), 370 -> 401,
-all green.
+35 new offline tests (`CouncilTests`, `MissionDbTests`, `WebTickTests`,
+`StatsTests` -- fake mission + fake scoring providers, no Chrome/CDP/
+network), 370 -> 405, all green.
+
+Repair (review pass): `_generate_for()`'s except clause only caught
+`(CouncilError, ProviderError)`, but `build_context()` ran outside any
+try at all and a live provider's own response parsing can raise other
+exception types (e.g. `TypeError`/`JSONDecodeError` on a malformed non-dict
+reply) -- either would have propagated out of `web_tick()` and aborted
+every other interest's execution for the tick, and left the generation row
+orphaned at `PENDING` forever. `_generate_for()` now inserts the generation
+row first and wraps `build_context()` + `plan_missions()` in one `except
+Exception`. `_replenish()` also gained a cool-off (reusing
+`mission_retry_seconds`, no new knob): an interest whose latest generation
+just `FAILED` is skipped until the cool-off passes, so a broken Council
+can't burn one real provider call every single tick. `web_tick()`'s
+preflight check now goes through `health.preflight_gate()` instead of a
+bare `mission_provider.preflight()` call, so a dead mission provider gets
+the same `chrome_launch_cmd` relaunch attempt and `provider_down` counter
+run-once's own gate already gives the scoring provider. `stats.py` gained
+a MISSIONS section (generation done/failed counts in-window, mission queue
+status all-time) -- the queue side of this subsystem had no `stats.py`
+surface at all before this repair.
 
 ## service hardening (step-01): no more in-process scheduler
 `discovery/scheduler.py` and `run` are DELETED; `ops/install_tasks.py` is the

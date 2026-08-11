@@ -33,7 +33,7 @@ import dataclasses
 import sys
 from collections import Counter
 
-from . import council, db, pipeline, providers
+from . import council, db, health, pipeline, providers
 from .collectors import _search
 from .collectors.web_search import PROMPT as STATIC_FALLBACK_PROMPT
 
@@ -64,12 +64,12 @@ def web_tick(conn, cfg, provider=None, dry_run=False):
 
     mission_cfg = dataclasses.replace(cfg, provider=cfg.mission_provider, model=cfg.mission_model)
     mission_provider = providers.get_provider(mission_cfg)
-    ok, detail = mission_provider.preflight()
-    if not ok:
-        print(
-            f"web_tick: mission provider '{cfg.mission_provider}' preflight failed -- {detail}",
-            file=sys.stderr,
-        )
+    # Reuses run-once's own gate (not a hand-rolled preflight() call) so a
+    # dead mission provider gets the same treatment a dead scoring provider
+    # does: one optional cfg.chrome_launch_cmd relaunch + re-check, and the
+    # provider_down/job:web:last_fail bookkeeping health.py/stats.py already
+    # read -- a bare preflight() call would silently drop both.
+    if not health.preflight_gate(conn, mission_provider, cfg, "web"):
         return {"leased": 0, "executed": 0, "notified": 0, "preflight_ok": False}
 
     all_interests = db.active_interests(conn)
@@ -110,11 +110,19 @@ def _replenish(conn, cfg, mission_provider, owner_interests):
     for a deterministic pick among true ties. This is what makes an empty
     DB self-populate one interest per tick instead of bursting through all
     of them -- Council generation is a reservoir refill, not a per-interest-
-    per-minute operation."""
+    per-minute operation.
+
+    An interest whose most recent generation just FAILED is skipped until
+    cfg.mission_retry_seconds has passed (same knob search_missions' own
+    fail_mission() cool-off uses) -- otherwise a Council that keeps
+    returning malformed output would burn one real provider call every
+    single tick for as long as it stays broken."""
     candidates = []
     for interest in owner_interests:
         pending = db.pending_mission_count(conn, interest.key)
         if pending >= cfg.mission_low_water:
+            continue
+        if _generation_in_cooldown(conn, interest.key, cfg.mission_retry_seconds):
             continue
         candidates.append((pending, _last_generation_at(conn, interest.key) or "", interest))
     if not candidates:
@@ -132,17 +140,35 @@ def _last_generation_at(conn, interest_key):
     return row["t"] if row else None
 
 
+def _generation_in_cooldown(conn, interest_key, retry_seconds):
+    row = conn.execute(
+        "SELECT status, created_at FROM search_generations WHERE interest_key = ? ORDER BY id DESC LIMIT 1",
+        (interest_key,),
+    ).fetchone()
+    if row is None or row["status"] != "FAILED":
+        return False
+    return row["created_at"] > db.ago(retry_seconds)
+
+
 def _generate_for(conn, cfg, mission_provider, interest):
-    context = council.build_context(conn, interest, cfg)
+    """The generation row is inserted before build_context()/plan_missions()
+    run, and the try/except wraps both -- any exception either can raise
+    (CouncilError, a ProviderError, or something a live provider's own
+    parsing didn't anticipate, e.g. a malformed non-dict CDP reply) is
+    caught here so one interest's planning failure can never propagate out
+    of web_tick() and abort every other interest's execution for the tick,
+    and so this generation is always finalized rather than left orphaned at
+    PENDING."""
     generation_id = db.insert_generation(
         conn, interest.key, mission_provider.name, mission_provider.model,
         cfg.council_missions_per_generation,
     )
     try:
+        context = council.build_context(conn, interest, cfg)
         missions = council.plan_missions(
             mission_provider, interest, context, cfg.council_missions_per_generation
         )
-    except (council.CouncilError, providers.ProviderError) as e:
+    except Exception as e:  # noqa: BLE001 -- one interest's planning failure must not crash the tick
         db.finish_generation(conn, generation_id, "FAILED", 0, str(e))
         _maybe_enqueue_fallback(conn, cfg, interest)
         return
