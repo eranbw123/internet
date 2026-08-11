@@ -19,6 +19,18 @@ endpoints don't require. A full round trip, all inside the tab:
   POST /backend-api/conversation                -> text/event-stream (SSE) reply
   PATCH /backend-api/conversation/{id}           -> {is_visible:false}  (best-effort tidy-up)
 
+Model + reasoning: the default model spec is the sentinel `latest-high`, which
+the send resolves live from GET /backend-api/models -- always the newest
+version at its High preset (the maximum-reasoning "thinking" model), so a new
+model generation is picked up with no code change. A concrete `DISCOVERY_MODEL`
+still pins explicitly: a bare slug, or `slug:effort` to also fix the thinking
+effort. The current latest High preset is a *thinking* model, and thinking
+models no longer stream their answer inline -- the POST returns only a
+`stream_handoff` frame -- so when the send comes back with a conversation id but
+no text, the answer is read back by polling GET /backend-api/conversation/{id}
+until the assistant message is finished. Non-thinking models still stream
+inline and skip the poll.
+
 The proof-of-work hash is SHA3-512, which the browser's SubtleCrypto cannot do,
 so a compact pure-JS keccak is embedded below (SHA3_JS). It was cross-checked
 byte-for-byte against Python's hashlib.sha3_512 on several vectors before
@@ -36,6 +48,10 @@ that can drift, and heavy automated use sits uneasily with chatgpt.com's terms
   * Web search is ChatGPT's own search tool, requested per message via
     system_hints=["search"]; search_json() cannot cap the number of searches,
     so max_searches becomes a prompt instruction rather than a hard limit.
+  * Reasoning cost: latest-high runs a thinking model at extended effort for
+    every call, scoring included, which is slower and heavier on the account's
+    thinking quota than a non-thinking model -- pin DISCOVERY_MODEL to a bare
+    slug (no effort) to opt a deployment out.
 
 Needs: Chrome launched with --remote-debugging-port (CHATGPT_BROWSER_PORT, or
 CLAUDE_BROWSER_PORT, default 9222) and a chatgpt.com tab logged in inside it.
@@ -43,6 +59,7 @@ No org id, no API key.
 """
 import json
 import os
+import time
 
 from . import cdp
 from .base import LLMProvider, ProviderError, parse_json_array, parse_json_object
@@ -51,6 +68,21 @@ from .claude_chat import _extract_object, _validate  # same "JSON out of a chat"
 DEFAULT_PORT = 9222
 PREFLIGHT_TIMEOUT_SECONDS = 5  # a port that accepts but never answers must not hang the free check
 ORIGIN = "https://chatgpt.com"
+
+# "always the newest model at max reasoning" -- resolved live per send, so a new
+# generation needs no code change (see module docstring / _js_completion).
+LATEST_HIGH = "latest-high"
+# Only used if GET /backend-api/models can't be read at send time -- the
+# last-known newest thinking slug + its High-preset effort. Refresh when a newer
+# generation ships; the live resolve makes this a rarely-hit safety net.
+FALLBACK_MODEL = "gpt-5-6-thinking"
+FALLBACK_EFFORT = "extended"
+
+# Thinking models answer on a handed-off stream, so the send returns a
+# conversation id but no inline text; poll the conversation until the assistant
+# message is finished. Interval/timeout are generous -- a missed poll just costs
+# one more read, and a truly stuck turn falls back to a normal ProviderError.
+POLL_INTERVAL_SECONDS = 3
 
 SETUP_HINT = (
     "launch Chrome with --remote-debugging-port={port} and log into "
@@ -159,15 +191,48 @@ class ChatGPTBrowserProvider(LLMProvider):
             raise ProviderError(f"unexpected completion payload from chatgpt.com: {result!r}")
 
         conv_id = result.get("conversation_id")
+        text = result.get("text") or ""
+        # Thinking models (the latest-high default) stream on a handed-off
+        # channel, so the send returns a stream_handoff and no inline text --
+        # read the answer back by polling the conversation until it's finished.
+        # Non-thinking models stream inline and already have their text here.
+        if not text.strip() and conv_id:
+            text = self._poll(conn, conv_id, timeout)
+
         if conv_id:  # best-effort: hide the scratch conversation, never fatal
             try:
                 conn.evaluate(_js_hide_conversation(conv_id), timeout=15)
             except Exception:  # noqa: BLE001
                 pass
 
-        text = result.get("text") or ""
         if not text.strip():
             raise ProviderError("empty completion from chatgpt.com")
+        return text
+
+    def _poll(self, conn, conv_id, timeout):
+        """Read a handed-off (thinking-model) answer back from the conversation.
+        Loops GET /backend-api/conversation/{id} until the assistant's text
+        message reports finished, or `timeout` elapses. A read failure (socket
+        drop mid-poll, HTTP error) is not retried with a fresh send -- that
+        would double-post; we return whatever text arrived (empty -> the caller
+        raises a normal, skippable ProviderError)."""
+        deadline = time.monotonic() + timeout
+        text = ""
+        while time.monotonic() < deadline:
+            time.sleep(POLL_INTERVAL_SECONDS)
+            try:
+                raw = conn.evaluate(_js_poll(conv_id), timeout=30)
+            except (RuntimeError, ConnectionError, OSError):
+                break
+            if raw is None:
+                continue
+            data = raw if isinstance(raw, dict) else json.loads(raw)
+            if not isinstance(data, dict):
+                continue
+            if data.get("text"):
+                text = data["text"]
+            if data.get("done"):
+                break
         return text
 
     # --- session --------------------------------------------------------------
@@ -248,12 +313,17 @@ function sha3_512_hex(input) {
 
 
 def _js_completion(prompt, model, search):
-    """One evaluate() that does the whole send: session token -> sentinel
-    chat-requirements + proof-of-work -> POST conversation -> read the SSE
-    stream. Returns JSON.stringify({text, conversation_id}). Any HTTP/auth
-    failure throws, surfacing as a ProviderError."""
+    """One evaluate() that does the whole send: session token -> resolve the
+    model + reasoning effort -> sentinel chat-requirements + proof-of-work ->
+    POST conversation -> read the SSE stream. Returns JSON.stringify({text,
+    conversation_id, handoff, model, effort}); `handoff` true means the answer
+    streams on a handed-off channel and the caller must poll for it. Any
+    HTTP/auth failure throws, surfacing as a ProviderError."""
     prompt_json = json.dumps(prompt)
-    model_json = json.dumps(model)
+    model_spec_json = json.dumps(model or "")
+    latest_high_json = json.dumps(["", "auto", "latest", LATEST_HIGH])
+    fallback_model_json = json.dumps(FALLBACK_MODEL)
+    fallback_effort_json = json.dumps(FALLBACK_EFFORT)
     hints_json = json.dumps(["search"] if search else [])
     return SHA3_JS + f"""
 (async () => {{
@@ -268,6 +338,37 @@ def _js_completion(prompt, model, search):
   const token = (await sess.json()).accessToken;
   if (!token) throw new Error('not logged in to chatgpt.com (no accessToken)');
   const auth = {{ 'Authorization': 'Bearer ' + token }};
+
+  // 1b) resolve the model + reasoning effort. A sentinel spec means "newest
+  // version at its High (max-reasoning) preset", read live so a new model
+  // generation is used with no code change; 'slug:effort' or a bare slug pins.
+  let model = null, effort = null;
+  const spec = {model_spec_json};
+  if ({latest_high_json}.includes(spec)) {{
+    try {{
+      const mres = await fetch(ORIGIN + '/backend-api/models?history_and_training_disabled=true', {{
+        headers: Object.assign({{ Accept: 'application/json' }}, auth), credentials: 'include' }});
+      if (mres.ok) {{
+        const mj = await mres.json();
+        const latest = (mj.versions || [])[0];   // "Latest" version group is first
+        if (latest) {{
+          const RANK = {{ standard: 1, extended: 2, heavy: 3 }};
+          for (const p of (latest.intelligence_presets || [])) {{
+            if (p.lane !== 'thinking') continue;
+            if (!model || (RANK[p.thinking_effort] || 0) >= (RANK[effort] || -1)) {{
+              model = p.model_slug; effort = p.thinking_effort;
+            }}
+          }}
+        }}
+        if (!model) model = mj.default_model_slug || null;
+      }}
+    }} catch (_) {{ /* fall through to the fallback below */ }}
+    if (!model) {{ model = {fallback_model_json}; effort = {fallback_effort_json}; }}
+  }} else if (spec.indexOf(':') !== -1) {{
+    const ix = spec.indexOf(':'); model = spec.slice(0, ix); effort = spec.slice(ix + 1) || null;
+  }} else {{
+    model = spec;
+  }}
 
   // 2) sentinel chat-requirements, then the proof-of-work if it demands one
   const pInit = 'gAAAAAC' + b64json([scr, new Date().toString(), 4294705152, 0, ua, '', '', lang]);
@@ -308,13 +409,15 @@ def _js_completion(prompt, model, search):
     messages: [{{ id: crypto.randomUUID(), author: {{ role: 'user' }},
                  content: {{ content_type: 'text', parts: [{prompt_json}] }}, metadata: {{}} }}],
     parent_message_id: crypto.randomUUID(),
-    model: {model_json},
+    model: model,
     timezone_offset_min: new Date().getTimezoneOffset(),
     history_and_training_disabled: true,
     conversation_mode: {{ kind: 'primary_assistant' }},
     force_paragen: false, force_rate_limit: false,
     system_hints: {hints_json}
   }};
+  // High/max reasoning: send the resolved thinking effort when there is one.
+  if (effort) body.thinking_effort = effort;
   const res = await fetch(ORIGIN + '/backend-api/conversation', {{
     method: 'POST', credentials: 'include',
     headers: Object.assign({{ 'Content-Type': 'application/json', Accept: 'text/event-stream' }}, auth, sentinel),
@@ -326,7 +429,7 @@ def _js_completion(prompt, model, search):
   // delta-encoded (v1) SSE shapes chatgpt.com uses.
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
-  let buf = '', text = '', convId = null, lastPath = null;
+  let buf = '', text = '', convId = null, lastPath = null, handoff = false;
   // Assistant snapshots are cumulative; a trailing empty one (or an early
   // status placeholder) must not wipe the answer, so only overwrite with a
   // non-empty join -- verified against live chatgpt.com frames.
@@ -347,6 +450,9 @@ def _js_completion(prompt, model, search):
       const p = line.slice(5).trim();
       if (!p || p === '[DONE]') continue;
       let e; try {{ e = JSON.parse(p); }} catch (_) {{ continue; }}
+      // thinking models hand the answer off to a separate stream: the POST
+      // ends here with only a conversation id, and the caller polls for text.
+      if (e.type === 'stream_handoff') {{ handoff = true; if (e.conversation_id) convId = e.conversation_id; continue; }}
       if (e.conversation_id) convId = e.conversation_id;
       // full-message snapshot (older format; cumulative, so overwrite)
       if (e.message && e.message.author && e.message.author.role === 'assistant' &&
@@ -371,7 +477,39 @@ def _js_completion(prompt, model, search):
       }}
     }}
   }}
-  return JSON.stringify({{ text, conversation_id: convId }});
+  return JSON.stringify({{ text, conversation_id: convId, handoff, model, effort }});
+}})()
+"""
+
+
+def _js_poll(conv_id):
+    """Read a handed-off answer back: GET the conversation and return
+    JSON.stringify({text, done}) for the assistant's user-facing text message.
+    `done` is true only once that message reports finished_successfully, so the
+    caller keeps polling while the model is still thinking/streaming. The
+    leading /* poll */ marker lets the test seam tell a poll from a send."""
+    cid = json.dumps(conv_id)
+    return f"""
+/* poll */
+(async () => {{
+  const ORIGIN = {json.dumps(ORIGIN)};
+  const sess = await fetch(ORIGIN + '/api/auth/session', {{ headers: {{ Accept: 'application/json' }}, credentials: 'include' }});
+  if (!sess.ok) throw new Error('session HTTP ' + sess.status);
+  const token = (await sess.json()).accessToken;
+  const c = await fetch(ORIGIN + '/backend-api/conversation/' + {cid}, {{
+    headers: {{ Accept: 'application/json', 'Authorization': 'Bearer ' + token }}, credentials: 'include' }});
+  if (!c.ok) throw new Error('conversation GET HTTP ' + c.status);
+  const cj = await c.json();
+  let text = '', done = false;
+  for (const n of Object.values(cj.mapping || {{}})) {{
+    const m = n && n.message; if (!m) continue;
+    if (m.author && m.author.role === 'assistant' && m.recipient === 'all' &&
+        m.content && m.content.content_type === 'text') {{
+      const parts = Array.isArray(m.content.parts) ? m.content.parts.filter(p => typeof p === 'string').join('') : '';
+      if (parts) {{ text = parts; done = (m.status === 'finished_successfully'); }}
+    }}
+  }}
+  return JSON.stringify({{ text, done }});
 }})()
 """
 

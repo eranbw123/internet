@@ -2392,8 +2392,11 @@ class FakeChatGPTConnection:
     the JS the provider actually builds, and every js string is kept so a test
     can assert the reverse-engineered contract stays in the payload."""
 
-    def __init__(self, replies, hide_error=None):
+    def __init__(self, replies, hide_error=None, poll_results=None):
         self.replies = list(replies)
+        # Handed-off (thinking-model) answers are read back by polling; each
+        # entry is one GET result {text, done}. Left empty for the inline path.
+        self.poll_results = list(poll_results or [])
         self.calls = []
         self.js = []
         self.closed = False
@@ -2406,6 +2409,14 @@ class FakeChatGPTConnection:
             if self.hide_error is not None:
                 raise self.hide_error
             return True
+        if "/* poll */" in js:
+            self.calls.append("poll")
+            if self.poll_results:
+                nxt = self.poll_results.pop(0)
+                if isinstance(nxt, Exception):
+                    raise nxt
+                return nxt if isinstance(nxt, str) else json.dumps(nxt)
+            return json.dumps({"text": "", "done": True})
         if "text/event-stream" in js:
             self.calls.append("completion")
             reply = self.replies.pop(0)
@@ -2421,6 +2432,13 @@ class FakeChatGPTConnection:
 
 def chatgpt_reply(text, conversation_id="c1"):
     return json.dumps({"text": text, "conversation_id": conversation_id})
+
+
+def chatgpt_handoff(conversation_id="c1"):
+    """A thinking-model send: the POST returns a stream_handoff with a
+    conversation id but no inline text, so the provider must poll for the
+    answer (see FakeChatGPTConnection.poll_results)."""
+    return json.dumps({"text": "", "conversation_id": conversation_id, "handoff": True})
 
 
 class ClaudeChatProviderTests(unittest.TestCase):
@@ -2609,14 +2627,15 @@ class ChatGPTBrowserProviderTests(unittest.TestCase):
         "additionalProperties": False,
     }
 
-    def _provider(self, *replies, connections=None, hide_error=None):
+    def _provider(self, *replies, connections=None, hide_error=None,
+                  poll_results=None, model="auto"):
         conns = connections if connections is not None else [
-            FakeChatGPTConnection(replies, hide_error=hide_error)
+            FakeChatGPTConnection(replies, hide_error=hide_error, poll_results=poll_results)
         ]
         remaining = list(conns)
         self.connections = conns
         return chatgpt_browser.ChatGPTBrowserProvider(
-            "auto", port=9222, connect=lambda: remaining.pop(0),
+            model, port=9222, connect=lambda: remaining.pop(0),
         )
 
     def test_registered_and_constructable_without_touching_chrome(self):
@@ -2699,6 +2718,60 @@ class ChatGPTBrowserProviderTests(unittest.TestCase):
             self.assertIn(token, js, f"completion JS lost {token!r}")
         # turnstile.required must NOT abort the send -- echoing dx works live
         self.assertNotIn("throw new Error('chatgpt.com demanded", js)
+
+    def test_the_send_js_resolves_latest_high_and_carries_the_reasoning_contract(self):
+        provider = self._provider(chatgpt_reply('{"a": 1}'))
+        provider.complete_json("s", "p", self.SCHEMA)
+        js = self.connections[0].js[0]
+        for token in ("/backend-api/models",          # resolves the newest model live
+                      "intelligence_presets",          # ...from the version's presets
+                      "'thinking'",                    # ...picking the thinking lane
+                      "body.thinking_effort = effort", # ...and sending its (High) effort
+                      "stream_handoff"):               # ...and noticing the handoff
+            self.assertIn(token, js, f"send JS lost {token!r}")
+
+    def test_a_handoff_answer_is_polled_until_finished(self):
+        # Thinking model: the send returns only a handoff, then two polls -- the
+        # first still streaming, the second finished with the JSON answer.
+        provider = self._provider(
+            chatgpt_handoff("c9"),
+            poll_results=[{"text": "", "done": False}, {"text": '{"a": 5}', "done": True}],
+        )
+        with mock.patch.object(chatgpt_browser.time, "sleep"):
+            self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 5})
+        (conn,) = self.connections
+        self.assertEqual(conn.calls, ["completion", "poll", "poll", "hide"])
+
+    def test_search_json_reads_a_handed_off_array_back_by_polling(self):
+        provider = self._provider(
+            chatgpt_handoff("c1"),
+            poll_results=[{"text": '[{"title": "T", "url": "https://e.com"}]', "done": True}],
+        )
+        with mock.patch.object(chatgpt_browser.time, "sleep"):
+            self.assertEqual(
+                provider.search_json("find things"),
+                [{"title": "T", "url": "https://e.com"}],
+            )
+
+    def test_a_handoff_that_never_finishes_times_out_to_a_provider_error(self):
+        # Poll keeps returning unfinished; the deadline passes and it surfaces as
+        # a normal empty-completion ProviderError rather than looping forever.
+        provider = self._provider(
+            chatgpt_handoff("c1"),
+            poll_results=[{"text": "", "done": False}] * 50,
+        )
+        clock = iter([0.0, 1.0, 2.0, 999.0])  # monotonic: enters loop once, then past deadline
+        with mock.patch.object(chatgpt_browser.time, "sleep"), \
+                mock.patch.object(chatgpt_browser.time, "monotonic", lambda: next(clock)):
+            with self.assertRaises(ProviderError) as ctx:
+                provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("empty completion", str(ctx.exception))
+
+    def test_an_explicit_slug_effort_spec_is_passed_through(self):
+        provider = self._provider(chatgpt_reply('{"a": 1}'), model="gpt-5-6-thinking:extended")
+        provider.complete_json("s", "p", self.SCHEMA)
+        js = self.connections[0].js[0]
+        self.assertIn('"gpt-5-6-thinking:extended"', js)  # the pin reaches the page verbatim
 
     def test_no_chrome_endpoint_is_a_clean_provider_error(self):
         provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
@@ -3255,9 +3328,9 @@ class InstallTasksTests(unittest.TestCase):
         self.assertEqual(by_name["internet-discovery-feedback"].trigger_value, 5 * 60)
         self.assertEqual(by_name["internet-discovery-health"].trigger_value, 3 * 3600)
 
-    def test_six_tasks_share_the_prefix_and_carry_the_right_app_args(self):
+    def test_tasks_share_the_prefix_and_carry_the_right_app_args(self):
         names = [t.name for t in install_tasks.build_tasks(CFG)]
-        self.assertEqual(len(names), 6)
+        self.assertEqual(len(names), 7)
         self.assertTrue(all(n.startswith("internet-discovery-") for n in names))
         by_name = {t.name: t for t in install_tasks.build_tasks(CFG)}
         self.assertEqual(
@@ -3271,6 +3344,18 @@ class InstallTasksTests(unittest.TestCase):
         self.assertEqual(
             by_name["internet-discovery-health"].app_args, ["health", "--notify"]
         )
+        # The updater is not a `python -m app` subcommand -- it shells to its own
+        # script with no app args.
+        update = by_name["internet-discovery-update"]
+        self.assertEqual(update.app_args, [])
+        self.assertEqual(update.script, "update.cmd")
+
+    def test_the_update_task_action_shells_to_update_cmd(self):
+        update = next(t for t in install_tasks.build_tasks(CFG)
+                      if t.name == "internet-discovery-update")
+        xml = install_tasks.render_xml(update)
+        self.assertIn("update.cmd", xml)
+        self.assertNotIn("run.cmd", xml)
 
     def test_rendered_xml_uses_the_d_flag_and_run_cmd(self):
         task = install_tasks.build_tasks(CFG)[0]
@@ -3309,11 +3394,11 @@ class InstallTasksTests(unittest.TestCase):
         self.assertEqual(code, 0)
         # One /create + one /query per task -- install() no longer trusts
         # /create's exit code alone to mean the task actually exists.
-        self.assertEqual(len(calls), 12)
+        self.assertEqual(len(calls), 14)
         creates = [a for a in calls if "/create" in a]
         queries = [a for a in calls if "/query" in a]
-        self.assertEqual(len(creates), 6)
-        self.assertEqual(len(queries), 6)
+        self.assertEqual(len(creates), 7)
+        self.assertEqual(len(queries), 7)
         for args in creates:
             self.assertEqual(args[0], "schtasks")
             self.assertIn("/xml", args)
@@ -3405,12 +3490,10 @@ class InstallTasksTests(unittest.TestCase):
         self.assertIn("internet-discovery-collect-stocks: not installed", text)
         self.assertNotIn("some-other-task", text)
 
-    def test_soak_task_is_not_one_of_the_six_build_tasks(self):
+    def test_soak_task_is_not_one_of_the_recurring_build_tasks(self):
         # SOAK_TASK must stay out of _TASK_SPECS/build_tasks -- otherwise
-        # --install would create it (seven tasks) and recreate/reschedule it
-        # on every reinstall.
+        # --install would create and recreate/reschedule it on every reinstall.
         names = [t.name for t in install_tasks.build_tasks(CFG)]
-        self.assertEqual(len(names), 6)
         self.assertNotIn(install_tasks.SOAK_TASK, names)
 
     def test_soak_trigger_is_a_single_time_trigger_with_no_repetition(self):
@@ -3830,6 +3913,131 @@ class ConnectorReconTests(unittest.TestCase):
         self.assertTrue(status["available"])
         self.assertIn("https://e.com/x", urls)
         self.assertIn("mode=ro", captured["uri"])
+
+
+import importlib.util as _ilu  # noqa: E402
+
+_su_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ops", "self_update.py")
+_su_spec = _ilu.spec_from_file_location("self_update", _su_path)
+self_update = _ilu.module_from_spec(_su_spec)
+_su_spec.loader.exec_module(self_update)
+
+
+class FakeGit:
+    """Answers the read-only queries self_update.gather() makes, plus records
+    the mutating ones (merge) so a test can assert whether a fast-forward ran."""
+
+    def __init__(self, *, branch="main", dirty=False, local="a" * 40,
+                 remote="a" * 40, ancestor=True, subjects=""):
+        self.branch, self.dirty = branch, dirty
+        self.local, self.remote = local, remote
+        self.ancestor, self.subjects = ancestor, subjects
+        self.calls = []
+
+    def __call__(self, args, check=True):
+        self.calls.append(args)
+        if args[0] == "fetch":
+            return 0, ""
+        if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+            return 0, self.branch
+        if args == ["status", "--porcelain"]:
+            return 0, ("M file\n" if self.dirty else "")
+        if args == ["rev-parse", "HEAD"]:
+            return 0, self.local
+        if args[0] == "rev-parse" and args[-1].startswith("origin/"):
+            return 0, self.remote
+        if args[:2] == ["merge-base", "--is-ancestor"]:
+            return (0 if self.ancestor else 1), ""
+        if args[:2] == ["log", "--oneline"]:
+            return 0, self.subjects
+        if args[:2] == ["merge", "--ff-only"]:
+            return 0, ""
+        return 0, ""
+
+    def merged(self):
+        return any(a[:2] == ["merge", "--ff-only"] for a in self.calls)
+
+
+class SelfUpdatePlanTests(unittest.TestCase):
+    """The pure decision -- no git, no I/O."""
+
+    def test_each_state_maps_to_the_right_action(self):
+        L, R = "a" * 40, "b" * 40
+        cases = [
+            (dict(branch="feature", deploy_branch="main", dirty=False, local=L, remote=R, is_ancestor=True),
+             self_update.SKIP_BRANCH),
+            (dict(branch="main", deploy_branch="main", dirty=True, local=L, remote=R, is_ancestor=True),
+             self_update.SKIP_DIRTY),
+            (dict(branch="main", deploy_branch="main", dirty=False, local=L, remote=L, is_ancestor=True),
+             self_update.CURRENT),
+            (dict(branch="main", deploy_branch="main", dirty=False, local=L, remote=R, is_ancestor=False),
+             self_update.DIVERGED),
+            (dict(branch="main", deploy_branch="main", dirty=False, local=L, remote=R, is_ancestor=True),
+             self_update.UPDATE),
+        ]
+        for kwargs, expected in cases:
+            action, _note = self_update.plan(**kwargs)
+            self.assertEqual(action, expected, kwargs)
+
+
+class SelfUpdateRunTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        self.addCleanup(self._tmp.cleanup)
+        self.cfg = SimpleNamespace(telegram_bot_token="", telegram_chat_id="")
+        self.sent = []
+        p = mock.patch.object(self_update.notify, "send",
+                              side_effect=lambda cfg, text, **_k: self.sent.append(text) or True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_a_clean_fast_forward_merges_redeploys_and_announces(self):
+        git = FakeGit(local="a" * 40, remote="b" * 40, subjects="b1 fix\nb2 more")
+        redeployed = []
+        action = self_update.run(
+            self.root, self.cfg, git=git, deploy_branch="main",
+            redeploy=lambda root, log=print: redeployed.append(root) or True, log=lambda *_: None)
+        self.assertEqual(action, self_update.UPDATE)
+        self.assertTrue(git.merged())
+        self.assertEqual(redeployed, [self.root])
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("updated on main", self.sent[0])
+
+    def test_current_does_nothing_and_stays_silent(self):
+        git = FakeGit(local="a" * 40, remote="a" * 40)
+        action = self_update.run(self.root, self.cfg, git=git, redeploy=self._fail_redeploy,
+                                 log=lambda *_: None)
+        self.assertEqual(action, self_update.CURRENT)
+        self.assertFalse(git.merged())
+        self.assertEqual(self.sent, [])
+
+    def test_diverged_notifies_once_and_never_merges(self):
+        def make():
+            return FakeGit(branch="main", local="a" * 40, remote="b" * 40, ancestor=False)
+        self_update.run(self.root, self.cfg, git=make(), redeploy=self._fail_redeploy, log=lambda *_: None)
+        self_update.run(self.root, self.cfg, git=make(), redeploy=self._fail_redeploy, log=lambda *_: None)
+        self.assertEqual(len(self.sent), 1)          # deduped across cycles
+        self.assertIn("diverged", self.sent[0])
+
+    def test_a_feature_branch_is_left_untouched(self):
+        git = FakeGit(branch="my-pr", local="a" * 40, remote="b" * 40)
+        action = self_update.run(self.root, self.cfg, git=git, redeploy=self._fail_redeploy,
+                                 log=lambda *_: None)
+        self.assertEqual(action, self_update.SKIP_BRANCH)
+        self.assertFalse(git.merged())
+        self.assertEqual(self.sent, [])
+
+    def test_dry_run_reports_but_changes_nothing(self):
+        git = FakeGit(local="a" * 40, remote="b" * 40, subjects="b1 x")
+        action = self_update.run(self.root, self.cfg, git=git, dry_run=True,
+                                 redeploy=self._fail_redeploy, log=lambda *_: None)
+        self.assertEqual(action, self_update.UPDATE)
+        self.assertFalse(git.merged())
+        self.assertEqual(self.sent, [])
+
+    def _fail_redeploy(self, root, log=print):
+        raise AssertionError("redeploy must not run in this case")
 
 
 if __name__ == "__main__":

@@ -1,6 +1,41 @@
 # PROJECT_STATE.md — `internet`
 
-Updated 2026-08-10. Imported by `CLAUDE.md`. Current state only — not a log.
+Updated 2026-08-11. Imported by `CLAUDE.md`. Current state only — not a log.
+
+## appliance self-update + chatgpt latest-high model (2026-08-11)
+The appliance runs `python -m app` from the deployed checkout, so a merged fix
+only goes live once that checkout is fast-forwarded — nothing did it, so it sat
+stranded on stale `engine-lab` (live log: `unknown provider 'chatgpt_browser'`).
+Fixed two ways:
+
+**Auto-update.** New 7th recurring task `internet-discovery-update` (30-min,
+`ops/update.cmd` → `ops/self_update.py`; added to `install_tasks._TASK_SPECS`
+with an optional 6th `script` element, `build_tasks` unpacks `spec[:5]` +
+default `run.cmd`). Each run: `git fetch`; **only when on
+`DISCOVERY_DEPLOY_BRANCH` (default `main`) AND clean** does it `merge --ff-only`
+then redeploy (`app init` + `install_tasks --install`). Never resets, never
+switches off a feature branch (same checkout authors PRs), never touches a
+dirty tree. Divergence/git-error → one Telegram alert deduped by
+`logs/.update_state.json`; success announced; "current" silent. `plan()` is a
+pure decision (unit-tested); `run()` takes injectable git/redeploy/notify.
+`--dry-run`/`--status` preview without changing anything. Exit 0 for routine
+outcomes, 2 for error/diverged.
+
+**chatgpt_browser latest-high.** `DEFAULT_MODELS["chatgpt_browser"]` is now the
+sentinel `latest-high`, resolved live in the send JS from
+`/backend-api/models`: newest `versions[0]` → its thinking preset with the
+highest `thinking_effort` (currently `gpt-5-6-thinking`/`extended`), so a new
+generation needs no code change. `slug`/`slug:effort` in `DISCOVERY_MODEL`
+pins. Body carries `thinking_effort`. Thinking models return only a
+`stream_handoff` (no inline SSE text), so `_attempt` polls
+`/backend-api/conversation/{id}` (`_poll`/`_js_poll`, `/* poll */` marker for
+the test seam) until the assistant text message is `finished_successfully`.
+Fallback `gpt-5-6-thinking`/`extended` only if the model list can't be read.
+Applies thinking to scoring too (slower/heavier quota — documented; pin a bare
+slug to opt out). All live-verified against the owner's chatgpt.com tab.
+Tests: `ChatGPTBrowserProviderTests` (+resolution/handoff-poll/timeout),
+`SelfUpdatePlanTests`/`SelfUpdateRunTests`, updated `InstallTasksTests` (7
+tasks). 285 in `test_discovery.py`, all green.
 
 ## service hardening (step-01): no more in-process scheduler
 `discovery/scheduler.py` and `run` are DELETED; `ops/install_tasks.py` is the

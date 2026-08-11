@@ -246,7 +246,7 @@ so swapping vendors is a config change:
 
 ```bash
 DISCOVERY_PROVIDER=claude_chat     # default, model claude-opus-5 -- claude.ai session, no API key
-DISCOVERY_PROVIDER=chatgpt_browser # model auto -- chatgpt.com session, no API key
+DISCOVERY_PROVIDER=chatgpt_browser # model latest-high -- chatgpt.com session, no API key
 DISCOVERY_PROVIDER=anthropic       # direct Anthropic API, needs ANTHROPIC_API_KEY
 DISCOVERY_PROVIDER=openai          # direct OpenAI API, model gpt-5, needs OPENAI_API_KEY and `pip install openai`
 ```
@@ -278,10 +278,25 @@ call the provider, all in-page:
 4. POSTs to `/backend-api/conversation` and reads the SSE stream (full-snapshot
    `message.content.parts`, with delta-encoded frames handled as a fallback).
 
+**Model + reasoning.** `chatgpt_browser`'s default model is the sentinel
+`latest-high`, which each send resolves live from `/backend-api/models`: the
+newest version at its **High** preset — currently a *thinking* model at
+`extended` (maximum) reasoning effort. Because it is resolved per call, a new
+model generation is used automatically with no code change. Pin explicitly with
+`DISCOVERY_MODEL` — a bare slug (`gpt-5-6`), or `slug:effort`
+(`gpt-5-6-thinking:extended`) to also fix the effort. Thinking models no longer
+stream their answer inline — the POST returns only a `stream_handoff` — so when
+a send comes back with a conversation id but no text, the provider polls
+`/backend-api/conversation/{id}` until the assistant message is finished and
+reads it back. Note that `latest-high` applies thinking to *every* call,
+scoring included, which is slower and heavier on the account's thinking quota;
+pin a bare (non-thinking) slug to opt out.
+
 History is disabled on the request and the scratch conversation is hidden
 afterward. This path has been **verified end to end against live chatgpt.com**
-— both scoring (`complete_json`) and web search (`search_json`, ChatGPT's own
-search) return correctly.
+— resolution (latest version → High → `gpt-5-6-thinking`/`extended`), scoring
+(`complete_json`) and web search (`search_json`, ChatGPT's own search, read back
+via the handoff poll) all return correctly.
 
 Both browser transports carry the same two caveats: the endpoints are internal
 and undocumented (they can drift — the sentinel/turnstile shapes especially),
@@ -411,7 +426,8 @@ day, so a window is just a date filter.
 | `OPENAI_API_KEY` | *(none)* | Required only when `DISCOVERY_PROVIDER=openai` |
 | `TELEGRAM_BOT_TOKEN` / `TELEGRAM_CHAT_ID` | *(none)* | Unset ⇒ pushes print to stdout |
 | `DISCOVERY_PROVIDER` | `claude_chat` | `claude_chat`, `chatgpt_browser`, `anthropic` or `openai` |
-| `DISCOVERY_MODEL` | per provider | `claude-opus-5` / `auto` (chatgpt.com slug) / `gpt-5` |
+| `DISCOVERY_MODEL` | per provider | `claude-opus-5` / `latest-high` (chatgpt.com: newest version at its High/max-reasoning preset, resolved live; or a bare slug / `slug:effort` to pin) / `gpt-5` |
+| `DISCOVERY_DEPLOY_BRANCH` | `main` | Branch the `-update` task fast-forwards the checkout to (see [appliance](#running-it-as-an-appliance)) |
 | `DISCOVERY_DB` | `discovery.db` | SQLite file (gitignored; rebuildable) |
 | `DISCOVERY_INTERESTS` | `interests.json` | Interests file |
 | `DISCOVERY_MAX_ITEMS` | `8` | Items per source per cycle |
@@ -431,11 +447,24 @@ day, so a window is just a date filter.
 
 There is no in-process scheduler (see [How a cycle works](#how-a-cycle-works))
 -- an OS scheduler has to call the commands above on their own cadence.
-`ops/install_tasks.py` registers six one-purpose Windows Scheduled Tasks
+`ops/install_tasks.py` registers seven one-purpose Windows Scheduled Tasks
 (`internet-discovery-collect-stocks/-web/-youtube`, `-digest`, `-feedback`,
-`-health`), one XML task per job, trigger intervals read straight from
-`config.load()` so a `.env` change and a re-`--install` is all it takes to
+`-health`, `-update`), one XML task per job, trigger intervals read straight
+from `config.load()` so a `.env` change and a re-`--install` is all it takes to
 reschedule.
+
+**Staying current (`-update`).** The appliance runs from this checkout, so a
+merged fix only goes live once the checkout is fast-forwarded. The `-update`
+task (every 30 min, `ops/update.cmd` → `ops/self_update.py`) does that
+automatically: it fetches `origin`, and **only when the checkout is on the
+deploy branch (`DISCOVERY_DEPLOY_BRANCH`, default `main`) and the tree is
+clean** fast-forwards to it, then redeploys — reloads interests (`app init`)
+and re-registers the tasks. It never resets, never switches off a feature
+branch (the same checkout is used to author PRs), and never touches a dirty
+tree; a divergence or git error is announced once over Telegram (deduped) and
+left for a human, while the appliance keeps running the current code. An actual
+update is announced; "already current" is silent. Check a decision without
+changing anything with `python ops/self_update.py --status` (or `--dry-run`).
 
 **One manual prerequisite:** Chrome has to be running, in the same
 interactive Windows session the tasks run in, launched with
@@ -447,13 +476,14 @@ can relaunch it once automatically, see [Configuration](#configuration).
 
 ```bash
 python ops/install_tasks.py --dry-run      # print every task's XML + schtasks command, register nothing
-python ops/install_tasks.py --install      # create/update all six tasks
+python ops/install_tasks.py --install      # create/update all seven tasks
 python ops/install_tasks.py --status       # state, last run, last result, next run
-python ops/install_tasks.py --uninstall    # delete only the six tasks this script created
+python ops/install_tasks.py --uninstall    # delete only the tasks this script created
 python ops/install_tasks.py --soak         # register the one-shot 24h soak checkpoint, see ops/SOAK.md
 ```
 
-Each task runs `ops/run.cmd`, which sets `PYTHONIOENCODING=utf-8`, `cd`s to
+Each collector/digest/feedback/health task runs `ops/run.cmd` (the `-update`
+task runs `ops/update.cmd`), which sets `PYTHONIOENCODING=utf-8`, `cd`s to
 the repo root and runs `python -m app <args>`, appending stdout+stderr to
 `logs\<args>-<YYYYMMDD>.log` (the log name comes from the full argument
 list, not just the first one -- the three `run-once --source ...` collect
