@@ -38,8 +38,10 @@ from discovery import config  # noqa: E402
 PREFIX = "internet-discovery-"
 
 # (name suffix, `python -m app` args, trigger kind, cfg field name or a literal
-# seconds/HH:MM value, ExecutionTimeLimit). Collect jobs get a longer time
-# limit than the rest -- they're the ones that can spend an LLM budget.
+# seconds/HH:MM value, ExecutionTimeLimit[, script]). Collect jobs get a longer
+# time limit than the rest -- they're the ones that can spend an LLM budget.
+# The optional 6th element overrides the run.cmd action for tasks that aren't a
+# `python -m app` subcommand (the updater shells to ops/update.cmd instead).
 _TASK_SPECS = [
     ("collect-stocks", ["run-once", "--source", "stocks"], "interval", "interval_stocks_seconds", "PT30M"),
     # Continuous Council-driven web discovery (discovery/missions.py) --
@@ -50,6 +52,10 @@ _TASK_SPECS = [
     ("digest", ["digest"], "daily", "digest_time", "PT10M"),
     ("feedback", ["listen", "--drain"], "interval", 5 * 60, "PT10M"),
     ("health", ["health", "--notify"], "interval", 3 * 3600, "PT10M"),
+    # Self-update: fast-forward the checkout to origin and redeploy, so a merged
+    # fix reaches production without a hand deploy. Literal 30-min cadence (like
+    # feedback/health); shells to ops/update.cmd, not `python -m app`.
+    ("update", [], "interval", 30 * 60, "PT10M", "update.cmd"),
 ]
 
 TASK_NAMES = [f"{PREFIX}{suffix}" for suffix, *_ in _TASK_SPECS]
@@ -76,9 +82,11 @@ def build_tasks(cfg):
     feedback poll and the 3-hour health check are the two literal exceptions
     the plan calls for; nothing per-source or per-day is a literal here."""
     tasks = []
-    for suffix, app_args, kind, field, limit in _TASK_SPECS:
+    for spec in _TASK_SPECS:
+        suffix, app_args, kind, field, limit = spec[:5]
+        script = spec[5] if len(spec) > 5 else "run.cmd"
         value = getattr(cfg, field) if isinstance(field, str) else field
-        tasks.append(TaskDef(f"{PREFIX}{suffix}", app_args, kind, value, limit))
+        tasks.append(TaskDef(f"{PREFIX}{suffix}", app_args, kind, value, limit, script=script))
     return tasks
 
 
