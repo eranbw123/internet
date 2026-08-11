@@ -51,6 +51,12 @@ RELATIONSHIPS = (
 
 _SECRET_NAME_RE = re.compile(r"(?i)(token|secret|key|password|cookie|auth)")
 
+# A candidate secret shorter than this is almost certainly a flag/mode value
+# ("1", "us", "true"), not a genuine token -- redacting it would rewrite
+# every stored prompt/response that happens to contain that short substring,
+# silently breaking the byte-exact guarantee with no signal it happened.
+_MIN_SECRET_LEN = 8
+
 
 def _now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -63,7 +69,7 @@ def _secret_values():
     and so a value that changes (rotated token) doesn't stick around stale."""
     values = {}
     for name, value in os.environ.items():
-        if value and _SECRET_NAME_RE.search(name):
+        if value and len(value) >= _MIN_SECRET_LEN and _SECRET_NAME_RE.search(name):
             values[value] = name
     return values
 
@@ -206,10 +212,15 @@ class Tracer:
     def edge(self, from_node_id, to_node_id, relationship, ordinal=0):
         if not self.enabled or from_node_id is None or to_node_id is None:
             return None
-        assert relationship in RELATIONSHIPS, f"unknown trace relationship {relationship!r}"
         return self._guard(lambda: self._edge(from_node_id, to_node_id, relationship, ordinal))
 
     def _edge(self, from_node_id, to_node_id, relationship, ordinal):
+        # Validation lives inside the guarded call (not a bare `assert`
+        # before it): a bad relationship must be recorded as a fail-soft
+        # trace_write_failed bump, never raise out and abort the tick -- and
+        # unlike `assert`, this check survives `python -O`.
+        if relationship not in RELATIONSHIPS:
+            raise ValueError(f"unknown trace relationship {relationship!r}")
         cur = self.conn.execute(
             "INSERT INTO trace_edges (from_node_id, to_node_id, relationship, ordinal) VALUES (?, ?, ?, ?)",
             (from_node_id, to_node_id, relationship, ordinal),

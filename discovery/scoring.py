@@ -70,6 +70,27 @@ didn't score it that way instead
 - uncertainties: what you couldn't verify or don't have enough evidence for
 """
 
+# Debug/reasoning-contract fields (see PROMPT above) -- parsed tolerantly by
+# _debug_payload(): absent or malformed becomes {'unavailable': True, ...} in
+# that field's place, never an error. Never affects final_score, confidence,
+# reason, why_better_than_generic or models.WEIGHTS -- those stay exactly as
+# scored above.
+DEBUG_FIELDS = (
+    "evidence_used", "why_this_interest", "dimension_rationale",
+    "alternative_interpretation", "why_not_higher", "uncertainties",
+)
+
+# dimension_rationale is one short phrase per DIMENSIONS name -- spelled out
+# (not a bare {"type": "object"}) so OpenAI strict structured outputs, which
+# require every object to declare properties/required/additionalProperties,
+# can accept SCORE_SCHEMA at all.
+DIMENSION_RATIONALE_SCHEMA = {
+    "type": "object",
+    "properties": {name: {"type": "string"} for name in DIMENSIONS},
+    "required": list(DIMENSIONS),
+    "additionalProperties": False,
+}
+
 SCORE_SCHEMA = {
     "type": "object",
     "properties": {
@@ -80,24 +101,21 @@ SCORE_SCHEMA = {
         "why_better_than_generic": {"type": "string"},
         "evidence_used": {"type": "string"},
         "why_this_interest": {"type": "string"},
-        "dimension_rationale": {"type": "object"},
+        "dimension_rationale": DIMENSION_RATIONALE_SCHEMA,
         "alternative_interpretation": {"type": "string"},
         "why_not_higher": {"type": "string"},
         "uncertainties": {"type": "string"},
     },
-    "required": ["interest_key", *DIMENSIONS, "confidence", "reason", "why_better_than_generic"],
+    # Every property must be required for OpenAI strict structured outputs
+    # (a schema-level constraint, not a production one) -- the six debug
+    # fields stay tolerantly parsed by _debug_payload() below, so a model
+    # that omits or malforms one still produces a valid ScoreResult.
+    "required": [
+        "interest_key", *DIMENSIONS, "confidence", "reason", "why_better_than_generic",
+        *DEBUG_FIELDS,
+    ],
     "additionalProperties": False,
 }
-
-# Debug/reasoning-contract fields (see PROMPT above) -- parsed tolerantly by
-# _debug_payload(): absent or malformed becomes {'unavailable': True, ...} in
-# that field's place, never an error. Never affects final_score, confidence,
-# reason, why_better_than_generic or models.WEIGHTS -- those stay exactly as
-# scored above.
-DEBUG_FIELDS = (
-    "evidence_used", "why_this_interest", "dimension_rationale",
-    "alternative_interpretation", "why_not_higher", "uncertainties",
-)
 
 
 class ScoringError(Exception):

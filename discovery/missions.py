@@ -204,9 +204,14 @@ def _generate_for(conn, cfg, mission_provider, interest, tracer, interest_state_
         context_node = tracer.node(
             tracer.run_id, "council-context", entity_type="interests", entity_id=interest.id,
             label=f"context:{interest.key}",
+            # The plan calls for build_context()'s own output here, not just
+            # its shape -- frontier/feedback/history are already plain
+            # dicts (council.build_context() converts each sqlite row via
+            # dict(r)), so they serialize as-is; `interest` is dropped since
+            # it's a dataclass already entity-linked via entity_id above.
             output_json={
-                "frontier_count": len(context["frontier"]), "feedback_count": len(context["feedback"]),
-                "history_count": len(context["history"]),
+                "frontier": context["frontier"], "feedback": context["feedback"],
+                "history": context["history"],
             },
         )
         tracer.edge(generation_node, context_node, "generated")

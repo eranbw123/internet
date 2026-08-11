@@ -87,6 +87,34 @@ test_discovery.py now also calls `_emit_call` (no-op unless `trace_sink` is
 set, so every pre-existing test is untouched) so trace parity tests can
 assert on `model_calls` through the same fake every other test already uses.
 
+Repair (review pass 2): `scoring.SCORE_SCHEMA` and `council.MISSION_SCHEMA`/
+`DELIBERATION_SCHEMA` had gone strict-invalid for OpenAI structured outputs
+(`openai_provider` sends `"strict": True`) -- optional debug/deliberation
+properties absent from `required`, and `dimension_rationale`/every
+`DELIBERATION_SCHEMA` nested object were bare `{"type": "object"}` with no
+`properties`/`additionalProperties: false`, which OpenAI's strict mode
+rejects outright before the model is ever called. All six debug fields and
+`deliberation` are now in their schema's `required` list (tolerant parsing
+in `_debug_payload`/`_extract_deliberation` is unchanged, so a model
+omitting one still produces a valid result -- required is a schema-shape
+constraint for strict providers, not a production contract);
+`dimension_rationale` gained an explicit `DIMENSION_RATIONALE_SCHEMA` (one
+string per `DIMENSIONS` name) and every `DELIBERATION_SCHEMA` nested object
+gained `properties`/`required`/`additionalProperties: false`.
+`anthropic_provider`'s `output_config` path doesn't set `strict`, so this
+was a compatibility no-op there. `__main__.py`'s `trace-fixture` subparser
+now accepts its own `--db` (previously only the pre-subcommand form
+worked, contradicting the documented/README CLI shape). `trace.Tracer.edge()`
+moved its relationship-vocabulary check inside the `_guard`-wrapped call (was
+a bare `assert` before it -- could abort a tick, and silently vanished under
+`python -O`); an unknown relationship now fails soft like every other trace
+write. `trace._secret_values()` gained an 8-char minimum on candidate secret
+values, so a short secret-shaped env var (e.g. `AUTH_MODE=on`) can't
+substring-rewrite unrelated stored text. `missions._generate_for()`'s
+`council-context` node now carries `build_context()`'s actual
+frontier/feedback/history content (already plain dicts), not just their
+counts. 432 tests, all green.
+
 ## chatgpt_browser provider reconciliation (step-12 task 1)
 Ported verbatim from owner `main` (which predates steps 06-10, so was reconciled
 by hand, file by file, not merged): `discovery/providers/chatgpt_browser.py`

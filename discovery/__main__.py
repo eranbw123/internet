@@ -132,10 +132,11 @@ def main(argv=None):
     mode.add_argument("--list", action="store_true", help="print the ranked queue and exit")
     mode.add_argument("--explain", action="store_true", help="print queue_metrics and exit")
     mode.add_argument("--send", action="store_true", help="push the top items to Telegram")
-    sub.add_parser(
+    tf = sub.add_parser(
         "trace-fixture",
-        help="build the deterministic trace acceptance fixture (offline, fake providers) -- use --db",
+        help="build the deterministic trace acceptance fixture (offline, fake providers)",
     )
+    tf.add_argument("--db", help="override DISCOVERY_DB")
 
     args = parser.parse_args(argv)
     cfg = config.load()

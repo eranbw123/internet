@@ -6311,11 +6311,19 @@ class WebTickTests(unittest.TestCase):
 
 class TraceRedactionTests(unittest.TestCase):
     def test_redact_replaces_only_matching_env_values(self):
-        with mock.patch.dict(os.environ, {"MY_SECRET_TOKEN": "abc123"}, clear=False):
-            text = trace.redact("token is abc123 but the interest text stays intact")
-        self.assertNotIn("abc123", text)
+        with mock.patch.dict(os.environ, {"MY_SECRET_TOKEN": "abc123456"}, clear=False):
+            text = trace.redact("token is abc123456 but the interest text stays intact")
+        self.assertNotIn("abc123456", text)
         self.assertIn("[REDACTED:MY_SECRET_TOKEN]", text)
         self.assertIn("the interest text stays intact", text)
+
+    def test_redact_ignores_short_secret_looking_values(self):
+        """A short value on a secret-shaped name (e.g. a flag, not a real
+        token) must not be substring-replaced -- that would silently rewrite
+        unrelated text anywhere it happens to appear."""
+        with mock.patch.dict(os.environ, {"MY_AUTH_MODE": "on"}, clear=False):
+            text = trace.redact("auth mode is on for this interest")
+        self.assertEqual(text, "auth mode is on for this interest")
 
     def test_redact_is_a_noop_without_matching_env_vars(self):
         with mock.patch.dict(os.environ, {}, clear=True):

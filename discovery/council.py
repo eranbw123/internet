@@ -68,6 +68,11 @@ plainly rather than padding it.
 # object -- no second call, no extra spend (see the module docstring's
 # GOODHART FIREWALL note: this section must stay free of scoring machinery,
 # same as everything else the Council sees or returns).
+# Every nested object below declares properties/required/additionalProperties
+# (not left bare) so OpenAI strict structured outputs -- which hard-require
+# that shape on every object, recursively -- can accept MISSION_SCHEMA at
+# all. _extract_deliberation() already parses each section tolerantly, so a
+# model that omits or malforms one still produces a valid deliberation.
 DELIBERATION_SCHEMA = {
     "type": "object",
     "properties": {
@@ -80,6 +85,8 @@ DELIBERATION_SCHEMA = {
                     "persona": {"type": "string"},
                     "analysis": {"type": "string"},
                 },
+                "required": ["name", "persona", "analysis"],
+                "additionalProperties": False,
             },
         },
         "peer_review": {
@@ -91,6 +98,8 @@ DELIBERATION_SCHEMA = {
                     "critiques": {"type": "string"},
                     "ranking": {"type": "array", "items": {"type": "string"}},
                 },
+                "required": ["reviewer", "critiques", "ranking"],
+                "additionalProperties": False,
             },
         },
         "aggregate_ranking": {"type": "array", "items": {"type": "string"}},
@@ -103,11 +112,18 @@ DELIBERATION_SCHEMA = {
                     "angle": {"type": "string"},
                     "reason": {"type": "string"},
                 },
+                "required": ["angle", "reason"],
+                "additionalProperties": False,
             },
         },
         "chairman_synthesis": {"type": "string"},
         "selection_rationale": {"type": "string"},
     },
+    "required": [
+        "advisors", "peer_review", "aggregate_ranking", "disagreements",
+        "rejected_angles", "chairman_synthesis", "selection_rationale",
+    ],
+    "additionalProperties": False,
 }
 
 # Sections _extract_deliberation() looks for -- each is graded independently,
@@ -135,7 +151,7 @@ MISSION_SCHEMA = {
         },
         "deliberation": DELIBERATION_SCHEMA,
     },
-    "required": ["missions"],
+    "required": ["missions", "deliberation"],
     "additionalProperties": False,
 }
 
