@@ -45,8 +45,14 @@ class Config:
     # cadence follows this field down to 60s (see ops/install_tasks.py).
     interval_web_seconds: int = 60
     interval_youtube_seconds: int = 4 * 3600
-    digest_time: str = "08:00"      # local HH:MM, once per day
+    digest_time: str = "08:00"      # local HH:MM, first digest of the day
     digest_max_items: int = 10      # Discovery items per digest; Alerts are unbounded and immediate
+    # Repeats the digest every digest_interval_seconds from digest_time until
+    # digest_window_end, same day, so pending items drain throughout waking
+    # hours instead of piling up for one 8am shot. See ops/install_tasks.py
+    # (Task Scheduler's own Repetition+Duration on the CalendarTrigger).
+    digest_interval_seconds: int = 3600
+    digest_window_end: str = "23:00"    # local HH:MM, last digest slot of the day
     # Immediate discovery delivery (opt-in). Off by default: DISCOVERY items
     # wait for the daily digest, exactly as before. On (DISCOVERY_IMMEDIATE=1),
     # deliver() also pushes freshly-scored above-bar discoveries the moment a
@@ -129,6 +135,8 @@ def load():
         interval_youtube_seconds=int(os.environ.get("DISCOVERY_INTERVAL_YOUTUBE", str(4 * 3600))),
         digest_time=os.environ.get("DISCOVERY_DIGEST_TIME", "08:00"),
         digest_max_items=int(os.environ.get("DISCOVERY_DIGEST_MAX", "10")),
+        digest_interval_seconds=int(os.environ.get("DISCOVERY_DIGEST_INTERVAL", "3600")),
+        digest_window_end=os.environ.get("DISCOVERY_DIGEST_WINDOW_END", "23:00"),
         immediate_discovery=os.environ.get("DISCOVERY_IMMEDIATE", "").strip().lower()
         in ("1", "true"),
         immediate_max_per_cycle=int(os.environ.get("DISCOVERY_IMMEDIATE_MAX_PER_CYCLE", "3")),
