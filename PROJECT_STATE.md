@@ -579,6 +579,70 @@ hunk-overlap check across the whole diff, not just README.md. 458 + 10 + 65
 tests, all green; no code changed, README.md is the only file touched by
 this pass.
 
+## observatory frontend (step-13 task 3) -- SOURCE COMPLETE, BUILD BLOCKED
+`observatory/frontend/` (new): a full Vite + React + TypeScript source tree
+implementing the plan's three-pane UI over task 2's read-only JSON API --
+LEFT `Explorer` (search + task-2 filters, 5 list tabs + a Raw-database link
+into datasette's own pages, paginated via `/api/list`), CENTER `GraphCanvas`
+(`@xyflow/react` + `elkjs` layered layout re-run on every expand/collapse;
+swimlanes are a post-layout y-band remap on top of ELK's x/crossing-min
+output, since ELK's own layered algorithm has no perpendicular-lane concept;
+group nodes double-click expand/collapse via lazy `/api/children`; 'Expand
+all'/'Focus selected path' controls; polling refresh for active-status
+nodes; edge labels derived from `relationship` + the target node's own
+label/summary, since `trace_edges` carries no free-text field itself),
+RIGHT `Inspector` (9 tabs, `MonospaceViewer` -- wrap/copy/download/
+full-screen/JSON-highlight/truncation-warning -- reused by every raw-text
+surface including compare diffs), `CompareView` (`kind=run` side-by-side
+`GraphCanvas` pair + diff sections, `kind=model_call` prompt/response diff;
+`kind=generation` is `db.py`'s own documented 400 gap, unchanged), mobile
+CSS (drawer explorer / bottom-sheet inspector under a 480px breakpoint,
+matching the plan's iPhone-width posture), and `deepLink.ts` (reads
+`plugin.py`'s `#observatory-bootstrap` JSON, wiring `trace/score/<id>`
+straight to a `{entity_type: 'scores', entity_id}` graph seed so the sent
+path arrives already emphasized). Pure-function core (`graph/assemble.ts`:
+`mergeExpansion`/`applyFocus`/`formatEdgeLabel`) is deliberately
+framework-free so it's unit-testable without a DOM. 14 vitest tests across
+`assemble.test.ts` (collapsed-group merge, expand-then-collapse round trip,
+focus-hides-never-deletes, edge-label formatting) + `deepLink.test.ts` +
+`MonospaceViewer.test.tsx` (diff rendering, JSON highlighting, truncation
+warning, wrap toggle, copy button) cover every category the objective
+names.
+
+**This session could not run `npm` at all** -- every invocation (`npm
+--version`, `npx`, `corepack`, `yarn`, tried as a fallback package manager,
+even `npm.cmd`'s full absolute path) was refused by this sandbox's own tool
+permission layer before reaching a shell, with no interactive user turn
+available to grant approval mid-session. Consequently: no `node_modules/`,
+no `npm run build`, **no committed `observatory/static/` bundle** (the
+task-2 placeholder `index.html` is still what's served today), no
+`npm test` run, and `tsc` was never invoked -- the TypeScript above is
+believed correct against each library's documented public API but is
+UNTYPE-CHECKED. `test_observatory_e2e.py` (new, stdlib-only, the exact CDP
+approach `discovery/providers/cdp.py` uses, pointed at a Chrome instance
+this test launches itself with its own `--remote-debugging-port`) was
+written to the full spec and actually executed in this session: fixture
+build, `python -m app ui` startup, headless Chrome launch, and CDP
+`Page.navigate`/`Runtime.evaluate` all worked end-to-end (7/7 tests reached
+their real assertions, no plumbing failure) -- every test then failed
+identically, waiting for `[data-testid="app"]` to mount, because the served
+page is still the pre-task-3 placeholder. This is the intended, spec-mandated
+failure mode (the test must NOT silently skip just because the build is
+missing -- only a genuinely absent Chrome binary should skip it), not a bug
+in the test. Chrome itself is confirmed present at the standard Windows path.
+
+**To finish this task**, a session with npm available needs only:
+```
+cd observatory/frontend && npm install && npm run build
+python test_observatory_e2e.py   # should go green once static/ is real
+cd ../.. && python test_discovery.py && python test_watch.py && python test_observatory.py
+```
+`vite.config.ts` builds to `../static` with deterministic (non-hashed)
+filenames and `emptyOutDir: true`, and `index.html`'s script tag points at
+`/src/main.tsx` so `npm run dev` also works unmodified. Canonical Python
+suites (458 + 10 + 65) are unaffected by this task and still green --
+nothing here touches `discovery/`.
+
 ## chatgpt_browser provider reconciliation (step-12 task 1)
 Ported verbatim from owner `main` (which predates steps 06-10, so was reconciled
 by hand, file by file, not merged): `discovery/providers/chatgpt_browser.py`

@@ -755,6 +755,55 @@ network) against a fixture db built by the real `discovery/trace_fixture.py`.
 Skips every test with a loud message (not a failure) if `datasette` genuinely
 isn't installed.
 
+### Observatory frontend (`observatory/frontend/`)
+
+React + TypeScript + React Flow (`@xyflow/react`) + ELK.js (`elkjs`), built
+with Vite. Node/npm is a **build-time only** dependency — the built output is
+committed to `observatory/static/` (deterministic, non-content-hashed
+filenames), so serving it (`python -m app ui`) needs no Node at runtime.
+
+```bash
+cd observatory/frontend
+npm install
+npm run build       # emits into ../static (tsc -b type-check + vite build)
+npm test             # vitest: graph assembly, edge labels, diffs, deep links
+```
+
+`npm run dev` (Vite dev server, hot reload) works against a running
+`python -m app ui` backend for iteration — the dev server itself doesn't
+serve the API, only proxy your fetches manually or run against
+`http://localhost:8001` directly by adjusting `fetch`'s base if needed. Only
+`observatory/frontend/{src,index.html,package.json,vite.config.ts,tsconfig*.json}`
+are source; `node_modules/` and Vite's cache are gitignored.
+
+**Mobile**: under a 480px viewport (iPhone width) the explorer becomes a
+slide-out drawer (☰ toggle in the header) and the inspector becomes a
+full-screen bottom sheet opened by tapping a node; the graph itself stays
+touch-pan/pinch-zoom via React Flow's own gesture handling. A
+`/observatory/trace/score/<id>` deep link lands directly on the graph with
+the sent path highlighted, on both viewport classes. Live iPhone-device and
+public-ngrok verification remain deferred to a live operator session — the
+iPhone-*sized* viewport (390×844, via CDP `Emulation.setDeviceMetricsOverride`)
+covered by the e2e test below is the in-repo evidence.
+
+**E2E smoke test**: `python test_observatory_e2e.py` — stdlib only, drives a
+real local headless Chrome over CDP (the same websocket approach
+`discovery/providers/cdp.py` uses, pointed at a Chrome instance the test
+launches itself rather than an existing authenticated tab). Builds the trace
+fixture db, starts `python -m app ui` on an ephemeral localhost port, and at
+both a desktop and an iPhone-width viewport: loads the app, selects the
+fixture's successful discovery, asserts the duplicate/prefilter-rejection/
+scoring-retry/below-threshold/sent branches are all present as real nodes,
+expands/collapses a group, pans/zooms, opens the inspector and asserts the
+displayed prompt is byte-equal to the fixture's own `model_calls` row,
+exercises the copy button, and opens the score deep link and asserts the
+sent path is highlighted. No network beyond localhost. Skips (loudly, not a
+failure) only when no Chrome/Chromium binary is found — set
+`DISCOVERY_UI_E2E_CHROME` to point at a non-standard install path. **A
+missing `observatory/static/` build does NOT skip this test — it fails**,
+since that's a real gap the test exists to catch, not an environment
+limitation.
+
 ## Tests
 
 ```bash
@@ -777,6 +826,12 @@ offline via Datasette's own ASGI test client — see
 `test_discovery.py` stays importable and green on a machine without
 `datasette` installed. `test_observatory.py` skips itself with a loud
 message instead of failing if `datasette` isn't installed.
+
+A fourth, separate suite — `python test_observatory_e2e.py` (real headless
+Chrome over CDP) — is not part of this always-run list: it needs a built
+`observatory/static/` bundle (see
+[Observatory frontend](#observatory-frontend-observatoryfrontend)) to pass,
+and only skips (rather than failing) when no Chrome binary exists.
 
 ## Provenance chain (step-08)
 
