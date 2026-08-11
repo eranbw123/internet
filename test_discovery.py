@@ -4783,6 +4783,46 @@ class InstallTasksTests(unittest.TestCase):
         # boundary must be in the future, not today's already-missed slot.
         self.assertGreater(start_dt, datetime.now())
 
+    def test_digest_repeats_within_its_window_not_just_once_a_day(self):
+        cfg = dataclasses.replace(
+            CFG, digest_time="09:00", digest_window_end="12:00",
+            digest_interval_seconds=1800,
+        )
+        task = next(t for t in install_tasks.build_tasks(cfg) if t.trigger_kind == "daily")
+        xml = install_tasks.render_xml(task)
+        self.assertIn("<Repetition>", xml)
+        self.assertIn("<Interval>PT30M</Interval>", xml)
+        # 09:00 -> 12:00 is a 3-hour window, regardless of which day the
+        # (possibly rolled-forward) StartBoundary lands on.
+        self.assertIn("<Duration>PT3H</Duration>", xml)
+
+    def test_digest_window_end_before_start_wraps_to_the_next_day(self):
+        cfg = dataclasses.replace(
+            CFG, digest_time="20:00", digest_window_end="02:00",
+            digest_interval_seconds=3600,
+        )
+        task = next(t for t in install_tasks.build_tasks(cfg) if t.trigger_kind == "daily")
+        xml = install_tasks.render_xml(task)
+        self.assertIn("<Duration>PT6H</Duration>", xml)
+
+    def test_zero_digest_interval_falls_back_to_a_single_daily_fire(self):
+        cfg = dataclasses.replace(CFG, digest_interval_seconds=0)
+        task = next(t for t in install_tasks.build_tasks(cfg) if t.trigger_kind == "daily")
+        xml = install_tasks.render_xml(task)
+        self.assertNotIn("<Repetition>", xml)
+
+    def test_interval_tasks_still_repeat_forever_with_no_duration(self):
+        # Regression guard: the digest's new bounded Repetition must not leak
+        # onto the plain interval-kind tasks, which repeat with no Duration
+        # (i.e. forever) by design.
+        task = next(
+            t for t in install_tasks.build_tasks(CFG)
+            if t.name == "internet-discovery-collect-stocks"
+        )
+        xml = install_tasks.render_xml(task)
+        self.assertIn("<Repetition>", xml)
+        self.assertNotIn("<Duration>", xml)
+
     def test_uninstall_is_scoped_to_the_six_task_names_plus_soak(self):
         calls = []
         install_tasks.uninstall(runner=lambda args: calls.append(args) or (0, "", ""))
