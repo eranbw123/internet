@@ -369,7 +369,7 @@ def deliver(conn, cfg, dry_run=False, lane_counts=None):
 def send_digest(conn, cfg, dry_run=False, lane_counts=None):
     """DISCOVERY items only, sorted by final_score (already
     notification_ready()'s order), capped at cfg.digest_max_items. Anything
-    past the cap simply stays pending for tomorrow's digest -- it was never
+    past the cap simply stays pending for the next digest slot -- it was never
     marked notified. Alerts are never touched here; deliver() already sent
     them. `lane_counts`: see deliver() -- no caller passes one today (the
     `digest` CLI command bumps no funnel metric at all, same as before this

@@ -11,10 +11,12 @@ tick loop. Every task shells out to ops/run.cmd, which calls `python -m app`.
         # register the one-shot 24h soak-checkpoint task (see ops/SOAK.md);
         # composable with --dry-run to preview without registering
 
-Cadence for the collect-* tasks and the digest time come from `config.load()`
+Cadence for the collect-* tasks and the digest come from `config.load()`
 (interval_stocks_seconds / interval_web_seconds / interval_youtube_seconds /
-digest_time) -- they are never hardcoded here, so changing a `.env` interval
-and re-running --install is enough to reschedule.
+digest_time / digest_interval_seconds / digest_window_end -- the digest
+re-fires every digest_interval_seconds from digest_time until
+digest_window_end, same day) -- they are never hardcoded here, so changing a
+`.env` interval and re-running --install is enough to reschedule.
 
 Registration goes through generated Task Scheduler XML + `schtasks /create
 /XML`, not `schtasks /create /sc minute`, which can't express the settings
@@ -75,6 +77,12 @@ class TaskDef:
     trigger_value: object   # seconds (interval), "HH:MM" (daily), or hours (once)
     exec_time_limit: str    # ISO-8601 duration
     script: str = "run.cmd"   # ops/<script>, the .cmd the action shells out to
+    # "daily" only: re-fire every repeat_seconds from trigger_value's HH:MM
+    # until window_end, same day (Task Scheduler's own Repetition+Duration on
+    # the CalendarTrigger) -- so a daily task can drain throughout the day
+    # instead of firing once. 0/"" = plain single daily fire (unchanged).
+    repeat_seconds: int = 0
+    window_end: str = ""
 
 
 def build_tasks(cfg):
@@ -86,7 +94,11 @@ def build_tasks(cfg):
         suffix, app_args, kind, field, limit = spec[:5]
         script = spec[5] if len(spec) > 5 else "run.cmd"
         value = getattr(cfg, field) if isinstance(field, str) else field
-        tasks.append(TaskDef(f"{PREFIX}{suffix}", app_args, kind, value, limit, script=script))
+        task = TaskDef(f"{PREFIX}{suffix}", app_args, kind, value, limit, script=script)
+        if kind == "daily":
+            task.repeat_seconds = cfg.digest_interval_seconds
+            task.window_end = cfg.digest_window_end
+        tasks.append(task)
     return tasks
 
 
@@ -141,12 +153,26 @@ def _trigger_xml(task):
             # on right after registration, firing an unscheduled extra
             # digest. Roll to tomorrow instead.
             start += timedelta(days=1)
+        repetition = ""
+        if task.repeat_seconds and task.window_end:
+            end_hour, end_minute = (int(p) for p in task.window_end.split(":"))
+            end = start.replace(hour=end_hour, minute=end_minute)
+            if end <= start:
+                end += timedelta(days=1)   # window wraps past midnight
+            duration = _iso8601_duration((end - start).total_seconds())
+            interval = _iso8601_duration(task.repeat_seconds)
+            repetition = f"""
+      <Repetition>
+        <Interval>{interval}</Interval>
+        <Duration>{duration}</Duration>
+        <StopAtDurationEnd>false</StopAtDurationEnd>
+      </Repetition>"""
         return f"""    <CalendarTrigger>
       <StartBoundary>{start.isoformat()}</StartBoundary>
       <Enabled>true</Enabled>
       <ScheduleByDay>
         <DaysInterval>1</DaysInterval>
-      </ScheduleByDay>
+      </ScheduleByDay>{repetition}
     </CalendarTrigger>"""
     if task.trigger_kind == "once":
         # The soak checkpoint: a single firing `trigger_value` hours out, no
