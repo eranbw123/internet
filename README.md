@@ -591,8 +591,9 @@ alternative interpretation, and uncertainties.
 deterministic fixture (one interest, one Council generation with three
 missions, a duplicate, a prefilter rejection, a scoring failure + retry, a
 below-bar score, and one delivered + feedback-rated discovery) against fake
-providers — offline, for the Datasette plugin/React UI in the next two steps
-to build and test against without a live Chrome/CDP session. `--db` is
+providers — offline, for the Datasette plugin and React UI (see
+[Observatory](#observatory)) to build and test against without a live
+Chrome/CDP session. `--db` is
 required; the command exits 2 rather than silently writing this fixture
 data — including a real feedback row — into the production `discovery.db`.
 
@@ -652,7 +653,8 @@ plugin (`observatory/`) over `discovery.db`, bound to localhost by default.
 importable and green on a machine that never installs it.
 
 - **Pages/APIs** (`observatory/plugin.py`, `register_routes()`): `/observatory/`
-  (a placeholder shell until task 3 lands the real static bundle) and JSON
+  (serves the built React frontend — see
+  [Observatory frontend](#observatory-frontend-observatoryfrontend)) and JSON
   APIs — `api/list?tab=discoveries|interests|generations|missions|failed`
   (paginated, `limit` capped at 50, filters for date range/interest/layer/
   source/provider/model/mission/sent/feedback verdict/failure stage/trace
