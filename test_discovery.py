@@ -7,6 +7,7 @@ the pipeline holds an LLMProvider, so a fake object with `complete_json` /
 `search_json` is the whole seam.
 """
 import dataclasses
+import hashlib
 import io
 import json
 import os
@@ -26,6 +27,7 @@ from discovery import (
     dedup,
     feedback_listener,
     health,
+    interest_state,
     interests,
     matching,
     models,
@@ -551,6 +553,84 @@ class DBTests(unittest.TestCase):
         # A live retry candidate (under the cap) is not "abandoned".
         self.assertEqual(db.abandoned_notifications(self.conn, max_attempts=10), 0)
 
+    # --- layered interest state: owner immutability + provenance -----------
+
+    def test_owner_row_survives_a_derived_write_attempt_by_key_collision(self):
+        """Structurally impossible in production (interests.load_file()
+        rejects an owner key carrying DERIVED_KEY_PREFIX), but guarded here
+        too -- upsert_derived_interest() refuses a non-prefixed key outright."""
+        db.upsert_interest(self.conn, an_interest(key="owner1"))
+        with self.assertRaises(ValueError):
+            db.upsert_derived_interest(
+                self.conn, an_interest(key="owner1", layer="inferred"), {}
+            )
+        stored = db.interest_by_key(self.conn, "owner1")
+        self.assertEqual(stored.layer, "owner")
+
+    def test_set_interest_layer_refuses_an_owner_row(self):
+        db.upsert_interest(self.conn, an_interest(key="owner1"))
+        with self.assertRaises(db.OwnerInterestImmutable):
+            db.set_interest_layer(self.conn, "owner1", "inferred", {})
+        self.assertEqual(db.interest_by_key(self.conn, "owner1").layer, "owner")
+
+    def test_set_interest_layer_refuses_a_key_that_does_not_exist(self):
+        with self.assertRaises(db.OwnerInterestImmutable):
+            db.set_interest_layer(self.conn, "derived:nope", "emerging", {})
+
+    def test_the_owner_layer_trigger_aborts_a_raw_update(self):
+        db.upsert_interest(self.conn, an_interest(key="owner1"))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("UPDATE interests SET layer = 'inferred' WHERE key = 'owner1'")
+        self.assertEqual(db.interest_by_key(self.conn, "owner1").layer, "owner")
+
+    def test_the_owner_delete_trigger_aborts_a_raw_delete(self):
+        db.upsert_interest(self.conn, an_interest(key="owner1"))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("DELETE FROM interests WHERE key = 'owner1'")
+        self.assertIsNotNone(db.interest_by_key(self.conn, "owner1"))
+
+    def test_upsert_derived_interest_round_trips_layer_and_provenance(self):
+        interest = an_interest(
+            key="derived:gizmo", title="gizmo", positive_signals=["gizmo"], layer="exploratory"
+        )
+        db.upsert_derived_interest(self.conn, interest, {"source": "corpus", "term": "gizmo"})
+        stored = db.interest_by_key(self.conn, "derived:gizmo")
+        self.assertEqual(stored.layer, "exploratory")
+        self.assertEqual(stored.provenance, {"source": "corpus", "term": "gizmo"})
+        row = self.conn.execute(
+            "SELECT active FROM interests WHERE key = 'derived:gizmo'"
+        ).fetchone()
+        self.assertEqual(row["active"], 0)   # exploratory never spends provider budget
+
+    def test_upsert_derived_interest_inferred_is_active(self):
+        interest = an_interest(key="derived:gizmo", layer="inferred", min_score=0.8)
+        db.upsert_derived_interest(self.conn, interest, {})
+        row = self.conn.execute(
+            "SELECT active FROM interests WHERE key = 'derived:gizmo'"
+        ).fetchone()
+        self.assertEqual(row["active"], 1)
+
+    def test_interest_events_is_append_only_and_ordered(self):
+        db.add_interest_event(self.conn, "derived:x", "automation", "enter", None, "exploratory", {"observations": 1})
+        db.add_interest_event(self.conn, "derived:x", "automation", "promote", "exploratory", "emerging", {"observations": 5})
+        events = db.interest_events(self.conn, "derived:x")
+        self.assertEqual([e["action"] for e in events], ["enter", "promote"])
+        self.assertEqual(events[0]["to_layer"], "exploratory")
+        self.assertEqual(events[1]["evidence"], {"observations": 5})
+        self.assertEqual(db.interest_events(self.conn, "derived:nothing-here"), [])
+
+    def test_list_interests_filters_by_layer_and_puts_owner_first(self):
+        db.upsert_interest(self.conn, an_interest(key="owner1"))
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:x", layer="exploratory"), {}
+        )
+        keys = [r["key"] for r in db.list_interests(self.conn)]
+        self.assertEqual(keys, ["owner1", "derived:x"])
+        self.assertEqual(
+            [r["key"] for r in db.list_interests(self.conn, layer="exploratory")], ["derived:x"]
+        )
+        self.assertEqual(db.list_interests(self.conn, layer="inferred"), [])
+
 
 class StatsTests(unittest.TestCase):
     def setUp(self):
@@ -887,6 +967,21 @@ class InterestsFileTests(unittest.TestCase):
         self.assertEqual(with_state, no_state)
         self.assertEqual(with_state, plain)
 
+    def test_an_owner_key_carrying_the_derived_prefix_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._load({"interests": [{"key": "derived:x", "title": "X"}]})
+        self.assertIn("derived:x", str(ctx.exception))
+
+    def test_load_blocked_reads_the_optional_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "i.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"interests": [], "blocked_derived_terms": ["spam", "clickbait"]}, fh)
+            self.assertEqual(interests.load_blocked(path), ["spam", "clickbait"])
+
+    def test_load_blocked_defaults_to_empty_list_when_absent(self):
+        self.assertEqual(interests.load_blocked("interests.json"), [])
+
 
 class PersonalStateTests(unittest.TestCase):
     def _write(self, data):
@@ -978,6 +1073,605 @@ class PersonalStateTests(unittest.TestCase):
         with self.assertRaises(PersonalStateError):
             personal_state.load(missing_key)
         self.assertIsNone(personal_state.load_optional(missing_key))
+
+
+NOW = datetime(2026, 8, 10, tzinfo=timezone.utc)
+FRESH = (NOW - timedelta(days=1)).isoformat(timespec="seconds")
+STALE = (NOW - timedelta(days=40)).isoformat(timespec="seconds")
+
+
+class InterestStateDecideTests(unittest.TestCase):
+    """decide() is pure -- no DB, no clock of its own -- so the whole ladder
+    is exercised as a table, current_layer/evidence/blocked in, Transition
+    (or None) out."""
+
+    RULES = interest_state.Rules()
+
+    CASES = [
+        ("absent, never observed -> stays absent",
+         None, dict(observations=0), False, None),
+        ("absent, observed once -> enters exploratory",
+         None, dict(observations=1, last_seen=FRESH), False, ("exploratory", "enter")),
+        ("absent, blocked -> never enters even though observed",
+         None, dict(observations=9, last_seen=FRESH), True, None),
+        ("exploratory, below the observation bar -> stays",
+         "exploratory", dict(observations=4, distinct_days=3, last_seen=FRESH), False, None),
+        ("exploratory, below the distinct-day bar -> stays",
+         "exploratory", dict(observations=5, distinct_days=2, last_seen=FRESH), False, None),
+        ("exploratory, both bars cleared -> promotes to emerging",
+         "exploratory", dict(observations=5, distinct_days=3, last_seen=FRESH), False,
+         ("emerging", "promote")),
+        ("emerging, feedback bar not cleared -> stays",
+         "emerging", dict(observations=5, distinct_days=3, positive_feedback=1,
+                           negative_feedback=0, last_seen=FRESH), False, None),
+        ("emerging, feedback tied (not strictly positive) -> stays",
+         "emerging", dict(observations=5, distinct_days=3, positive_feedback=2,
+                           negative_feedback=2, last_seen=FRESH), False, None),
+        ("emerging, observation bar regressed even with feedback -> stays",
+         "emerging", dict(observations=4, distinct_days=3, positive_feedback=5,
+                           negative_feedback=0, last_seen=FRESH), False, None),
+        ("emerging, every bar cleared -> promotes to inferred",
+         "emerging", dict(observations=5, distinct_days=3, positive_feedback=2,
+                           negative_feedback=0, last_seen=FRESH), False,
+         ("inferred", "promote")),
+        ("inferred, nothing above it and still fresh -> stays",
+         "inferred", dict(observations=5, distinct_days=3, last_seen=FRESH), False, None),
+        ("inferred, idle -> decays one rung to emerging",
+         "inferred", dict(last_seen=STALE), False, ("emerging", "decay")),
+        ("emerging, idle -> decays one rung to exploratory",
+         "emerging", dict(last_seen=STALE), False, ("exploratory", "decay")),
+        ("exploratory, idle -> decays to retired",
+         "exploratory", dict(last_seen=STALE), False, ("retired", "decay")),
+        ("exploratory, never actually observed this evidence -> treated as idle",
+         "exploratory", dict(last_seen=None), False, ("retired", "decay")),
+        ("exploratory, negative feedback dominates -> immediate retire",
+         "exploratory", dict(negative_feedback=3, positive_feedback=0, last_seen=FRESH), False,
+         ("retired", "retire_negative_feedback")),
+        ("inferred, negative feedback dominates -> immediate retire even though active",
+         "inferred", dict(negative_feedback=3, positive_feedback=1, last_seen=FRESH), False,
+         ("retired", "retire_negative_feedback")),
+        ("inferred, negative feedback at the bar but not dominant -> stays",
+         "inferred", dict(negative_feedback=3, positive_feedback=3, last_seen=FRESH), False, None),
+        ("retired, re-entry evidence below the anti-flap multiplier -> stays retired",
+         "retired", dict(observations=9), False, None),
+        ("retired, re-entry evidence clears the multiplier -> re-enters at exploratory",
+         "retired", dict(observations=10), False, ("exploratory", "reentry")),
+        ("exploratory, blocked -> retired",
+         "exploratory", dict(last_seen=FRESH), True, ("retired", "retire_blocked")),
+        ("retired, blocked -> stays retired, no duplicate event",
+         "retired", dict(observations=100), True, None),
+    ]
+
+    def test_the_ladder(self):
+        for name, current_layer, evidence_kwargs, blocked, expected in self.CASES:
+            with self.subTest(name):
+                evidence = interest_state.Evidence(**evidence_kwargs)
+                transition = interest_state.decide(current_layer, evidence, self.RULES, NOW, blocked)
+                if expected is None:
+                    self.assertIsNone(transition, name)
+                else:
+                    to_layer, action = expected
+                    self.assertEqual((transition.to_layer, transition.action), (to_layer, action), name)
+                    self.assertEqual(transition.from_layer, current_layer)
+
+    def test_decide_never_emits_a_transition_into_owner(self):
+        """Never any transition to OWNER, from any state, ever."""
+        evidences = [
+            interest_state.Evidence(),
+            interest_state.Evidence(observations=100, distinct_days=50, last_seen=FRESH),
+            interest_state.Evidence(positive_feedback=10, negative_feedback=0, last_seen=FRESH),
+            interest_state.Evidence(negative_feedback=10, positive_feedback=0, last_seen=FRESH),
+            interest_state.Evidence(last_seen=STALE),
+        ]
+        for current_layer in (None, "exploratory", "emerging", "inferred", "retired"):
+            for evidence in evidences:
+                for blocked in (False, True):
+                    transition = interest_state.decide(current_layer, evidence, self.RULES, NOW, blocked)
+                    if transition is not None:
+                        self.assertNotEqual(transition.to_layer, "owner")
+
+    def test_personal_state_seed_evidence_can_never_promote_on_its_own(self):
+        """Zero observations (what a seed transition's Evidence carries) can
+        never clear the exploratory -> emerging bar by itself -- it may only
+        decay (never observed = stale), never promote."""
+        seeded = interest_state.Evidence()
+        transition = interest_state.decide("exploratory", seeded, self.RULES, NOW, blocked=False)
+        self.assertTrue(transition is None or transition.action != "promote")
+
+
+class InterestStateEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.rules = interest_state.Rules()
+
+    _counter = 0
+
+    def _item(self, title, days_ago=0):
+        InterestStateEvidenceTests._counter += 1
+        seen = (NOW - timedelta(days=days_ago)).isoformat(timespec="seconds")
+        item = normalize.normalize(an_item(title=title, url=f"https://e.com/{self._counter}"))
+        self.conn.execute(
+            "INSERT INTO candidate_items (source, type, title, text, url, dedup_key, url_hash,"
+            " title_hash, content_hash, first_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (item.source, item.type, item.title, item.text, item.url, item.dedup_key,
+             item.url_hash, item.title_hash, item.content_hash, seen),
+        )
+        self.conn.commit()
+
+    def test_gather_evidence_counts_observations_and_distinct_days(self):
+        self._item("Gizmo breakthrough announced", days_ago=1)
+        self._item("Another gizmo update lands", days_ago=1)
+        self._item("Gizmo momentum continues", days_ago=3)
+        evidence = interest_state.gather_evidence(self.conn, self.rules, NOW)
+        self.assertEqual(evidence["gizmo"].observations, 3)
+        self.assertEqual(evidence["gizmo"].distinct_days, 2)
+
+    def test_gather_evidence_excludes_owner_covered_terms(self):
+        db.upsert_interest(self.conn, an_interest(title="Gizmo watch", positive_signals=["gizmo"]))
+        self._item("Gizmo breakthrough announced", days_ago=1)
+        evidence = interest_state.gather_evidence(self.conn, self.rules, NOW)
+        self.assertNotIn("gizmo", evidence)
+
+    def test_gather_evidence_excludes_an_existing_non_retired_derived_term_but_not_a_retired_one(self):
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="exploratory"), {}
+        )
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:widget", layer="retired"), {}
+        )
+        self._item("Gizmo breakthrough announced", days_ago=1)
+        self._item("Widget breakthrough announced", days_ago=1)
+        evidence = interest_state.gather_evidence(self.conn, self.rules, NOW)
+        self.assertNotIn("gizmo", evidence)
+        self.assertIn("widget", evidence)   # retired terms are still reconsidered (re-entry)
+
+    def test_gather_evidence_ignores_items_outside_the_window(self):
+        self._item("Gizmo breakthrough announced", days_ago=200)
+        evidence = interest_state.gather_evidence(self.conn, self.rules, NOW)
+        self.assertNotIn("gizmo", evidence)
+
+    def test_gather_evidence_counts_feedback_on_matching_titles(self):
+        item = normalize.normalize(an_item(title="Gizmo breakthrough announced", url="https://e.com/g1"))
+        item.id = db.insert_item(self.conn, item)
+        db.add_feedback(self.conn, item.id, None, "up")
+        db.add_feedback(self.conn, item.id, None, "trash")
+        self._item("Gizmo momentum continues", days_ago=1)
+        evidence = interest_state.gather_evidence(self.conn, self.rules, NOW)
+        self.assertEqual(evidence["gizmo"].positive_feedback, 1)
+        self.assertEqual(evidence["gizmo"].negative_feedback, 1)
+
+    def test_gather_evidence_skips_a_verdict_outside_feedback_verdicts_rather_than_assuming_positive(self):
+        item = normalize.normalize(an_item(title="Gizmo breakthrough announced", url="https://e.com/g1"))
+        item.id = db.insert_item(self.conn, item)
+        db.add_feedback(self.conn, item.id, None, "not-a-real-verdict")
+        self._item("Gizmo momentum continues", days_ago=1)
+        evidence = interest_state.gather_evidence(self.conn, self.rules, NOW)
+        self.assertEqual(evidence["gizmo"].positive_feedback, 0)
+        self.assertEqual(evidence["gizmo"].negative_feedback, 0)
+
+    def test_gather_evidence_is_truncated_deterministically(self):
+        rules = dataclasses.replace(self.rules, max_candidates=1)
+        self._item("Gizmo news today", days_ago=1)
+        self._item("Gizmo update lands", days_ago=1)
+        self._item("Widget only mention here", days_ago=1)
+        evidence = interest_state.gather_evidence(self.conn, rules, NOW)
+        # "gizmo" (2 observations) beats every single-observation term.
+        self.assertEqual(list(evidence), ["gizmo"])
+
+
+class InterestStateApplyTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.cfg = dataclasses.replace(CFG, dynamic_interests=False)
+
+    def _seed_items(self, title, n, distinct_days=3):
+        for i in range(n):
+            day = i % distinct_days
+            seen = (NOW - timedelta(days=day)).isoformat(timespec="seconds")
+            self.conn.execute(
+                "INSERT INTO candidate_items (source, type, title, text, url, dedup_key,"
+                " url_hash, title_hash, content_hash, first_seen_at)"
+                " VALUES ('web_search', 'article', ?, 'body', ?, ?, ?, ?, NULL, ?)",
+                (title, f"https://e.com/{title}-{i}", f"k{title}-{i}", f"u{title}-{i}",
+                 f"t{title}-{i}", seen),
+            )
+        self.conn.commit()
+
+    def _positive_feedback(self, term, up=0, fire=0):
+        """Feedback rows on an item whose title contains `term` -- gathered
+        regardless of the evidence window (see interest_state._feedback_index)."""
+        item = normalize.normalize(an_item(title=f"{term} feedback item", url=f"https://fb/{term}"))
+        item.id = db.insert_item(self.conn, item)
+        for _ in range(up):
+            db.add_feedback(self.conn, item.id, None, "up")
+        for _ in range(fire):
+            db.add_feedback(self.conn, item.id, None, "fire")
+
+    def test_default_off_is_a_true_noop(self):
+        """Byte-identical to today with the flag off: no row, no query, no
+        write -- not just a filtered result."""
+        self._seed_items("Gizmo breakthrough", 10)
+        before = self.conn.execute("SELECT COUNT(*) c FROM interests").fetchone()["c"]
+        summary = interest_state.apply_transitions(self.conn, self.cfg)
+        after = self.conn.execute("SELECT COUNT(*) c FROM interests").fetchone()["c"]
+        self.assertEqual(summary, {
+            "enabled": False, "seeded": 0, "entered": 0, "promoted": 0,
+            "decayed": 0, "retired": 0, "reentered": 0, "capped": 0,
+        })
+        self.assertEqual(before, after)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM interest_events").fetchone()["c"], 0)
+
+    def test_a_fresh_term_enters_exploratory_then_needs_a_second_pass_to_promote(self):
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True)
+        # "Gizmo breakthrough" also seeds a "breakthrough" candidate; only
+        # "gizmo" is asserted on below, the point being one ladder rung per
+        # apply_transitions() call, not a specific candidate count.
+        self._seed_items("Gizmo breakthrough", 5, distinct_days=3)
+
+        first = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertGreaterEqual(first["entered"], 1)
+        self.assertEqual(first["promoted"], 0)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = 'derived:gizmo'").fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("exploratory", 0))
+
+        second = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertGreaterEqual(second["promoted"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = 'derived:gizmo'").fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("emerging", 0))
+
+        events = db.interest_events(self.conn, "derived:gizmo")
+        self.assertEqual([e["action"] for e in events], ["enter", "promote"])
+
+    def test_promotion_to_inferred_is_capped_and_recorded(self):
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True, derived_max_active=0)
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="emerging"), {}
+        )
+        self._seed_items("Gizmo breakthrough", 5, distinct_days=3)
+        self._positive_feedback("gizmo", up=1, fire=1)
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary["promoted"], 0)
+        self.assertEqual(summary["capped"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = 'derived:gizmo'").fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("emerging", 0))
+        events = db.interest_events(self.conn, "derived:gizmo")
+        self.assertEqual(events[-1]["action"], "promotion_capped")
+
+    def test_inferred_interest_carries_the_derived_min_score_floor(self):
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True, derived_min_score=0.9)
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="emerging"), {}
+        )
+        self._seed_items("Gizmo breakthrough", 5, distinct_days=3)
+        self._positive_feedback("gizmo", up=1, fire=1)   # clears the emerging -> inferred bar
+        interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        row = self.conn.execute(
+            "SELECT layer, active, min_score, positive_signals FROM interests WHERE key = 'derived:gizmo'"
+        ).fetchone()
+        self.assertEqual(row["layer"], "inferred")
+        self.assertEqual(row["active"], 1)
+        self.assertEqual(row["min_score"], 0.9)
+        self.assertEqual(json.loads(row["positive_signals"]), ["gizmo"])
+
+    def test_idle_derived_interest_decays_one_rung(self):
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True)
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="inferred"), {}
+        )
+        # upsert_derived_interest() always stamps last_observed_at = db.now()
+        # (real wall-clock); backdate it past decay_idle_days so this test's
+        # "idle" is genuine rather than an artifact of a fixed injected `now`.
+        stale = (NOW - timedelta(days=40)).isoformat(timespec="seconds")
+        self.conn.execute(
+            "UPDATE interests SET last_observed_at = ? WHERE key = 'derived:gizmo'", (stale,)
+        )
+        self.conn.commit()
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary["decayed"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = 'derived:gizmo'").fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("emerging", 0))
+
+    def test_a_freshly_written_derived_interest_is_not_immediately_idle(self):
+        """Regression: last_observed_at is the decay-staleness baseline for a
+        row with no corpus evidence this pass (see upsert_derived_interest's
+        docstring) -- a row written moments ago must not decay on its very
+        next re-evaluation just because it has no fresh window evidence."""
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True)
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="inferred"), {}
+        )
+        fresh = NOW.isoformat(timespec="seconds")
+        self.conn.execute(
+            "UPDATE interests SET last_observed_at = ? WHERE key = 'derived:gizmo'", (fresh,)
+        )
+        self.conn.commit()
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary["decayed"], 0)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = 'derived:gizmo'").fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("inferred", 1))
+
+    def test_blocked_term_already_tracked_is_retired(self):
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True)
+        path = os.path.join(tempfile.mkdtemp(), "interests.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"interests": [], "blocked_derived_terms": ["gizmo"]}, fh)
+        cfg = dataclasses.replace(cfg, interests_path=path)
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="exploratory"), {}
+        )
+        self._seed_items("Gizmo breakthrough", 5, distinct_days=3)
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary["retired"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = 'derived:gizmo'").fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("retired", 0))
+
+    def test_personal_state_seed_never_promotes_by_itself(self):
+        cfg = dataclasses.replace(
+            self.cfg, dynamic_interests=True,
+            personal_state_path=self._personal_state_artifact(["nocorpusterm"]),
+        )
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary["seeded"], 1)
+        row = self.conn.execute(
+            "SELECT layer, active FROM interests WHERE key = 'derived:nocorpusterm'"
+        ).fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("exploratory", 0))
+        # Pin last_observed_at to this test's own fixed clock -- production
+        # apply_transitions()'s `now` and db.upsert_derived_interest()'s
+        # db.now() are both real wall-clock and so agree, but here `now` is
+        # injected and fixed, so pin the row to match rather than lean on
+        # the sandbox's real clock happening to agree with NOW.
+        self.conn.execute(
+            "UPDATE interests SET last_observed_at = ? WHERE key = 'derived:nocorpusterm'",
+            (NOW.isoformat(timespec="seconds"),),
+        )
+        self.conn.commit()
+        # A second pass, same instant, no new corpus evidence: must never
+        # promote it (the hard requirement), and -- since no idle time has
+        # actually elapsed since the seed -- must not decay it either. Zero
+        # observations can only ever demote/hold, never advance the ladder.
+        summary2 = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary2["promoted"], 0)
+        row2 = self.conn.execute(
+            "SELECT layer FROM interests WHERE key = 'derived:nocorpusterm'"
+        ).fetchone()
+        self.assertEqual(row2["layer"], "exploratory")
+
+    def _personal_state_artifact(self, terms):
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "personal_state.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "contract_version": 1,
+                "generated_at": "2026-08-10T00:00:00Z",
+                "topics": [{"key": t, "weight": 1.0} for t in terms],
+            }, fh)
+        return path
+
+    def test_personal_state_seed_records_full_provenance_on_the_row_and_the_event(self):
+        """Work item 1: the seed's origin -- artifact identity, contract
+        version, topic key, seeded_at -- lands on BOTH the interest's own
+        provenance JSON and its interest_events seed row, and seeding writes
+        no score row (zero LLM/network calls -- apply_transitions() doesn't
+        even take a provider argument)."""
+        term = "zzqleaktest"
+        path = self._personal_state_artifact([term])
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True, personal_state_path=path)
+        expected_hash = hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary["seeded"], 1)
+
+        row = self.conn.execute(
+            "SELECT provenance FROM interests WHERE key = ?", (f"derived:{term}",)
+        ).fetchone()
+        provenance = json.loads(row["provenance"])
+        self.assertEqual(provenance["origin"], "personal_state")
+        self.assertEqual(provenance["artifact_sha256"], expected_hash)
+        self.assertEqual(provenance["generated_at"], "2026-08-10T00:00:00Z")
+        self.assertEqual(provenance["contract_version"], 1)
+        self.assertEqual(provenance["topic_key"], term)
+        self.assertEqual(provenance["seeded_at"], NOW.isoformat(timespec="seconds"))
+
+        events = db.interest_events(self.conn, f"derived:{term}")
+        self.assertEqual([e["action"] for e in events], ["seed"])
+        seed_evidence = events[0]["evidence"]
+        self.assertEqual(seed_evidence["artifact_sha256"], expected_hash)
+        self.assertEqual(seed_evidence["generated_at"], "2026-08-10T00:00:00Z")
+        self.assertEqual(seed_evidence["contract_version"], 1)
+        self.assertEqual(seed_evidence["topic_key"], term)
+
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM scores").fetchone()["c"], 0)
+
+    def test_personal_state_seeded_term_never_promotes_on_self_referential_matching_alone(self):
+        """Work item 2 (the core of this step): the only legal influence
+        channel of personal_state on discovery is a zero-weight exploratory
+        seed (PROJECT_STATE.md's step-05 gate) -- prove the row can never
+        promote off evidence that is only attributable to its own matching
+        (an item whose ONLY row in item_interests points back at this very
+        derived interest), with no independent corpus signal and no human
+        feedback anywhere. Drives the real apply_transitions() over 3 cycles,
+        not a mock of decide()."""
+        term = "zzqleaktest"
+        key = f"derived:{term}"
+        cfg = dataclasses.replace(
+            self.cfg, dynamic_interests=True,
+            personal_state_path=self._personal_state_artifact([term]),
+        )
+        interest_state.apply_transitions(self.conn, cfg, now=NOW)  # pass 0: seeds
+        row = self.conn.execute("SELECT id, layer, active FROM interests WHERE key = ?", (key,)).fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("exploratory", 0))
+        # Pin last_observed_at to the fixed test clock (see
+        # test_personal_state_seed_never_promotes_by_itself for why).
+        self.conn.execute(
+            "UPDATE interests SET last_observed_at = ? WHERE key = ?",
+            (NOW.isoformat(timespec="seconds"), key),
+        )
+        self.conn.commit()
+        owner_before = [
+            dict(r) for r in self.conn.execute("SELECT * FROM interests WHERE layer = 'owner'").fetchall()
+        ]
+
+        for cycle in range(3):
+            derived_interest = db.interest_by_key(self.conn, key)
+            # Well past the ordinary observation/distinct-day bars by the
+            # last cycle, but every single item's ONLY matched interest (via
+            # item_interests -- the matching pipeline's own attribution) is
+            # the seeded interest itself: self-referential, not independent.
+            for day in range(cycle * 2, cycle * 2 + 2):
+                seen = (NOW - timedelta(days=day)).isoformat(timespec="seconds")
+                # Title is the term alone -- no second shared word, so this
+                # fixture can't accidentally promote some *other* incidental
+                # term (e.g. a repeated second word) instead of proving
+                # anything about the seeded one.
+                item = normalize.normalize(an_item(
+                    title=term, url=f"https://e.com/{term}-{cycle}-{day}"
+                ))
+                item.id = db.insert_item(self.conn, item)
+                self.conn.execute(
+                    "UPDATE candidate_items SET first_seen_at = ? WHERE id = ?", (seen, item.id)
+                )
+                self.conn.commit()
+                db.save_matches(self.conn, item.id, [(derived_interest, 0.5, [term])])
+
+            summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+            self.assertEqual(summary["promoted"], 0)
+            row = self.conn.execute("SELECT layer FROM interests WHERE key = ?", (key,)).fetchone()
+            self.assertEqual(row["layer"], "exploratory")
+
+        events = db.interest_events(self.conn, key)
+        self.assertNotIn("promote", [e["action"] for e in events])
+        self.assertEqual(
+            [dict(r) for r in self.conn.execute("SELECT * FROM interests WHERE layer = 'owner'").fetchall()],
+            owner_before,
+        )
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM scores").fetchone()["c"], 0)
+
+        # Now let it go genuinely idle (no fresh self-referential item this
+        # pass) past decay_idle_days -- must demote/retire per the ordinary
+        # decide() rules, exactly like any other exploratory row.
+        stale = (NOW - timedelta(days=interest_state.Rules().decay_idle_days + 1)).isoformat(timespec="seconds")
+        self.conn.execute("UPDATE interests SET last_observed_at = ? WHERE key = ?", (stale, key))
+        self.conn.commit()
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        # exploratory decays straight to retired (nothing below it); the
+        # summary bucket is "decayed" -- see _summary_key(), which only
+        # counts an explicit retire_* action (blocked/negative-feedback) as
+        # "retired".
+        self.assertEqual(summary["decayed"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = ?", (key,)).fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("retired", 0))
+
+    def _promote_seeded_term_to_inferred_and_notify(self, term):
+        """The companion, positive-path fixture to the leakage test above:
+        same seed, but with independent owner-collector corpus evidence (no
+        item_interests involved at all) plus positive human feedback
+        recorded through the existing db.add_feedback path -- promotes
+        exploratory -> emerging -> inferred, one rung per
+        apply_transitions() call, and then delivers an above-bar match on it
+        through the real pipeline. Returns (key, item_id, score_id,
+        notification_id)."""
+        key = f"derived:{term}"
+        cfg = dataclasses.replace(
+            self.cfg, dynamic_interests=True,
+            personal_state_path=self._personal_state_artifact([term]),
+        )
+        interest_state.apply_transitions(self.conn, cfg, now=NOW)  # pass 1: seeds
+        self.conn.execute(
+            "UPDATE interests SET last_observed_at = ? WHERE key = ?",
+            (NOW.isoformat(timespec="seconds"), key),
+        )
+        self.conn.commit()
+
+        # Independent corpus evidence: plain items, exactly as an owner
+        # collector would have stored them -- no item_interests row at all.
+        self._seed_items(term, 6, distinct_days=3)
+        pass2 = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(pass2["promoted"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = ?", (key,)).fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("emerging", 0))
+
+        # Positive human feedback, through the existing recording path.
+        self._positive_feedback(term, up=2)
+        pass3 = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(pass3["promoted"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = ?", (key,)).fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("inferred", 1))
+
+        events = db.interest_events(self.conn, key)
+        self.assertEqual([e["action"] for e in events], ["seed", "promote", "promote"])
+
+        active = db.active_interests(self.conn)
+        self.assertIn(key, [i.key for i in active])
+        provider = FakeProvider({f"{term} breaks through": 0.95})
+        item = an_item(
+            title=f"{term} breaks through", url=f"https://e.com/{term}-notify", text=BODY
+        )
+        outcome = pipeline.ingest(self.conn, provider, cfg, item, active, origin_interest=key)
+        self.assertEqual(outcome.stage, "scored")
+        sent = pipeline.send_digest(self.conn, cfg, dry_run=True)
+        self.assertEqual(sent, 1)
+        notification = self.conn.execute(
+            "SELECT n.id, n.ok FROM notifications n JOIN scores s ON s.id = n.score_id"
+            " WHERE s.item_id = ?",
+            (outcome.item.id,),
+        ).fetchone()
+        self.assertEqual(notification["ok"], 1)
+        return key, outcome.item.id, outcome.score.id, notification["id"]
+
+    def test_personal_state_seeded_term_promotes_on_independent_evidence_plus_feedback(self):
+        """Work item 3: the loop closes positively -- same seeded term as the
+        leakage test, but with real independent evidence. once inferred, an
+        above-bar match yields a notification through the real pipeline."""
+        self._promote_seeded_term_to_inferred_and_notify("zzqleaktest")
+
+    # The documented chain query from README.md's "Provenance chain" section
+    # -- kept byte-identical to what's published there so this test proves
+    # the exact query a human would copy-paste actually resolves every hop.
+    PROVENANCE_CHAIN_QUERY = """
+        SELECT
+          n.id                                            AS notification_id,
+          s.id                                            AS score_id,
+          s.final_score                                   AS score,
+          ci.id                                            AS item_id,
+          ci.title                                         AS item_title,
+          it.key                                           AS interest_key,
+          it.layer                                         AS interest_layer,
+          ev.id                                            AS seed_event_id,
+          json_extract(ev.evidence, '$.artifact_sha256')   AS artifact_sha256,
+          json_extract(ev.evidence, '$.generated_at')      AS artifact_generated_at,
+          json_extract(ev.evidence, '$.contract_version')  AS contract_version
+        FROM notifications n
+        JOIN scores s           ON s.id = n.score_id
+        JOIN candidate_items ci ON ci.id = s.item_id
+        JOIN interests it       ON it.id = s.interest_id
+        JOIN interest_events ev ON ev.interest_key = it.key AND ev.action = 'seed'
+        WHERE n.id = ?
+    """
+
+    def test_provenance_chain_query_resolves_every_hop(self):
+        """Work item 4: the documented SQL query walks notification -> score
+        -> item -> matched interest -> interest_events -> seed event with
+        the artifact hash, and every hop resolves non-empty against the
+        positive-path fixture."""
+        key, item_id, score_id, notification_id = self._promote_seeded_term_to_inferred_and_notify(
+            "zzqleaktest"
+        )
+        row = self.conn.execute(self.PROVENANCE_CHAIN_QUERY, (notification_id,)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["notification_id"], notification_id)
+        self.assertEqual(row["score_id"], score_id)
+        self.assertEqual(row["item_id"], item_id)
+        self.assertEqual(row["interest_key"], key)
+        self.assertEqual(row["interest_layer"], "inferred")
+        self.assertIsNotNone(row["seed_event_id"])
+        self.assertTrue(row["artifact_sha256"])
+        self.assertEqual(row["artifact_generated_at"], "2026-08-10T00:00:00Z")
+        self.assertEqual(row["contract_version"], 1)
 
 
 class ScoringTests(unittest.TestCase):
@@ -2242,6 +2936,306 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(self._pending_titles(), [])
 
+    # --- exploration lane (step-10): default-off no-op ------------------------
+
+    def test_default_off_never_writes_an_explore_metric_or_shows_the_section(self):
+        """With DISCOVERY_DYNAMIC_INTERESTS off (CFG's default) and no derived
+        interest anywhere in play, run_once is byte-identical to before this
+        step: same summary shape, and the metrics table never grows an
+        explore_* name; stats.report has no EXPLORATION section either."""
+        provider = FakeProvider({"Good": 0.9, "Meh": 0.2})
+        summary = self._run(provider)
+        self.assertEqual(
+            summary,
+            {"collected": 2, "duplicate": 0, "filtered": 0, "already_scored": 0,
+             "scored": 2, "deferred": 0, "errors": 0, "notified": 0},
+        )
+        names = {r["name"] for r in self.conn.execute("SELECT DISTINCT name FROM metrics").fetchall()}
+        self.assertFalse(any(n.startswith("explore_") for n in names))
+        self.assertNotIn("EXPLORATION", stats.report(self.conn, days=7, cfg=CFG))
+
+    def test_default_off_a_stray_active_derived_row_still_cannot_spend_explore_budget(self):
+        """Defense in depth: interest_state.py never creates a non-owner row
+        while the flag is off, but even a manually-inserted active derived
+        row can't spend an exploration score -- explore_budget is
+        Budget(0) whenever cfg.dynamic_interests is False, structurally, not
+        merely filtered out afterwards."""
+        db.upsert_derived_interest(
+            self.conn,
+            an_interest(
+                key="derived:zeta", title="Zeta signal", layer="inferred", sources=[],
+                positive_signals=["exclusive zeta research"],
+            ),
+            {},
+        )
+
+        def collector(interest, cfg, provider, conn=None):
+            return [an_item(source="fake", title="Exclusive zeta research finding",
+                             url="https://e.com/zeta")]
+
+        provider = FakeProvider({"zeta": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            summary = pipeline.run_once(self.conn, provider, CFG, dry_run=True)
+        self.assertEqual((summary["deferred"], summary["scored"]), (1, 0))
+
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("explore_deferred"), 1)
+        self.assertNotIn("deferred", metrics)
+        self.assertNotIn("scored", metrics)
+
+
+class LaneProvider(FakeProvider):
+    """Like FakeProvider, but each needle can also pick which interest_key
+    the model claims (default 'k') -- the exploration tests need a score
+    landing on a *specific* interest (owner vs. derived) to prove
+    notification attribution stays split, not just the match-time lane."""
+
+    def __init__(self, scores, keys=None):
+        super().__init__(scores)
+        self.keys = keys or {}
+
+    def complete_json(self, system, prompt, schema, max_tokens=2000):
+        self.prompts.append(prompt)
+        for needle, value in self.scores.items():
+            if needle in prompt:
+                if isinstance(value, Exception):
+                    raise value
+                return self._payload(value, self.keys.get(needle, "k"))
+        raise AssertionError(f"LaneProvider got an unexpected prompt:\n{prompt}")
+
+
+class ExplorationLaneTests(unittest.TestCase):
+    """step-10: exploit (owner-layer) vs explore (derived/inferred-layer)
+    lane separation at the scoring boundary. classify_lane()'s rule: an
+    item's lane is 'explore' iff matches[0] (match_interests()'s own
+    strongest-first order) is a non-owner interest."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        db.upsert_interest(self.conn, an_interest(
+            key="k", positive_signals=["good stuff"], min_score=0.70, sources=["fake"],
+        ))
+        db.upsert_derived_interest(
+            self.conn,
+            an_interest(
+                key="derived:zeta", title="Zeta signal", layer="inferred", sources=[],
+                positive_signals=["exclusive zeta research"], min_score=0.80,
+            ),
+            {},
+        )
+        self.cfg = dataclasses.replace(CFG, dynamic_interests=True, explore_max_scores_per_cycle=2)
+
+    def _owner_item(self, n):
+        return an_item(source="fake", title=f"Owner item {n}", url=f"https://e.com/owner-{n}")
+
+    def _explore_item(self, n):
+        return an_item(
+            source="fake", title=f"Exclusive zeta research finding {n}",
+            url=f"https://e.com/explore-{n}",
+        )
+
+    # --- budget cap + isolation ------------------------------------------------
+
+    def test_explore_budget_cap_is_enforced_without_starving_owner_items(self):
+        owner_items = [self._owner_item(n) for n in range(3)]
+        explore_items = [self._explore_item(n) for n in range(5)]  # cap is 2
+
+        def collector(interest, cfg, provider, conn=None):
+            return owner_items + explore_items if interest.key == "k" else []
+
+        provider = FakeProvider({"Owner item": 0.9, "Exclusive zeta research": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            pipeline.run_once(self.conn, provider, self.cfg, dry_run=True)
+
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("explore_scored"), 2)     # the cap, exactly
+        self.assertEqual(metrics.get("explore_deferred"), 3)   # 5 - 2 overflow
+        self.assertEqual(metrics.get("scored"), 3)             # every owner item, untouched
+        self.assertNotIn("deferred", metrics)                  # exploit budget never ran dry
+        explore_calls = sum(1 for p in provider.prompts if "Exclusive zeta research" in p)
+        self.assertEqual(explore_calls, 2)
+
+    def test_exhausted_exploit_budget_does_not_draw_from_explore_budget(self):
+        cfg = dataclasses.replace(self.cfg, max_scores_per_cycle=1)
+        owner_items = [self._owner_item(n) for n in range(3)]
+        explore_items = [self._explore_item(n) for n in range(2)]
+
+        def collector(interest, cfg, provider, conn=None):
+            return owner_items + explore_items if interest.key == "k" else []
+
+        provider = FakeProvider({"Owner item": 0.9, "Exclusive zeta research": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            pipeline.run_once(self.conn, provider, cfg, dry_run=True)
+
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("scored"), 1)             # the exploit cap, exactly
+        self.assertEqual(metrics.get("deferred"), 2)           # 3 owner - 1 scored
+        self.assertEqual(metrics.get("explore_scored"), 2)     # both explore items, untouched
+        self.assertNotIn("explore_deferred", metrics)
+
+    # --- metrics isolation -------------------------------------------------------
+
+    def test_metrics_isolation_owner_and_derived_notifications_split(self):
+        owner_item = an_item(
+            source="fake", type="market_event", title="Owner alert",
+            url="https://e.com/owner-alert",
+        )
+        explore_item = an_item(
+            source="fake", type="market_event",
+            title="Exclusive zeta research breakthrough",
+            url="https://e.com/explore-alert",
+        )
+
+        def collector(interest, cfg, provider, conn=None):
+            return [owner_item, explore_item] if interest.key == "k" else []
+
+        provider = LaneProvider(
+            {"Owner alert": 0.95, "Exclusive zeta research": 0.95},
+            keys={"Owner alert": "k", "Exclusive zeta research": "derived:zeta"},
+        )
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            summary = pipeline.run_once(self.conn, provider, self.cfg, dry_run=True)
+        self.assertEqual(summary["notified"], 2)   # both attempted, neither dropped
+
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("notified"), 1)
+        self.assertEqual(metrics.get("explore_notified"), 1)
+
+        text = stats.report(self.conn, days=7)
+        self.assertRegex(text, r"notifications sent\s+1\s")           # FUNNEL: owner only
+        self.assertRegex(text, r"(?m)^k\s+1\s+1\s+100%")              # owner-only per-interest table
+        self.assertIn("EXPLORATION", text)
+        self.assertRegex(text, r"(?m)^derived:zeta\s+1\s+1\s+100%")   # derived-only table
+
+    def test_containment_explore_error_does_not_touch_exploit(self):
+        owner_item = an_item(
+            source="fake", type="market_event", title="Owner alert",
+            url="https://e.com/owner-alert",
+        )
+        explore_item = self._explore_item(0)
+
+        def collector(interest, cfg, provider, conn=None):
+            return [owner_item, explore_item] if interest.key == "k" else []
+
+        provider = FakeProvider({
+            "Owner alert": 0.95,
+            "Exclusive zeta research": RuntimeError("boom"),
+        })
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            summary = pipeline.run_once(self.conn, provider, self.cfg, dry_run=True)
+
+        self.assertEqual(summary["errors"], 1)
+        self.assertEqual(summary["notified"], 1)
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("explore_errors"), 1)
+        self.assertNotIn("errors", metrics)
+        self.assertEqual(metrics.get("scored"), 1)
+
+    # --- backlog lane fairness ---------------------------------------------------
+
+    def test_backlog_lane_fairness_zero_explore_budget_still_drains_owner(self):
+        # Owner rows inserted first (lower ids); explore rows inserted after
+        # (higher ids, so they sort newest-first) and outnumber the exploit
+        # budget -- a fixture with 1-of-each can't distinguish a correct
+        # per-lane page from a single `ORDER BY id DESC LIMIT
+        # budget+explore_budget` pass that happens to land entirely on the
+        # unbudgeted lane and never even reaches the owner rows.
+        cfg = dataclasses.replace(self.cfg, explore_max_scores_per_cycle=0, max_scores_per_cycle=2)
+        owner_items = []
+        for n in range(3):
+            item = stored_item(self.conn, url=f"https://e.com/owner-b{n}", title=f"Owner item {n}")
+            db.set_prefilter(self.conn, item.id, True, "ok")
+            owner_items.append(item)
+        explore_items = []
+        for n in range(5):  # > the exploit budget (2), all newer than every owner row
+            item = stored_item(
+                self.conn, url=f"https://e.com/explore-b{n}",
+                title=f"Exclusive zeta research finding {n}",
+            )
+            db.set_prefilter(self.conn, item.id, True, "ok")
+            explore_items.append(item)
+
+        def scored_ids(items):
+            return {
+                item.id for item in items
+                if self.conn.execute(
+                    "SELECT 1 FROM scores WHERE item_id = ?", (item.id,)
+                ).fetchone()
+            }
+
+        provider = FakeProvider({"Owner item": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": lambda i, c, p, conn=None: []}):
+            summary = pipeline.run_once(self.conn, provider, cfg, dry_run=True)
+        # The exploit budget (2) caps how many owner items land this cycle --
+        # the point being that it drains at all despite the newer, unbudgeted
+        # explore rows sitting on top of the backlog.
+        self.assertEqual(summary["scored"], 2)
+        self.assertEqual(len(scored_ids(owner_items)), 2)
+        self.assertEqual(scored_ids(explore_items), set())
+
+        # Next cycle: raise the exploit budget so the remaining owner item
+        # drains too, still with explore budget at 0.
+        cfg2 = dataclasses.replace(cfg, max_scores_per_cycle=5)
+        with mock.patch.dict(COLLECTORS, {"fake": lambda i, c, p, conn=None: []}):
+            pipeline.run_once(self.conn, provider, cfg2, dry_run=True)
+        self.assertEqual(scored_ids(owner_items), {i.id for i in owner_items})
+        self.assertEqual(scored_ids(explore_items), set())
+
+        # Explore budget is back (self.cfg's cap of 2) -- skipped items are
+        # scored, never dropped.
+        provider2 = FakeProvider({"Exclusive zeta research": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": lambda i, c, p, conn=None: []}):
+            summary2 = pipeline.run_once(self.conn, provider2, self.cfg, dry_run=True)
+        self.assertEqual(summary2["scored"], 2)
+        self.assertEqual(len(scored_ids(explore_items)), 2)
+
+    # --- classification ------------------------------------------------------
+
+    def test_classification_owner_best_match_wins_even_with_a_weaker_derived_match(self):
+        item = an_item(
+            source="fake", title="Good stuff about zeta research trends",
+            url="https://e.com/mixed",
+        )
+
+        def collector(interest, cfg, provider, conn=None):
+            return [item] if interest.key == "k" else []
+
+        provider = FakeProvider({"Good stuff": 0.8})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            summary = pipeline.run_once(self.conn, provider, self.cfg, dry_run=True)
+
+        self.assertEqual(summary["scored"], 1)
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("scored"), 1)
+        self.assertNotIn("explore_scored", metrics)
+        row = self.conn.execute(
+            "SELECT n.key FROM scores s JOIN interests n ON n.id = s.interest_id"
+        ).fetchone()
+        self.assertEqual(row["key"], "k")
+
+    # --- _discover CLI path ---------------------------------------------------
+
+    def test_discover_cli_path_enforces_both_budgets(self):
+        from discovery.__main__ import _discover
+
+        def collector(interest, cfg, provider, conn=None):
+            if interest.key != "k":
+                return []
+            return [self._explore_item(n) for n in range(4)]  # cap is 2
+
+        provider = FakeProvider({"Exclusive zeta research": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}), \
+             mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = _discover(self.conn, provider, self.cfg, SimpleNamespace(source="fake"))
+        self.assertEqual(code, 0)
+
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("explore_scored"), 2)
+        self.assertEqual(metrics.get("explore_deferred"), 2)
+        self.assertNotIn("scored", metrics)
+
 
 class FeedbackListenerTests(unittest.TestCase):
     def setUp(self):
@@ -3007,6 +4001,191 @@ class CLITests(unittest.TestCase):
         ]
         self.assertEqual(listed_keys, [f"t{i}" for i in range(10)])
 
+    def test_interests_list_is_empty_before_init(self):
+        code, out, _err = self._main("interests")
+        self.assertEqual(code, 0)
+        self.assertIn("no interests", out)
+
+    def test_interests_why_on_an_owner_key_shows_the_sync_event(self):
+        path = self._interests_file('{"interests": [{"key": "x", "title": "X"}]}')
+        self._main("init", env={"DISCOVERY_INTERESTS": path})
+        code, out, _err = self._main("interests", "--why", "x")
+        self.assertEqual(code, 0)
+        self.assertIn("owner_sync", out)
+        self.assertIn("-> owner", out)
+
+    def test_interests_why_on_an_unknown_key_exits_cleanly(self):
+        code, _out, err = self._main("interests", "--why", "nope")
+        self.assertEqual(code, 2)
+        self.assertIn("no interest with key", err)
+
+    def test_interests_layer_filter(self):
+        path = self._interests_file('{"interests": [{"key": "x", "title": "X"}]}')
+        self._main("init", env={"DISCOVERY_INTERESTS": path})
+        code, out, _err = self._main("interests", "--layer", "owner")
+        self.assertEqual(code, 0)
+        self.assertIn("layer=owner", out)
+        code, out, _err = self._main("interests", "--layer", "inferred")
+        self.assertEqual(code, 0)
+        self.assertIn("no interests", out)
+
+    def test_interests_refresh_is_a_noop_when_the_flag_is_off(self):
+        code, out, _err = self._main("interests", "--refresh")
+        self.assertEqual(code, 0)
+        self.assertIn("dynamic interests are off", out)
+
+    def test_interests_refresh_runs_apply_transitions_when_the_flag_is_on(self):
+        code, out, _err = self._main(
+            "interests", "--refresh", env={"DISCOVERY_DYNAMIC_INTERESTS": "1"}
+        )
+        self.assertEqual(code, 0)
+        self.assertIn('"enabled": true', out)
+
+    def test_interests_refresh_with_a_missing_interests_file_exits_cleanly(self):
+        missing = os.path.join(self.tmp.name, "nope.json")
+        code, _out, err = self._main(
+            "interests", "--refresh",
+            env={"DISCOVERY_DYNAMIC_INTERESTS": "1", "DISCOVERY_INTERESTS": missing},
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("not found", err)
+
+    def test_interests_refresh_with_a_malformed_interests_file_exits_cleanly(self):
+        path = self._interests_file("{ not json")
+        code, _out, err = self._main(
+            "interests", "--refresh",
+            env={"DISCOVERY_DYNAMIC_INTERESTS": "1", "DISCOVERY_INTERESTS": path},
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("malformed interests file", err)
+
+    def test_interests_refresh_seeds_from_personal_state_without_ever_building_a_provider(self):
+        """Work items 1 + 4 at the CLI layer: `interests --refresh` seeds a
+        personal-state topic (already reachable -- apply_transitions() calls
+        personal_state.load_optional() itself, no separate wiring needed),
+        never touches the provider factory (zero LLM/network calls), and
+        `--why` on the seeded key prints the full seed origin."""
+        path = self._interests_file('{"interests": []}')
+        ps_path = os.path.join(self.tmp.name, "ps.json")
+        with open(ps_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "contract_version": 1, "generated_at": "2026-08-10T00:00:00Z",
+                    "topics": [{"key": "zzqleaktest", "weight": 1.0}],
+                },
+                fh,
+            )
+        self._main("init", env={"DISCOVERY_INTERESTS": path})
+
+        with mock.patch.object(providers, "get_provider", side_effect=AssertionError("provider built")):
+            code, out, _err = self._main(
+                "interests", "--refresh",
+                env={
+                    "DISCOVERY_DYNAMIC_INTERESTS": "1", "DISCOVERY_INTERESTS": path,
+                    "DISCOVERY_PERSONAL_STATE": ps_path,
+                },
+            )
+        self.assertEqual(code, 0)
+        self.assertIn('"seeded": 1', out)
+
+        code, out, _err = self._main("interests", "--why", "derived:zzqleaktest")
+        self.assertEqual(code, 0)
+        self.assertIn("seed", out)
+        self.assertIn("artifact_sha256", out)
+        self.assertIn('"generated_at": "2026-08-10T00:00:00Z"', out)
+        self.assertIn('"contract_version": 1', out)
+        self.assertIn('"topic_key": "zzqleaktest"', out)
+
+
+class TeachCLITests(unittest.TestCase):
+    """`python -m app teach` wiring: --list/--explain, provider isolation,
+    the interactive default, and --send reusing the existing Telegram flow
+    end to end (see FeedbackListenerTests for the flow it reuses)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = os.path.join(self.tmp.name, "t.db")
+        conn = db.connect(self.db_path)
+        db.init(conn)
+        db.upsert_interest(conn, an_interest())
+        interest = db.interest_by_key(conn, "k")
+        item = stored_item(conn)
+        db.save_score(conn, a_score(item.id, interest.id, 0.8))
+        conn.close()
+
+    def _main(self, *argv, read_inputs=None):
+        import contextlib
+
+        from discovery.__main__ import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(out))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            if read_inputs is not None:
+                stack.enter_context(mock.patch("builtins.input", side_effect=iter(read_inputs)))
+            code = main(["--db", self.db_path, *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_list_prints_the_ranked_queue_and_exits_zero(self):
+        code, out, _err = self._main("teach", "--list")
+        self.assertEqual(code, 0)
+        self.assertIn("queued item(s)", out)
+
+    def test_explain_prints_queue_metrics_and_exits_zero(self):
+        code, out, _err = self._main("teach", "--explain")
+        self.assertEqual(code, 0)
+        self.assertIn("pool_size=", out)
+        self.assertIn("band_lift", out)
+
+    def test_teach_never_constructs_a_provider(self):
+        with mock.patch.object(
+            providers, "get_provider", side_effect=AssertionError("must not build a provider")
+        ):
+            code, _out, _err = self._main("teach", "--list")
+        self.assertEqual(code, 0)
+
+    def test_interactive_default_records_a_label_via_the_injected_reader(self):
+        code, _out, _err = self._main("teach", "--limit", "1", read_inputs=["fire"])
+        self.assertEqual(code, 0)
+        conn = db.connect(self.db_path)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1)
+
+    def test_send_reuses_format_message_and_the_feedback_keyboard(self):
+        sent = []
+
+        def fake_send(cfg, text, reply_markup=None, dry_run=False):
+            sent.append((text, reply_markup))
+            return True
+
+        with mock.patch.object(notify, "send", side_effect=fake_send):
+            code, _out, _err = self._main("teach", "--send", "--limit", "1")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sent), 1)
+        text, markup = sent[0]
+        self.assertIn("DISCOVERY", text)
+        callback_datas = [b["callback_data"] for row in markup["inline_keyboard"] for b in row]
+        self.assertEqual(len(callback_datas), 4)
+        score_id = callback_datas[0].split(":")[2]
+        self.assertTrue(all(cd.endswith(f":{score_id}") for cd in callback_datas))
+
+        # Proof the send path reuses the existing flow, not a new one: feed
+        # one of those exact payloads into the real listener callback.
+        callback = {"id": "cb", "data": callback_datas[0], "message": {"chat": {"id": 1}}}
+        conn = db.connect(self.db_path)
+        self.addCleanup(conn.close)
+        with mock.patch.object(feedback_listener, "api_call"):
+            self.assertTrue(feedback_listener._handle_callback(conn, "tok", callback))
+        self.assertEqual(conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1)
+
+    def test_dry_run_send_never_touches_the_network(self):
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            code, _out, _err = self._main("--dry-run", "teach", "--send")
+        self.assertEqual(code, 0)
+        urlopen.assert_not_called()
+
 
 class TeachCLITests(unittest.TestCase):
     """`python -m app teach` wiring: --list/--explain, provider isolation,
@@ -3725,21 +4904,6 @@ class ConnectorReconTests(unittest.TestCase):
         self.assertFalse(status["available"])
         self.assertIn(missing, status["reason"])
 
-    def test_build_x_entry_not_implemented_regardless_of_provider_ok(self):
-        # x has no sampler at all in this harness version -- the status must
-        # say so plainly and identically whether or not a live provider is
-        # reachable (repair: it used to say PENDING unconditionally, implying
-        # a live session alone would resolve it).
-        for provider_ok, provider_why in ((False, "CLAUDE_ORG_ID is not set"), (True, "")):
-            with self.subTest(provider_ok=provider_ok):
-                entry = exp_connectors.build_x_entry(["ai-agents-dev-tools"], provider_ok, provider_why)
-                self.assertEqual(entry["availability"]["status"], "NOT_IMPLEMENTED")
-                self.assertEqual(entry["sample"]["status"], "NOT_IMPLEMENTED")
-                self.assertIsNone(entry["metrics"]["marginal_unique_rate"])
-                self.assertEqual(entry["metrics"]["marginal_unique_rate_status"], "NOT_IMPLEMENTED")
-                self.assertIsNone(entry["command_to_complete"])
-                self.assertTrue(entry["follow_up"])
-
     def test_http_connector_entry_void_when_endpoint_unreachable(self):
         def boom(url, timeout=15, connector=None):
             raise exp_connectors.ConnectorUnreachable("host.example: connection refused")
@@ -3875,6 +5039,279 @@ class ConnectorReconTests(unittest.TestCase):
         self.assertTrue(status["available"])
         self.assertIn("https://e.com/x", urls)
         self.assertIn("mode=ro", captured["uri"])
+
+    # (g) E5b / H2 (step-09): revised query rule, USABLE definition, gate ---
+
+    def test_build_query_v2_first_four_distinctive_tokens_in_title_order(self):
+        interest = an_interest(title="Zebra Quantum Coding Wizard Extra Words Here")
+        self.assertEqual(exp_connectors.build_query_v2(interest), "zebra quantum coding wizard")
+
+    def test_build_query_v2_dedupes_within_title(self):
+        interest = an_interest(title="Coding Coding Quantum Wizard")
+        self.assertEqual(exp_connectors.build_query_v2(interest), "coding quantum wizard")
+
+    def test_build_query_v2_extends_from_positive_signals_until_two(self):
+        interest = an_interest(title="AI", positive_signals=["Great Learning Systems Here"])
+        self.assertEqual(exp_connectors.build_query_v2(interest), "great learning")
+
+    def test_build_query_v2_extend_stops_at_two_not_four(self):
+        interest = an_interest(title="Zebra", positive_signals=["Wizard Coding Extra"])
+        self.assertEqual(exp_connectors.build_query_v2(interest), "zebra wizard")
+
+    def test_usable_records_rejects_missing_url_or_title(self):
+        interest = an_interest(key="k", title="Zebra Quantum Coding")
+        per_interest = [{"interest": "k", "records": [
+            {"title": "Zebra quantum coding release", "url": None},
+            {"title": None, "url": "https://e.com/1"},
+        ]}]
+        self.assertEqual(exp_connectors.usable_records(per_interest, {"k": interest}, CFG), [])
+
+    def test_usable_records_rejects_weak_match_and_grants_no_origin_floor(self):
+        # If origin_interest were mistakenly set, matching.ORIGIN_MATCH_FLOOR
+        # (0.5) would pass this record despite zero shared tokens -- proves
+        # the metric isn't made vacuous.
+        interest = an_interest(key="k", title="Alpha Beta Gamma", positive_signals=[])
+        per_interest = [{"interest": "k", "records": [
+            {"title": "Totally unrelated words nothing shared", "url": "https://e.com/3"},
+        ]}]
+        self.assertEqual(exp_connectors.usable_records(per_interest, {"k": interest}, CFG), [])
+
+    def test_usable_records_accepts_strong_match(self):
+        interest = an_interest(key="k", title="Zebra Quantum Coding")
+        per_interest = [{"interest": "k", "records": [
+            {"title": "Zebra quantum coding release", "url": "https://e.com/1"},
+        ]}]
+        usable = exp_connectors.usable_records(per_interest, {"k": interest}, CFG)
+        self.assertEqual(len(usable), 1)
+        self.assertGreaterEqual(usable[0]["match_score"], CFG.min_match_score)
+
+    def test_usable_records_dedups_pooled_across_interests_by_url_and_title(self):
+        interest = an_interest(key="k", title="Zebra Quantum Coding")
+        per_interest = [
+            {"interest": "k", "records": [
+                {"title": "Zebra quantum coding launch", "url": "https://e.com/x?ref=1"}]},
+            {"interest": "k", "records": [
+                {"title": "ZEBRA QUANTUM CODING LAUNCH", "url": "https://e.com/x?ref=2"}]},
+        ]
+        usable = exp_connectors.usable_records(per_interest, {"k": interest}, CFG)
+        self.assertEqual(len(usable), 1)
+
+    def test_apply_h2_falsification_rule(self):
+        self.assertEqual(exp_connectors.apply_h2_falsification_rule({"a": 3, "b": 7}), "H2_FALSIFIED")
+        self.assertEqual(exp_connectors.apply_h2_falsification_rule({"a": 9, "b": 2}), "H2_SUPPORTED")
+
+    def test_gate_promote_when_all_three_clear(self):
+        metrics = {"a": {"usable_yield": 10, "marginal_unique_rate": 0.5},
+                  "b": {"usable_yield": 3, "marginal_unique_rate": 0.9}}
+        result = exp_connectors.apply_promotion_gate(metrics, True)
+        self.assertEqual(result["result"], "PROMOTE")
+        self.assertEqual(result["winner"], "a")
+        self.assertIsNone(result["failing_gate"])
+
+    def test_gate_no_promotion_g1_tie(self):
+        metrics = {"a": {"usable_yield": 8, "marginal_unique_rate": 0.9},
+                  "b": {"usable_yield": 8, "marginal_unique_rate": 0.9}}
+        result = exp_connectors.apply_promotion_gate(metrics, True)
+        self.assertEqual(result["result"], "NO_PROMOTION")
+        self.assertEqual(result["failing_gate"], "G1")
+
+    def test_gate_no_promotion_g1_below_eight(self):
+        metrics = {"a": {"usable_yield": 7, "marginal_unique_rate": 0.9}}
+        result = exp_connectors.apply_promotion_gate(metrics, True)
+        self.assertEqual(result["failing_gate"], "G1")
+
+    def test_gate_no_promotion_g2_not_clear_winner(self):
+        metrics = {"a": {"usable_yield": 10, "marginal_unique_rate": 0.9},
+                  "b": {"usable_yield": 6, "marginal_unique_rate": 0.1}}
+        result = exp_connectors.apply_promotion_gate(metrics, True)
+        self.assertEqual(result["failing_gate"], "G2")
+
+    def test_gate_no_promotion_g3_void_baseline(self):
+        metrics = {"a": {"usable_yield": 10, "marginal_unique_rate": 0.9}}
+        result = exp_connectors.apply_promotion_gate(metrics, False)
+        self.assertEqual(result["result"], "NO_PROMOTION")
+        self.assertEqual(result["failing_gate"], "G3")
+
+    def test_gate_no_promotion_g3_below_threshold(self):
+        metrics = {"a": {"usable_yield": 10, "marginal_unique_rate": 0.1}}
+        result = exp_connectors.apply_promotion_gate(metrics, True)
+        self.assertEqual(result["failing_gate"], "G3")
+
+    def test_x_deferred_entry_shape(self):
+        entry = exp_connectors.x_deferred_entry()
+        self.assertEqual(entry["status"], "DEFERRED_NEEDS_PROVIDER")
+        self.assertTrue(entry["detail"])
+
+    def test_uniqueness_among_candidates(self):
+        by_connector = {"a": {"u1", "u2"}, "b": {"u2", "u3"}}
+        self.assertAlmostEqual(exp_connectors.uniqueness_among_candidates("a", by_connector), 0.5)
+        self.assertIsNone(exp_connectors.uniqueness_among_candidates("c", by_connector))
+
+    def test_sample_reddit_pass2_is_retired_and_makes_no_network_call(self):
+        # step-09's own re-check 403'd (a second independent 403 after
+        # step-09a's 5-interest sweep), so reddit_url/parse_reddit were
+        # deleted and this always returns the retired state with zero HTTP.
+        interests_by_key = {f"i{n}": an_interest(key=f"i{n}", title=f"Topic Number {n} Words")
+                            for n in range(3)}
+
+        def boom(*a, **kw):
+            raise AssertionError("reddit is retired -- must not call _http_get")
+
+        with mock.patch("exp_connectors._http_get", side_effect=boom):
+            per_interest, availability = exp_connectors.sample_reddit_pass2(
+                list(interests_by_key), interests_by_key)
+        self.assertEqual(per_interest, [])
+        self.assertFalse(availability["reachable"])
+        self.assertIn("RETIRED_UNREACHABLE", availability["detail"])
+
+    def test_build_connector_pass2_entry_computes_both_arms(self):
+        interest = an_interest(key="k", title="Zebra Quantum Coding")
+        old_per_interest = [{"interest": "k", "records": [
+            {"title": "Zebra old quantum coding record", "url": "https://e.com/old1"},
+            {"title": "unrelated old record entirely", "url": "https://e.com/old2"},
+        ]}]
+
+        def two_hits(url, timeout=15, connector=None):
+            hits = [
+                {"title": "Zebra quantum coding new release", "url": "https://e.com/new1",
+                 "created_at": "2026-08-01T00:00:00.000Z", "objectID": "1"},
+                {"title": "unrelated new item entirely", "url": "https://e.com/new2",
+                 "created_at": "2026-08-01T00:00:00.000Z", "objectID": "2"},
+            ]
+            return 200, json.dumps({"hits": hits}).encode(), {}
+
+        with mock.patch("exp_connectors._http_get", side_effect=two_hits):
+            entry, usable_urls = exp_connectors.build_connector_pass2_entry(
+                "hackernews", ["k"], {"k": interest}, CFG, old_per_interest,
+                set(), False, datetime.now(timezone.utc), 0)
+
+        self.assertEqual(entry["arm_new_rule"]["usable_yield"], 1)
+        self.assertEqual(entry["arm_old_rule_recomputed"]["usable_yield"], 1)
+        self.assertIsNone(entry["arm_new_rule"]["marginal_unique_rate"])
+        self.assertEqual(entry["arm_new_rule"]["marginal_unique_rate_status"], "VOID_NO_BASELINE")
+        self.assertEqual(usable_urls, {"https://e.com/new1"})
+        # repair: promised by PREREGISTRATION_PASS2 but previously never emitted.
+        self.assertIsNone(entry["arm_new_rule"]["jaccard_overlap_with_web_search_sample"])
+        self.assertEqual(entry["arm_new_rule"]["jaccard_overlap_status"], "VOID_NO_WEB_SEARCH_SAMPLE")
+
+    def test_query_level_network_failures_only_flags_no_status_errors(self):
+        # A read timeout (no http_status at all) is a network failure; a
+        # reachable-but-blocked response (e.g. reddit's 403, which DOES carry
+        # a status) is not -- it's already surfaced via disposition/
+        # availability and must not double up in aborted_attempts.
+        per_interest = [
+            {"interest": "a", "query": "q1", "http_status": None,
+             "error": "host: The read operation timed out", "collected_at": "t1"},
+            {"interest": "b", "query": "q2", "http_status": 403,
+             "error": "http 403", "collected_at": "t2"},
+            {"interest": "c", "query": "q3", "http_status": 200, "error": None, "collected_at": "t3"},
+        ]
+        failures = exp_connectors.query_level_network_failures("arxiv", per_interest)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["interest"], "a")
+        self.assertEqual(failures[0]["connector"], "arxiv")
+
+    def test_degraded_arms_note(self):
+        self.assertEqual(exp_connectors.degraded_arms_note([]), "")
+        note = exp_connectors.degraded_arms_note([
+            {"connector": "arxiv", "interest": "a", "query": "q", "reason": "timeout", "at": "t"},
+            {"connector": "arxiv", "interest": "b", "query": "q", "reason": "timeout", "at": "t"},
+        ])
+        self.assertIn("arxiv", note)
+        self.assertIn("2 query failure(s)", note)
+
+    def test_run_pass2_e5b_records_query_level_network_failures(self):
+        # repair: a query-level network failure (no http_status at all, e.g.
+        # a read timeout) used to only land in per_interest['error'] --
+        # never in aborted_attempts or verdict_detail.
+        def fake_http_get(url, timeout=15, connector=None):
+            host = urllib.parse.urlparse(url).netloc
+            if host == "hn.algolia.com":
+                return 200, json.dumps({"hits": []}).encode(), {}
+            if host == "export.arxiv.org":
+                raise exp_connectors.ConnectorUnreachable(
+                    "export.arxiv.org: The read operation timed out")
+            if host == "eutils.ncbi.nlm.nih.gov":
+                return 200, json.dumps({"esearchresult": {"idlist": []}}).encode(), {}
+            raise AssertionError(f"unexpected host {host}")
+
+        with tempfile.TemporaryDirectory() as d:
+            missing_db = os.path.join(d, "discovery.db")
+            cfg = dataclasses.replace(CFG, db_path=missing_db, interests_path="interests.json")
+            empty_dossier = {"connectors": [{"name": n, "sample": {"per_interest": []}}
+                                            for n in ("hackernews", "arxiv", "pubmed", "reddit")]}
+            with mock.patch("exp_connectors._http_get", side_effect=fake_http_get), \
+                 mock.patch("exp_connectors.time.sleep"):
+                pass2 = exp_connectors.run_pass2_e5b(empty_dossier, cfg)
+
+        self.assertTrue(pass2["aborted_attempts"])
+        self.assertTrue(all(a["connector"] == "arxiv" for a in pass2["aborted_attempts"]))
+        self.assertIn("Degraded arms", pass2["verdict_detail"])
+        self.assertIn("arxiv", pass2["verdict_detail"])
+
+    def test_run_pass2_e5b_end_to_end_offline_no_promotion_on_void_baseline(self):
+        # Fully offline: patches _http_get for every host the real pass would
+        # hit, reads the real tracked dossier (read-only, for old-rule
+        # baseline records) and a real interests.json, but never touches the
+        # network or writes the dossier file.
+        hn_bodies = iter([
+            json.dumps({"hits": [{"title": "New AI coding agents automation research",
+                                  "url": "https://e.com/hn1", "created_at": "2026-08-01T00:00:00.000Z",
+                                  "objectID": "1"}]}).encode(),
+            json.dumps({"hits": [{"title": "Personal knowledge memory learning system launch",
+                                  "url": "https://e.com/hn2", "created_at": "2026-08-01T00:00:00.000Z",
+                                  "objectID": "2"}]}).encode(),
+        ])
+
+        def atom(url_, title_):
+            return (
+                '<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">'
+                f"<entry><id>{url_}</id><title>{title_}</title>"
+                "<published>2026-01-01T00:00:00Z</published></entry></feed>"
+            ).encode()
+
+        arxiv_bodies = iter([
+            atom("https://arxiv.org/abs/1", "Human interaction attraction behavioral study"),
+            atom("https://arxiv.org/abs/2", "Personal knowledge memory learning systems"),
+            atom("https://arxiv.org/abs/3", "Agents coding automation for personal tools"),
+        ])
+        pubmed_bodies = iter([
+            json.dumps({"esearchresult": {"idlist": ["101"]}}).encode(),
+            json.dumps({"result": {"uids": ["101"], "101": {
+                "title": "Narcolepsy wakefulness orexin trial", "pubdate": "2026 Jan"}}}).encode(),
+            json.dumps({"esearchresult": {"idlist": ["201"]}}).encode(),
+            json.dumps({"result": {"uids": ["201"], "201": {
+                "title": "EMDR trauma processing mechanisms study", "pubdate": "2026 Feb"}}}).encode(),
+        ])
+
+        def fake_http_get(url, timeout=15, connector=None):
+            # reddit is retired (sample_reddit_pass2 makes no HTTP call at
+            # all) -- www.reddit.com deliberately has no branch here.
+            host = urllib.parse.urlparse(url).netloc
+            if host == "hn.algolia.com":
+                return 200, next(hn_bodies), {}
+            if host == "export.arxiv.org":
+                return 200, next(arxiv_bodies), {}
+            if host == "eutils.ncbi.nlm.nih.gov":
+                return 200, next(pubmed_bodies), {}
+            raise AssertionError(f"unexpected host {host}")
+
+        with tempfile.TemporaryDirectory() as d:
+            missing_db = os.path.join(d, "discovery.db")
+            cfg = dataclasses.replace(CFG, db_path=missing_db, interests_path="interests.json")
+            dossier = json.loads(exp_connectors.DOSSIER_PATH.read_text(encoding="utf-8"))
+            with mock.patch("exp_connectors._http_get", side_effect=fake_http_get), \
+                 mock.patch("exp_connectors.time.sleep"):
+                pass2 = exp_connectors.run_pass2_e5b(dossier, cfg)
+
+        self.assertEqual(pass2["x"]["status"], "DEFERRED_NEEDS_PROVIDER")
+        self.assertEqual(pass2["aborted_attempts"], [])
+        self.assertFalse(pass2["corpus"]["available"])
+        self.assertEqual(pass2["dispositions"]["reddit"], "RETIRED_UNREACHABLE")
+        for name in ("hackernews", "arxiv", "pubmed"):
+            self.assertEqual(pass2["dispositions"][name], "NOT_PROMOTED_VOID_BASELINE")
+        self.assertEqual(pass2["gate"]["result"], "NO_PROMOTION")
+        self.assertIn(pass2["verdict"], ("H2_SUPPORTED", "H2_FALSIFIED"))
 
 
 if __name__ == "__main__":

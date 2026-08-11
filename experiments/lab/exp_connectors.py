@@ -114,6 +114,7 @@ import db_replay
 import prod_scorer
 from lab_common import REPO, Lab, now, utf8_streams
 
+from discovery import matching  # noqa: E402
 from discovery.config import load as load_cfg  # noqa: E402
 from discovery.interests import load_file as load_interests_file  # noqa: E402
 from discovery.models import CandidateItem  # noqa: E402
@@ -207,6 +208,164 @@ PREREGISTRATION = {
     "candidate_connectors": list(CONNECTORS),
     "probed_interests": list(PROBED_INTERESTS),
     "applicability_map": {k: list(v) for k, v in APPLICABILITY.items()},
+}
+
+# === E5b (step-09) PRE-REGISTRATION -- a SEPARATE, later-registered pass ===
+# step-09a's H1/PREREGISTRATION above is FROZEN and untouched: its recorded
+# results (connectors[], verdict, verdict_detail) stay byte-identical. This
+# is a second, independently pre-registered question (H2), added because
+# step-09a's own dossier showed the frozen query rule -- interest.title plus
+# its first 3 positive_signals, concatenated into up to 300 chars of prose --
+# was over-constrained for AND-matching engines (hackernews: 0 hits) and
+# topically wrong for relevance-ranked ones (arxiv/pubmed returned mostly
+# off-topic records). So step-09a measured the query rule, not the
+# connectors; H2 asks the retrieval question again under a corrected,
+# still-mechanical rule.
+#
+# HYPOTHESIS H2 (usable retrieval yield): under a corrected, still-mechanical
+# query rule, at least one candidate connector delivers, pooled over its
+# applicable probed interests and within the unchanged spend bound, >= 8
+# USABLE records.
+#
+# USABLE, exactly: (a) the record has both a URL and a title; (b) built into
+# a discovery.models.CandidateItem with origin_interest EXPLICITLY UNSET
+# (None) and text = the record's title, discovery.matching.match_interests
+# against the interest it was queried for scores >= cfg.min_match_score
+# (production default 0.25, read from discovery.config.load()); (c) not a
+# within-sample duplicate (pooled across a connector's applicable interests)
+# by canonicalized URL or canonicalized title. origin_interest stays None so
+# matching.ORIGIN_MATCH_FLOOR does not hand every record a free 0.5 pass
+# (that would make the metric vacuous); matching.prefilter is NOT used
+# because its min_text_chars branch would reject every title-only recon
+# record regardless of relevance -- only the relevance component of the
+# engine's own free gate applies. No new tokenizer, no new relevance
+# heuristic: reuse discovery.matching (interest_state.py already reuses
+# matching._tokens; same precedent).
+#
+# REVISED QUERY RULE (frozen, see build_query_v2): the first 4 distinctive
+# tokens of interest.title, in title order, deduped, lowercased, joined by
+# single spaces, where 'distinctive token' is exactly matching._tokens (4+
+# chars, not a stopword). If the title yields fewer than 2 distinctive
+# tokens, extend in order with distinctive tokens from positive_signals[0]
+# until 2 are present. Identical for every connector -- no per-connector hand
+# tuning beyond each endpoint's existing parameter encoding.
+#
+# BASELINE (zero new spend): the same connectors' step-09a records, already
+# persisted in connector_evidence.json, with usable-yield recomputed under
+# the identical USABLE definition (see usable_records, called on both arms).
+#
+# PRIMARY METRIC: usable_yield, an absolute count per connector pooled over
+# its applicable interests. usable_rate is reported only when n_sampled >= 8
+# (LAB.md guardrail 7 forbids share-based criteria below 8 observations).
+#
+# SECONDARY, EXPLICITLY NON-DECISIVE: median item age in days; sample
+# validity rate; per-connector uniqueness against the union of the OTHER
+# candidate connectors' usable URLs (uniqueness among candidates, NOT against
+# the engine's existing surface); observed failure behavior and rate-limit
+# headers; requests spent.
+#
+# MARGINAL UNIQUENESS vs the engine's existing surface: marginal_unique_rate
+# is computed against the production corpus only when discovery.db is
+# genuinely reachable (same db_replay.open_ro path as H1); when it is not, it
+# is recorded VOID_NO_BASELINE, never 0. jaccard_overlap_with_web_search_
+# sample stays VOID_NO_WEB_SEARCH_SAMPLE unless a live provider lane ran.
+#
+# STOPPING CONDITION: exactly one pass per (connector, interest) pair under
+# the new rule. Spend bound is UNCHANGED from H1 (see PREREGISTRATION above):
+# <=40 requests total, <=10/connector, one page/query, 15s timeout, per-host
+# spacing, descriptive UA, no auth, no scraping, $0, 0 YouTube quota, 0
+# provider calls. No query tuning, no re-runs, no connector added after
+# seeing results. A pass that aborts is recorded in aborted_attempts, not
+# silently re-run.
+#
+# CONNECTOR SCOPE: hackernews, arxiv, pubmed sampled under the new rule;
+# reddit gets ONE availability re-check request (its 403s may have been
+# transient) and is sampled further only if that re-check succeeds -- a
+# second independent 403 retires it (RETIRED_UNREACHABLE). x is NOT sampled:
+# it needs provider.search_json both to sample and to exist as a collector,
+# no provider is reachable here -- recorded DEFERRED_NEEDS_PROVIDER.
+#
+# FALSIFICATION: if every candidate connector's usable_yield under the new
+# rule is < 8, H2 is FALSIFIED -- a successful, properly measured outcome,
+# not a shortfall. Do not soften, re-run, or hand-tune toward a pass.
+#
+# PROMOTION GATE (apply_promotion_gate; all three must hold, any VOID input
+# fails rather than passes): G1 exactly one connector holds the max
+# usable_yield and that max is >= 8; G2 that max is >= 2x the runner-up's
+# (clear winner, not noise); G3 that connector's marginal_unique_rate against
+# a REACHABLE baseline is >= 0.40 (VOID baseline fails G3 outright).
+PREREGISTRATION_PASS2 = {
+    "hypothesis_h2": (
+        "Under a corrected, still-mechanical query rule, at least one candidate "
+        "connector delivers, pooled over its applicable probed interests and within "
+        "the unchanged spend bound, >= 8 USABLE records."
+    ),
+    "usable_definition": (
+        "(a) has both a URL and a title; (b) built into a CandidateItem with "
+        "origin_interest UNSET (None) and text=title, matching.match_interests "
+        "against the interest it was queried for scores >= cfg.min_match_score "
+        "(matching.prefilter NOT used -- its min_text_chars branch would reject every "
+        "title-only record regardless of relevance); (c) not a within-sample "
+        "(pooled per connector) duplicate by canonicalized URL or title."
+    ),
+    "query_rule": (
+        "build_query_v2: first 4 distinctive tokens (matching._tokens: 4+ chars, not "
+        "a stopword) of interest.title, in title order, deduped, lowercased, joined "
+        "by spaces; extended from positive_signals[0] if the title yields < 2. Frozen "
+        "before any run; identical for every connector."
+    ),
+    "baseline": (
+        "step-09a's already-persisted records for the same connectors, with "
+        "usable-yield recomputed under the identical USABLE definition -- zero new "
+        "spend for this arm."
+    ),
+    "primary_metric": (
+        "usable_yield: absolute count per connector, pooled over its applicable "
+        "interests. usable_rate reported only when n_sampled >= 8 (LAB.md guardrail 7)."
+    ),
+    "secondary_metrics_non_decisive": [
+        "median item age in days",
+        "sample validity rate (fraction of records with both a URL and a title)",
+        "per-connector uniqueness against the union of the OTHER candidate connectors' "
+        "usable URLs (among candidates, NOT against the engine's existing surface)",
+        "observed failure behavior and rate-limit headers",
+        "requests spent",
+    ],
+    "marginal_uniqueness_vs_corpus": (
+        "marginal_unique_rate computed against discovery.db only when reachable via "
+        "db_replay.open_ro; VOID_NO_BASELINE (never 0) otherwise. "
+        "jaccard_overlap_with_web_search_sample stays VOID_NO_WEB_SEARCH_SAMPLE unless "
+        "a live provider lane actually ran."
+    ),
+    "stopping_condition": (
+        "Exactly one pass per (connector, interest) pair under the new rule. Spend "
+        "bound unchanged from H1. No query tuning, no re-runs, no connector added "
+        "after seeing results. Aborted passes recorded in aborted_attempts, not "
+        "silently re-run."
+    ),
+    "connector_scope": {
+        "sampled_under_new_rule": ["hackernews", "arxiv", "pubmed"],
+        "reddit": (
+            "ONE availability re-check request only; sampled further only if it "
+            "succeeds. A second independent 403 retires it (RETIRED_UNREACHABLE)."
+        ),
+        "x": (
+            "NOT sampled -- needs provider.search_json both to sample and to exist as "
+            "a collector, no provider reachable here; DEFERRED_NEEDS_PROVIDER."
+        ),
+    },
+    "falsification_condition": (
+        "If every candidate connector's usable_yield under the new rule is < 8, H2 is "
+        "FALSIFIED. A falsified H2 is a successful outcome of this step, not a "
+        "shortfall."
+    ),
+    "promotion_gate": (
+        "G1: exactly one connector holds max usable_yield and that max >= 8. "
+        "G2: that max >= 2x the runner-up's usable_yield (clear winner). "
+        "G3: that connector's marginal_unique_rate against a REACHABLE baseline is "
+        ">= 0.40 (VOID baseline fails G3 outright). All three must hold to PROMOTE."
+    ),
+    "spend_bound": PREREGISTRATION["spend_bound"],
 }
 
 PRIOR_EVIDENCE = [
@@ -434,10 +593,134 @@ def apply_falsification_rule(connector_metrics, baseline_available):
     return "H1_FALSIFIED"
 
 
+def apply_h2_falsification_rule(usable_yields):
+    """usable_yields: {connector_name: int}. Pure mechanical application of
+    the H2 falsification rule: SUPPORTED if any connector cleared >= 8
+    USABLE records under the new rule, else FALSIFIED (a real, decisive
+    result -- not a void; H2 has no baseline dependency, unlike H1)."""
+    if any(n >= 8 for n in usable_yields.values()):
+        return "H2_SUPPORTED"
+    return "H2_FALSIFIED"
+
+
+def apply_promotion_gate(pass2_metrics, baseline_available):
+    """Pure, mechanical application of the pre-registered promotion gate.
+
+    pass2_metrics: {connector: {"usable_yield": int,
+    "marginal_unique_rate": float|None}}. All three gates must hold; any VOID
+    input fails the gate rather than passing it.
+
+    G1: exactly one connector holds the max usable_yield, and that max >= 8.
+    G2: that max is >= 2x the runner-up's usable_yield (a clear winner, not a
+        tie inside noise).
+    G3: the G1 winner's marginal_unique_rate against a REACHABLE baseline is
+        >= 0.40. baseline_available=False, or a None/low rate, fails G3.
+
+    Returns {"result": "PROMOTE"|"NO_PROMOTION", "winner": str|None,
+             "failing_gate": "G1"|"G2"|"G3"|None, "detail": str}.
+    """
+    if not pass2_metrics:
+        return {"result": "NO_PROMOTION", "winner": None, "failing_gate": "G1",
+                "detail": "no connectors measured this pass"}
+
+    ranked = sorted(pass2_metrics.items(), key=lambda kv: kv[1]["usable_yield"], reverse=True)
+    top_name, top = ranked[0]
+    tied = [n for n, m in pass2_metrics.items() if m["usable_yield"] == top["usable_yield"]]
+    if len(tied) != 1 or top["usable_yield"] < 8:
+        return {"result": "NO_PROMOTION", "winner": None, "failing_gate": "G1",
+                "detail": f"max usable_yield={top['usable_yield']} held by {tied}"}
+
+    runner_up = ranked[1][1]["usable_yield"] if len(ranked) > 1 else 0
+    if top["usable_yield"] < 2 * runner_up:
+        return {"result": "NO_PROMOTION", "winner": None, "failing_gate": "G2",
+                "detail": f"{top_name} usable_yield={top['usable_yield']} not >= 2x "
+                          f"runner-up={runner_up}"}
+
+    mur = top.get("marginal_unique_rate")
+    if not baseline_available or mur is None or mur < 0.40:
+        return {"result": "NO_PROMOTION", "winner": None, "failing_gate": "G3",
+                "detail": f"{top_name} marginal_unique_rate={mur} "
+                          f"baseline_available={baseline_available}"}
+
+    return {"result": "PROMOTE", "winner": top_name, "failing_gate": None,
+            "detail": f"{top_name} usable_yield={top['usable_yield']} clears G1/G2/G3 "
+                      f"(marginal_unique_rate={mur})"}
+
+
 def build_query(interest):
     parts = [interest.title, *interest.positive_signals[:3]]
     text = " ".join(p for p in parts if p)
     return text[:QUERY_MAX_CHARS]
+
+
+def _ordered_distinctive_tokens(text):
+    """Same distinctiveness rule as matching._tokens (4+ chars, not a
+    stopword) -- but order-preserving and de-duplicating, which the frozen
+    "first N tokens in title order" query rule needs and the set that
+    matching._tokens returns can't give us."""
+    seen, out = set(), []
+    for w in re.findall(r"[a-z0-9]{4,}", (text or "").lower()):
+        if w in matching.STOPWORDS or w in seen:
+            continue
+        seen.add(w)
+        out.append(w)
+    return out
+
+
+def build_query_v2(interest):
+    """H2's frozen revised query rule (pre-registered above): first 4
+    distinctive tokens of the title, in title order, deduped, extended from
+    positive_signals[0] if the title alone yields fewer than 2. Identical for
+    every connector -- derived mechanically from the committed interest, must
+    not be adjusted after any result is seen."""
+    tokens = _ordered_distinctive_tokens(interest.title)
+    if len(tokens) < 2 and interest.positive_signals:
+        for w in _ordered_distinctive_tokens(interest.positive_signals[0]):
+            if w not in tokens:
+                tokens.append(w)
+            if len(tokens) >= 2:
+                break
+    return " ".join(tokens[:4])
+
+
+def build_probe_item(record):
+    """The CandidateItem used only to test USABLE-ness (H2). origin_interest
+    is deliberately left unset (None): setting it would hand every record a
+    free matching.ORIGIN_MATCH_FLOOR (0.5) pass, making the metric vacuous.
+    text = title only -- these recon records carry no body."""
+    return CandidateItem(source="connector_probe_pass2", type="article",
+                          title=record.get("title") or "", url=record.get("url") or "",
+                          text=record.get("title") or "")
+
+
+def usable_records(per_interest, interests_by_key, cfg):
+    """USABLE records per the H2 pre-registration, pooled across a
+    connector's applicable interests (within-sample dedup is pooled, not
+    per-interest -- see PRIMARY METRIC). Reused for BOTH arms: the freshly
+    sampled new-rule records and step-09a's already-persisted old-rule
+    records (same shape: {"interest": key, "records": [...]}), which is what
+    makes the baseline arm's "identical USABLE definition" requirement exact
+    rather than reimplemented. matching.prefilter is deliberately NOT used --
+    see build_probe_item / the H2 pre-registration comment above."""
+    seen_urls, seen_titles, out = set(), set(), []
+    for pi in per_interest:
+        interest = interests_by_key.get(pi["interest"])
+        if interest is None:
+            continue
+        for r in pi["records"]:
+            url, title = r.get("url"), r.get("title")
+            if not url or not title:
+                continue
+            cu, ct = canon_url(url), canon_title(title)
+            if cu in seen_urls or ct in seen_titles:
+                continue
+            matches = matching.match_interests(build_probe_item(r), [interest])
+            if not matches or matches[0][1] < cfg.min_match_score:
+                continue
+            seen_urls.add(cu)
+            seen_titles.add(ct)
+            out.append({**r, "interest": pi["interest"], "match_score": matches[0][1]})
+    return out
 
 
 # --- connector endpoint builders + parsers (pure given bytes) -------------
@@ -456,25 +739,6 @@ def parse_hn(body):
         )
         out.append({"url": url, "title": hit.get("title") or hit.get("story_title"),
                     "published_at": hit.get("created_at")})
-    return out
-
-
-def reddit_url(query, n=N_PER_QUERY):
-    qs = urllib.parse.urlencode({"q": query, "sort": "new", "limit": n, "t": "year"})
-    return f"https://www.reddit.com/search.json?{qs}"
-
-
-def parse_reddit(body):
-    data = json.loads(body)
-    out = []
-    for child in data.get("data", {}).get("children", []):
-        d = child.get("data", {})
-        permalink = d.get("permalink")
-        url = f"https://www.reddit.com{permalink}" if permalink else d.get("url")
-        created = d.get("created_utc")
-        published = (datetime.fromtimestamp(created, tz=timezone.utc).isoformat(timespec="seconds")
-                     if created else None)
-        out.append({"url": url, "title": d.get("title"), "published_at": published})
     return out
 
 
@@ -585,9 +849,13 @@ def sample_pubmed(query, n=N_PER_QUERY):
     return entry
 
 
+# reddit has no sampler anymore (step-09, RETIRED_UNREACHABLE -- see
+# sample_reddit_pass2): two independent passes (step-09a's own 5-interest
+# zero-spend sweep, and this step's one-request availability re-check) both
+# got HTTP 403, so its sampler+parser were deleted rather than kept around to
+# 403 a third time. The dossier retains both passes' 403 evidence.
 CONNECTOR_SAMPLERS = {
     "hackernews": lambda q, n=N_PER_QUERY: _sample(hn_url(q, n), parse_hn, connector="hackernews"),
-    "reddit": lambda q, n=N_PER_QUERY: _sample(reddit_url(q, n), parse_reddit, connector="reddit"),
     "arxiv": lambda q, n=N_PER_QUERY: _sample(arxiv_url(q, n), parse_arxiv, connector="arxiv"),
     "pubmed": sample_pubmed,
 }
@@ -611,6 +879,294 @@ def _static_budget_check():
 
 
 _static_budget_check()
+
+
+def _static_budget_check_pass2():
+    """Same early-warning check as _static_budget_check, for the H2 pass:
+    worst case is reddit's re-check succeeding and every applicable interest
+    getting sampled (len(APPLICABILITY['reddit']) requests, same as its
+    step-09a request count) -- so the same per_query_requests shape and the
+    same total bound apply. Kept separate from _static_budget_check because
+    the two passes are independently pre-registered and must not share a
+    single check that could silently drift when only one changes."""
+    per_query_requests = {"hackernews": 1, "reddit": 1, "arxiv": 1, "pubmed": 2}
+    total = 0
+    for name, per_query in per_query_requests.items():
+        n = len(APPLICABILITY[name]) * per_query
+        if n > PER_CONNECTOR_CAP:
+            raise AssertionError(f"pass2 {name} would need {n} requests > cap {PER_CONNECTOR_CAP}")
+        total += n
+    if total > MAX_REQUESTS:
+        raise AssertionError(f"pass2 total {total} requests > cap {MAX_REQUESTS}")
+
+
+_static_budget_check_pass2()
+
+
+# --- H2 (pass_2_e5b) sampling: reuses CONNECTOR_SAMPLERS, new query rule --
+
+def sample_connector_pass2(name, applicable, interests_by_key):
+    """One bounded fetch per (connector, applicable interest) under the
+    revised query rule (build_query_v2). No baseline/above-bar logic here --
+    unlike H1's build_http_connector_entry, H2's metrics (usable_records,
+    apply_promotion_gate) are computed separately from the raw sample."""
+    per_interest = []
+    for key in applicable:
+        interest = interests_by_key[key]
+        query = build_query_v2(interest)
+        result = CONNECTOR_SAMPLERS[name](query, N_PER_QUERY)
+        per_interest.append({
+            "interest": key, "query": query, "endpoint": result["endpoint"],
+            "http_status": result["http_status"], "error": result["error"],
+            "records": result["records"], "n_records": len(result["records"]),
+            "rate_limit_headers": result.get("rate_limit_headers") or {},
+            "collected_at": now(), "lane": "pass_2_e5b",
+        })
+    return per_interest
+
+
+REDDIT_RETIRED_DETAIL = (
+    "RETIRED_UNREACHABLE: two independent passes both got HTTP 403 -- "
+    "step-09a's own 5-interest zero-spend sweep, and this step's one-request "
+    "availability re-check. No sampler is called anymore (reddit_url/"
+    "parse_reddit were deleted); see connector_evidence.json's connectors[] "
+    "(step-09a) and pass_2_e5b.connectors[] (this step) for the recorded "
+    "evidence of both 403s."
+)
+
+
+def sample_reddit_pass2(applicable, interests_by_key):
+    """reddit is RETIRED_UNREACHABLE as of this step (see
+    REDDIT_RETIRED_DETAIL): the CONNECTOR SCOPE re-check this function used
+    to perform already ran, for real, and 403'd again -- a second
+    independent 403 after step-09a's own 5-interest sweep. No further HTTP
+    call is made; this always returns the retired state."""
+    return [], {"reachable": False, "detail": REDDIT_RETIRED_DETAIL}
+
+
+def x_deferred_entry():
+    """x is DEFERRED_NEEDS_PROVIDER for H2, not sampled: it needs
+    provider.search_json both to sample and to exist as a collector, and no
+    provider is reachable from this harness. Its only evidence stays the
+    unreplicated experiments/x_prompt_lab prior (see PRIOR_EVIDENCE)."""
+    return {
+        "name": "x",
+        "status": "DEFERRED_NEEDS_PROVIDER",
+        "detail": (
+            "Not sampled per CONNECTOR SCOPE: needs provider.search_json both to "
+            "sample and to exist as a collector; no provider is reachable from this "
+            "harness. Blocking work: implement an x sampler (provider.search_json "
+            "against build_query_v2) and a web_search baseline sampler, then re-run "
+            "from a live claude.ai Chrome/CDP operator session."
+        ),
+    }
+
+
+def uniqueness_among_candidates(name, usable_urls_by_connector):
+    """Fraction of `name`'s usable URLs absent from the union of every OTHER
+    candidate connector's usable URLs this pass. Non-decisive: measures
+    uniqueness AMONG CANDIDATES, not against the engine's existing surface
+    (that's marginal_unique_rate, against the corpus)."""
+    own = usable_urls_by_connector.get(name) or set()
+    if not own:
+        return None
+    others = [u for n, u in usable_urls_by_connector.items() if n != name]
+    other_union = set().union(*others) if others else set()
+    return round(len(own - other_union) / len(own), 3)
+
+
+def build_connector_pass2_entry(name, applicable, interests_by_key, cfg, old_per_interest,
+                                corpus_urls, corpus_available, now_dt, requests_before):
+    """Samples `name` under the new rule (or reddit's recheck-gated flow),
+    then computes both arms' usable_yield plus the non-decisive secondary
+    metrics. `old_per_interest` is step-09a's already-persisted per_interest
+    list for this connector (same shape), used for the zero-new-spend
+    baseline arm."""
+    availability = None
+    if name == "reddit":
+        per_interest, availability = sample_reddit_pass2(applicable, interests_by_key)
+    else:
+        per_interest = sample_connector_pass2(name, applicable, interests_by_key)
+
+    all_records = [r for pi in per_interest for r in pi["records"]]
+    successes = [pi for pi in per_interest if pi["error"] is None]
+    sample_urls = dedup_urls(all_records)
+
+    if corpus_available:
+        mur = marginal_unique_rate(sample_urls, corpus_urls)
+        mur_status = "OK_OFFLINE_LANE_CORPUS_ONLY_BASELINE" if mur is not None else "VOID_EMPTY_SAMPLE"
+    else:
+        mur, mur_status = None, "VOID_NO_BASELINE"
+
+    new_usable = usable_records(per_interest, interests_by_key, cfg)
+    old_usable = usable_records(old_per_interest, interests_by_key, cfg)
+
+    arm_new_rule = {
+        "queries": {pi["interest"]: pi["query"] for pi in per_interest},
+        "per_interest": per_interest,
+        "n_sampled": len(all_records),
+        "n_unique_urls": len(sample_urls),
+        "usable_yield": len(new_usable),
+        "usable_rate": (round(len(new_usable) / len(all_records), 3)
+                        if len(all_records) >= 8 else None),
+        "usable_records": new_usable,
+        "marginal_unique_rate": mur,
+        "marginal_unique_rate_status": mur_status,
+        # Promised by PREREGISTRATION_PASS2.marginal_uniqueness_vs_corpus:
+        # stays VOID_NO_WEB_SEARCH_SAMPLE (never a computed value) unless a
+        # live provider lane actually ran one -- no lane here ran one, same
+        # as every H1 connector entry's identically-named field.
+        "jaccard_overlap_with_web_search_sample": None,
+        "jaccard_overlap_status": "VOID_NO_WEB_SEARCH_SAMPLE",
+        "median_age_days": median_age_days(all_records, now_dt),
+        "sample_validity_rate": validity_rate(all_records),
+        "requests_spent": _connector_request_count.get(name, 0) - requests_before,
+        "failure_behavior": ("; ".join(f"{pi['interest']}: {pi['error']}"
+                                       for pi in per_interest if pi["error"])
+                             or "no failures observed in this pass"),
+    }
+    if availability is not None:
+        arm_new_rule["availability"] = availability
+
+    old_all_records = [r for pi in old_per_interest for r in pi["records"]]
+    arm_old_rule_recomputed = {
+        "n_sampled": len(old_all_records),
+        "usable_yield": len(old_usable),
+        "usable_rate": (round(len(old_usable) / len(old_all_records), 3)
+                        if len(old_all_records) >= 8 else None),
+        "usable_records": old_usable,
+    }
+
+    # `reachable` normally follows whether any per_interest fetch succeeded;
+    # reddit's stub returns per_interest=[] (no fetch attempted at all,
+    # RETIRED_UNREACHABLE) so its own availability dict's explicit False is
+    # authoritative there instead of falling through to None.
+    reachable = availability["reachable"] if availability is not None else (
+        bool(successes) if per_interest else None)
+
+    return {
+        "name": name,
+        "applicable_interests": list(applicable),
+        "reachable": reachable,
+        "arm_new_rule": arm_new_rule,
+        "arm_old_rule_recomputed": arm_old_rule_recomputed,
+    }, dedup_urls(new_usable)
+
+
+def query_level_network_failures(name, per_interest):
+    """(connector, interest) queries that failed with NO http_status at all
+    -- a connection-level failure (e.g. a read timeout), distinct from a
+    reachable-but-blocked response (e.g. reddit's 403, which does carry a
+    status). Per the pre-registration's 'if a pass aborts (crash, network
+    failure), record it in an aborted_attempts list ... rather than silently
+    re-running' -- these are exactly that, at query rather than whole-
+    connector granularity (repair: they used to only ever land in
+    per_interest['error'], not in aborted_attempts)."""
+    return [
+        {"connector": name, "interest": pi["interest"], "query": pi["query"],
+         "reason": pi["error"], "at": pi["collected_at"]}
+        for pi in per_interest if pi["error"] and pi["http_status"] is None
+    ]
+
+
+def degraded_arms_note(aborted_attempts):
+    """Human-readable addendum to verdict_detail naming any connector whose
+    new-rule arm is under-sampled because of a query_level_network_failures
+    entry -- so a reader doesn't have to cross-reference aborted_attempts to
+    notice a connector's n_sampled fell short of its designed sample."""
+    if not aborted_attempts:
+        return ""
+    by_conn = {}
+    for a in aborted_attempts:
+        by_conn.setdefault(a["connector"], []).append(a["interest"])
+    parts = [f"{c} ({len(v)} query failure(s): {', '.join(v)})" for c, v in by_conn.items()]
+    return (" Degraded arms (network failures during sampling, not retried per "
+            "the stopping condition's 'no re-runs'): " + "; ".join(parts) + ".")
+
+
+def run_pass2_e5b(dossier, cfg):
+    """Runs the H2 pre-registered pass (see PREREGISTRATION_PASS2 above) and
+    returns the pass_2_e5b dict to be merged into the loaded dossier. Never
+    touches `dossier`'s existing step-09a keys -- the caller is responsible
+    for only adding this under a new top-level key."""
+    now_dt = datetime.now(timezone.utc)
+    interests_by_key = {i.key: i for i in load_interests_file(cfg.interests_path)}
+    old_by_connector = {c["name"]: c["sample"]["per_interest"] for c in dossier["connectors"]}
+    corpus_urls, corpus_status = load_corpus_urls(cfg.db_path)
+    corpus_urls = corpus_urls or set()
+
+    sampled_connectors, aborted_attempts = [], []
+    usable_urls_by_connector = {}
+    for name in ("hackernews", "arxiv", "pubmed", "reddit"):
+        applicable = [k for k in APPLICABILITY[name] if k in interests_by_key]
+        requests_before = _connector_request_count.get(name, 0)
+        try:
+            entry, usable_urls = build_connector_pass2_entry(
+                name, applicable, interests_by_key, cfg, old_by_connector.get(name, []),
+                corpus_urls, corpus_status["available"], now_dt, requests_before)
+        except Exception as e:
+            aborted_attempts.append({"connector": name, "reason": str(e), "at": now()})
+            continue
+        aborted_attempts.extend(
+            query_level_network_failures(name, entry["arm_new_rule"]["per_interest"]))
+        sampled_connectors.append(entry)
+        usable_urls_by_connector[name] = usable_urls
+
+    for entry in sampled_connectors:
+        entry["arm_new_rule"]["uniqueness_among_candidates"] = uniqueness_among_candidates(
+            entry["name"], usable_urls_by_connector)
+
+    gate_metrics = {
+        e["name"]: {"usable_yield": e["arm_new_rule"]["usable_yield"],
+                    "marginal_unique_rate": e["arm_new_rule"]["marginal_unique_rate"]}
+        for e in sampled_connectors
+    }
+    gate = apply_promotion_gate(gate_metrics, corpus_status["available"])
+    verdict = apply_h2_falsification_rule(
+        {name: m["usable_yield"] for name, m in gate_metrics.items()})
+
+    # Per-connector disposition for the dossier + PROJECT_STATE.md: the
+    # binding constraint in THIS worktree is the absent corpus (G3), not low
+    # yield -- so every sampled connector reads NOT_PROMOTED_VOID_BASELINE
+    # unless it's the gate's own winner, even where usable_yield alone would
+    # have cleared H2.
+    dispositions = {"x": "DEFERRED_NEEDS_PROVIDER"}
+    for e in sampled_connectors:
+        name = e["name"]
+        if gate["result"] == "PROMOTE" and gate["winner"] == name:
+            dispositions[name] = "PROMOTED"
+        elif name == "reddit" and e["reachable"] is False:
+            dispositions[name] = "RETIRED_UNREACHABLE"
+        elif not corpus_status["available"]:
+            dispositions[name] = "NOT_PROMOTED_VOID_BASELINE"
+        else:
+            dispositions[name] = "NOT_PROMOTED_LOW_YIELD"
+
+    return {
+        "schema_version": 1,
+        "evidence_cutoff": now(),
+        "git_commit": git_head_sha(),
+        "preregistration": PREREGISTRATION_PASS2,
+        "spend_actual": {
+            "http_requests": _request_count,
+            "provider_calls": 0,
+            "paid_usd": 0.0,
+            "youtube_quota_units": 0,
+        },
+        "corpus": {**corpus_status, "path": cfg.db_path},
+        "connectors": sampled_connectors,
+        "x": x_deferred_entry(),
+        "aborted_attempts": aborted_attempts,
+        "gate": gate,
+        "dispositions": dispositions,
+        "verdict": verdict,
+        "verdict_detail": (
+            f"H2 gate: {gate['detail']}. " +
+            (f"H2 {verdict.split('_')[1].lower()}: "
+             f"{ {n: m['usable_yield'] for n, m in gate_metrics.items()} }.") +
+            degraded_arms_note(aborted_attempts)
+        ),
+    }
 
 
 # --- discovery.db (read-only corpus baseline) -----------------------------
@@ -671,45 +1227,6 @@ def git_head_sha():
         return None
 
 
-def build_x_entry(applicable, provider_ok, provider_why):
-    """x has NO sampler in this harness version: unlike the 4 HTTP connectors,
-    nothing here ever calls provider.search_json. This is a code gap, not an
-    operator-session gap -- status is NOT_IMPLEMENTED regardless of
-    provider_ok, and there is deliberately no `command_to_complete` a reader
-    could run today, since running `sample` (even live) would not change this
-    entry until an x sampler is written."""
-    detail = (
-        "x sampling via provider.search_json is NOT IMPLEMENTED in this harness "
-        "version -- no code path calls search_json for x, independent of provider "
-        f"reachability (provider.preflight() here: {provider_ok}, "
-        f"{provider_why or 'reachable'}). Re-running `sample`, live or not, will "
-        "not change this entry until that sampler is written."
-    )
-    return {
-        "name": "x",
-        "applicable_interests": list(applicable),
-        "availability": {"reachable": None, "status": "NOT_IMPLEMENTED", "detail": detail,
-                         "checked_at": now()},
-        "sample": {"status": "NOT_IMPLEMENTED", "detail": detail, "per_interest": []},
-        "metrics": {
-            "marginal_unique_rate": None, "marginal_unique_rate_status": "NOT_IMPLEMENTED",
-            "jaccard_overlap_with_web_search_sample": None, "jaccard_overlap_status": "NOT_IMPLEMENTED",
-            "sample_validity_rate": None, "median_age_days": None,
-            "above_bar_count": None, "above_bar_status": "NOT_IMPLEMENTED",
-            "n_sampled": 0, "n_unique_urls": 0,
-        },
-        "failure_behavior": None,
-        "command_to_complete": None,
-        "follow_up": (
-            "Implement an x sampler in exp_connectors.py (provider.search_json "
-            "against the same mechanical query rule the HTTP connectors use), "
-            "THEN re-run python experiments/lab/exp_connectors.py sample from a "
-            "live operator session (Chrome --remote-debugging-port=9222, logged "
-            "into claude.ai)."
-        ),
-    }
-
-
 def build_http_connector_entry(name, applicable, interests_by_key, corpus_urls, corpus_available,
                                now_dt, git_commit, provider, provider_ok, lab):
     per_interest = []
@@ -745,7 +1262,7 @@ def build_http_connector_entry(name, applicable, interests_by_key, corpus_urls, 
     # VOIDS explicitly lists "sample n < 5 for a connector"), that void
     # reason wins over the baseline question. jaccard_overlap always stays
     # void here -- it needs a web_search sample, which this harness does not
-    # yet implement (see build_x_entry / lanes.live.blocking_work).
+    # yet implement (see x_deferred_entry / lanes.live.blocking_work).
     if sample_status_ != "OK":
         mur, mur_status = None, sample_status_
     elif not corpus_available:
@@ -814,111 +1331,13 @@ def build_http_connector_entry(name, applicable, interests_by_key, corpus_urls, 
     }
 
 
-def run_sample(lab, cfg):
-    now_dt = datetime.now(timezone.utc)
-    git_commit = git_head_sha()
-    interests_by_key = {i.key: i for i in load_interests_file(cfg.interests_path)}
-
-    corpus_urls, corpus_status = load_corpus_urls(cfg.db_path)
-    provider = get_provider(cfg)
-    provider_ok, provider_why = provider.preflight()
-
-    connectors_out = []
-    for name in CONNECTORS:
-        applicable = [k for k in APPLICABILITY[name] if k in interests_by_key]
-        if name == "x":
-            connectors_out.append(build_x_entry(applicable, provider_ok, provider_why))
-        else:
-            connectors_out.append(build_http_connector_entry(
-                name, applicable, interests_by_key, corpus_urls or set(), corpus_status["available"],
-                now_dt, git_commit, provider, provider_ok, lab))
-
-    # baseline_available reflects whether *a* baseline could be assembled at
-    # all this pass. Per pre-registration, the offline lane's baseline
-    # substitutes corpus alone when discovery.db is reachable -- so this is
-    # corpus reachability, not hardcoded False (previous bug: no code path
-    # could ever set it True). jaccard_overlap_with_web_search_sample still
-    # needs an actual web_search sample, which this harness does not yet
-    # implement, so apply_falsification_rule's own "measurable" check (both
-    # metrics present) still returns VOID_NO_MEASURABLE_CONNECTORS rather than
-    # a decisive verdict whenever that's the only gap.
-    baseline_available = corpus_status["available"]
-    connector_metrics_for_rule = {
-        c["name"]: {"marginal_unique_rate": c["metrics"]["marginal_unique_rate"],
-                    "jaccard_overlap": c["metrics"]["jaccard_overlap_with_web_search_sample"]}
-        for c in connectors_out
-    }
-    verdict = apply_falsification_rule(connector_metrics_for_rule, baseline_available)
-
-    corpus_note = ("reachable" if corpus_status["available"]
-                   else f"not reachable -- {corpus_status['reason']}")
-    verdict_detail = (
-        "The pre-registered primary metric needs corpus UNION web_search_sample as "
-        "its baseline; the offline lane substitutes corpus alone when reachable "
-        f"(discovery.db at {cfg.db_path}: {corpus_note}). "
-        "jaccard_overlap_with_web_search_sample always needs an actual web_search "
-        "sample, which this harness version does not yet implement (no x sampler, "
-        "no web_search baseline sampler -- see lanes.live.blocking_work), so no "
-        "connector this pass has both metrics measured and H1 cannot be resolved "
-        "as SUPPORTED or FALSIFIED. Completing H1 needs that code AND a live "
-        "claude.ai Chrome/CDP session to run it."
-    )
-
-    dossier = {
-        "schema_version": 1,
-        "evidence_cutoff": now(),
-        "git_commit": git_commit,
-        "tool_version": TOOL_VERSION,
-        "preregistration": PREREGISTRATION,
-        "spend_actual": {
-            "http_requests": _request_count,
-            "provider_calls": lab.state["budget_used"],
-            "paid_usd": 0.0,
-            "youtube_quota_units": 0,
-        },
-        "lanes": {
-            "zero_spend": {
-                "status": "RAN",
-                "detail": ("hackernews/reddit/arxiv/pubmed sampled via bounded free HTTP, "
-                          "one pass per connector-interest pair; 0 provider calls spent."),
-            },
-            "live": {
-                "status": "PENDING",
-                "reason": (
-                    "Not just an operator-session gap: this harness version does not "
-                    "yet implement x's provider.search_json sampling or a web_search "
-                    "baseline sampler, so even a live claude.ai Chrome/CDP session would "
-                    "reproduce this zero-spend lane's connectors[] unchanged for x and "
-                    "for jaccard_overlap_with_web_search_sample on every connector. "
-                    f"provider.preflight() here: {provider_ok} ({provider_why or 'ok'})."
-                ),
-                "blocking_work": [
-                    "implement an x sampler: provider.search_json against the same "
-                    "mechanical query rule the HTTP connectors use",
-                    "implement a web_search baseline sampler over the probed interests "
-                    "so jaccard_overlap_with_web_search_sample and the full corpus "
-                    "UNION web_search_sample primary metric become computable",
-                ],
-                "command_to_complete": None,
-            },
-        },
-        "corpus": {**corpus_status, "path": cfg.db_path},
-        "connectors": connectors_out,
-        "prior_evidence": PRIOR_EVIDENCE,
-        "verdict": verdict,
-        "verdict_detail": verdict_detail,
-    }
-    lab.log(event="sample_run", verdict=verdict, http_requests=_request_count)
-    lab.save()
-    return dossier
-
-
 def run_probe(cfg):
     interests_by_key = {i.key: i for i in load_interests_file(cfg.interests_path)}
     provider = get_provider(cfg)
     provider_ok, provider_why = provider.preflight()
     print(f"x: provider.preflight() = {provider_ok} ({provider_why or 'reachable'})")
-    for name in ("hackernews", "reddit", "arxiv", "pubmed"):
+    print("reddit: RETIRED_UNREACHABLE (see REDDIT_RETIRED_DETAIL) -- not probed")
+    for name in ("hackernews", "arxiv", "pubmed"):
         applicable = [k for k in APPLICABILITY[name] if k in interests_by_key]
         if not applicable:
             print(f"{name}: no applicable probed interest")
@@ -934,6 +1353,8 @@ def print_report():
         print(f"no dossier yet at {DOSSIER_PATH}; run: python experiments/lab/exp_connectors.py sample")
         return
     dossier = json.loads(DOSSIER_PATH.read_text(encoding="utf-8"))
+
+    print("=== pass 1 (step-09a, H1: marginal retrieval surface) ===")
     print(f"schema_version={dossier['schema_version']} evidence_cutoff={dossier['evidence_cutoff']} "
           f"git_commit={dossier['git_commit']} tool_version={dossier['tool_version']}")
     print(f"verdict: {dossier['verdict']}")
@@ -946,6 +1367,28 @@ def print_report():
         print(f"- {c['name']}: sample={c['sample']['status']} n_sampled={m['n_sampled']} "
               f"validity={m['sample_validity_rate']} median_age_days={m['median_age_days']} "
               f"marginal_unique_rate={m['marginal_unique_rate']} ({m['marginal_unique_rate_status']})")
+
+    pass2 = dossier.get("pass_2_e5b")
+    if not pass2:
+        print("\n=== pass 2 (step-09, H2: usable retrieval yield) ===\nnot yet run")
+        return
+    print("\n=== pass 2 (step-09, H2: usable retrieval yield) ===")
+    print(f"evidence_cutoff={pass2['evidence_cutoff']} git_commit={pass2['git_commit']}")
+    print(f"verdict: {pass2['verdict']}")
+    print(f"  {pass2.get('verdict_detail', '')}")
+    print(f"spend_actual: {pass2['spend_actual']}")
+    print(f"gate: {pass2['gate']}")
+    print(f"dispositions: {pass2['dispositions']}")
+    for c in pass2["connectors"]:
+        new_arm, old_arm = c["arm_new_rule"], c["arm_old_rule_recomputed"]
+        print(f"- {c['name']}: new_rule usable_yield={new_arm['usable_yield']} "
+              f"(n_sampled={new_arm['n_sampled']}, mur={new_arm['marginal_unique_rate']} "
+              f"[{new_arm['marginal_unique_rate_status']}]) | "
+              f"old_rule_recomputed usable_yield={old_arm['usable_yield']} "
+              f"(n_sampled={old_arm['n_sampled']})")
+    print(f"- x: {pass2['x']['status']}")
+    if pass2["aborted_attempts"]:
+        print(f"aborted_attempts: {pass2['aborted_attempts']}")
 
 
 def main():
@@ -968,11 +1411,27 @@ def main():
         run_probe(cfg)
         return
 
-    dossier = run_sample(lab, cfg)
+    # `sample` now runs ONLY the H2 (pass_2_e5b) pass: step-09a's own
+    # zero_spend lane already ran for real and its dossier keys are frozen
+    # (see PREREGISTRATION_PASS2 above) -- re-running it would spend fresh
+    # requests against live, non-reproducible data and silently overwrite
+    # results the pre-registration commits this pass supersedes rather than
+    # edits. The frozen dossier must already exist; there is no code path
+    # left that regenerates it from scratch.
+    if not DOSSIER_PATH.exists():
+        print(f"no existing dossier at {DOSSIER_PATH} -- step-09a's frozen pass_1 "
+              "results must already be committed before pass_2_e5b can run", file=sys.stderr)
+        return 1
+    dossier = json.loads(DOSSIER_PATH.read_text(encoding="utf-8"))
+    pass2 = run_pass2_e5b(dossier, cfg)
+    dossier["pass_2_e5b"] = pass2
+    lab.log(event="pass2_e5b_run", verdict=pass2["verdict"], gate=pass2["gate"],
+            http_requests=pass2["spend_actual"]["http_requests"])
+    lab.save()
     DOSSIER_PATH.write_text(json.dumps(dossier, ensure_ascii=False, indent=1), encoding="utf-8")
-    print(f"wrote {DOSSIER_PATH}")
-    print(json.dumps({"verdict": dossier["verdict"], "spend_actual": dossier["spend_actual"]},
-                     ensure_ascii=False, indent=1))
+    print(f"wrote {DOSSIER_PATH} (pass_2_e5b)")
+    print(json.dumps({"verdict": pass2["verdict"], "gate": pass2["gate"],
+                     "spend_actual": pass2["spend_actual"]}, ensure_ascii=False, indent=1))
 
 
 if __name__ == "__main__":

@@ -681,5 +681,748 @@
   }
  ],
  "verdict": "VOID_NO_BASELINE",
- "verdict_detail": "The pre-registered primary metric needs corpus UNION web_search_sample as its baseline; the offline lane substitutes corpus alone when reachable (discovery.db at C:\\projects\\engine-control\\artifacts\\wt\\step-09a-c0-t0\\discovery.db: not reachable -- discovery.db not reachable at C:\\projects\\engine-control\\artifacts\\wt\\step-09a-c0-t0\\discovery.db: unable to open database file). jaccard_overlap_with_web_search_sample always needs an actual web_search sample, which this harness version does not yet implement (no x sampler, no web_search baseline sampler -- see lanes.live.blocking_work), so no connector this pass has both metrics measured and H1 cannot be resolved as SUPPORTED or FALSIFIED. Completing H1 needs that code AND a live claude.ai Chrome/CDP session to run it."
+ "verdict_detail": "The pre-registered primary metric needs corpus UNION web_search_sample as its baseline; the offline lane substitutes corpus alone when reachable (discovery.db at C:\\projects\\engine-control\\artifacts\\wt\\step-09a-c0-t0\\discovery.db: not reachable -- discovery.db not reachable at C:\\projects\\engine-control\\artifacts\\wt\\step-09a-c0-t0\\discovery.db: unable to open database file). jaccard_overlap_with_web_search_sample always needs an actual web_search sample, which this harness version does not yet implement (no x sampler, no web_search baseline sampler -- see lanes.live.blocking_work), so no connector this pass has both metrics measured and H1 cannot be resolved as SUPPORTED or FALSIFIED. Completing H1 needs that code AND a live claude.ai Chrome/CDP session to run it.",
+ "pass_2_e5b": {
+  "schema_version": 1,
+  "evidence_cutoff": "2026-08-10T23:17:41+00:00",
+  "git_commit": "21086ad184009fd51ade335adebfa6f622dbe038",
+  "preregistration": {
+   "hypothesis_h2": "Under a corrected, still-mechanical query rule, at least one candidate connector delivers, pooled over its applicable probed interests and within the unchanged spend bound, >= 8 USABLE records.",
+   "usable_definition": "(a) has both a URL and a title; (b) built into a CandidateItem with origin_interest UNSET (None) and text=title, matching.match_interests against the interest it was queried for scores >= cfg.min_match_score (matching.prefilter NOT used -- its min_text_chars branch would reject every title-only record regardless of relevance); (c) not a within-sample (pooled per connector) duplicate by canonicalized URL or title.",
+   "query_rule": "build_query_v2: first 4 distinctive tokens (matching._tokens: 4+ chars, not a stopword) of interest.title, in title order, deduped, lowercased, joined by spaces; extended from positive_signals[0] if the title yields < 2. Frozen before any run; identical for every connector.",
+   "baseline": "step-09a's already-persisted records for the same connectors, with usable-yield recomputed under the identical USABLE definition -- zero new spend for this arm.",
+   "primary_metric": "usable_yield: absolute count per connector, pooled over its applicable interests. usable_rate reported only when n_sampled >= 8 (LAB.md guardrail 7).",
+   "secondary_metrics_non_decisive": [
+    "median item age in days",
+    "sample validity rate (fraction of records with both a URL and a title)",
+    "per-connector uniqueness against the union of the OTHER candidate connectors' usable URLs (among candidates, NOT against the engine's existing surface)",
+    "observed failure behavior and rate-limit headers",
+    "requests spent"
+   ],
+   "marginal_uniqueness_vs_corpus": "marginal_unique_rate computed against discovery.db only when reachable via db_replay.open_ro; VOID_NO_BASELINE (never 0) otherwise. jaccard_overlap_with_web_search_sample stays VOID_NO_WEB_SEARCH_SAMPLE unless a live provider lane actually ran.",
+   "stopping_condition": "Exactly one pass per (connector, interest) pair under the new rule. Spend bound unchanged from H1. No query tuning, no re-runs, no connector added after seeing results. Aborted passes recorded in aborted_attempts, not silently re-run.",
+   "connector_scope": {
+    "sampled_under_new_rule": [
+     "hackernews",
+     "arxiv",
+     "pubmed"
+    ],
+    "reddit": "ONE availability re-check request only; sampled further only if it succeeds. A second independent 403 retires it (RETIRED_UNREACHABLE).",
+    "x": "NOT sampled -- needs provider.search_json both to sample and to exist as a collector, no provider reachable here; DEFERRED_NEEDS_PROVIDER."
+   },
+   "falsification_condition": "If every candidate connector's usable_yield under the new rule is < 8, H2 is FALSIFIED. A falsified H2 is a successful outcome of this step, not a shortfall.",
+   "promotion_gate": "G1: exactly one connector holds max usable_yield and that max >= 8. G2: that max >= 2x the runner-up's usable_yield (clear winner). G3: that connector's marginal_unique_rate against a REACHABLE baseline is >= 0.40 (VOID baseline fails G3 outright). All three must hold to PROMOTE.",
+   "spend_bound": {
+    "paid_usd": 0.0,
+    "youtube_quota_units": 0,
+    "http_requests_max_total": 40,
+    "http_requests_max_per_connector": 10,
+    "http_records_max_per_query": 50,
+    "http_timeout_seconds": 15,
+    "http_min_gap_seconds": 1.0,
+    "http_min_gap_seconds_arxiv": 3.0,
+    "provider_calls_zero_spend_lane": 0,
+    "provider_calls_live_lane_max": 40,
+    "deliberate_rate_limit_stress_testing": false
+   }
+  },
+  "spend_actual": {
+   "http_requests": 10,
+   "provider_calls": 0,
+   "paid_usd": 0.0,
+   "youtube_quota_units": 0
+  },
+  "corpus": {
+   "available": false,
+   "reason": "discovery.db not reachable at C:\\projects\\engine-control\\artifacts\\wt\\step-09-c0-t0\\discovery.db: unable to open database file",
+   "path": "C:\\projects\\engine-control\\artifacts\\wt\\step-09-c0-t0\\discovery.db"
+  },
+  "connectors": [
+   {
+    "name": "hackernews",
+    "applicable_interests": [
+     "ai-agents-dev-tools",
+     "personal-knowledge-learning"
+    ],
+    "reachable": true,
+    "arm_new_rule": {
+     "queries": {
+      "ai-agents-dev-tools": "agents coding personal automation",
+      "personal-knowledge-learning": "learning memory personal knowledge"
+     },
+     "per_interest": [
+      {
+       "interest": "ai-agents-dev-tools",
+       "query": "agents coding personal automation",
+       "endpoint": "https://hn.algolia.com/api/v1/search_by_date?query=agents+coding+personal+automation&tags=story&hitsPerPage=10",
+       "http_status": 200,
+       "error": null,
+       "records": [
+        {
+         "url": "https://news.ycombinator.com/item?id=49235224",
+         "title": "Ask HN: Should a coding client import another client's rules by default?",
+         "published_at": "2026-08-09T20:03:52Z"
+        },
+        {
+         "url": "https://github.com/matt0x6F/irc-client",
+         "title": "Show HN: Cascade Chat – A Hackable IRCv3 Client for macOS, Windows, and Linux",
+         "published_at": "2026-07-14T15:11:31Z"
+        },
+        {
+         "url": "https://www.runaether.dev/",
+         "title": "Show HN: Aether – Run Claude Code, Codex, or OpenCode in devboxes you can watch",
+         "published_at": "2026-07-11T15:25:00Z"
+        },
+        {
+         "url": "https://news.ycombinator.com/item?id=48736251",
+         "title": "Show HN: 143.dev – we open-sourced our internal coding-agent infrastructure",
+         "published_at": "2026-06-30T17:37:06Z"
+        },
+        {
+         "url": "https://news.ycombinator.com/item?id=48296321",
+         "title": "Show HN: Turnstile – a Windows browser picker that suggests routing rules",
+         "published_at": "2026-05-27T16:06:04Z"
+        },
+        {
+         "url": "https://github.com/trycua/cua",
+         "title": "Show HN: Drive any macOS app in the background without stealing the cursor",
+         "published_at": "2026-04-28T16:03:34Z"
+        },
+        {
+         "url": "https://news.ycombinator.com/item?id=47748747",
+         "title": "Tell HN: AI is bringing back waterfall, here's what I've found",
+         "published_at": "2026-04-13T07:14:37Z"
+        },
+        {
+         "url": "https://news.ycombinator.com/item?id=47299856",
+         "title": "Show HN: Skales – Local AI agent desktop app (.exe/.dmg, 300MB idle RAM)",
+         "published_at": "2026-03-08T18:45:01Z"
+        },
+        {
+         "url": "https://typescript-start.danield9tqh.com/",
+         "title": "Show HN: A Typescript Starter Template for Full Stack Apps",
+         "published_at": "2026-01-22T22:01:54Z"
+        },
+        {
+         "url": "https://news.ycombinator.com/item?id=46292682",
+         "title": "Ask HN: How are you LLM-coding in an established code base?",
+         "published_at": "2025-12-16T18:54:37Z"
+        }
+       ],
+       "n_records": 10,
+       "rate_limit_headers": {},
+       "collected_at": "2026-08-10T23:16:44+00:00",
+       "lane": "pass_2_e5b"
+      },
+      {
+       "interest": "personal-knowledge-learning",
+       "query": "learning memory personal knowledge",
+       "endpoint": "https://hn.algolia.com/api/v1/search_by_date?query=learning+memory+personal+knowledge&tags=story&hitsPerPage=10",
+       "http_status": 200,
+       "error": null,
+       "records": [
+        {
+         "url": "https://lingle.ai/",
+         "title": "Show HN: Lingle – Voice agent to simulate zoom-based personal language lessons",
+         "published_at": "2026-04-09T22:28:24Z"
+        },
+        {
+         "url": "https://news.ycombinator.com/item?id=47639059",
+         "title": "My 11-step GraphRAG pipeline, what worked, and what's still broken",
+         "published_at": "2026-04-04T13:50:22Z"
+        },
+        {
+         "url": "https://github.com/varun369/SuperLocalMemoryV2",
+         "title": "Show HN: SuperLocalMemory– Local-first AI memory for Claude, Cursor and 16+tools",
+         "published_at": "2026-02-12T10:11:31Z"
+        },
+        {
+         "url": "https://news.ycombinator.com/item?id=46852619",
+         "title": "Six things we're learning from 1.5M AI agents self-organizing in a week",
+         "published_at": "2026-02-02T05:04:06Z"
+        },
+        {
+         "url": "https://gitbybit.com",
+         "title": "Show HN: GitByBit — Git course integrated into VSCode and Cursor",
+         "published_at": "2026-01-27T13:10:02Z"
+        },
+        {
+         "url": "https://news.ycombinator.com/item?id=46432041",
+         "title": "Debugging for Systems Programming Learning",
+         "published_at": "2025-12-30T11:10:58Z"
+        },
+        {
+         "url": "https://tolearn.blog/blog/ai-chatbot-detection-methods-2025",
+         "title": "Show HN: How to Spot AI Chatbots vs. Real Humans: 5 Proven Detection Methods",
+         "published_at": "2025-09-14T06:42:45Z"
+        },
+        {
+         "url": "https://www.loom.com/share/d4b1a77f8609456ba8605e0255881d89?sid=a575d725-ab7c-4f59-b807-ed91a31a3dc8",
+         "title": "Show HN: A Peek into My Accelerated Learning Stack and the Missing UI for AI",
+         "published_at": "2025-08-13T07:12:04Z"
+        },
+        {
+         "url": "https://www.kinic.io/",
+         "title": "Show HN: Kinic – A Portable AI Memory Store You Own (Farewell AI Amnesia)",
+         "published_at": "2025-07-09T14:30:35Z"
+        },
+        {
+         "url": "https://github.com/fredcamaral/mcp-memory",
+         "title": "Show HN: A Real and Proactive MCP Memory Tool",
+         "published_at": "2025-05-29T03:45:42Z"
+        }
+       ],
+       "n_records": 10,
+       "rate_limit_headers": {},
+       "collected_at": "2026-08-10T23:16:45+00:00",
+       "lane": "pass_2_e5b"
+      }
+     ],
+     "n_sampled": 20,
+     "n_unique_urls": 12,
+     "usable_yield": 2,
+     "usable_rate": 0.1,
+     "usable_records": [
+      {
+       "url": "https://www.runaether.dev/",
+       "title": "Show HN: Aether – Run Claude Code, Codex, or OpenCode in devboxes you can watch",
+       "published_at": "2026-07-11T15:25:00Z",
+       "interest": "ai-agents-dev-tools",
+       "match_score": 0.36
+      },
+      {
+       "url": "https://news.ycombinator.com/item?id=48736251",
+       "title": "Show HN: 143.dev – we open-sourced our internal coding-agent infrastructure",
+       "published_at": "2026-06-30T17:37:06Z",
+       "interest": "ai-agents-dev-tools",
+       "match_score": 0.48
+      }
+     ],
+     "marginal_unique_rate": null,
+     "marginal_unique_rate_status": "VOID_NO_BASELINE",
+     "median_age_days": 167.37,
+     "sample_validity_rate": 1.0,
+     "requests_spent": 2,
+     "failure_behavior": "no failures observed in this pass",
+     "uniqueness_among_candidates": 1.0,
+     "jaccard_overlap_with_web_search_sample": null,
+     "jaccard_overlap_status": "VOID_NO_WEB_SEARCH_SAMPLE"
+    },
+    "arm_old_rule_recomputed": {
+     "n_sampled": 0,
+     "usable_yield": 0,
+     "usable_rate": null,
+     "usable_records": []
+    }
+   },
+   {
+    "name": "arxiv",
+    "applicable_interests": [
+     "behavioral-psychology",
+     "personal-knowledge-learning",
+     "ai-agents-dev-tools"
+    ],
+    "reachable": true,
+    "arm_new_rule": {
+     "queries": {
+      "behavioral-psychology": "human interaction attraction behavioral",
+      "personal-knowledge-learning": "learning memory personal knowledge",
+      "ai-agents-dev-tools": "agents coding personal automation"
+     },
+     "per_interest": [
+      {
+       "interest": "behavioral-psychology",
+       "query": "human interaction attraction behavioral",
+       "endpoint": "https://export.arxiv.org/api/query?search_query=all%3Ahuman+interaction+attraction+behavioral&start=0&max_results=10",
+       "http_status": null,
+       "error": "export.arxiv.org: The read operation timed out",
+       "records": [],
+       "n_records": 0,
+       "rate_limit_headers": {},
+       "collected_at": "2026-08-10T23:17:01+00:00",
+       "lane": "pass_2_e5b"
+      },
+      {
+       "interest": "personal-knowledge-learning",
+       "query": "learning memory personal knowledge",
+       "endpoint": "https://export.arxiv.org/api/query?search_query=all%3Alearning+memory+personal+knowledge&start=0&max_results=10",
+       "http_status": null,
+       "error": "export.arxiv.org: The read operation timed out",
+       "records": [],
+       "n_records": 0,
+       "rate_limit_headers": {},
+       "collected_at": "2026-08-10T23:17:20+00:00",
+       "lane": "pass_2_e5b"
+      },
+      {
+       "interest": "ai-agents-dev-tools",
+       "query": "agents coding personal automation",
+       "endpoint": "https://export.arxiv.org/api/query?search_query=all%3Aagents+coding+personal+automation&start=0&max_results=10",
+       "http_status": 200,
+       "error": null,
+       "records": [
+        {
+         "url": "http://arxiv.org/abs/2603.01035v1",
+         "title": "From Human Negotiation to Agent Negotiation: Personal Mobility Agents in Automated Traffic",
+         "published_at": "2026-03-01T10:20:07Z"
+        },
+        {
+         "url": "http://arxiv.org/abs/2607.03332v1",
+         "title": "AtomicCommitBench: Can Coding Agents Reconstruct Commit Histories from Squashed Patches?",
+         "published_at": "2026-07-03T13:51:22Z"
+        },
+        {
+         "url": "http://arxiv.org/abs/1301.6236v2",
+         "title": "Multi-Trial Guruswami--Sudan Decoding for Generalised Reed--Solomon Codes",
+         "published_at": "2013-01-26T11:16:40Z"
+        },
+        {
+         "url": "http://arxiv.org/abs/2309.06635v3",
+         "title": "Collaborative Dynamic 3D Scene Graphs for Automated Driving",
+         "published_at": "2023-09-12T22:54:30Z"
+        },
+        {
+         "url": "http://arxiv.org/abs/2203.08975v2",
+         "title": "A Survey of Multi-Agent Deep Reinforcement Learning with Communication",
+         "published_at": "2022-03-16T22:39:46Z"
+        },
+        {
+         "url": "http://arxiv.org/abs/2305.09349v1",
+         "title": "Establishing Shared Query Understanding in an Open Multi-Agent System",
+         "published_at": "2023-05-16T11:07:05Z"
+        },
+        {
+         "url": "http://arxiv.org/abs/2011.03117v3",
+         "title": "IFC models for (semi)automating common planning checks for building permits",
+         "published_at": "2020-11-03T15:29:47Z"
+        },
+        {
+         "url": "http://arxiv.org/abs/2511.02841v2",
+         "title": "AI Agents with Decentralized Identifiers and Verifiable Credentials",
+         "published_at": "2025-10-01T08:10:37Z"
+        },
+        {
+         "url": "http://arxiv.org/abs/1607.05006v2",
+         "title": "End-to-end optimization of nonlinear transform codes for perceptual quality",
+         "published_at": "2016-07-18T10:41:17Z"
+        },
+        {
+         "url": "http://arxiv.org/abs/1301.2165v1",
+         "title": "List Decoding of Lifted Gabidulin Codes via the Plücker Embedding",
+         "published_at": "2013-01-10T15:43:04Z"
+        }
+       ],
+       "n_records": 10,
+       "rate_limit_headers": {},
+       "collected_at": "2026-08-10T23:17:35+00:00",
+       "lane": "pass_2_e5b"
+      }
+     ],
+     "n_sampled": 10,
+     "n_unique_urls": 10,
+     "usable_yield": 1,
+     "usable_rate": 0.1,
+     "usable_records": [
+      {
+       "url": "http://arxiv.org/abs/2603.01035v1",
+       "title": "From Human Negotiation to Agent Negotiation: Personal Mobility Agents in Automated Traffic",
+       "published_at": "2026-03-01T10:20:07Z",
+       "interest": "ai-agents-dev-tools",
+       "match_score": 0.36
+      }
+     ],
+     "marginal_unique_rate": null,
+     "marginal_unique_rate_status": "VOID_NO_BASELINE",
+     "median_age_days": 1395.27,
+     "sample_validity_rate": 1.0,
+     "requests_spent": 3,
+     "failure_behavior": "behavioral-psychology: export.arxiv.org: The read operation timed out; personal-knowledge-learning: export.arxiv.org: The read operation timed out",
+     "uniqueness_among_candidates": 1.0,
+     "jaccard_overlap_with_web_search_sample": null,
+     "jaccard_overlap_status": "VOID_NO_WEB_SEARCH_SAMPLE"
+    },
+    "arm_old_rule_recomputed": {
+     "n_sampled": 30,
+     "usable_yield": 10,
+     "usable_rate": 0.333,
+     "usable_records": [
+      {
+       "url": "http://arxiv.org/abs/2501.10713v1",
+       "title": "Human-like Nonverbal Behavior with MetaHumans in Real-World Interaction Studies: An Architecture Using Generative Methods and Motion Capture",
+       "published_at": "2025-01-18T10:13:15Z",
+       "interest": "behavioral-psychology",
+       "match_score": 0.6
+      },
+      {
+       "url": "http://arxiv.org/abs/2501.02583v1",
+       "title": "Gaze Behavior During a Long-Term, In-Home, Social Robot Intervention for Children with ASD",
+       "published_at": "2025-01-05T15:33:22Z",
+       "interest": "behavioral-psychology",
+       "match_score": 0.36
+      },
+      {
+       "url": "http://arxiv.org/abs/2608.07067v1",
+       "title": "DocMemo: Dynamic Evidence Discovery via Probabilistic Memory-Guided Retrieval for Multi-Modal Document Understanding",
+       "published_at": "2026-08-07T10:16:56Z",
+       "interest": "personal-knowledge-learning",
+       "match_score": 0.36
+      },
+      {
+       "url": "http://arxiv.org/abs/2604.07863v1",
+       "title": "Task-Adaptive Retrieval over Agentic Multi-Modal Web Histories via Learned Graph Memory",
+       "published_at": "2026-04-09T06:24:16Z",
+       "interest": "personal-knowledge-learning",
+       "match_score": 0.36
+      },
+      {
+       "url": "http://arxiv.org/abs/2508.08322v1",
+       "title": "Context Engineering for Multi-Agent LLM Code Assistants Using Elicit, NotebookLM, ChatGPT, and Claude Code",
+       "published_at": "2025-08-09T14:45:53Z",
+       "interest": "ai-agents-dev-tools",
+       "match_score": 0.48
+      },
+      {
+       "url": "http://arxiv.org/abs/2606.17099v1",
+       "title": "Software Delegation Contracts: Measuring Reviewability in AI Coding-Agent Work",
+       "published_at": "2026-06-14T05:53:27Z",
+       "interest": "ai-agents-dev-tools",
+       "match_score": 0.36
+      },
+      {
+       "url": "http://arxiv.org/abs/2604.14228v2",
+       "title": "Dive into Claude Code: The Design Space of Today's and Future AI Agent Systems",
+       "published_at": "2026-04-14T17:59:37Z",
+       "interest": "ai-agents-dev-tools",
+       "match_score": 0.36
+      },
+      {
+       "url": "http://arxiv.org/abs/2603.13258v1",
+       "title": "Your Code Agent Can Grow Alongside You with Structured Memory",
+       "published_at": "2026-02-25T06:39:29Z",
+       "interest": "ai-agents-dev-tools",
+       "match_score": 0.36
+      },
+      {
+       "url": "http://arxiv.org/abs/2511.09268v2",
+       "title": "Decoding the Configuration of AI Coding Agents: Insights from Claude Code Projects",
+       "published_at": "2025-11-12T12:28:57Z",
+       "interest": "ai-agents-dev-tools",
+       "match_score": 0.48
+      },
+      {
+       "url": "http://arxiv.org/abs/2606.04455v1",
+       "title": "The Meta-Agent Challenge: Are Current Agents Capable of Autonomous Agent Development?",
+       "published_at": "2026-06-03T04:58:17Z",
+       "interest": "ai-agents-dev-tools",
+       "match_score": 0.36
+      }
+     ]
+    }
+   },
+   {
+    "name": "pubmed",
+    "applicable_interests": [
+     "narcolepsy-eds",
+     "emdr-trauma-therapy"
+    ],
+    "reachable": true,
+    "arm_new_rule": {
+     "queries": {
+      "narcolepsy-eds": "narcolepsy wakefulness",
+      "emdr-trauma-therapy": "emdr trauma processing mechanisms"
+     },
+     "per_interest": [
+      {
+       "interest": "narcolepsy-eds",
+       "query": "narcolepsy wakefulness",
+       "endpoint": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=narcolepsy+wakefulness&retmode=json&retmax=10 -> https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id=42551881%2C42533134%2C42418402%2C42412740%2C42348342%2C42258964%2C42236577%2C42169202%2C42137740%2C42090728&retmode=json",
+       "http_status": 200,
+       "error": null,
+       "records": [
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/42551881/",
+         "title": "Targeting Orexin 2 Receptors in Idiopathic Hypersomnia and Narcolepsy: A Randomised Phase 1b Proof-Of-Concept Study of Alixorexton.",
+         "published_at": "2026 Aug 4"
+        },
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/42533134/",
+         "title": "Therapeutic potential of targeting the orexin (hypocretin) system in sleep disorders.",
+         "published_at": "2026 Jul 30"
+        },
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/42418402/",
+         "title": "GABA neurons in the sublaterodorsal tegmental nucleus suppress wakefulness in healthy and narcoleptic mice.",
+         "published_at": "2026 Jul"
+        },
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/42412740/",
+         "title": "Nocturnal Features and Daytime Characteristics in Narcolepsy: Reliability and Diagnostic Relevance for NT1 vs NT2.",
+         "published_at": "2026 Jul 7"
+        },
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/42348342/",
+         "title": "Postmortem Evidence of CRH Neuron Reduction in Narcolepsy Without Cataplexy With Borderline Hypocretin-1 Levels.",
+         "published_at": "2026 Jun 25"
+        },
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/42258964/",
+         "title": "Narcolepsy type 1: an environment-influenced disease.",
+         "published_at": "2026 Oct"
+        },
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/42236577/",
+         "title": "REM sleep favors the restructuring of problem-related semantic associations.",
+         "published_at": "2026 Jun 3"
+        },
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/42169202/",
+         "title": "A novel, wearable, in-ear EEG technology to assess sleep and daytime sleepiness.",
+         "published_at": "2026 May 22"
+        },
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/42137740/",
+         "title": "Modafinil-associated psychosis: a systematic review of case characteristics and management strategies.",
+         "published_at": "2026"
+        },
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/42090728/",
+         "title": "Relational hypnotherapy, lucid dreaming, and sleep paralysis: A case study.",
+         "published_at": "2026 Jun"
+        }
+       ],
+       "n_records": 10,
+       "rate_limit_headers": {
+        "X-Ratelimit-Limit": "3",
+        "X-Ratelimit-Remaining": "2"
+       },
+       "collected_at": "2026-08-10T23:17:38+00:00",
+       "lane": "pass_2_e5b"
+      },
+      {
+       "interest": "emdr-trauma-therapy",
+       "query": "emdr trauma processing mechanisms",
+       "endpoint": "https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esearch.fcgi?db=pubmed&term=emdr+trauma+processing+mechanisms&retmode=json&retmax=10 -> https://eutils.ncbi.nlm.nih.gov/entrez/eutils/esummary.fcgi?db=pubmed&id=42368797%2C42254728%2C41561982%2C41371190%2C41367945%2C41160072%2C41066786%2C40778697%2C38268571%2C37727746&retmode=json",
+       "http_status": 200,
+       "error": null,
+       "records": [
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/42368797/",
+         "title": "The Smart Therapy Model: a Fourth Wave framework for assessment-driven, integrative multimodal biopsychosocial psychotherapy.",
+         "published_at": "2026"
+        },
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/42254728/",
+         "title": "Remote EMDR versus CBT for PTSD after the Kahramanmaraş earthquakes: a randomized trial.",
+         "published_at": "2026"
+        },
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/41561982/",
+         "title": "Group EMDR therapy for disaster-affected adolescents: evaluating effectiveness and navigating implementation challenges in PTSD, depression, and anxiety.",
+         "published_at": "2025"
+        },
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/41371190/",
+         "title": "The exposure continuum model: A theoretical framework for understanding exposure across trauma-centered psychotherapies.",
+         "published_at": "2026 Jan"
+        },
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/41367945/",
+         "title": "Exploring EMDR: an innovative approach with Posner Paradigm to reprocessing negative memories in a non-clinical sample.",
+         "published_at": "2025"
+        },
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/41160072/",
+         "title": "Frontliners narratives: qualitative insights into EMDR group therapy during COVID-19.",
+         "published_at": "2025 Dec"
+        },
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/41066786/",
+         "title": "A novel theory of trauma offers new treatment possibilities.",
+         "published_at": "2025 Oct 10"
+        },
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/40778697/",
+         "title": "Dissociative and traumatic experiences in people with eating disorders.",
+         "published_at": "2025 Nov 1"
+        },
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/38268571/",
+         "title": "Trauma-Informed Care in Psychedelic Therapy Research: A Qualitative Literature Review of Evidence-Based Psychotherapy Interventions in PTSD and Psychedelic Therapy Across Conditions.",
+         "published_at": "2024"
+        },
+        {
+         "url": "https://pubmed.ncbi.nlm.nih.gov/37727746/",
+         "title": "The integrative process promoted by EMDR in dissociative disorders: neurobiological mechanisms, psychometric tools, and intervention efficacy on the psychological impact of the COVID-19 pandemic.",
+         "published_at": "2023"
+        }
+       ],
+       "n_records": 10,
+       "rate_limit_headers": {
+        "X-Ratelimit-Limit": "3",
+        "X-Ratelimit-Remaining": "2"
+       },
+       "collected_at": "2026-08-10T23:17:40+00:00",
+       "lane": "pass_2_e5b"
+      }
+     ],
+     "n_sampled": 20,
+     "n_unique_urls": 20,
+     "usable_yield": 6,
+     "usable_rate": 0.3,
+     "usable_records": [
+      {
+       "url": "https://pubmed.ncbi.nlm.nih.gov/42551881/",
+       "title": "Targeting Orexin 2 Receptors in Idiopathic Hypersomnia and Narcolepsy: A Randomised Phase 1b Proof-Of-Concept Study of Alixorexton.",
+       "published_at": "2026 Aug 4",
+       "interest": "narcolepsy-eds",
+       "match_score": 0.48
+      },
+      {
+       "url": "https://pubmed.ncbi.nlm.nih.gov/42348342/",
+       "title": "Postmortem Evidence of CRH Neuron Reduction in Narcolepsy Without Cataplexy With Borderline Hypocretin-1 Levels.",
+       "published_at": "2026 Jun 25",
+       "interest": "narcolepsy-eds",
+       "match_score": 0.48
+      },
+      {
+       "url": "https://pubmed.ncbi.nlm.nih.gov/41561982/",
+       "title": "Group EMDR therapy for disaster-affected adolescents: evaluating effectiveness and navigating implementation challenges in PTSD, depression, and anxiety.",
+       "published_at": "2025",
+       "interest": "emdr-trauma-therapy",
+       "match_score": 0.36
+      },
+      {
+       "url": "https://pubmed.ncbi.nlm.nih.gov/41160072/",
+       "title": "Frontliners narratives: qualitative insights into EMDR group therapy during COVID-19.",
+       "published_at": "2025 Dec",
+       "interest": "emdr-trauma-therapy",
+       "match_score": 0.36
+      },
+      {
+       "url": "https://pubmed.ncbi.nlm.nih.gov/38268571/",
+       "title": "Trauma-Informed Care in Psychedelic Therapy Research: A Qualitative Literature Review of Evidence-Based Psychotherapy Interventions in PTSD and Psychedelic Therapy Across Conditions.",
+       "published_at": "2024",
+       "interest": "emdr-trauma-therapy",
+       "match_score": 0.72
+      },
+      {
+       "url": "https://pubmed.ncbi.nlm.nih.gov/37727746/",
+       "title": "The integrative process promoted by EMDR in dissociative disorders: neurobiological mechanisms, psychometric tools, and intervention efficacy on the psychological impact of the COVID-19 pandemic.",
+       "published_at": "2023",
+       "interest": "emdr-trauma-therapy",
+       "match_score": 0.36
+      }
+     ],
+     "marginal_unique_rate": null,
+     "marginal_unique_rate_status": "VOID_NO_BASELINE",
+     "median_age_days": 221.97,
+     "sample_validity_rate": 1.0,
+     "requests_spent": 4,
+     "failure_behavior": "no failures observed in this pass",
+     "uniqueness_among_candidates": 1.0,
+     "jaccard_overlap_with_web_search_sample": null,
+     "jaccard_overlap_status": "VOID_NO_WEB_SEARCH_SAMPLE"
+    },
+    "arm_old_rule_recomputed": {
+     "n_sampled": 11,
+     "usable_yield": 0,
+     "usable_rate": 0.0,
+     "usable_records": []
+    }
+   },
+   {
+    "name": "reddit",
+    "applicable_interests": [
+     "behavioral-psychology",
+     "personal-knowledge-learning",
+     "emdr-trauma-therapy",
+     "narcolepsy-eds",
+     "ai-agents-dev-tools"
+    ],
+    "reachable": false,
+    "arm_new_rule": {
+     "queries": {
+      "behavioral-psychology": "human interaction attraction behavioral"
+     },
+     "per_interest": [
+      {
+       "interest": "behavioral-psychology",
+       "query": "human interaction attraction behavioral",
+       "endpoint": "https://www.reddit.com/search.json?q=human+interaction+attraction+behavioral&sort=new&limit=10&t=year",
+       "http_status": 403,
+       "error": "http 403",
+       "records": [],
+       "n_records": 0,
+       "rate_limit_headers": {
+        "Retry-After": "0"
+       },
+       "collected_at": "2026-08-10T23:17:41+00:00",
+       "lane": "pass_2_e5b"
+      }
+     ],
+     "n_sampled": 0,
+     "n_unique_urls": 0,
+     "usable_yield": 0,
+     "usable_rate": null,
+     "usable_records": [],
+     "marginal_unique_rate": null,
+     "marginal_unique_rate_status": "VOID_NO_BASELINE",
+     "median_age_days": null,
+     "sample_validity_rate": null,
+     "requests_spent": 1,
+     "failure_behavior": "behavioral-psychology: http 403",
+     "availability": {
+      "reachable": false,
+      "detail": "availability re-check failed: http 403"
+     },
+     "uniqueness_among_candidates": null,
+     "jaccard_overlap_with_web_search_sample": null,
+     "jaccard_overlap_status": "VOID_NO_WEB_SEARCH_SAMPLE"
+    },
+    "arm_old_rule_recomputed": {
+     "n_sampled": 0,
+     "usable_yield": 0,
+     "usable_rate": null,
+     "usable_records": []
+    }
+   }
+  ],
+  "x": {
+   "name": "x",
+   "status": "DEFERRED_NEEDS_PROVIDER",
+   "detail": "Not sampled per CONNECTOR SCOPE: needs provider.search_json both to sample and to exist as a collector; no provider is reachable from this harness. Blocking work: implement an x sampler (provider.search_json against build_query_v2) and a web_search baseline sampler, then re-run from a live claude.ai Chrome/CDP operator session."
+  },
+  "aborted_attempts": [
+   {
+    "connector": "arxiv",
+    "interest": "behavioral-psychology",
+    "query": "human interaction attraction behavioral",
+    "reason": "export.arxiv.org: The read operation timed out",
+    "at": "2026-08-10T23:17:01+00:00"
+   },
+   {
+    "connector": "arxiv",
+    "interest": "personal-knowledge-learning",
+    "query": "learning memory personal knowledge",
+    "reason": "export.arxiv.org: The read operation timed out",
+    "at": "2026-08-10T23:17:20+00:00"
+   }
+  ],
+  "gate": {
+   "result": "NO_PROMOTION",
+   "winner": null,
+   "failing_gate": "G1",
+   "detail": "max usable_yield=6 held by ['pubmed']"
+  },
+  "dispositions": {
+   "x": "DEFERRED_NEEDS_PROVIDER",
+   "hackernews": "NOT_PROMOTED_VOID_BASELINE",
+   "arxiv": "NOT_PROMOTED_VOID_BASELINE",
+   "pubmed": "NOT_PROMOTED_VOID_BASELINE",
+   "reddit": "RETIRED_UNREACHABLE"
+  },
+  "verdict": "H2_FALSIFIED",
+  "verdict_detail": "H2 gate: max usable_yield=6 held by ['pubmed']. H2 falsified: {'hackernews': 2, 'arxiv': 1, 'pubmed': 6, 'reddit': 0}. Degraded arms (network failures during sampling, not retried per the stopping condition's 'no re-runs'): arxiv (2 query failure(s): behavioral-psychology, personal-knowledge-learning).",
+  "reproducibility_note": "This pass_2_e5b artifact was produced by the code as it stood in commit 21086ad (the pre-registration commit): reddit's entry below (requests_spent=1, http_status=403, one live availability re-check) reflects that commit's sample_reddit_pass2(), which performed one real HTTP request. That sampler was deleted in commit 131359a once the second independent 403 confirmed the retirement (see LAB.md/PROJECT_STATE.md), so sample_reddit_pass2() in the current tree returns the retired state directly with 0 requests and would NOT reproduce this entry's HTTP call if `sample` were run again -- it would only reproduce hackernews/arxiv/pubmed's calls (and per the stopping condition, must not be run again for this pass regardless)."
+ }
 }

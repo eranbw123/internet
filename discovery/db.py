@@ -24,6 +24,37 @@ RESEND_FAILED_AFTER_SECONDS = 15 * 60
 # for this long before the backlog pass tries it again.
 SCORE_RETRY_SECONDS = 30 * 60
 
+# Namespaces every derived-interest key so it can never collide with an
+# owner one -- interests.load_file() rejects an owner entry that carries it.
+DERIVED_KEY_PREFIX = "derived:"
+
+# DB-level backstop for owner immutability, on top of the two guarded write
+# helpers below. References the `layer` column added by the ALTER pass in
+# init(), so this must run AFTER that pass on a pre-existing DB -- schema.sql's
+# executescript() runs first and would fail with "no such column: layer".
+TRIGGERS_SQL = """
+CREATE TRIGGER IF NOT EXISTS trg_owner_layer_immutable
+BEFORE UPDATE OF layer ON interests
+WHEN OLD.layer = 'owner' AND NEW.layer != 'owner'
+BEGIN
+    SELECT RAISE(ABORT, 'owner interest layer is immutable');
+END;
+
+CREATE TRIGGER IF NOT EXISTS trg_owner_delete_immutable
+BEFORE DELETE ON interests
+WHEN OLD.layer = 'owner'
+BEGIN
+    SELECT RAISE(ABORT, 'owner interest rows cannot be deleted');
+END;
+"""
+
+
+class OwnerInterestImmutable(Exception):
+    """Raised by upsert_derived_interest()/set_interest_layer() when the
+    write would have touched a row whose layer is 'owner' -- both guard
+    every UPDATE with `WHERE layer != 'owner'` and treat a zero rowcount
+    (no matching non-owner row) as this."""
+
 
 def now():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
@@ -59,11 +90,17 @@ def init(conn):
         ("notifications", "attempts", "INTEGER NOT NULL DEFAULT 1"),
         ("candidate_items", "score_attempted_at", "TEXT"),
         ("scores", "prompt_hash", "TEXT"),
+        ("interests", "layer", "TEXT NOT NULL DEFAULT 'owner'"),
+        ("interests", "provenance", "TEXT NOT NULL DEFAULT '{}'"),
+        ("interests", "last_observed_at", "TEXT"),
     ):
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
         except sqlite3.OperationalError:
             pass  # column already exists
+    conn.commit()
+    # Must come after the ALTER pass above -- see TRIGGERS_SQL's docstring.
+    conn.executescript(TRIGGERS_SQL)
     conn.commit()
 
 
@@ -71,13 +108,17 @@ def init(conn):
 
 def upsert_interest(conn, interest):
     """Insert or update by `key`. interests.json is the source of truth, so a
-    re-load overwrites the stored copy rather than merging."""
+    re-load overwrites the stored copy rather than merging. Always writes
+    layer='owner'; the ON CONFLICT branch only fires `WHERE layer = 'owner'`,
+    so this can never overwrite a derived row (structurally impossible
+    anyway -- interests.load_file() rejects an owner key carrying
+    DERIVED_KEY_PREFIX -- but guarded here too, defense in depth)."""
     conn.execute(
         """
         INSERT INTO interests
             (key, title, description, positive_signals, negative_signals,
-             min_score, sources, source_config, active)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1)
+             min_score, sources, source_config, active, layer)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'owner')
         ON CONFLICT(key) DO UPDATE SET
             title = excluded.title,
             description = excluded.description,
@@ -86,7 +127,9 @@ def upsert_interest(conn, interest):
             min_score = excluded.min_score,
             sources = excluded.sources,
             source_config = excluded.source_config,
-            active = 1
+            active = 1,
+            layer = 'owner'
+        WHERE interests.layer = 'owner'
         """,
         (
             interest.key,
@@ -102,6 +145,77 @@ def upsert_interest(conn, interest):
     conn.commit()
 
 
+def upsert_derived_interest(conn, interest, provenance):
+    """Insert or update a non-owner interest row -- one of only two ways
+    (see set_interest_layer) any automation may write a non-owner row.
+    `interest.layer` decides `active` (1 only for 'inferred'; see
+    interest_state.py's operational-meaning rules). Refuses to touch an
+    owner row: the ON CONFLICT branch is `WHERE layer != 'owner'`, and a
+    zero rowcount (also covering "no such key at all") raises
+    OwnerInterestImmutable.
+
+    `last_observed_at` is always stamped to now() here, including on a
+    personal-state seed with zero real observations -- it doubles as the
+    row's decay-staleness baseline (interest_state.apply_transitions() falls
+    back to it when a pass has no fresh corpus evidence for the term), not
+    only "last actually observed in the corpus". A freshly written row is
+    correctly not idle yet, even before it has ever been observed."""
+    if not interest.key.startswith(DERIVED_KEY_PREFIX):
+        raise ValueError(
+            f"derived interest key {interest.key!r} must start with {DERIVED_KEY_PREFIX!r}"
+        )
+    active = 1 if interest.layer == "inferred" else 0
+    cur = conn.execute(
+        """
+        INSERT INTO interests
+            (key, title, description, positive_signals, negative_signals,
+             min_score, sources, source_config, active, layer, provenance,
+             last_observed_at)
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET
+            title            = excluded.title,
+            description      = excluded.description,
+            positive_signals = excluded.positive_signals,
+            negative_signals = excluded.negative_signals,
+            min_score        = excluded.min_score,
+            sources          = excluded.sources,
+            source_config    = excluded.source_config,
+            active           = excluded.active,
+            layer            = excluded.layer,
+            provenance       = excluded.provenance,
+            last_observed_at = excluded.last_observed_at
+        WHERE interests.layer != 'owner'
+        """,
+        (
+            interest.key, interest.title, interest.description,
+            json.dumps(interest.positive_signals), json.dumps(interest.negative_signals),
+            interest.min_score, json.dumps(interest.sources), json.dumps(interest.source_config),
+            active, interest.layer, json.dumps(provenance), now(),
+        ),
+    )
+    if cur.rowcount == 0:
+        raise OwnerInterestImmutable(interest.key)
+    conn.commit()
+
+
+def set_interest_layer(conn, key, to_layer, evidence):
+    """Change only the layer (and the `active` flag it implies) on an
+    existing non-owner row -- decay, immediate retirement and re-entry never
+    change title/signals/min_score/last_observed_at (no fresh observation
+    backs them). Promotion into 'inferred' goes through
+    upsert_derived_interest() instead, since that also sets
+    min_score/positive_signals. `evidence` is not persisted here -- the
+    caller (interest_state.apply_transitions) logs it to interest_events."""
+    active = 1 if to_layer == "inferred" else 0
+    cur = conn.execute(
+        "UPDATE interests SET layer = ?, active = ? WHERE key = ? AND layer != 'owner'",
+        (to_layer, active, key),
+    )
+    if cur.rowcount == 0:
+        raise OwnerInterestImmutable(key)
+    conn.commit()
+
+
 def active_interests(conn):
     rows = conn.execute("SELECT * FROM interests WHERE active = 1 ORDER BY id").fetchall()
     return [_row_to_interest(r) for r in rows]
@@ -110,6 +224,23 @@ def active_interests(conn):
 def interest_by_key(conn, key):
     row = conn.execute("SELECT * FROM interests WHERE key = ?", (key,)).fetchone()
     return _row_to_interest(row) if row else None
+
+
+def list_interests(conn, layer=None):
+    """Raw readout rows for `python -m app interests` -- key, layer, active,
+    min_score, last_observed_at, owner rows first. Deliberately not routed
+    through _row_to_interest(): models.Interest doesn't carry `active` (a
+    DB-only bookkeeping column the pipeline reads straight from SQL)."""
+    if layer:
+        return conn.execute(
+            "SELECT key, layer, active, min_score, last_observed_at FROM interests"
+            " WHERE layer = ? ORDER BY id",
+            (layer,),
+        ).fetchall()
+    return conn.execute(
+        "SELECT key, layer, active, min_score, last_observed_at FROM interests"
+        " ORDER BY (layer != 'owner'), id"
+    ).fetchall()
 
 
 def _row_to_interest(row):
@@ -123,7 +254,41 @@ def _row_to_interest(row):
         min_score=row["min_score"],
         sources=json.loads(row["sources"]),
         source_config=json.loads(row["source_config"]),
+        layer=row["layer"],
+        provenance=json.loads(row["provenance"]),
     )
+
+
+# --- interest provenance -----------------------------------------------------
+
+def add_interest_event(conn, interest_key, actor, action, from_layer, to_layer, evidence=None):
+    """Append one row. Nothing ever UPDATEs or DELETEs interest_events."""
+    conn.execute(
+        """
+        INSERT INTO interest_events (at, interest_key, actor, action, from_layer, to_layer, evidence)
+        VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (now(), interest_key, actor, action, from_layer, to_layer, json.dumps(evidence or {})),
+    )
+    conn.commit()
+
+
+def interest_events(conn, key):
+    """The full append-only chain for one interest, oldest first -- the
+    provenance answer behind `python -m app interests --why <key>`."""
+    rows = conn.execute(
+        "SELECT at, actor, action, from_layer, to_layer, evidence FROM interest_events"
+        " WHERE interest_key = ? ORDER BY id",
+        (key,),
+    ).fetchall()
+    return [
+        {
+            "at": r["at"], "actor": r["actor"], "action": r["action"],
+            "from_layer": r["from_layer"], "to_layer": r["to_layer"],
+            "evidence": json.loads(r["evidence"]),
+        }
+        for r in rows
+    ]
 
 
 # --- items -------------------------------------------------------------------
