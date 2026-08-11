@@ -3662,6 +3662,31 @@ class ClaudeChatProviderTests(unittest.TestCase):
         with self.assertRaises(ProviderError):
             provider.complete_json("s", "p", self.SCHEMA)
 
+    def test_complete_json_accepts_a_score_reply_with_no_debug_fields(self):
+        """The real production schemas (scoring.SCORE_SCHEMA/council.MISSION_
+        SCHEMA), not a hand-shrunk test schema, through the real provider --
+        repair 2 broke this by putting the optional debug/deliberation
+        fields into these schemas' top-level `required`, which claude_chat's
+        _validate() enforces verbatim. A reply with only the production
+        fields must succeed in one attempt, not fall back to the retry
+        suffix or raise."""
+        good_score = {
+            "interest_key": "x",
+            **{name: 0.5 for name in models.DIMENSIONS},
+            "confidence": 0.5, "reason": "r", "why_better_than_generic": "w",
+        }
+        provider = self._provider(completion_reply(json.dumps(good_score)))
+        self.assertEqual(provider.complete_json("s", "p", scoring.SCORE_SCHEMA), good_score)
+        (conn,) = self.connections
+        self.assertEqual(conn.calls.count("completion"), 1)  # no retry needed
+
+    def test_complete_json_accepts_missions_reply_with_no_deliberation(self):
+        good_missions = {"missions": [{"label": "a", "rationale": "b", "prompt": "c"}]}
+        provider = self._provider(completion_reply(json.dumps(good_missions)))
+        self.assertEqual(provider.complete_json("s", "p", council.MISSION_SCHEMA), good_missions)
+        (conn,) = self.connections
+        self.assertEqual(conn.calls.count("completion"), 1)  # no retry needed
+
     def test_search_json_returns_the_embedded_array_and_garbage_becomes_empty(self):
         provider = self._provider(
             completion_reply('I searched.\n[{"title": "T", "url": "https://e.com"}]\nDone.'),
@@ -3937,6 +3962,62 @@ class SchemaContractTests(unittest.TestCase):
         for schema in (scoring.SCORE_SCHEMA, stocks_module.EXPLAIN_SCHEMA):
             self.assertIs(schema.get("additionalProperties"), False, schema)
 
+    def test_default_provider_validate_accepts_score_missing_all_debug_fields(self):
+        """claude_chat/chatgpt_browser's hand-rolled _validate() is the ONLY
+        schema enforcement the two default browser providers have, and it
+        enforces `required` verbatim with no tolerance. The six debug fields
+        (scoring.DEBUG_FIELDS) are documented as 'absent => unavailable, not
+        an error' -- so a reply carrying every production field but none of
+        the debug ones must still pass _validate() through the real
+        SCORE_SCHEMA, on the real default provider's validator, not just via
+        _debug_payload()'s own tolerant parsing."""
+        good = {
+            "interest_key": "x",
+            **{name: 0.5 for name in models.DIMENSIONS},
+            "confidence": 0.5, "reason": "r", "why_better_than_generic": "w",
+        }
+        claude_chat._validate(good, scoring.SCORE_SCHEMA)  # must not raise
+
+    def test_default_provider_validate_accepts_missions_missing_deliberation(self):
+        """Same contract on the Council side: a valid missions array with no
+        deliberation object at all must still pass the real _validate()
+        against the real MISSION_SCHEMA -- _extract_deliberation()'s
+        {'unavailable': True, ...} fallback is only reachable if validation
+        doesn't reject the reply first."""
+        good = {"missions": [{"label": "a", "rationale": "b", "prompt": "c"}]}
+        claude_chat._validate(good, council.MISSION_SCHEMA)  # must not raise
+
+    def test_openai_strict_transport_still_requires_every_property(self):
+        """The inverse guarantee: OpenAI's structured-outputs API 400s unless
+        every object in the schema has `required` == all of its properties.
+        The shared schema constants are lenient (see the two tests above),
+        so openai_provider must build its own strict copy for the wire, not
+        rely on the shared constant."""
+        from discovery.providers.openai_provider import _strict_schema
+
+        for schema in (scoring.SCORE_SCHEMA, council.MISSION_SCHEMA):
+            strict = _strict_schema(schema)
+            self._assert_fully_strict(strict)
+
+    def _assert_fully_strict(self, node):
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "object" and "properties" in node:
+            self.assertEqual(set(node["required"]), set(node["properties"]), node)
+            self.assertIs(node.get("additionalProperties"), False, node)
+            for prop in node["properties"].values():
+                self._assert_fully_strict(prop)
+        if "items" in node:
+            self._assert_fully_strict(node["items"])
+
+    def test_openai_strict_conversion_does_not_mutate_the_shared_schema(self):
+        from discovery.providers.openai_provider import _strict_schema
+
+        _strict_schema(scoring.SCORE_SCHEMA)
+        _strict_schema(council.MISSION_SCHEMA)
+        self.assertNotIn("evidence_used", scoring.SCORE_SCHEMA["required"])
+        self.assertNotIn("deliberation", council.MISSION_SCHEMA["required"])
+
 
 class CLITests(unittest.TestCase):
     """Config mistakes surface as clean exit codes, not tracebacks."""
@@ -4032,6 +4113,35 @@ class CLITests(unittest.TestCase):
             line.split("'")[1] for line in out.splitlines() if line.strip().startswith("'t")
         ]
         self.assertEqual(listed_keys, [f"t{i}" for i in range(10)])
+
+    def test_trace_fixture_db_override_works_before_and_after_the_subcommand(self):
+        # Repair-2 regression: `tf.add_argument("--db")` on the trace-fixture
+        # subparser wrote its own default (None) over an already-parsed
+        # global --db, so `--db PATH trace-fixture` silently fell back to
+        # cfg.db_path's real default (REPO_ROOT/discovery.db) instead of
+        # PATH. _main() always puts --db before the subcommand, which is
+        # exactly the form that broke -- exercise both orders directly
+        # against discovery.__main__.main so this can't go blind again.
+        import contextlib
+        import io
+
+        from discovery.__main__ import main
+
+        for argv in (
+            ["--db", self.db_path, "trace-fixture"],
+            ["trace-fixture", "--db", self.db_path],
+        ):
+            with self.subTest(argv=argv):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = main(argv)
+                self.assertEqual(code, 0, err.getvalue())
+                conn = db.connect(self.db_path)
+                self.addCleanup(conn.close)
+                count = conn.execute("SELECT COUNT(*) c FROM trace_runs").fetchone()["c"]
+                self.assertGreater(count, 0, "fixture did not write to the overridden --db path")
+                conn.close()
+                os.remove(self.db_path)
 
     def test_interests_list_is_empty_before_init(self):
         code, out, _err = self._main("interests")

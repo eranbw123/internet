@@ -151,7 +151,18 @@ MISSION_SCHEMA = {
         },
         "deliberation": DELIBERATION_SCHEMA,
     },
-    "required": ["missions", "deliberation"],
+    # Only "missions" is required here -- that's the strict, byte-compatible
+    # CouncilError contract. "deliberation" stays optional at this layer:
+    # claude_chat/chatgpt_browser's hand-rolled _validate() enforces
+    # `required` verbatim (no recursion, no tolerant parsing) as the only
+    # schema check they have, so requiring "deliberation" here would turn a
+    # missing/malformed deliberation into a failed generation on the default
+    # provider, instead of the lenient {'unavailable': True, ...} marker
+    # _extract_deliberation() already produces. OpenAI strict structured
+    # outputs need every property required; that's a transport-specific
+    # constraint enforced by openai_provider._strict_schema() on a copy of
+    # this schema, not here.
+    "required": ["missions"],
     "additionalProperties": False,
 }
 

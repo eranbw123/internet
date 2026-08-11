@@ -115,6 +115,46 @@ substring-rewrite unrelated stored text. `missions._generate_for()`'s
 frontier/feedback/history content (already plain dicts), not just their
 counts. 432 tests, all green.
 
+Repair (review pass 3): review pass 2's `required` fix above was applied at
+the wrong layer -- it mutated the SHARED `SCORE_SCHEMA`/`MISSION_SCHEMA`
+constants, which are also the ONLY schema enforcement `claude_chat`/
+`chatgpt_browser` have (`_validate()`, hand-rolled, checks `required`
+verbatim with no tolerance, unlike OpenAI's server-side strict mode). That
+made every omitted debug/deliberation field a hard `ProviderError` on the
+two DEFAULT providers: a lone missing debug field cost a wasted retry
+attempt, and a Council reply with valid missions but no deliberation failed
+the whole generation -- exactly the "never fatal" contract this step
+requires, broken on the default path. Fixed at the correct layer instead:
+`SCORE_SCHEMA['required']`/`MISSION_SCHEMA['required']` reverted to
+production-only fields (`interest_key`+`DIMENSIONS`+`confidence`+`reason`+
+`why_better_than_generic`, and `['missions']`); everything else review pass
+2 added (`DIMENSION_RATIONALE_SCHEMA`, nested `properties`/`required`/
+`additionalProperties: false` throughout `DELIBERATION_SCHEMA`) is kept, since
+`_validate()` never recurses so those nested shapes only ever bind under
+OpenAI strict. `openai_provider._strict_schema()` (new) deep-copies a schema
+and forces `required = properties` + `additionalProperties: False` on every
+object node, recursing through `properties`/`items`; `complete_json` now
+sends `_strict_schema(schema)`, not the raw shared constant, so OpenAI still
+gets full-strict compliance without touching claude_chat/chatgpt_browser's
+contract. Second bug, same repair-2 commit: `trace-fixture`'s subparser
+`--db` had `argparse`'s own default (`None`) written over an already-parsed
+global `--db` whenever `--db` preceded the subcommand (the documented/
+tested form) -- `tf.add_argument("--db", default=argparse.SUPPRESS, ...)`
+fixes it; SUPPRESS means "don't touch the namespace unless the flag is
+actually given on THIS parser", so both orders work. Both bugs were
+introduced by repair 2 and both were invisible to the existing suite:
+`FakeProvider`/`FakeCouncilProvider` return dicts directly and never call
+`_validate()`, and `CLITests` never exercised `trace-fixture`. Closed both
+blind spots: `SchemaContractTests` gained real-`_validate()`/real-schema
+round-trips (production-only reply accepted, `_strict_schema` output
+verified fully-strict, shared constants proven unmutated);
+`ClaudeChatProviderTests` gained two tests driving the real
+`ClaudeChatProvider.complete_json` through `SCORE_SCHEMA`/`MISSION_SCHEMA`
+with debug/deliberation omitted, asserting one attempt (no retry); `CLITests`
+gained a real `discovery.__main__.main()` invocation for both `--db` orders,
+asserting the fixture actually landed in the overridden path (not the
+default `REPO_ROOT/discovery.db`). 439 tests, all green.
+
 ## chatgpt_browser provider reconciliation (step-12 task 1)
 Ported verbatim from owner `main` (which predates steps 06-10, so was reconciled
 by hand, file by file, not merged): `discovery/providers/chatgpt_browser.py`

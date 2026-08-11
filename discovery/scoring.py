@@ -106,14 +106,15 @@ SCORE_SCHEMA = {
         "why_not_higher": {"type": "string"},
         "uncertainties": {"type": "string"},
     },
-    # Every property must be required for OpenAI strict structured outputs
-    # (a schema-level constraint, not a production one) -- the six debug
-    # fields stay tolerantly parsed by _debug_payload() below, so a model
-    # that omits or malforms one still produces a valid ScoreResult.
-    "required": [
-        "interest_key", *DIMENSIONS, "confidence", "reason", "why_better_than_generic",
-        *DEBUG_FIELDS,
-    ],
+    # Only the production fields are required here. OpenAI strict structured
+    # outputs need every property required, but that's a transport-specific
+    # constraint enforced by openai_provider._strict_schema() on a copy of
+    # this schema -- NOT here. claude_chat/chatgpt_browser's hand-rolled
+    # _validate() enforces this list verbatim as the only schema check they
+    # have, so putting the six debug fields in `required` here would turn
+    # every one of them from "tolerantly parsed, absent => unavailable" into
+    # a hard ProviderError on the default provider.
+    "required": ["interest_key", *DIMENSIONS, "confidence", "reason", "why_better_than_generic"],
     "additionalProperties": False,
 }
 

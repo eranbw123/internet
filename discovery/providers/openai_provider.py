@@ -13,6 +13,30 @@ def _now_iso():
     return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 
+def _strict_schema(schema):
+    """Deep copy of `schema` with every object node forced into OpenAI's
+    strict structured-output shape: `required` = every key in `properties`,
+    `additionalProperties: False`. Recurses through `properties` and `items`.
+
+    This is a transport-specific constraint, not a production one -- the
+    shared schema constants in scoring.py/council.py stay lenient (only
+    production-critical fields required) so claude_chat/chatgpt_browser's
+    hand-rolled _validate(), which enforces `required` verbatim, doesn't
+    turn an optional debug/deliberation field into a hard provider error.
+    Only OpenAI's strict transport needs everything required, so it makes
+    its own copy here instead of mutating the shared constant."""
+    if not isinstance(schema, dict):
+        return schema
+    out = dict(schema)
+    if out.get("type") == "object" and "properties" in out:
+        out["properties"] = {k: _strict_schema(v) for k, v in out["properties"].items()}
+        out["required"] = list(out["properties"])
+        out["additionalProperties"] = False
+    if "items" in out:
+        out["items"] = _strict_schema(out["items"])
+    return out
+
+
 class OpenAIProvider(LLMProvider):
     name = "openai"
 
@@ -42,7 +66,9 @@ class OpenAIProvider(LLMProvider):
                 ],
                 response_format={
                     "type": "json_schema",
-                    "json_schema": {"name": "result", "schema": schema, "strict": True},
+                    "json_schema": {
+                        "name": "result", "schema": _strict_schema(schema), "strict": True,
+                    },
                 },
             )
         except Exception as e:  # noqa: BLE001

@@ -136,7 +136,13 @@ def main(argv=None):
         "trace-fixture",
         help="build the deterministic trace acceptance fixture (offline, fake providers)",
     )
-    tf.add_argument("--db", help="override DISCOVERY_DB")
+    # default=SUPPRESS: a subparser argument's own default is written into
+    # the namespace even when the flag isn't given on the command line,
+    # which would silently blow away a --db already parsed before the
+    # subcommand (e.g. `python -m app --db PATH trace-fixture`). SUPPRESS
+    # means "leave the namespace alone unless this flag is actually passed",
+    # so both `--db PATH trace-fixture` and `trace-fixture --db PATH` work.
+    tf.add_argument("--db", default=argparse.SUPPRESS, help="override DISCOVERY_DB")
 
     args = parser.parse_args(argv)
     cfg = config.load()
