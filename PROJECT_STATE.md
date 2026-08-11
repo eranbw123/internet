@@ -179,6 +179,406 @@ edges were silently skipped (`Tracer.edge()` no-ops on a `None` endpoint)
 and every run-once candidate's subtree was reachable only via `run_id`, not
 via any edge. 8 new tests (445 total), all green.
 
+## observatory server (step-13 task 2)
+In-repo Datasette plugin over the task-1 trace tables. New top-level package
+`observatory/` (sibling to `discovery/`), split so datasette stays confined:
+`observatory/db.py` is the query layer, pure stdlib (sqlite3/json/difflib),
+no datasette import; `observatory/plugin.py`/`app.py` are the only other
+places datasette is imported, plus `discovery/__main__.py`'s new `ui`
+command handler (lazy import, same pattern `trace-fixture` already used for
+`trace_fixture`). `datasette` is the one sanctioned new dependency this step
+adds (`requirements.txt`, commented like every other optional dep) --
+`discovery/` and `test_discovery.py` stay importable/green without it,
+proven by a `CLITests` test that runs a fresh subprocess with
+`sys.modules['datasette'] = None` (the standard "make any import of it raise
+ImportError" trick) and imports every discovery/ module that touches this
+step's code -- a fresh interpreter so it can't pass off an already-cached
+import in the test process itself; a companion test proves the trick
+actually blocks by importing `observatory.app` under the same guard and
+asserting it fails (repair 1: this pair of tests didn't exist -- the claim
+was unverified when first written).
+
+`observatory/db.py` opens its own independent `file:...?mode=ro` connection
+per request (on top of Datasette's own -- `Datasette(files=[cfg.db_path])`,
+no `immutables=`, which is what makes ITS OWN read connections `mode=ro`
+too, while still tailing a live-changing `discovery.db`). Registered once
+via `datasette.plugins.pm.register()` (no setuptools entry point -- nothing
+on disk for Datasette to auto-discover); hookimpls are stateless, reading
+`datasette._observatory_db_path`/`_public`/`_token` off the passed-in
+`datasette` argument, so one registration serves every `Datasette(...)`
+instance a test or the CLI constructs.
+
+Routes (`register_routes()`): `/observatory/` (placeholder shell --
+`observatory/static/index.html`, real bundle lands in task 3, marker
+`<!--OBSERVATORY_BOOTSTRAP-->` swapped for a `<script id="observatory-bootstrap">`
+JSON blob), `/observatory/static/<path>` , and JSON APIs -- `api/list`
+(tabs `discoveries|interests|generations|missions|failed`; `discoveries` is
+a single query joining `candidate_items`/`scores`/`interests`/
+`notifications`/`feedback`(latest)/mission+generation ids via
+`json_extract(metadata,...)`/the item's `candidate` trace node; `failed` is
+a `UNION ALL` of six trace-rooted kinds -- `scoring_error`, `mission_failed`,
+`generation_failed`, `duplicate`, `prefilter_rejected`, `below_threshold`;
+every filter in the plan is a real SQL `WHERE` clause, not a post-filter;
+`search` spans title/url/text/reason AND an `EXISTS` subquery over
+`model_calls` linked via the item's own score-attempt node or its mission's
+mission-execution node -- proven by a test searching text that only exists
+inside a mission's `search_json` framing, never in any item field),
+`api/graph`, `api/children`, `api/node/<id>`, `api/interest/<key>`,
+`api/compare`, `trace/score/<score_id>`.
+
+`api/graph`'s key design point: **the connected component, not one run's
+nodes**. `trace_edges` legitimately cross `trace_runs` (a web-tick's
+`threshold` node `rendered`-edges to a later `digest` run's `render` node,
+which `feedback_on`-edges to a still-later `feedback`-listener run's
+`feedback` node) -- a naive `WHERE run_id = ?` would truncate "the graph for
+this discovery" before reaching its own sent+feedback branch. Implemented
+as a `WITH RECURSIVE` SQL walk over `trace_edges` in both directions from
+the resolved seed node(s) (capped at `MAX_COMPONENT_NODES`=5000, defensive
+only). Collapsing (`COLLAPSE_THRESHOLD`=3): sibling edges are grouped by
+`(from_node_id, relationship, child_node_type)` -- child_node_type matters
+because e.g. a generation node's `generated` children are one
+`council-context` node plus 3 different `mission` nodes; grouping by
+`(parent, relationship)` alone (the first cut, caught by a test) silently
+folded the 3 real mission branches into one misleading group alongside an
+unrelated context node. Only genuinely-homogeneous large sibling sets
+collapse in the task-1 fixture (5 advisors, 5 peer-reviewers); the 3 mission
+nodes and every named branch (duplicate, prefilter rejection, retried
+scoring, below-threshold, sent+feedback) stay individually visible in one
+`api/graph` call.
+
+`api/node/<id>` returns every `model_calls` row for that node byte-exact
+(prompt round-tripped identical to the raw stored column, proven against a
+direct sqlite3 read, not just the API's own claim) plus raw+parsed
+responses, the run's redacted config, and `/discovery/<table>/<pk>` row URLs
+(`discovery` = `Path(cfg.db_path).stem`, matching Datasette's own db-naming
+so the links resolve to the same instance) for every linked entity.
+`api/compare` (`kind=run` default, or `kind=model_call`): run diff keys
+nodes by `(node_type, label)` and edges by `(from_key, to_key, relationship,
+ordinal)`, `added`/`removed`/`changed` (status or `output_json` differs);
+model_call diff is a `difflib.unified_diff` over `exact_user_prompt`/
+`raw_response_text`. Tested against two hand-built runs via the real
+`Tracer` API (not two `trace_fixture.build()` calls -- the fixture's own
+Council fake asserts it's called exactly once per build, so it isn't
+reentrant against one `conn`).
+
+Read-only, twice over: Datasette's default (non-`immutables`) `files=`
+config already opens its own query-serving connections `mode=ro`
+(`datasette.database.Database.connect()`); `observatory/db.py` also opens
+its own `mode=ro` connection independently. No write route is registered.
+Proven by a test hitting every route (including a native `/discovery?sql=
+DELETE...` -- datasette 0.65's real SQL-query surface; `/discovery/-/query`
+is not a route in this version and its own 400 proves nothing about SQL
+parsing) and asserting every table's row count is byte-identical before/
+after, plus a POST to an API route returning 405.
+
+Redaction, twice: every `observatory/db.py` query result is passed through
+`discovery.trace.redact_json` before being returned -- independent of task
+1's at-write redaction. Proven by planting a secret directly into raw
+`trace_nodes`/`model_calls` bytes via a second, un-redacted sqlite3
+connection (bypassing write-time redaction entirely, so this can't pass by
+accident) and asserting it's absent from the API response.
+
+Auth (`cfg.ui_token` / `DISCOVERY_UI_TOKEN`, `cfg.ngrok_cmd` /
+`DISCOVERY_NGROK_CMD`, both new `Config` fields): `ui`'s default is open
+(localhost-bound is the boundary); `--public` requires both to be non-empty
+or refuses to start (checked before `observatory`/`datasette` is even
+imported). In public mode, `actor_from_request`/`permission_allowed`
+hookimpls (`observatory/plugin.py`) form one shared gate -- an actor only
+resolves from a correct `Authorization: Bearer <token>` (or `?token=`), and
+only a resolved actor gets `permission_allowed=True` -- gating our own
+routes (checked explicitly via `_guard()`, since custom routes aren't
+auto-gated) AND every native Datasette table/row/SQL page (gated for free,
+since core calls `permission_allowed` before serving any of them; verified
+by hitting a native table page anonymously and with the token). ngrok is
+launched via `subprocess.Popen(["cmd", "/d", "/c", ...])` (same convention
+as `DISCOVERY_CHROME_LAUNCH_CMD`) -- **live tunnel verification is deferred
+to an operator session**, this worktree has no ngrok binary/network; the
+auth boundary itself is what the offline tests prove.
+
+Telegram (`discovery/notify.py`): `feedback_keyboard(score_id,
+observatory_base_url="")` appends one `🔬 Open full trace` URL button as a
+third row when `cfg.observatory_base_url` is set (`pipeline._send_one` and
+`teach.run_send`, its only two callers, now pass `cfg.observatory_base_url`)
+-- the four existing feedback buttons + `callback_data` are untouched
+either way; empty (the default) is byte-identical to before this button
+existed, and every pre-existing `feedback_listener`/`pipeline` test still
+passes unmodified.
+
+`python -m app ui [--host] [--port] [--public]` (`discovery/__main__.py`):
+builds `observatory.app.build_datasette(cfg, public=...)` and serves it via
+`uvicorn.run(ds.app(), ...)` (same call shape `datasette serve` itself
+uses). New `test_observatory.py` (47 tests, offline via
+`Datasette(...).client` -- httpx over `ASGITransport`, no socket) --
+skips itself with a loud stderr message (not a failure) if datasette isn't
+installed; documented next to the other two canonical suites in README's
+Tests section. 2 new CLI tests in `test_discovery.py` cover the `--public`
+guard clauses (no import of datasette needed, since the guard fires first)
+and 4 new `notify.feedback_keyboard` tests cover the button. 450 + 10 + 47
+tests, all green.
+
+Repair (review pass 1): `interest_detail()`'s `failures` query correlated
+on `trace_nodes.entity_id` alone, with no `entity_type` constraint -- since
+entity_id is only unique WITHIN one entity_type, a `scores.id` and a
+`search_missions.id` routinely collide numerically (verified live: the
+fixture's two `below_threshold` failures were only being pulled in because
+`scores.id` 1/2 happen to equal `search_missions.id` 1/2, not because they
+were actually linked). Fixed by pairing each IN-list with its matching
+`entity_type` (`search_missions`/`search_generations`/`scores` via
+`interest_id`, `candidate_items` via `item_interests`), and dropping the
+dead `entity_type = 'interests'` clause (no `_FAILED_UNION` branch ever
+produces one). `duplicate`/`prefilter_rejected` nodes carry no entity link
+at all in today's schema, so they stay structurally unreachable from
+`api/interest/<key>`'s failures list -- an honest gap, not something this
+repair invents new trace-writing behavior to close.
+`_discoveries_query`'s `failure_stage=prefilter` filter checked only "this
+item has ANY `trace_nodes` row", which is trivially true for every
+non-duplicate item (its own `candidate` node) regardless of outcome; now
+requires the actual `candidate -[rejected]-> prefilter(label='filtered')`
+edge pipeline.py writes, matching `_FAILED_UNION`'s own definition.
+`observatory/plugin.py`'s JSON endpoints returned a Datasette HTML 500 for
+malformed params (`limit=abc`, `run_id=notanint`, `children?group=1:matched`,
+`compare?a=x&b=y`) instead of a 400; `compare?kind=<anything but
+model_call>` also silently fell through to a `run` diff (`kind=generation`
+would diff two RUN ids that happen to equal the given generation ids and
+return a wrong-but-plausible response) -- both fixed: every risky
+conversion is now caught and returned as 400, and `odb.compare()` gained an
+explicit `COMPARE_KINDS` whitelist. Finally, PROJECT_STATE.md itself had
+claimed the datasette-isolation guarantee was "proven by a test that
+monkeypatches `builtins.__import__`" when no such test existed (verified:
+`grep '__import__'` over both test files returned nothing) -- landed two
+real `CLITests` tests instead (subprocess + `sys.modules['datasette'] =
+None`, the standard import-blocking trick, so a fresh interpreter proves
+the isolation rather than relying on this test process's own already-cached
+imports), and corrected the wording above to describe them. 452 + 10 + 54
+tests, all green.
+
+Repair (review pass 2): `observatory/db.py`'s `list_rows()` clamped `limit`
+only on the high end (`min(limit, MAX_LIMIT)`) -- SQLite treats a negative
+LIMIT as "no upper bound", so `limit=-1` returned the entire result set
+against the plugin's most expensive query (the discoveries join) and
+defeated the objective's mandatory pagination; now clamped on both ends
+(`max(min(limit, MAX_LIMIT), 1)`). `children()` had no LIMIT at all -- the
+lazy-load escape hatch collapsing exists for was itself unbounded; capped
+at a new `MAX_CHILDREN` (500). `_compare_model_calls()` treated a
+nonexistent id as an empty string, rendering a wrong-but-plausible
+"everything was removed" diff for a typo'd id instead of a 404 -- now
+raises `LookupError`, caught by `plugin.compare_view` and returned as 404
+(same class of bug the `COMPARE_KINDS` whitelist above was added to
+prevent). `_compare_runs()` keyed nodes by `(node_type, label)` only, so
+same-labelled siblings (edges already disambiguate via `ordinal`, nodes
+didn't) silently collapsed into one dict entry and vanished from
+added/removed/changed; nodes are now keyed by `(node_type, label,
+inbound_relationship, inbound_ordinal)` via a new `_node_key_map()`, using
+each node's own inbound edge the same way `graph()`'s sibling-collapse
+already does. `_ui_cmd`'s `uvicorn.run()` ran with its default
+`access_log=True`; in `--public` mode the token can only be carried as
+`?token=` (a plain URL button can't set a header), and uvicorn's access log
+records the full path+query, which would have persisted the token to disk
+on every request -- violates "never persist ... tokens anywhere". Now
+`access_log=not args.public` (private mode keeps logging; nothing sensitive
+to leak there). Documented, not code-fixed (matches this same repair's own
+"deferred to an operator session" posture for ngrok): the Telegram deep-link
+button and `--public` don't compose on their own -- the emitted URL carries
+no token and there's no login route, so tapping it against a public
+(ngrok) base URL 403s; README's Observatory section now states this
+limitation explicitly instead of presenting the button as unconditionally
+working. 452 + 10 + 57 tests, all green.
+
+Repair (review pass 3): `graph()`'s sibling collapse disconnected the
+component whenever a collapsed sibling had its own descendants -- proven
+live via the real Tracer API (a mission-execution with 6 'raw-result'
+siblings, each with its own normalized_to/scored/cleared_threshold chain,
+matching what `missions._execute_mission` actually writes per raw result):
+the 6 candidates/score-attempts/thresholds under the collapsed raw-results
+came back as floating nodes with no inbound edge, and a focus id inside the
+collapsed set was missing from `nodes` entirely -- `trace_fixture.build()`'s
+own sibling sets (5 advisors, 5 peer-reviewers) have zero descendants, so no
+existing test could catch this. Fixed in `graph()`: emphasized_path is now
+computed BEFORE collapsing; a sibling set is only eligible to collapse if
+its full subtree (walked forward through `trace_edges`, not just its direct
+children) contains no emphasized-path/focus id -- the selected entity's own
+branch never collapses out from under it. Sets that DO collapse hide their
+entire subtree (not just the direct children) and the group becomes a real
+pseudo-node appended to `nodes` (`node_type='group'`, `swimlane` derived
+from the child node_type, carrying `child_count`) instead of a
+disconnected, node-list-only entry. `out_edges` now maps both endpoints
+through a hidden-node -> owning-group lookup before emitting, which
+simultaneously produces the parent->group edge and rewires any edge that
+crosses a collapsed boundary (e.g. a hidden threshold's own outbound edge
+into a later run); the dedup key drops `ordinal` once several sibling
+edges collapse onto the same group (it stops meaning anything once their
+target is one shared pseudo-node). `/api/children?group=<id>` is
+unchanged -- it already returns exactly the group's direct children.
+`test_observatory.py` gained `ObservatoryGraphCollapseConnectivityTests`
+(new, real-Tracer-built fixture with a 6-wide collapsible branch that has
+descendants): focus inside the branch keeps it fully expanded with no
+group; unfocused, the branch collapses into one reachable group node,
+asserting every node has an inbound edge (except the genuine root) and
+every emphasized-path id is present in `nodes`. 452 + 10 + 59 tests, all
+green.
+
+Repair (review pass 4): `graph()`'s collapse still leaked when a collapsed
+sibling set's own subtree contained ANOTHER collapsible sibling set (e.g. 6
+`raw-result` siblings, each with 5 `match` siblings underneath -- exactly
+what `mission_max_results` scales) -- the inner set got its own separate
+group pseudo-node hanging off the outer one instead of staying hidden
+inside the outer group's subtree, and which group "won" a shared node id
+depended on dict-iteration order, not enforced. Fixed: sibling-set
+eligibility is now decided in two passes -- collect every candidate set with
+its own independently-computed subtree first, then drop any candidate whose
+PARENT node lies inside another candidate's subtree (order-independent,
+correct at any nesting depth) before hiding/emitting groups.
+`ObservatoryReadOnlyTests`' native-SQL-write proof hit `/{db}/-/query`,
+which is not a route in the pinned datasette 0.65.x (it 400s by falling
+through to a row lookup for a table named "-", never parsing the SQL) --
+the guarantee itself holds (verified: `/{db}?sql=DELETE...`, the real 0.65
+SQL surface, correctly 400s with "Statement must be a SELECT"), but the
+test and this doc's/README's claim about it were not proving it; both now
+point at the real route. `permission_allowed` now denies datasette's write
+actions (`insert-row`/`update-row`/`delete-row`/`create-table`/
+`drop-table`/`alter-table`) unconditionally in both modes -- inert against
+0.65 (no write routes exist), hardening against an unpinned future
+datasette version registering one. `_like()` now escapes `%`/`_`/`\` (with
+matching `ESCAPE '\'` on every LIKE clause) so a literal underscore/percent
+in a search term is matched literally instead of as a SQL wildcard --
+previously `search=_` matched nearly every row. 452 + 10 + 60 tests, all
+green.
+
+Repair (review pass 5): `trace._cfg_snapshot()`'s value-substitution
+redaction (`redact_json`) missed two real leaks into `trace_runs.config_json`
+(and from there, `api/node/<id>`'s `config` field and Datasette's native
+`/<db>/trace_runs.json`): a `DISCOVERY_UI_TOKEN` under `redact()`'s 8-char
+floor was stored verbatim (the ONLY access credential in `--public` mode),
+and `DISCOVERY_NGROK_CMD` -- a free-form shell command that commonly embeds
+`--authtoken <value>` -- doesn't match the secret-name regex on its own
+field name, so an inline ngrok authtoken survived byte-exact regardless of
+length. `_cfg_snapshot()` now also masks `ui_token`/`ngrok_cmd` (plus any
+future field whose NAME matches the secret regex) wholesale, by field name,
+independent of value shape/length -- `redact()`/`redact_json` are otherwise
+unchanged (still the only mechanism for secrets embedded inside prompts/
+responses, which have no field name to key off of).
+`_discoveries_query`'s `cand` LEFT JOIN onto `trace_nodes(node_type=
+'candidate')` was unconstrained to one row -- a force re-ingest
+(`ingest(..., force=True)`, reachable from `__main__.py`) writes a second
+candidate node for an already-stored item, which fanned the SQL join and
+inflated both the item's row count and `total` (the pagination driver).
+Replaced with two scalar subqueries (`ORDER BY tn.id DESC LIMIT 1`, latest
+node wins) and rewrote the `trace_complete` filter's `cand.id IS [NOT] NULL`
+clauses as `[NOT] EXISTS` now that the join alias is gone.
+`notify.feedback_keyboard()` embedded `cfg.observatory_base_url` into a
+Telegram inline URL button with no scheme check -- Telegram rejects the
+WHOLE `sendMessage` (`BUTTON_URL_INVALID`) for a malformed URL button, so a
+schemeless base URL (e.g. `DISCOVERY_OBSERVATORY_BASE_URL=localhost:8001`)
+would have silently killed every digest/alert, not just the trace button.
+Now the button is only appended when the base URL starts with `http://` or
+`https://`; otherwise the keyboard is byte-identical to unset. Documented,
+not code-changed: `api/compare?kind=generation` (named in the step
+objective alongside `run`/`model_call`) is a real unimplemented gap, not
+just an unrecognized-`kind` typo guard -- README's Observatory section now
+says so explicitly, same posture as the ngrok/Telegram-button limitations
+already documented there; a generation doesn't correlate 1:1 with a
+`trace_runs` row, so it can't just alias the `run` diff, and rejecting with
+400 stays correct behavior until a real diff is built. 458 + 10 + 62 tests
+(6 new in test_discovery.py: 5 config-snapshot masking, 1 schemeless-URL
+keyboard; 1 new in test_observatory.py: duplicate-candidate-node
+pagination), all green.
+
+Repair (review pass 6): `graph()`'s collapse still leaked through
+CROSS-LINK relationships (`duplicate_of`, structurally also `retried_as`/
+`feedback_on`) -- `_subtree()` walked every forward `trace_edges` link as
+containment, but a `duplicate_of` edge points AT an already-stored,
+differently-parented candidate (its own inbound edge is from its real
+source, not the duplicate), not a node this sibling set owns. Reproduced
+live via the real Tracer API (a >COLLAPSE_THRESHOLD raw-result set where
+one sibling is a `duplicate` node `duplicate_of`-pointing at an earlier,
+fully-delivered candidate with its own threshold/render/notification
+chain): the earlier candidate's whole chain vanished from the response
+when the unrelated raw-result set collapsed, and with two independent
+collapsing sets both pointing at the same shared duplicate target,
+whichever set's dict-iteration ran last "won" the shared node and hid it
+out from under the other -- exactly the order-dependence review pass 3
+claimed to have eliminated (it hadn't covered cross-links, only nesting).
+Fixed with a new `_owned_subtree(child_ids, parent_id)`: a node is only
+absorbed into a sibling set's hidden subtree if EVERY inbound edge into it
+comes from `parent_id` or another node already owned by that same set
+(fixed-point over `_subtree()`'s forward reachability, which stays an
+upper bound only) -- a cross-linked foreign node keeps its inbound edge
+from its real parent, which lies outside the set, so it can never become
+owned. This same `_owned_subtree()` result now also gates the
+emphasized-path protection check (previously `subtree & protected` used
+the raw, cross-link-inflated reachable set, so a set could wrongly refuse
+to collapse just because an unrelated cross-linked node happened to sit on
+the focus path). `_FAILED_UNION`'s `mission_failed` branch LEFT JOINed
+`trace_nodes(node_type='mission-execution')` with no one-row constraint,
+but `missions._execute_mission` writes one such node PER ATTEMPT and a
+mission only reaches `status='FAILED'` after `mission_max_attempts`
+(default 3) tries -- same class of fanout review pass 5 (this file, "step-13
+task 2" section) already fixed for the discoveries tab's candidate node,
+left unfixed here; now a scalar `ORDER BY id DESC LIMIT 1` subquery, latest
+attempt wins, matching that same fix's pattern. Two doc-only fixes:
+README's Tests section had stale counts (445/61 vs the actual 458/62 this
+worktree runs, disagreeing with this file's own numbers); and CI
+(`.github/workflows/tests.yml`) never installed `datasette` or ran
+`test_observatory.py`, so the entire observatory/ surface had zero CI
+protection -- `test_observatory.py` skips itself quietly enough (loud
+stderr, not a failure) that a missing dependency wouldn't have failed the
+build either. CI now installs `datasette>=0.65` and runs all three suites.
+458 + 10 + 65 tests (3 new in test_observatory.py: cross-linked-branch
+survives an unrelated collapse, shared duplicate target stays visible
+under both of two independent collapsing sets, FAILED mission appears once
+not once per attempt), all green.
+
+Repair (integration convergence): `automation/integration`'s only advance
+past this task's merge-base is one docs commit touching five README.md
+spots (CLI table row wording, `trace_runs` kind list, redaction paragraph,
+fixture paragraph, test count). Four of the five were already
+byte-identical to integration's content (prior repairs 5/6 landed that);
+the other two were textually identical PLUS an adjacent line this task
+inserts right next to them (the new `ui` command row after `trace-fixture`,
+and the `## Observatory` section right after the fixture paragraph) --
+harmless in practice, but not provably conflict-free to a naive 3-way
+merge. Repositioned both, no content change: the `ui` row now sits after
+`stats` (mid-table, untouched by integration on either side) instead of
+right after `trace-fixture`; `## Observatory` now sits after `## Running it
+as an appliance` instead of right after the trace-fixture paragraph --
+both new locations have an untouched line immediately before and after,
+so the insertion hunk can't fuse with integration's edit hunk. Verified via
+a Python difflib 3-way check (base vs this branch vs integration) rather
+than `git merge`/`merge-file`/`merge-tree` (all blocked in this sandbox by
+a policy guard on the literal string "merge"): 4 of 5 shared hunks are now
+byte-identical (auto-resolves, no conflict under any 3-way algorithm); the
+5th (`445 tests` vs `458 tests` on one line) is a genuine, irreducible
+single-line collision -- both branches legitimately touch this exact
+running-total line for unrelated reasons (integration for task-1's own
+repair count, this task for test_discovery.py's task-2 additions). No
+other file differs from integration beyond this task's own additions
+(verified via `git diff <merge-base> automation/integration --stat`), so
+this was the only remaining merge surface.
+
+Repair (integration convergence, pass 2): the prior repair's resolution of
+that one collision (keeping this branch's `458`) was still a same-line,
+different-content edit against integration's `445` -- a real 3-way merge
+tool flags that as a conflict regardless of which value is "more correct";
+picking a value doesn't make the line byte-identical. Fixed by making the
+line itself byte-identical to integration's `445` (verified: `git diff
+automation/integration -- README.md` now shows zero removed/changed lines
+against integration's content, only pure insertions), and moving the
+accurate current count into the next paragraph -- a region integration
+never touches, since it's new text this task adds after the trace-fixture
+paragraph. That paragraph now states plainly that `test_discovery.py`
+actually runs 458 in this branch, `445` is integration's own count as of
+its last docs-sync commit, and a follow-up docs-sync (the same pattern
+integration's own `1ec8220` commit already used to fix prior drift) is
+expected to reconcile the number once this branch lands. Every other file
+was already a pure superset of integration's content with no shared-region
+edits at all (`PROJECT_STATE.md`, `.github/workflows/tests.yml`,
+`discovery/__main__.py`/`config.py`/`notify.py`/`pipeline.py`/`teach.py`/
+`trace.py`, `observatory/*`, `requirements.txt`, `test_discovery.py`,
+`test_observatory.py`) -- confirmed via a difflib base/head/integration
+hunk-overlap check across the whole diff, not just README.md. 458 + 10 + 65
+tests, all green; no code changed, README.md is the only file touched by
+this pass.
+
 ## chatgpt_browser provider reconciliation (step-12 task 1)
 Ported verbatim from owner `main` (which predates steps 06-10, so was reconciled
 by hand, file by file, not merged): `discovery/providers/chatgpt_browser.py`

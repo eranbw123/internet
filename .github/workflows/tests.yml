@@ -15,7 +15,11 @@ jobs:
         with:
           python-version: "3.14"
 
+      - name: Install datasette (observatory's one sanctioned dependency)
+        run: pip install "datasette>=0.65"
+
       - name: Run offline test suites
         run: |
           python test_discovery.py
           python test_watch.py
+          python test_observatory.py

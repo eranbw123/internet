@@ -192,9 +192,8 @@ def run_send(conn, cfg, limit=5, interest=None, dry_run=False):
             interest_obj, item_obj, row["final_score"], row["reason"],
             row["why_better_than_generic"], row["confidence"],
         )
-        ok = notify.send(
-            cfg, text, reply_markup=notify.feedback_keyboard(row["score_id"]), dry_run=dry_run
-        )
+        keyboard = notify.feedback_keyboard(row["score_id"], cfg.observatory_base_url)
+        ok = notify.send(cfg, text, reply_markup=keyboard, dry_run=dry_run)
         sent += 1 if ok else 0
     print_safe(f"sent {sent} teaching prompt(s)")
     return sent

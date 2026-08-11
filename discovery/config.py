@@ -93,6 +93,14 @@ class Config:
     # a config change to find where their own read-only views live.
     trace_enabled: bool = True
     observatory_base_url: str = ""
+    # Observatory server (discovery/../observatory/, step-13 task 2). Empty
+    # ui_token is fine for `ui`'s default localhost-bound mode; `ui --public`
+    # refuses to start without one (see __main__.py's `_ui_cmd`) -- there is
+    # no default token, on purpose, so public exposure always requires an
+    # explicit operator choice. ngrok_cmd is likewise empty by default (never
+    # spawns anything) and only read by `ui --public`.
+    ui_token: str = ""
+    ngrok_cmd: str = ""
 
 
 def load():
@@ -162,4 +170,6 @@ def load():
         ),
         trace_enabled=os.environ.get("DISCOVERY_TRACE", "1").strip().lower() in ("1", "true"),
         observatory_base_url=os.environ.get("DISCOVERY_OBSERVATORY_BASE_URL", ""),
+        ui_token=os.environ.get("DISCOVERY_UI_TOKEN", ""),
+        ngrok_cmd=os.environ.get("DISCOVERY_NGROK_CMD", ""),
     )

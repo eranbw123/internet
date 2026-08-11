@@ -491,7 +491,8 @@ def _send_one(conn, cfg, row, item, interest, dry_run, lane_counts=None, tracer=
         threshold_node = tracer.find_entity_node("scores", row["score_id"], node_type="threshold")
         tracer.edge(threshold_node, render_node, "rendered")
 
-    ok = notify.send(cfg, text, reply_markup=notify.feedback_keyboard(row["score_id"]), dry_run=dry_run)
+    keyboard = notify.feedback_keyboard(row["score_id"], cfg.observatory_base_url)
+    ok = notify.send(cfg, text, reply_markup=keyboard, dry_run=dry_run)
     # Recorded either way: a failed send stays recorded as not-ok rather
     # than being retried forever on every cycle.
     notification_id = db.record_notification(conn, row["score_id"], "telegram", ok)

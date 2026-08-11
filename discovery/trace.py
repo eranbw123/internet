@@ -324,13 +324,29 @@ class Tracer:
             return None
 
 
+# Config fields masked by NAME, not by value, before a snapshot is stored.
+# redact()/redact_json() (see above) only ever substitute a genuine env-var
+# VALUE that is >=_MIN_SECRET_LEN chars long -- that misses two real cases:
+# a short DISCOVERY_UI_TOKEN (the *only* access credential in `ui --public`)
+# falls under the length floor and would be stored verbatim, and
+# DISCOVERY_NGROK_CMD is a free-form shell command whose field name doesn't
+# match _SECRET_NAME_RE even though it commonly embeds an inline secret
+# (e.g. `ngrok http {port} --authtoken ...`). Both are stripped from every
+# config snapshot outright, independent of their value's shape or length.
+_SECRET_FIELD_NAMES = frozenset({"ngrok_cmd"})
+
+
 def _cfg_snapshot(cfg):
     if cfg is None:
         return None
     try:
-        return dataclasses.asdict(cfg)
+        snapshot = dataclasses.asdict(cfg)
     except TypeError:
         return None
+    for field, value in snapshot.items():
+        if value and (_SECRET_NAME_RE.search(field) or field in _SECRET_FIELD_NAMES):
+            snapshot[field] = f"[REDACTED:FIELD:{field}]"
+    return snapshot
 
 
 class _DisabledCfg:

@@ -2607,6 +2607,40 @@ class NotifyTests(unittest.TestCase):
         self.assertEqual(codes, set(notify.FEEDBACK_VERDICTS))
         self.assertTrue(all(b["callback_data"].endswith(":42") for b in buttons))
 
+    def test_feedback_keyboard_with_no_observatory_url_is_byte_identical_to_before(self):
+        # Default (empty observatory_base_url): same as calling with just a
+        # score id -- no fifth button, no third row, byte-identical keyboard.
+        self.assertEqual(notify.feedback_keyboard(42), notify.feedback_keyboard(42, ""))
+        markup = notify.feedback_keyboard(42, "")
+        self.assertEqual(len(markup["inline_keyboard"]), 2)
+        self.assertEqual(sum(len(row) for row in markup["inline_keyboard"]), 4)
+
+    def test_feedback_keyboard_appends_a_trace_button_when_observatory_url_is_set(self):
+        markup = notify.feedback_keyboard(42, "https://observatory.example.com")
+        # The original four feedback buttons + their callback_data are
+        # untouched -- only a new third row is appended.
+        self.assertEqual(markup["inline_keyboard"][:2], notify.feedback_keyboard(42)["inline_keyboard"])
+        self.assertEqual(len(markup["inline_keyboard"]), 3)
+        trace_button = markup["inline_keyboard"][2][0]
+        self.assertEqual(trace_button["url"], "https://observatory.example.com/observatory/trace/score/42")
+        self.assertNotIn("callback_data", trace_button)
+
+    def test_feedback_keyboard_strips_a_trailing_slash_on_the_base_url(self):
+        markup = notify.feedback_keyboard(1, "https://observatory.example.com/")
+        self.assertEqual(
+            markup["inline_keyboard"][2][0]["url"],
+            "https://observatory.example.com/observatory/trace/score/1",
+        )
+
+    def test_feedback_keyboard_skips_the_trace_button_for_a_schemeless_base_url(self):
+        # Telegram rejects the WHOLE sendMessage (BUTTON_URL_INVALID) for a
+        # malformed inline URL button -- an operator typo like
+        # DISCOVERY_OBSERVATORY_BASE_URL='localhost:8001' (no scheme) must
+        # not reach the keyboard at all; the other four buttons stay intact.
+        markup = notify.feedback_keyboard(1, "localhost:8001")
+        self.assertEqual(markup, notify.feedback_keyboard(1))
+        self.assertEqual(len(markup["inline_keyboard"]), 2)
+
 
 class PipelineTests(unittest.TestCase):
     def setUp(self):
@@ -4156,6 +4190,75 @@ class CLITests(unittest.TestCase):
             code = main(["trace-fixture"])
         self.assertEqual(code, 2)
         self.assertIn("--db", err.getvalue())
+
+    def test_ui_public_without_a_token_refuses_to_start(self):
+        # This guard fires before observatory/datasette is ever imported, so
+        # it's exercised here (test_discovery.py must stay importable/green
+        # without datasette installed) rather than in test_observatory.py.
+        code, _out, err = self._main(
+            "ui", "--public", env={"DISCOVERY_UI_TOKEN": "", "DISCOVERY_NGROK_CMD": "ngrok http {port}"}
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("DISCOVERY_UI_TOKEN", err)
+
+    def test_ui_public_without_ngrok_cmd_refuses_to_start(self):
+        code, _out, err = self._main(
+            "ui", "--public", env={"DISCOVERY_UI_TOKEN": "tok", "DISCOVERY_NGROK_CMD": ""}
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("DISCOVERY_NGROK_CMD", err)
+
+    def test_discovery_modules_import_cleanly_without_datasette_installed(self):
+        # datasette must stay confined to observatory/ + __main__.py's `ui`
+        # command handler (see PROJECT_STATE.md's Observatory section) -- a
+        # subprocess with `sys.modules['datasette'] = None` (the standard
+        # trick that makes any `import datasette`/`import datasette.x` raise
+        # ImportError, exactly as if the package were never installed) is
+        # what actually proves it: the modules under test haven't been
+        # imported yet in that fresh interpreter, so this can't pass by
+        # accident off an already-cached import in this test process.
+        import subprocess
+
+        script = (
+            "import sys\n"
+            "sys.modules['datasette'] = None\n"
+            "import discovery.__main__\n"
+            "import discovery.trace\n"
+            "import discovery.trace_fixture\n"
+            "import discovery.notify\n"
+            "import discovery.pipeline\n"
+            "import discovery.teach\n"
+            "import discovery.config\n"
+            "print('IMPORTS_OK')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(config.REPO_ROOT), capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("IMPORTS_OK", result.stdout)
+
+    def test_observatory_app_genuinely_requires_datasette(self):
+        # The converse of the test above -- proves the blocking trick itself
+        # actually blocks (observatory/app.py DOES import datasette), so a
+        # bug that silently no-ops the import couldn't make the previous
+        # test pass vacuously.
+        import subprocess
+
+        script = (
+            "import sys\n"
+            "sys.modules['datasette'] = None\n"
+            "try:\n"
+            "    import observatory.app\n"
+            "    print('IMPORTED_UNEXPECTEDLY')\n"
+            "except ImportError:\n"
+            "    print('BLOCKED_AS_EXPECTED')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(config.REPO_ROOT), capture_output=True, text=True, timeout=30,
+        )
+        self.assertIn("BLOCKED_AS_EXPECTED", result.stdout)
 
     def test_trace_fixture_db_override_works_before_and_after_the_subcommand(self):
         # Repair-2 regression: `tf.add_argument("--db")` on the trace-fixture
@@ -6499,6 +6602,53 @@ class TraceRedactionTests(unittest.TestCase):
         ):
             text = trace.redact("value: sekrit-full")
         self.assertEqual(text, "value: [REDACTED:LONG_KEY]")
+
+
+class TraceConfigSnapshotFieldMaskingTests(unittest.TestCase):
+    """value-substitution redact()/redact_json() misses two real cases for a
+    Config snapshot: a short DISCOVERY_UI_TOKEN (under redact()'s 8-char
+    floor) and DISCOVERY_NGROK_CMD (a free-form command whose field name
+    doesn't match the secret-name regex, but which commonly embeds an inline
+    --authtoken). _cfg_snapshot masks both by FIELD NAME, independent of the
+    value's shape/length."""
+
+    def test_short_ui_token_is_masked_by_field_name_not_left_verbatim(self):
+        cfg = dataclasses.replace(CFG, ui_token="abc12")  # 5 chars: under redact()'s floor
+        snapshot = trace._cfg_snapshot(cfg)
+        self.assertEqual(snapshot["ui_token"], "[REDACTED:FIELD:ui_token]")
+
+    def test_ngrok_cmd_with_inline_authtoken_is_masked_wholesale(self):
+        cfg = dataclasses.replace(
+            CFG, ngrok_cmd="ngrok http {port} --authtoken 2abcSecretTunnelToken"
+        )
+        snapshot = trace._cfg_snapshot(cfg)
+        self.assertEqual(snapshot["ngrok_cmd"], "[REDACTED:FIELD:ngrok_cmd]")
+
+    def test_empty_secret_named_fields_stay_empty_not_masked(self):
+        snapshot = trace._cfg_snapshot(dataclasses.replace(CFG, ui_token="", ngrok_cmd=""))
+        self.assertEqual(snapshot["ui_token"], "")
+        self.assertEqual(snapshot["ngrok_cmd"], "")
+
+    def test_non_secret_fields_survive_a_snapshot_unmasked(self):
+        snapshot = trace._cfg_snapshot(dataclasses.replace(CFG, provider="claude_chat"))
+        self.assertEqual(snapshot["provider"], "claude_chat")
+
+    def test_masked_config_snapshot_reaches_trace_runs_and_stays_masked(self):
+        conn = db.connect(":memory:")
+        db.init(conn)
+        self.addCleanup(conn.close)
+        cfg = dataclasses.replace(
+            CFG, trace_enabled=True, ui_token="abc12",
+            ngrok_cmd="ngrok http {port} --authtoken tunnel-secret-xyz",
+        )
+        tracer = trace.Tracer(conn, cfg)
+        run_id = tracer.begin_run("test")
+        row = conn.execute("SELECT config_json FROM trace_runs WHERE id = ?", (run_id,)).fetchone()
+        stored = json.loads(row["config_json"])
+        self.assertEqual(stored["ui_token"], "[REDACTED:FIELD:ui_token]")
+        self.assertEqual(stored["ngrok_cmd"], "[REDACTED:FIELD:ngrok_cmd]")
+        self.assertNotIn("abc12", row["config_json"])
+        self.assertNotIn("tunnel-secret-xyz", row["config_json"])
 
 
 class _ProxyConn:
