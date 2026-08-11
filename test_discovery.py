@@ -5139,6 +5139,21 @@ class _FakeHTTPResponse:
         return False
 
 
+def _write_recon_interests_fixture(dirpath):
+    """Write a minimal interests.json whose keys are exactly the ones
+    exp_connectors.APPLICABILITY samples, so the connector-recon pass2 tests
+    reproduce the step-09 pre-registered sample independently of the live
+    product interests.json -- whose keys the owner's 40-interest rewrite
+    renamed. Only key/title are required by discovery.interests.load_file;
+    everything else defaults."""
+    keys = sorted({k for vals in exp_connectors.APPLICABILITY.values() for k in vals})
+    path = os.path.join(dirpath, "interests.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"defaults": {}, "interests":
+                   [{"key": k, "title": k.replace("-", " ")} for k in keys]}, f)
+    return path
+
+
 class ConnectorReconTests(unittest.TestCase):
     """exp_connectors.py (step-09a): offline, no network, no provider, no
     real DB -- every test injects a fake fetcher into _http_get or exercises
@@ -5588,7 +5603,16 @@ class ConnectorReconTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             missing_db = os.path.join(d, "discovery.db")
-            cfg = dataclasses.replace(CFG, db_path=missing_db, interests_path="interests.json")
+            # Pin the interest keys this pass samples to a fixture, not the live
+            # product interests.json: exp_connectors.APPLICABILITY maps each
+            # connector to the interest keys the step-09 experiment was
+            # pre-registered against, and the owner's 40-interest rewrite renamed
+            # those keys. Reading the live file would leave arxiv with zero
+            # applicable interests, so the query-level failure under test never
+            # fires. The fixture keeps this test reproducing the pre-registered
+            # sample regardless of how the product interest set evolves.
+            interests_path = _write_recon_interests_fixture(d)
+            cfg = dataclasses.replace(CFG, db_path=missing_db, interests_path=interests_path)
             empty_dossier = {"connectors": [{"name": n, "sample": {"per_interest": []}}
                                             for n in ("hackernews", "arxiv", "pubmed", "reddit")]}
             with mock.patch("exp_connectors._http_get", side_effect=fake_http_get), \
