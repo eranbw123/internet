@@ -11,7 +11,6 @@ from pathlib import Path
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
 # Per-provider default, so switching DISCOVERY_PROVIDER alone gives a sane model.
-# Per-provider default, so switching DISCOVERY_PROVIDER alone gives a sane model.
 # chatgpt_browser's "latest-high" is a sentinel the provider resolves live to
 # chatgpt.com's newest version at its High (max-reasoning) preset -- so it stays
 # on the latest model with no code change; a concrete DISCOVERY_MODEL overrides.
@@ -46,8 +45,36 @@ class Config:
     # cadence follows this field down to 60s (see ops/install_tasks.py).
     interval_web_seconds: int = 60
     interval_youtube_seconds: int = 4 * 3600
-    digest_time: str = "08:00"      # local HH:MM, once per day
+    digest_time: str = "08:00"      # local HH:MM, first digest of the day
     digest_max_items: int = 10      # Discovery items per digest; Alerts are unbounded and immediate
+    # Repeats the digest every digest_interval_seconds from digest_time until
+    # digest_window_end, same day, so pending items drain throughout waking
+    # hours instead of piling up for one 8am shot. See ops/install_tasks.py
+    # (Task Scheduler's own Repetition+Duration on the CalendarTrigger).
+    digest_interval_seconds: int = 3600
+    digest_window_end: str = "23:00"    # local HH:MM, last digest slot of the day
+    # Immediate discovery delivery (opt-in). Off by default: DISCOVERY items
+    # wait for the daily digest, exactly as before. On (DISCOVERY_IMMEDIATE=1),
+    # deliver() also pushes freshly-scored above-bar discoveries the moment a
+    # cycle finds them -- bounded three ways so a backlog or a burst can't flood
+    # the owner: only scores newer than `immediate_fresh_seconds` (the existing
+    # backlog is never immediately sent), at most `immediate_max_per_cycle` per
+    # deliver() call, and at most `immediate_max_per_day` successful sends in a
+    # rolling 24h. Anything skipped by a cap still reaches the daily digest.
+    immediate_discovery: bool = False
+    immediate_max_per_cycle: int = 3
+    immediate_max_per_day: int = 40
+    immediate_fresh_seconds: int = 1800   # only discoveries scored in the last 30 min go out immediately
+    # LLM-confirmed near-duplicate detection (dedup.llm_near_duplicate). The
+    # exact-hash layers catch re-posts; this catches the same story re-told in
+    # different words ("VPG down 25%" from three outlets). A judge call is only
+    # spent when free lexical retrieval finds suspects among recently stored
+    # articles, and a confirmed repeat skips the larger scoring call it would
+    # otherwise buy. The window bounds how far back retrieval looks (cost),
+    # not what counts as a duplicate -- the judge sees dates and decides.
+    dedup_llm: bool = True
+    dedup_window_days: int = 30
+    dedup_max_candidates: int = 6
     # Failed-send retry policy (see db.pending_notifications); raised from the
     # smaller db.py module constants, which stay as that function's own
     # defaults so a call site that doesn't pass cfg still gets a sane policy.
@@ -133,6 +160,16 @@ def load():
         interval_youtube_seconds=int(os.environ.get("DISCOVERY_INTERVAL_YOUTUBE", str(4 * 3600))),
         digest_time=os.environ.get("DISCOVERY_DIGEST_TIME", "08:00"),
         digest_max_items=int(os.environ.get("DISCOVERY_DIGEST_MAX", "10")),
+        digest_interval_seconds=int(os.environ.get("DISCOVERY_DIGEST_INTERVAL", "3600")),
+        digest_window_end=os.environ.get("DISCOVERY_DIGEST_WINDOW_END", "23:00"),
+        immediate_discovery=os.environ.get("DISCOVERY_IMMEDIATE", "").strip().lower()
+        in ("1", "true"),
+        immediate_max_per_cycle=int(os.environ.get("DISCOVERY_IMMEDIATE_MAX_PER_CYCLE", "3")),
+        immediate_max_per_day=int(os.environ.get("DISCOVERY_IMMEDIATE_MAX_PER_DAY", "40")),
+        immediate_fresh_seconds=int(os.environ.get("DISCOVERY_IMMEDIATE_FRESH_SECONDS", str(30 * 60))),
+        dedup_llm=os.environ.get("DISCOVERY_DEDUP_LLM", "1").strip().lower() in ("1", "true"),
+        dedup_window_days=int(os.environ.get("DISCOVERY_DEDUP_WINDOW_DAYS", "30")),
+        dedup_max_candidates=int(os.environ.get("DISCOVERY_DEDUP_MAX_CANDIDATES", "6")),
         send_max_attempts=int(os.environ.get("DISCOVERY_SEND_MAX_ATTEMPTS", "5")),
         send_retry_seconds=int(os.environ.get("DISCOVERY_SEND_RETRY_SECONDS", str(30 * 60))),
         chrome_launch_cmd=os.environ.get("DISCOVERY_CHROME_LAUNCH_CMD", ""),

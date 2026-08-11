@@ -139,18 +139,28 @@ def stored_item(conn, **kw):
 
 class FakeProvider(LLMProvider):
     """Stands in for anthropic/openai. `scores` maps a substring of the item
-    title to the value every dimension gets back; an Exception value raises."""
+    title to the value every dimension gets back; an Exception value raises.
+    `dup_answers` is the same idea for the near-dup judge's prompts
+    (recognised by NEAR_DUP_PROMPT's <already_stored> marker): substring ->
+    the duplicate_of id to return, or an Exception; an unmatched judge prompt
+    gets the null verdict rather than raising. Judge prompts land in
+    `dedup_prompts`, apart from `prompts`, so existing len(prompts)
+    assertions keep counting scoring spend only."""
 
     name = "fake"
 
-    def __init__(self, scores=None, search_results=None, model="fake-1"):
+    def __init__(self, scores=None, search_results=None, model="fake-1", dup_answers=None):
         super().__init__(model)
         self.scores = scores or {}
         self.search_results = search_results
         self.prompts = []
         self.search_prompts = []
+        self.dup_answers = dup_answers or {}
+        self.dedup_prompts = []
 
     def complete_json(self, system, prompt, schema, max_tokens=2000):
+        if "<already_stored>" in prompt:
+            return self._dedup_verdict(prompt)
         self.prompts.append(prompt)
         for needle, value in self.scores.items():
             if needle in prompt:
@@ -163,6 +173,15 @@ class FakeProvider(LLMProvider):
                                  payload, "valid", None, "t0", "t1")
                 return payload
         raise AssertionError(f"FakeProvider got an unexpected prompt:\n{prompt}")
+
+    def _dedup_verdict(self, prompt):
+        self.dedup_prompts.append(prompt)
+        for needle, value in self.dup_answers.items():
+            if needle in prompt:
+                if isinstance(value, Exception):
+                    raise value
+                return {"duplicate_of": value, "reason": "same story"}
+        return {"duplicate_of": None, "reason": "distinct"}
 
     def search_json(self, prompt, max_searches=5, max_tokens=8000):
         self.search_prompts.append(prompt)
@@ -294,6 +313,158 @@ class DedupTests(unittest.TestCase):
             an_item(url="https://other.com/x", title="Different", text="Different body.")
         )
         self.assertIsNone(dedup.find_duplicate(self.conn, fresh))
+
+
+class NearDupTests(unittest.TestCase):
+    """The fourth dedup layer: free lexical suspects, one small judge call to
+    confirm, and a confirmed repeat linked (duplicate_of) instead of scored."""
+
+    VPG_A = dict(
+        url="https://a.com/vpg", title="VPG stock plunges 25% after earnings miss",
+        text="Vishay Precision Group (VPG) shares dropped 25% on Tuesday after the "
+             "sensor maker reported quarterly revenue well below expectations.")
+    VPG_B = dict(
+        url="https://b.com/vishay", title="Vishay Precision Group falls by a quarter",
+        text="Shares of Vishay Precision Group tumbled about 25% following an "
+             "earnings miss, with revenue guidance cut for the year.")
+    VPG_C = dict(
+        url="https://c.com/sensors", title="Sensor maker VPG sinks 25% on weak guidance",
+        text="VPG stock lost a quarter of its value on Tuesday after quarterly "
+             "earnings missed estimates; the sensor maker also cut revenue guidance.")
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        db.upsert_interest(self.conn, an_interest())
+        self.interests = db.active_interests(self.conn)
+
+    def _ingest(self, provider, **kw):
+        return pipeline.ingest(self.conn, provider, CFG, an_item(**kw), self.interests, "k")
+
+    def test_the_same_story_retold_is_linked_and_never_scored(self):
+        provider = FakeProvider(
+            {"VPG stock plunges": 0.9},
+            dup_answers={"falls by a quarter": 1, "Sensor maker VPG sinks": 1},
+        )
+        first = self._ingest(provider, **self.VPG_A)
+        self.assertEqual(first.stage, "scored")
+        self.assertEqual(provider.dedup_prompts, [])  # nothing stored to compare against
+
+        second = self._ingest(provider, **self.VPG_B)
+        third = self._ingest(provider, **self.VPG_C)
+        self.assertEqual((second.stage, third.stage), ("near_duplicate", "near_duplicate"))
+        self.assertIn("same story as #1", second.detail)
+        self.assertEqual(len(provider.prompts), 1)       # only the first telling paid a score
+        self.assertEqual(len(provider.dedup_prompts), 2)
+        rows = self.conn.execute(
+            "SELECT id, duplicate_of FROM candidate_items ORDER BY id").fetchall()
+        self.assertEqual([(r["id"], r["duplicate_of"]) for r in rows],
+                         [(1, None), (2, 1), (3, 1)])
+        # The second repeat was compared against the ORIGINAL only -- a linked
+        # item leaves the judge's pool, so chains always point at the first telling.
+        self.assertNotIn("falls by a quarter", provider.dedup_prompts[1])
+
+    def test_a_distinct_development_about_the_same_company_still_scores(self):
+        provider = FakeProvider(
+            {"VPG stock plunges": 0.9, "VPG names next chief executive": 0.8})
+        self._ingest(provider, **self.VPG_A)
+        outcome = self._ingest(
+            provider, url="https://d.com/ceo",
+            title="VPG names next chief executive",
+            text="Vishay Precision Group appointed a new chief executive on Tuesday; "
+                 "shares of the sensor maker were little changed after the announcement.")
+        # Lexically suspicious (same company vocabulary), so the judge IS
+        # consulted -- and its null verdict lets the item through to scoring.
+        self.assertEqual(len(provider.dedup_prompts), 1)
+        self.assertEqual(outcome.stage, "scored")
+
+    def test_unrelated_stories_never_consult_the_judge(self):
+        provider = FakeProvider({"VPG stock plunges": 0.9, "Orexin agonist": 0.8})
+        self._ingest(provider, **self.VPG_A)
+        outcome = self._ingest(provider, url="https://e.com/orexin",
+                               title="Orexin agonist hits phase 2 endpoint", text=BODY)
+        self.assertEqual(outcome.stage, "scored")
+        self.assertEqual(provider.dedup_prompts, [])
+
+    def test_a_judge_outage_repeats_a_story_rather_than_losing_one(self):
+        provider = FakeProvider(
+            {"VPG stock plunges": 0.9, "Vishay Precision Group falls": 0.85},
+            dup_answers={"falls by a quarter": RuntimeError("provider down")},
+        )
+        self._ingest(provider, **self.VPG_A)
+        outcome = self._ingest(provider, **self.VPG_B)
+        self.assertEqual(outcome.stage, "scored")
+
+    def test_a_made_up_judge_id_is_ignored(self):
+        provider = FakeProvider(
+            {"VPG stock plunges": 0.9, "Vishay Precision Group falls": 0.85},
+            dup_answers={"falls by a quarter": 999},
+        )
+        self._ingest(provider, **self.VPG_A)
+        outcome = self._ingest(provider, **self.VPG_B)
+        self.assertEqual(outcome.stage, "scored")
+        row = self.conn.execute(
+            "SELECT duplicate_of FROM candidate_items WHERE id = 2").fetchone()
+        self.assertIsNone(row["duplicate_of"])
+
+    def test_a_shared_ticker_makes_a_suspect_even_with_disjoint_wording(self):
+        # The stocks collector stamps metadata.ticker on the articles it
+        # fetches to explain a move -- two explanations of the same move can
+        # share almost no words and must still meet the judge.
+        provider = FakeProvider(
+            {"Earnings shock": 0.9},
+            dup_answers={"Sharp fall follows results": 1},
+        )
+        first = self._ingest(
+            provider, source="stocks", url="https://s.com/a",
+            title="Earnings shock at a precision measurement group",
+            text="The company reported a steep quarterly loss, sending investors to the exits.",
+            metadata={"ticker": "VPG"})
+        self.assertEqual(first.stage, "scored")
+        second = self._ingest(
+            provider, source="stocks", url="https://s.com/b",
+            title="Sharp fall follows results",
+            text="Traders reacted badly and the share price slid in heavy volume on Tuesday.",
+            metadata={"ticker": "VPG"})
+        self.assertEqual(second.stage, "near_duplicate")
+
+    def test_a_linked_item_is_excluded_from_delivery(self):
+        original = stored_item(self.conn, url="https://x.com/1", title="First telling")
+        repeat = stored_item(self.conn, url="https://x.com/2", title="Second telling")
+        interest = self.interests[0]
+        db.save_score(self.conn, a_score(repeat.id, interest.id, 0.95))
+        self.assertEqual(len(db.pending_notifications(self.conn)), 1)
+        db.mark_near_duplicate(self.conn, repeat.id, original.id, "same story as #1")
+        self.assertEqual(db.pending_notifications(self.conn), [])
+
+    def test_the_backlog_rescorer_skips_linked_items(self):
+        original = stored_item(self.conn, url="https://x.com/1", title="First telling")
+        repeat = stored_item(self.conn, url="https://x.com/2", title="Second telling")
+        db.set_prefilter(self.conn, repeat.id, True, "")
+        db.mark_near_duplicate(self.conn, repeat.id, original.id, "same story as #1")
+        provider = FakeProvider()
+        scored = pipeline._score_backlog(
+            self.conn, provider, self.interests, pipeline.Budget(5))
+        self.assertEqual(scored["exploit"] + scored["explore"], 0)
+        self.assertEqual(provider.prompts, [])
+
+    # Frozen from production discovery.db items 11/173 and 22/174 -- two real
+    # stories each delivered twice on 2026-08-10 because the exact title
+    # hashes differ on a parenthetical suffix.
+    NEBIUS_DEBT = "Nebius raises $775 million in first secured debt financing to accelerate global buildout"
+    NEBIUS_META = "Nebius signs new AI infrastructure agreement with Meta (company newsroom)"
+    NEBIUS_DEBT_REPEAT = NEBIUS_DEBT + " (Form 6-K, Ex. 99.1)"
+    NEBIUS_META_REPEAT = "Nebius signs new AI infrastructure agreement with Meta (Form 6-K and press release)"
+
+    def test_the_prod_double_sends_are_now_retrieved_as_suspects(self):
+        stored_item(self.conn, url="https://n.com/debt", title=self.NEBIUS_DEBT, text="")
+        stored_item(self.conn, url="https://n.com/meta", title=self.NEBIUS_META, text="")
+        for title, expected_id in ((self.NEBIUS_DEBT_REPEAT, 1), (self.NEBIUS_META_REPEAT, 2)):
+            fresh = normalize.normalize(
+                an_item(url="https://other.com/x", title=title, text=""))
+            suspects = dedup.find_suspects(self.conn, fresh, CFG)
+            self.assertEqual([s["id"] for s in suspects], [expected_id])
 
 
 class MatchingTests(unittest.TestCase):
@@ -912,8 +1083,8 @@ class InterestsFileTests(unittest.TestCase):
         self.assertIn("stocks", nbis.sources)
         self.assertEqual(nbis.source_config["stocks"]["tickers"][0]["ticker"], "NBIS")
         youtube_cfg = loaded[keys.index("narcolepsy-eds")].source_config["youtube"]
-        self.assertIn("max_candidate_videos", youtube_cfg)
         self.assertIn("max_transcript_fetches", youtube_cfg)
+        self.assertTrue(youtube_cfg.get("queries"))  # owner hints the collector feeds the prompt
 
     def test_sample_file_thresholds_are_on_the_0_1_scale(self):
         for interest in interests.load_file("interests.json"):
@@ -2092,6 +2263,22 @@ class YoutubeCollectorTests(unittest.TestCase):
             self.assertEqual(youtube.collect(self.interest(), self.cfg, FakeProvider()), [])
             lv.assert_not_called()
 
+    def test_owner_queries_ride_into_the_discovery_prompt(self):
+        """`source_config.youtube.queries` are starting-point hints for the
+        model's iterative search -- blank entries dropped, absent key means
+        the prompt stays byte-identical to the hintless form."""
+        interest = self.interest(
+            source_config={"youtube": {"queries": ["orexin agonist trial MWT", "  ", ""]}}
+        )
+        provider = FakeProvider(search_results=[])
+        self.assertEqual(youtube.collect(interest, self.cfg, provider), [])
+        self.assertIn("orexin agonist trial MWT", provider.search_prompts[0])
+        self.assertIn("Starting-point searches", provider.search_prompts[0])
+
+        bare = FakeProvider(search_results=[])
+        youtube.collect(self.interest(), self.cfg, bare)
+        self.assertNotIn("Starting-point searches", bare.search_prompts[0])
+
     def test_collect_shapes_one_candidate_per_segment(self):
         interest = self.interest(
             source_config={"youtube": {"chunk_seconds": 30, "chunk_overlap_seconds": 10}}
@@ -2670,8 +2857,9 @@ class PipelineTests(unittest.TestCase):
         summary = self._run(provider)
         self.assertEqual(
             summary,
-            {"collected": 2, "duplicate": 0, "filtered": 0, "already_scored": 0,
-             "scored": 2, "deferred": 0, "errors": 0, "notified": 0},
+            {"collected": 2, "duplicate": 0, "near_duplicate": 0, "filtered": 0,
+             "already_scored": 0, "scored": 2, "deferred": 0, "errors": 0,
+             "notified": 0},
         )
         self.assertEqual(pipeline.send_digest(self.conn, CFG, dry_run=True), 1)
 
@@ -2812,6 +3000,48 @@ class PipelineTests(unittest.TestCase):
         self.assertEqual(pipeline.deliver(self.conn, CFG, dry_run=True), 1)
         pending = [r["item_id"] for r in db.pending_notifications(self.conn)]
         self.assertEqual(pending, [discovery.id])
+
+    def test_immediate_discovery_delivers_fresh_discoveries_bounded_by_cycle(self):
+        # With cfg.immediate_discovery on, deliver() also pushes freshly-scored
+        # discoveries -- but no more than immediate_max_per_cycle per call, so a
+        # big batch trickles out rather than flooding the owner.
+        db.upsert_interest(self.conn, an_interest())
+        (interest,) = db.active_interests(self.conn)
+        for i in range(3):
+            d = stored_item(self.conn, url=f"https://e.com/d{i}", title=f"D{i}")
+            db.save_score(self.conn, a_score(d.id, interest.id, 0.9))
+        cfg = dataclasses.replace(CFG, immediate_discovery=True, immediate_max_per_cycle=2)
+        self.assertEqual(pipeline.deliver(self.conn, cfg, dry_run=True), 2)
+        self.assertEqual(len(db.pending_notifications(self.conn)), 1)
+
+    def test_immediate_discovery_skips_the_stale_backlog(self):
+        # The existing pre-enable backlog must never be dumped immediately: only
+        # scores newer than immediate_fresh_seconds go out; older ones stay
+        # pending for the digest exactly as before.
+        db.upsert_interest(self.conn, an_interest())
+        (interest,) = db.active_interests(self.conn)
+        old = stored_item(self.conn, url="https://e.com/old", title="Old")
+        sid = db.save_score(self.conn, a_score(old.id, interest.id, 0.9))
+        self.conn.execute("UPDATE scores SET created_at = ? WHERE id = ?", (db.ago(10_000), sid))
+        self.conn.commit()
+        cfg = dataclasses.replace(CFG, immediate_discovery=True)
+        self.assertEqual(pipeline.deliver(self.conn, cfg, dry_run=True), 0)
+        self.assertEqual([r["item_id"] for r in db.pending_notifications(self.conn)], [old.id])
+
+    def test_immediate_day_cap_counts_only_immediate_sends(self):
+        # A busy digest/alert day must not zero the immediate per-day budget:
+        # the cap counts only prior immediate-channel sends, so the feature keeps
+        # firing regardless of how many digest items already went out today.
+        db.upsert_interest(self.conn, an_interest())
+        (interest,) = db.active_interests(self.conn)
+        for i in range(50):  # 50 prior NON-immediate (digest/alert) sends today
+            it = stored_item(self.conn, url=f"https://e.com/old{i}", title=f"Old{i}")
+            sid = db.save_score(self.conn, a_score(it.id, interest.id, 0.9))
+            db.record_notification(self.conn, sid, "telegram", True)
+        fresh = stored_item(self.conn, url="https://e.com/fresh", title="Fresh")
+        db.save_score(self.conn, a_score(fresh.id, interest.id, 0.9))
+        cfg = dataclasses.replace(CFG, immediate_discovery=True, immediate_max_per_day=40)
+        self.assertEqual(pipeline.deliver(self.conn, cfg, dry_run=True), 1)
 
     def test_send_digest_sorts_by_score_and_caps_leaving_the_rest_pending(self):
         db.upsert_interest(self.conn, an_interest())
@@ -3013,8 +3243,9 @@ class PipelineTests(unittest.TestCase):
         summary = self._run(provider)
         self.assertEqual(
             summary,
-            {"collected": 2, "duplicate": 0, "filtered": 0, "already_scored": 0,
-             "scored": 2, "deferred": 0, "errors": 0, "notified": 0},
+            {"collected": 2, "duplicate": 0, "near_duplicate": 0, "filtered": 0,
+             "already_scored": 0, "scored": 2, "deferred": 0, "errors": 0,
+             "notified": 0},
         )
         names = {r["name"] for r in self.conn.execute("SELECT DISTINCT name FROM metrics").fetchall()}
         self.assertFalse(any(n.startswith("explore_") for n in names))
@@ -3061,6 +3292,8 @@ class LaneProvider(FakeProvider):
         self.keys = keys or {}
 
     def complete_json(self, system, prompt, schema, max_tokens=2000):
+        if "<already_stored>" in prompt:
+            return self._dedup_verdict(prompt)
         self.prompts.append(prompt)
         for needle, value in self.scores.items():
             if needle in prompt:
@@ -3628,6 +3861,63 @@ def completion_reply(text):
     return json.dumps({"text": text})
 
 
+class FakeChatGPTConnection:
+    """Stands in for cdp.CDPConnection for the chatgpt.com provider. The whole
+    send is one evaluate() (session + sentinel + PoW + conversation SSE), so a
+    completion reply is a JSON string/dict `{text, conversation_id}` (or an
+    Exception to raise); the follow-up hide is a second evaluate. Dispatch is on
+    the JS the provider actually builds, and every js string is kept so a test
+    can assert the reverse-engineered contract stays in the payload."""
+
+    def __init__(self, replies, hide_error=None, poll_results=None):
+        self.replies = list(replies)
+        # Handed-off (thinking-model) answers are read back by polling; each
+        # entry is one GET result {text, done}. Left empty for the inline path.
+        self.poll_results = list(poll_results or [])
+        self.calls = []
+        self.js = []
+        self.closed = False
+        self.hide_error = hide_error
+
+    def evaluate(self, js, timeout=None, **_kw):
+        self.js.append(js)
+        if "is_visible" in js:
+            self.calls.append("hide")
+            if self.hide_error is not None:
+                raise self.hide_error
+            return True
+        if "/* poll */" in js:
+            self.calls.append("poll")
+            if self.poll_results:
+                nxt = self.poll_results.pop(0)
+                if isinstance(nxt, Exception):
+                    raise nxt
+                return nxt if isinstance(nxt, str) else json.dumps(nxt)
+            return json.dumps({"text": "", "done": True})
+        if "text/event-stream" in js:
+            self.calls.append("completion")
+            reply = self.replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+        self.calls.append("other")
+        return True
+
+    def close(self):
+        self.closed = True
+
+
+def chatgpt_reply(text, conversation_id="c1"):
+    return json.dumps({"text": text, "conversation_id": conversation_id})
+
+
+def chatgpt_handoff(conversation_id="c1"):
+    """A thinking-model send: the POST returns a stream_handoff with a
+    conversation id but no inline text, so the provider must poll for the
+    answer (see FakeChatGPTConnection.poll_results)."""
+    return json.dumps({"text": "", "conversation_id": conversation_id, "handoff": True})
+
+
 class ClaudeChatProviderTests(unittest.TestCase):
     """The claude.ai-over-CDP provider, with the browser faked out entirely."""
 
@@ -3818,6 +4108,251 @@ class ClaudeChatProviderTests(unittest.TestCase):
         provider = claude_chat.ClaudeChatProvider("claude-opus-5", org_id="org", port=9222)
         with mock.patch.object(
             claude_chat.cdp, "find_claude_tab", return_value={"id": "1"}
+        ):
+            self.assertEqual(provider.preflight(), (True, ""))
+
+
+class ChatGPTBrowserProviderTests(unittest.TestCase):
+    """The chatgpt.com-over-CDP provider, with the browser faked out entirely.
+    The novel core it shares with no other provider -- the sentinel proof-of-
+    work handshake and the delta-encoded SSE accumulation -- runs as JS inside
+    the page, so it's verified separately at execution level; here the seam is
+    the same as claude_chat's: the Python orchestration around evaluate()."""
+
+    SCHEMA = {
+        "type": "object",
+        "properties": {
+            "a": {"type": "number"},
+            "kind": {"type": "string", "enum": ["x", "y"]},
+        },
+        "required": ["a"],
+        "additionalProperties": False,
+    }
+
+    def _provider(self, *replies, connections=None, hide_error=None,
+                  poll_results=None, model="auto"):
+        conns = connections if connections is not None else [
+            FakeChatGPTConnection(replies, hide_error=hide_error, poll_results=poll_results)
+        ]
+        remaining = list(conns)
+        self.connections = conns
+        return chatgpt_browser.ChatGPTBrowserProvider(
+            model, port=9222, connect=lambda: remaining.pop(0),
+        )
+
+    def test_registered_and_constructable_without_touching_chrome(self):
+        self.assertIn("chatgpt_browser", PROVIDERS)
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
+        self.assertEqual(provider.name, "chatgpt_browser")  # lazy: no connection yet
+
+    def test_complete_json_parses_a_clean_reply_and_hides_the_conversation(self):
+        provider = self._provider(chatgpt_reply('{"a": 0.5, "kind": "x"}'))
+        data = provider.complete_json("sys", "prompt", self.SCHEMA)
+        self.assertEqual(data, {"a": 0.5, "kind": "x"})
+        (conn,) = self.connections
+        self.assertEqual(conn.calls, ["completion", "hide"])
+        self.assertEqual(provider.usage["calls"], 1)
+        self.assertEqual(provider.usage["input_tokens"], 0)  # not reported, never guessed
+
+    def test_complete_json_survives_prose_and_fences_around_the_object(self):
+        provider = self._provider(
+            chatgpt_reply('Sure! Here it is:\n```json\n{"a": 1.0}\n```\nHope that helps.')
+        )
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 1.0})
+
+    def test_a_malformed_reply_is_retried_once_then_succeeds(self):
+        provider = self._provider(
+            chatgpt_reply("I cannot answer in JSON, sorry."),
+            chatgpt_reply('{"a": 0.25}'),
+        )
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 0.25})
+        (conn,) = self.connections
+        self.assertEqual(conn.calls.count("completion"), 2)
+
+    def test_two_malformed_replies_fail_gracefully(self):
+        provider = self._provider(
+            chatgpt_reply('{"wrong": true}'),        # missing required "a"
+            chatgpt_reply('{"a": "not a number"}'),
+        )
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("attempt 2", str(ctx.exception))
+
+    def test_an_enum_violation_counts_as_malformed(self):
+        provider = self._provider(
+            chatgpt_reply('{"a": 1, "kind": "zebra"}'),
+            chatgpt_reply('{"a": 1, "kind": "zebra"}'),
+        )
+        with self.assertRaises(ProviderError):
+            provider.complete_json("s", "p", self.SCHEMA)
+
+    def test_search_json_returns_the_embedded_array_and_garbage_becomes_empty(self):
+        provider = self._provider(
+            chatgpt_reply('I searched.\n[{"title": "T", "url": "https://e.com"}]\nDone.'),
+            chatgpt_reply("no array here at all"),
+        )
+        self.assertEqual(
+            provider.search_json("find things"),
+            [{"title": "T", "url": "https://e.com"}],
+        )
+        self.assertEqual(provider.search_json("find things"), [])
+
+    def test_search_json_asks_for_the_search_tool_but_complete_json_does_not(self):
+        provider = self._provider(
+            chatgpt_reply("[]"), chatgpt_reply('{"a": 1}'),
+        )
+        provider.search_json("find things")
+        provider.complete_json("s", "p", self.SCHEMA)
+        (conn,) = self.connections
+        search_js, complete_js = conn.js[0], conn.js[2]  # [0]=search, [1]=its hide, [2]=complete
+        self.assertIn('system_hints: ["search"]', search_js)
+        self.assertIn("system_hints: []", complete_js)
+
+    def test_the_completion_js_carries_the_sentinel_and_pow_contract(self):
+        provider = self._provider(chatgpt_reply('{"a": 1}'))
+        provider.complete_json("s", "p", self.SCHEMA)
+        js = self.connections[0].js[0]
+        for token in ("sha3_512_hex", "/sentinel/chat-requirements",
+                      "OpenAI-Sentinel-Chat-Requirements-Token",
+                      "OpenAI-Sentinel-Proof-Token",
+                      "OpenAI-Sentinel-Turnstile-Token",  # forwarded, not thrown on
+                      "/api/auth/session"):
+            self.assertIn(token, js, f"completion JS lost {token!r}")
+        # turnstile.required must NOT abort the send -- echoing dx works live
+        self.assertNotIn("throw new Error('chatgpt.com demanded", js)
+
+    def test_the_send_js_resolves_latest_high_and_carries_the_reasoning_contract(self):
+        provider = self._provider(chatgpt_reply('{"a": 1}'))
+        provider.complete_json("s", "p", self.SCHEMA)
+        js = self.connections[0].js[0]
+        for token in ("/backend-api/models",          # resolves the newest model live
+                      "intelligence_presets",          # ...from the version's presets
+                      "'thinking'",                    # ...picking the thinking lane
+                      "body.thinking_effort = effort", # ...and sending its (High) effort
+                      "stream_handoff"):               # ...and noticing the handoff
+            self.assertIn(token, js, f"send JS lost {token!r}")
+
+    def test_a_handoff_answer_is_polled_until_finished(self):
+        # Thinking model: the send returns only a handoff, then two polls -- the
+        # first still streaming, the second finished with the JSON answer.
+        provider = self._provider(
+            chatgpt_handoff("c9"),
+            poll_results=[{"text": "", "done": False}, {"text": '{"a": 5}', "done": True}],
+        )
+        with mock.patch.object(chatgpt_browser.time, "sleep"):
+            self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 5})
+        (conn,) = self.connections
+        self.assertEqual(conn.calls, ["completion", "poll", "poll", "hide"])
+
+    def test_search_json_reads_a_handed_off_array_back_by_polling(self):
+        provider = self._provider(
+            chatgpt_handoff("c1"),
+            poll_results=[{"text": '[{"title": "T", "url": "https://e.com"}]', "done": True}],
+        )
+        with mock.patch.object(chatgpt_browser.time, "sleep"):
+            self.assertEqual(
+                provider.search_json("find things"),
+                [{"title": "T", "url": "https://e.com"}],
+            )
+
+    def test_a_handoff_that_never_finishes_times_out_to_a_provider_error(self):
+        # Poll keeps returning unfinished; the deadline passes and it surfaces as
+        # a normal empty-completion ProviderError rather than looping forever.
+        provider = self._provider(
+            chatgpt_handoff("c1"),
+            poll_results=[{"text": "", "done": False}] * 50,
+        )
+        clock = iter([0.0, 1.0, 2.0, 999.0])  # monotonic: enters loop once, then past deadline
+        with mock.patch.object(chatgpt_browser.time, "sleep"), \
+                mock.patch.object(chatgpt_browser.time, "monotonic", lambda: next(clock)):
+            with self.assertRaises(ProviderError) as ctx:
+                provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("empty completion", str(ctx.exception))
+
+    def test_an_explicit_slug_effort_spec_is_passed_through(self):
+        provider = self._provider(chatgpt_reply('{"a": 1}'), model="gpt-5-6-thinking:extended")
+        provider.complete_json("s", "p", self.SCHEMA)
+        js = self.connections[0].js[0]
+        self.assertIn('"gpt-5-6-thinking:extended"', js)  # the pin reaches the page verbatim
+
+    def test_no_chrome_endpoint_is_a_clean_provider_error(self):
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
+        with mock.patch.object(
+            chatgpt_browser.cdp, "find_chatgpt_tab", side_effect=ConnectionRefusedError("refused")
+        ):
+            with self.assertRaises(ProviderError) as ctx:
+                provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("Chrome DevTools endpoint", str(ctx.exception))
+
+    def test_no_chatgpt_tab_is_a_clean_provider_error(self):
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
+        with mock.patch.object(chatgpt_browser.cdp, "find_chatgpt_tab", return_value=None):
+            with self.assertRaises(ProviderError) as ctx:
+                provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("chatgpt.com tab", str(ctx.exception))
+
+    def test_a_js_exception_in_the_tab_is_a_provider_error_not_a_crash(self):
+        provider = self._provider(RuntimeError("JS exception: conversation HTTP 429"))
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("HTTP 429", str(ctx.exception))
+
+    def test_a_dropped_connection_reconnects_once_and_recovers(self):
+        dead = FakeChatGPTConnection([ConnectionError("websocket closed")])
+        alive = FakeChatGPTConnection([chatgpt_reply('{"a": 0.75}')])
+        provider = self._provider(connections=[dead, alive])
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 0.75})
+        self.assertTrue(dead.closed)     # reset closed the dead connection
+        self.assertFalse(alive.closed)
+
+    def test_a_connection_that_keeps_dropping_fails_gracefully(self):
+        dead1 = FakeChatGPTConnection([ConnectionError("closed")])
+        dead2 = FakeChatGPTConnection([ConnectionError("closed again")])
+        provider = self._provider(connections=[dead1, dead2])
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("twice", str(ctx.exception))
+
+    def test_a_null_completion_result_blames_the_tab(self):
+        provider = self._provider(None)
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("no text", str(ctx.exception))
+
+    def test_a_dict_reply_from_cdp_is_accepted_as_is(self):
+        # Some Chrome/CDP combinations hand back the JS return value already
+        # deserialized; no conversation_id here, so no hide fires.
+        provider = self._provider({"text": '{"a": 2}', "conversation_id": None})
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 2})
+        self.assertEqual(self.connections[0].calls, ["completion"])
+
+    def test_a_hide_failure_never_breaks_the_reply(self):
+        provider = self._provider(
+            chatgpt_reply('{"a": 3}'), hide_error=RuntimeError("hide blew up")
+        )
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 3})
+        self.assertIn("hide", self.connections[0].calls)
+
+    def test_preflight_fails_cleanly_with_no_chrome_endpoint(self):
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
+        with mock.patch.object(
+            chatgpt_browser.cdp, "find_chatgpt_tab", side_effect=ConnectionRefusedError("refused")
+        ):
+            ok, detail = provider.preflight()
+        self.assertFalse(ok)
+        self.assertIn("Chrome DevTools endpoint", detail)
+
+    def test_preflight_fails_cleanly_with_no_chatgpt_tab(self):
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
+        with mock.patch.object(chatgpt_browser.cdp, "find_chatgpt_tab", return_value=None):
+            ok, detail = provider.preflight()
+        self.assertFalse(ok)
+        self.assertIn("chatgpt.com tab", detail)
+
+    def test_preflight_succeeds_when_the_tab_is_open(self):
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
+        with mock.patch.object(
+            chatgpt_browser.cdp, "find_chatgpt_tab", return_value={"id": "1"}
         ):
             self.assertEqual(provider.preflight(), (True, ""))
 
@@ -4767,9 +5302,9 @@ class InstallTasksTests(unittest.TestCase):
         self.assertEqual(by_name["internet-discovery-feedback"].trigger_value, 5 * 60)
         self.assertEqual(by_name["internet-discovery-health"].trigger_value, 3 * 3600)
 
-    def test_six_tasks_share_the_prefix_and_carry_the_right_app_args(self):
+    def test_tasks_share_the_prefix_and_carry_the_right_app_args(self):
         names = [t.name for t in install_tasks.build_tasks(CFG)]
-        self.assertEqual(len(names), 6)
+        self.assertEqual(len(names), 7)
         self.assertTrue(all(n.startswith("internet-discovery-") for n in names))
         by_name = {t.name: t for t in install_tasks.build_tasks(CFG)}
         self.assertEqual(
@@ -4783,6 +5318,18 @@ class InstallTasksTests(unittest.TestCase):
         self.assertEqual(
             by_name["internet-discovery-health"].app_args, ["health", "--notify"]
         )
+        # The updater is not a `python -m app` subcommand -- it shells to its own
+        # script with no app args.
+        update = by_name["internet-discovery-update"]
+        self.assertEqual(update.app_args, [])
+        self.assertEqual(update.script, "update.cmd")
+
+    def test_the_update_task_action_shells_to_update_cmd(self):
+        update = next(t for t in install_tasks.build_tasks(CFG)
+                      if t.name == "internet-discovery-update")
+        xml = install_tasks.render_xml(update)
+        self.assertIn("update.cmd", xml)
+        self.assertNotIn("run.cmd", xml)
 
     def test_rendered_xml_uses_the_d_flag_and_run_cmd(self):
         task = install_tasks.build_tasks(CFG)[0]
@@ -4821,11 +5368,11 @@ class InstallTasksTests(unittest.TestCase):
         self.assertEqual(code, 0)
         # One /create + one /query per task -- install() no longer trusts
         # /create's exit code alone to mean the task actually exists.
-        self.assertEqual(len(calls), 12)
+        self.assertEqual(len(calls), 14)
         creates = [a for a in calls if "/create" in a]
         queries = [a for a in calls if "/query" in a]
-        self.assertEqual(len(creates), 6)
-        self.assertEqual(len(queries), 6)
+        self.assertEqual(len(creates), 7)
+        self.assertEqual(len(queries), 7)
         for args in creates:
             self.assertEqual(args[0], "schtasks")
             self.assertIn("/xml", args)
@@ -4886,6 +5433,46 @@ class InstallTasksTests(unittest.TestCase):
         # boundary must be in the future, not today's already-missed slot.
         self.assertGreater(start_dt, datetime.now())
 
+    def test_digest_repeats_within_its_window_not_just_once_a_day(self):
+        cfg = dataclasses.replace(
+            CFG, digest_time="09:00", digest_window_end="12:00",
+            digest_interval_seconds=1800,
+        )
+        task = next(t for t in install_tasks.build_tasks(cfg) if t.trigger_kind == "daily")
+        xml = install_tasks.render_xml(task)
+        self.assertIn("<Repetition>", xml)
+        self.assertIn("<Interval>PT30M</Interval>", xml)
+        # 09:00 -> 12:00 is a 3-hour window, regardless of which day the
+        # (possibly rolled-forward) StartBoundary lands on.
+        self.assertIn("<Duration>PT3H</Duration>", xml)
+
+    def test_digest_window_end_before_start_wraps_to_the_next_day(self):
+        cfg = dataclasses.replace(
+            CFG, digest_time="20:00", digest_window_end="02:00",
+            digest_interval_seconds=3600,
+        )
+        task = next(t for t in install_tasks.build_tasks(cfg) if t.trigger_kind == "daily")
+        xml = install_tasks.render_xml(task)
+        self.assertIn("<Duration>PT6H</Duration>", xml)
+
+    def test_zero_digest_interval_falls_back_to_a_single_daily_fire(self):
+        cfg = dataclasses.replace(CFG, digest_interval_seconds=0)
+        task = next(t for t in install_tasks.build_tasks(cfg) if t.trigger_kind == "daily")
+        xml = install_tasks.render_xml(task)
+        self.assertNotIn("<Repetition>", xml)
+
+    def test_interval_tasks_still_repeat_forever_with_no_duration(self):
+        # Regression guard: the digest's new bounded Repetition must not leak
+        # onto the plain interval-kind tasks, which repeat with no Duration
+        # (i.e. forever) by design.
+        task = next(
+            t for t in install_tasks.build_tasks(CFG)
+            if t.name == "internet-discovery-collect-stocks"
+        )
+        xml = install_tasks.render_xml(task)
+        self.assertIn("<Repetition>", xml)
+        self.assertNotIn("<Duration>", xml)
+
     def test_uninstall_is_scoped_to_the_six_task_names_plus_soak(self):
         calls = []
         install_tasks.uninstall(runner=lambda args: calls.append(args) or (0, "", ""))
@@ -4917,12 +5504,10 @@ class InstallTasksTests(unittest.TestCase):
         self.assertIn("internet-discovery-collect-stocks: not installed", text)
         self.assertNotIn("some-other-task", text)
 
-    def test_soak_task_is_not_one_of_the_six_build_tasks(self):
+    def test_soak_task_is_not_one_of_the_recurring_build_tasks(self):
         # SOAK_TASK must stay out of _TASK_SPECS/build_tasks -- otherwise
-        # --install would create it (seven tasks) and recreate/reschedule it
-        # on every reinstall.
+        # --install would create and recreate/reschedule it on every reinstall.
         names = [t.name for t in install_tasks.build_tasks(CFG)]
-        self.assertEqual(len(names), 6)
         self.assertNotIn(install_tasks.SOAK_TASK, names)
 
     def test_soak_trigger_is_a_single_time_trigger_with_no_repetition(self):
@@ -5074,6 +5659,21 @@ class _FakeHTTPResponse:
 
     def __exit__(self, *exc):
         return False
+
+
+def _write_recon_interests_fixture(dirpath):
+    """Write a minimal interests.json whose keys are exactly the ones
+    exp_connectors.APPLICABILITY samples, so the connector-recon pass2 tests
+    reproduce the step-09 pre-registered sample independently of the live
+    product interests.json -- whose keys the owner's 40-interest rewrite
+    renamed. Only key/title are required by discovery.interests.load_file;
+    everything else defaults."""
+    keys = sorted({k for vals in exp_connectors.APPLICABILITY.values() for k in vals})
+    path = os.path.join(dirpath, "interests.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"defaults": {}, "interests":
+                   [{"key": k, "title": k.replace("-", " ")} for k in keys]}, f)
+    return path
 
 
 class ConnectorReconTests(unittest.TestCase):
@@ -5525,7 +6125,16 @@ class ConnectorReconTests(unittest.TestCase):
 
         with tempfile.TemporaryDirectory() as d:
             missing_db = os.path.join(d, "discovery.db")
-            cfg = dataclasses.replace(CFG, db_path=missing_db, interests_path="interests.json")
+            # Pin the interest keys this pass samples to a fixture, not the live
+            # product interests.json: exp_connectors.APPLICABILITY maps each
+            # connector to the interest keys the step-09 experiment was
+            # pre-registered against, and the owner's 40-interest rewrite renamed
+            # those keys. Reading the live file would leave arxiv with zero
+            # applicable interests, so the query-level failure under test never
+            # fires. The fixture keeps this test reproducing the pre-registered
+            # sample regardless of how the product interest set evolves.
+            interests_path = _write_recon_interests_fixture(d)
+            cfg = dataclasses.replace(CFG, db_path=missing_db, interests_path=interests_path)
             empty_dossier = {"connectors": [{"name": n, "sample": {"per_interest": []}}
                                             for n in ("hackernews", "arxiv", "pubmed", "reddit")]}
             with mock.patch("exp_connectors._http_get", side_effect=fake_http_get), \
@@ -6558,8 +7167,9 @@ class WebTickTests(unittest.TestCase):
             summary = pipeline.run_once(self.conn, provider, CFG, dry_run=True)
         self.assertEqual(
             summary,
-            {"collected": 1, "duplicate": 0, "filtered": 0, "already_scored": 0,
-             "scored": 1, "deferred": 0, "errors": 0, "notified": 0},   # "article" isn't an ALERT type
+            {"collected": 1, "duplicate": 0, "near_duplicate": 0, "filtered": 0,
+             "already_scored": 0, "scored": 1, "deferred": 0, "errors": 0,
+             "notified": 0},   # "article" isn't an ALERT type
         )
 
 
@@ -7369,6 +7979,131 @@ class TraceRunOnceCollectorItemRootTests(unittest.TestCase):
             "SELECT node_type FROM trace_nodes WHERE id = ?", (edge["to_node_id"],)
         ).fetchone()
         self.assertEqual(candidate_node["node_type"], "candidate")
+
+
+import importlib.util as _ilu  # noqa: E402
+
+_su_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ops", "self_update.py")
+_su_spec = _ilu.spec_from_file_location("self_update", _su_path)
+self_update = _ilu.module_from_spec(_su_spec)
+_su_spec.loader.exec_module(self_update)
+
+
+class FakeGit:
+    """Answers the read-only queries self_update.gather() makes, plus records
+    the mutating ones (merge) so a test can assert whether a fast-forward ran."""
+
+    def __init__(self, *, branch="main", dirty=False, local="a" * 40,
+                 remote="a" * 40, ancestor=True, subjects=""):
+        self.branch, self.dirty = branch, dirty
+        self.local, self.remote = local, remote
+        self.ancestor, self.subjects = ancestor, subjects
+        self.calls = []
+
+    def __call__(self, args, check=True):
+        self.calls.append(args)
+        if args[0] == "fetch":
+            return 0, ""
+        if args == ["rev-parse", "--abbrev-ref", "HEAD"]:
+            return 0, self.branch
+        if args == ["status", "--porcelain"]:
+            return 0, ("M file\n" if self.dirty else "")
+        if args == ["rev-parse", "HEAD"]:
+            return 0, self.local
+        if args[0] == "rev-parse" and args[-1].startswith("origin/"):
+            return 0, self.remote
+        if args[:2] == ["merge-base", "--is-ancestor"]:
+            return (0 if self.ancestor else 1), ""
+        if args[:2] == ["log", "--oneline"]:
+            return 0, self.subjects
+        if args[:2] == ["merge", "--ff-only"]:
+            return 0, ""
+        return 0, ""
+
+    def merged(self):
+        return any(a[:2] == ["merge", "--ff-only"] for a in self.calls)
+
+
+class SelfUpdatePlanTests(unittest.TestCase):
+    """The pure decision -- no git, no I/O."""
+
+    def test_each_state_maps_to_the_right_action(self):
+        L, R = "a" * 40, "b" * 40
+        cases = [
+            (dict(branch="feature", deploy_branch="main", dirty=False, local=L, remote=R, is_ancestor=True),
+             self_update.SKIP_BRANCH),
+            (dict(branch="main", deploy_branch="main", dirty=True, local=L, remote=R, is_ancestor=True),
+             self_update.SKIP_DIRTY),
+            (dict(branch="main", deploy_branch="main", dirty=False, local=L, remote=L, is_ancestor=True),
+             self_update.CURRENT),
+            (dict(branch="main", deploy_branch="main", dirty=False, local=L, remote=R, is_ancestor=False),
+             self_update.DIVERGED),
+            (dict(branch="main", deploy_branch="main", dirty=False, local=L, remote=R, is_ancestor=True),
+             self_update.UPDATE),
+        ]
+        for kwargs, expected in cases:
+            action, _note = self_update.plan(**kwargs)
+            self.assertEqual(action, expected, kwargs)
+
+
+class SelfUpdateRunTests(unittest.TestCase):
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.root = self._tmp.name
+        self.addCleanup(self._tmp.cleanup)
+        self.cfg = SimpleNamespace(telegram_bot_token="", telegram_chat_id="")
+        self.sent = []
+        p = mock.patch.object(self_update.notify, "send",
+                              side_effect=lambda cfg, text, **_k: self.sent.append(text) or True)
+        p.start()
+        self.addCleanup(p.stop)
+
+    def test_a_clean_fast_forward_merges_redeploys_and_announces(self):
+        git = FakeGit(local="a" * 40, remote="b" * 40, subjects="b1 fix\nb2 more")
+        redeployed = []
+        action = self_update.run(
+            self.root, self.cfg, git=git, deploy_branch="main",
+            redeploy=lambda root, log=print: redeployed.append(root) or True, log=lambda *_: None)
+        self.assertEqual(action, self_update.UPDATE)
+        self.assertTrue(git.merged())
+        self.assertEqual(redeployed, [self.root])
+        self.assertEqual(len(self.sent), 1)
+        self.assertIn("updated on main", self.sent[0])
+
+    def test_current_does_nothing_and_stays_silent(self):
+        git = FakeGit(local="a" * 40, remote="a" * 40)
+        action = self_update.run(self.root, self.cfg, git=git, redeploy=self._fail_redeploy,
+                                 log=lambda *_: None)
+        self.assertEqual(action, self_update.CURRENT)
+        self.assertFalse(git.merged())
+        self.assertEqual(self.sent, [])
+
+    def test_diverged_notifies_once_and_never_merges(self):
+        def make():
+            return FakeGit(branch="main", local="a" * 40, remote="b" * 40, ancestor=False)
+        self_update.run(self.root, self.cfg, git=make(), redeploy=self._fail_redeploy, log=lambda *_: None)
+        self_update.run(self.root, self.cfg, git=make(), redeploy=self._fail_redeploy, log=lambda *_: None)
+        self.assertEqual(len(self.sent), 1)          # deduped across cycles
+        self.assertIn("diverged", self.sent[0])
+
+    def test_a_feature_branch_is_left_untouched(self):
+        git = FakeGit(branch="my-pr", local="a" * 40, remote="b" * 40)
+        action = self_update.run(self.root, self.cfg, git=git, redeploy=self._fail_redeploy,
+                                 log=lambda *_: None)
+        self.assertEqual(action, self_update.SKIP_BRANCH)
+        self.assertFalse(git.merged())
+        self.assertEqual(self.sent, [])
+
+    def test_dry_run_reports_but_changes_nothing(self):
+        git = FakeGit(local="a" * 40, remote="b" * 40, subjects="b1 x")
+        action = self_update.run(self.root, self.cfg, git=git, dry_run=True,
+                                 redeploy=self._fail_redeploy, log=lambda *_: None)
+        self.assertEqual(action, self_update.UPDATE)
+        self.assertFalse(git.merged())
+        self.assertEqual(self.sent, [])
+
+    def _fail_redeploy(self, root, log=print):
+        raise AssertionError("redeploy must not run in this case")
 
 
 if __name__ == "__main__":

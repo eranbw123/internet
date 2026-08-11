@@ -62,6 +62,12 @@ CREATE TABLE IF NOT EXISTS candidate_items (
     -- rescorer skips items attempted within SCORE_RETRY_SECONDS (db.py) so a
     -- provider outage doesn't re-fail the same items every cycle.
     score_attempted_at TEXT,
+    -- The earlier item that already tells this story, per the LLM near-dup
+    -- judge (dedup.llm_near_duplicate). A linked item is never scored or
+    -- delivered; NULL = not a known repeat. dup_reason keeps the judge's own
+    -- sentence for auditing.
+    duplicate_of     INTEGER REFERENCES candidate_items(id),
+    dup_reason       TEXT,
     first_seen_at    TEXT NOT NULL,
     -- One row per distinct thing a collector saw. A stock move recurs daily,
     -- so the stocks collector puts the date in dedup_key; everything else

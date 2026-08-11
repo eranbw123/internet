@@ -1,7 +1,8 @@
 """The pipeline, in stages:
 
     collect -> normalize -> dedup -> persist -> interest matching
-            -> cheap pre-filter -> LLM scoring -> threshold -> notification
+            -> cheap pre-filter -> near-dup judge -> LLM scoring
+            -> threshold -> notification
 
 `ingest()` is that whole chain for one candidate and is what both run_once()
 and `python -m app score` call, so a manual run exercises exactly the
@@ -24,9 +25,14 @@ from .collectors import COLLECTORS
 from .models import CandidateItem, ScoreResult
 
 STAGES = (
-    "collected", "duplicate", "filtered", "already_scored",
+    "collected", "duplicate", "near_duplicate", "filtered", "already_scored",
     "scored", "deferred", "errors", "notified",
 )
+
+# Notification channel tag for immediate discovery sends. Distinct from plain
+# "telegram" so the per-day immediate cap counts only immediate traffic, not
+# digest/alert sends (both still record as "telegram").
+IMMEDIATE_CHANNEL = "telegram_immediate"
 
 
 @dataclass
@@ -265,6 +271,15 @@ def ingest(conn, provider, cfg, item, interests, origin_interest=None, force=Fal
         tracer.edge(candidate_node, filtered_node, "rejected")
         return Outcome("filtered", item, reason, matches, lane=lane)
 
+    # The exact hashes above catch re-posts; this catches the same story
+    # re-told in different words. After the prefilter so junk never buys a
+    # judge call, before _score so a confirmed repeat saves the strictly
+    # larger scoring call.
+    near = None if force else dedup.llm_near_duplicate(conn, provider, item, cfg)
+    if near is not None:
+        db.mark_near_duplicate(conn, item.id, near.existing.id, near.reason)
+        return Outcome("near_duplicate", item, near.reason, matches, lane=lane)
+
     if db.is_scored(conn, item.id):
         if not force:
             deferred_node = tracer.node(
@@ -373,6 +388,7 @@ def _score_backlog(conn, provider, interests, budget, explore_budget=None, trace
             """
             SELECT id FROM candidate_items
             WHERE prefilter_ok = 1
+              AND duplicate_of IS NULL
               AND NOT EXISTS (SELECT 1 FROM scores s WHERE s.item_id = candidate_items.id)
               AND (score_attempted_at IS NULL OR score_attempted_at < ?)
               AND (? IS NULL OR id < ?)
@@ -425,8 +441,10 @@ def notification_ready(conn, cfg):
 
 
 def deliver(conn, cfg, dry_run=False, lane_counts=None, tracer=None):
-    """ALERT-type items only, sent the moment they clear the bar. DISCOVERY
-    items are left pending -- send_digest() is what clears those.
+    """ALERT-type items the moment they clear the bar. DISCOVERY items are
+    normally left pending for send_digest() -- unless cfg.immediate_discovery
+    is on, in which case freshly-scored discoveries also go out here, bounded
+    so a backlog or a burst can't flood the owner (see cfg.immediate_*).
 
     `lane_counts`, if given, is a Counter bumped with 'exploit'/'explore' per
     attempt (owner vs. derived interest) -- run_once() uses it to bump
@@ -434,17 +452,33 @@ def deliver(conn, cfg, dry_run=False, lane_counts=None, tracer=None):
     leaves it None and gets the old plain int back, unchanged."""
     tracer = tracer or trace.NULL_TRACER
     sent = 0
+    cycle_left = cfg.immediate_max_per_cycle if cfg.immediate_discovery else 0
+    # The per-day cap counts ONLY prior immediate sends (IMMEDIATE_CHANNEL), not
+    # digest/alert traffic -- otherwise a busy digest day would zero the budget
+    # and the feature would silently never fire.
+    day_left = (
+        max(0, cfg.immediate_max_per_day - db.successful_notifications_since(
+            conn, db.ago(24 * 3600), channel=IMMEDIATE_CHANNEL))
+        if cfg.immediate_discovery else 0
+    )
+    fresh_cutoff = db.ago(cfg.immediate_fresh_seconds)
     for row, item, interest in notification_ready(conn, cfg):
-        if not notify.is_alert(item):
-            continue
-        sent += _send_one(conn, cfg, row, item, interest, dry_run, lane_counts, tracer)
+        if notify.is_alert(item):
+            sent += _send_one(conn, cfg, row, item, interest, dry_run, lane_counts, tracer)
+        elif (cycle_left > 0 and day_left > 0
+              and row["score_created_at"] > fresh_cutoff):
+            n = _send_one(conn, cfg, row, item, interest, dry_run, lane_counts, tracer,
+                          channel=IMMEDIATE_CHANNEL)
+            sent += n
+            cycle_left -= n
+            day_left -= n
     return sent
 
 
 def send_digest(conn, cfg, dry_run=False, lane_counts=None, tracer=None):
     """DISCOVERY items only, sorted by final_score (already
     notification_ready()'s order), capped at cfg.digest_max_items. Anything
-    past the cap simply stays pending for tomorrow's digest -- it was never
+    past the cap simply stays pending for the next digest slot -- it was never
     marked notified. Alerts are never touched here; deliver() already sent
     them. `lane_counts`: see deliver() -- no caller passes one today (the
     `digest` CLI command bumps no funnel metric at all, same as before this
@@ -462,7 +496,8 @@ def send_digest(conn, cfg, dry_run=False, lane_counts=None, tracer=None):
     return sent
 
 
-def _send_one(conn, cfg, row, item, interest, dry_run, lane_counts=None, tracer=None):
+def _send_one(conn, cfg, row, item, interest, dry_run, lane_counts=None, tracer=None,
+              channel="telegram"):
     tracer = tracer or trace.NULL_TRACER
     text = notify.format_message(
         interest,
@@ -495,10 +530,10 @@ def _send_one(conn, cfg, row, item, interest, dry_run, lane_counts=None, tracer=
     ok = notify.send(cfg, text, reply_markup=keyboard, dry_run=dry_run)
     # Recorded either way: a failed send stays recorded as not-ok rather
     # than being retried forever on every cycle.
-    notification_id = db.record_notification(conn, row["score_id"], "telegram", ok)
+    notification_id = db.record_notification(conn, row["score_id"], channel, ok)
     outcome_node = tracer.node(
         tracer.run_id, "notification", entity_type="notifications", entity_id=notification_id,
-        label="telegram", status="ok" if ok else "error",
+        label=channel, status="ok" if ok else "error",
     )
     tracer.edge(render_node, outcome_node, "sent" if ok else "failed")
     if not ok:

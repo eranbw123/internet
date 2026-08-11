@@ -6,7 +6,7 @@
                                        Chrome tab; no API key
     DISCOVERY_PROVIDER=anthropic       -- direct Anthropic API; needs
                                        ANTHROPIC_API_KEY
-    DISCOVERY_PROVIDER=openai
+    DISCOVERY_PROVIDER=openai          -- direct OpenAI API; needs OPENAI_API_KEY
 
 The pipeline only ever holds an LLMProvider; it never imports a vendor SDK,
 so the whole difference between vendors lives in this package.
