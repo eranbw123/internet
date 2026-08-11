@@ -570,6 +570,12 @@ whose value is at least 8 characters has its literal *value* substituted with
 (config snapshots, prompts, responses) — the length floor keeps a short
 secret-shaped value (e.g. `AUTH_MODE=on`) from substring-rewriting unrelated
 stored text. Everything else — prompt/interest content — is stored byte-exact.
+Two config fields are masked by NAME instead, independent of their value's
+shape or length, before a config snapshot is stored: `ui_token` (the only
+access credential in `ui --public`, and often short) and `ngrok_cmd` (a
+free-form shell command that commonly embeds an inline `--authtoken`, so its
+field name alone never matches the secret-name pattern above) both become
+`[REDACTED:FIELD:<name>]` in `trace_runs.config_json`.
 
 **Council deliberation and scoring reasoning** ride the SAME `complete_json`
 call the missions/score already needed — no extra spend. The Council's
@@ -658,13 +664,16 @@ importable and green on a machine that never installs it.
   run's `render` node, which `feedback_on`-links to a still-later listener
   run's `feedback` node, so a single discovery's story usually spans 2-3
   runs), `api/children?node_id=` or `?group=` (lazy-loads a collapsed
-  sibling group), `api/node/<id>` (full inspector: exact input/output, every
-  `model_calls` row with byte-exact prompts + raw/parsed responses, redacted
+  sibling group, capped at 500 rows), `api/node/<id>` (full inspector: exact
+  input/output, every `model_calls` row with byte-exact prompts + raw/parsed
+  responses, redacted
   run config, direct `/discovery/<table>/<pk>` row URLs), `api/interest/<key>`
   (definition, provenance, `interest_events`, generations/missions/
   discoveries/failures/feedback), `api/compare?a=&b=&kind=run|model_call`
   (line-level `difflib` prompt/response diffs, or added/removed/changed
-  nodes+edges keyed by `(node_type, label)`/`(relationship, ordinal)`), and
+  nodes+edges — nodes keyed by `(node_type, label, inbound_relationship,
+  inbound_ordinal)` so same-labelled siblings stay distinct, edges keyed by
+  `(from_key, to_key, relationship, ordinal)`), and
   `trace/score/<score_id>` (an HTML deep link — resolves the score's
   `threshold` trace node, serves the shell with a `focus` bootstrap script
   tag the frontend reads). **Known gap:** `api/compare`'s `kind` is
@@ -695,7 +704,11 @@ importable and green on a machine that never installs it.
   `/{db}/-/query`), but any write attempt through them is rejected before
   execution (Datasette's own "Statement must be a SELECT" check), not just
   by convention — proven by a table-row-count-unchanged test plus the
-  rejection status code, not just the status code alone.
+  rejection status code, not just the status code alone. The plugin's own
+  `permission_allowed` hook also denies Datasette's write actions
+  (insert/update/delete row, create/drop/alter table) outright in both
+  modes — inert against 0.65 (none of those routes exist yet), hardening
+  against an unpinned future Datasette version adding one.
 - **Redaction, twice**: every API response is passed through
   `discovery.trace.redact_json` on the way OUT, independent of task 1's
   at-write redaction — defense in depth, proven with a secret planted
@@ -713,7 +726,11 @@ importable and green on a machine that never installs it.
   `permission_allowed` before serving any of them). **Live tunnel
   verification is deferred to an operator session** — this worktree has no
   ngrok binary or network to verify the tunnel itself against; the auth
-  boundary above is what the offline tests prove.
+  boundary above is what the offline tests prove. Since the token in
+  `--public` mode can only be carried as `?token=` (a plain URL button can't
+  set a header), `ui` disables uvicorn's access log in that mode
+  (`access_log=not args.public`) so the token never gets written to a log
+  file on disk; private-mode logging is unchanged.
 - **Telegram deep link** (`discovery/notify.py`): when `DISCOVERY_OBSERVATORY_BASE_URL`
   is set, `feedback_keyboard()` appends one `🔬 Open full trace` URL button
   (`<base>/observatory/trace/score/<id>`) as a third row, after the four
