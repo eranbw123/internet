@@ -1,7 +1,8 @@
 """The pipeline, in stages:
 
     collect -> normalize -> dedup -> persist -> interest matching
-            -> cheap pre-filter -> LLM scoring -> threshold -> notification
+            -> cheap pre-filter -> near-dup judge -> LLM scoring
+            -> threshold -> notification
 
 `ingest()` is that whole chain for one candidate and is what both run_once()
 and `python -m app score` call, so a manual run exercises exactly the
@@ -24,7 +25,7 @@ from .collectors import COLLECTORS
 from .models import CandidateItem, ScoreResult
 
 STAGES = (
-    "collected", "duplicate", "filtered", "already_scored",
+    "collected", "duplicate", "near_duplicate", "filtered", "already_scored",
     "scored", "deferred", "errors", "notified",
 )
 
@@ -217,6 +218,15 @@ def ingest(conn, provider, cfg, item, interests, origin_interest=None, force=Fal
     if not ok:
         return Outcome("filtered", item, reason, matches, lane=lane)
 
+    # The exact hashes above catch re-posts; this catches the same story
+    # re-told in different words. After the prefilter so junk never buys a
+    # judge call, before _score so a confirmed repeat saves the strictly
+    # larger scoring call.
+    near = None if force else dedup.llm_near_duplicate(conn, provider, item, cfg)
+    if near is not None:
+        db.mark_near_duplicate(conn, item.id, near.existing.id, near.reason)
+        return Outcome("near_duplicate", item, near.reason, matches, lane=lane)
+
     if db.is_scored(conn, item.id):
         if not force:
             return Outcome("already_scored", item, "scored on an earlier run", matches, lane=lane)
@@ -283,6 +293,7 @@ def _score_backlog(conn, provider, interests, budget, explore_budget=None):
             """
             SELECT id FROM candidate_items
             WHERE prefilter_ok = 1
+              AND duplicate_of IS NULL
               AND NOT EXISTS (SELECT 1 FROM scores s WHERE s.item_id = candidate_items.id)
               AND (score_attempted_at IS NULL OR score_attempted_at < ?)
               AND (? IS NULL OR id < ?)

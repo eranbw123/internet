@@ -137,18 +137,28 @@ def stored_item(conn, **kw):
 
 class FakeProvider(LLMProvider):
     """Stands in for anthropic/openai. `scores` maps a substring of the item
-    title to the value every dimension gets back; an Exception value raises."""
+    title to the value every dimension gets back; an Exception value raises.
+    `dup_answers` is the same idea for the near-dup judge's prompts
+    (recognised by NEAR_DUP_PROMPT's <already_stored> marker): substring ->
+    the duplicate_of id to return, or an Exception; an unmatched judge prompt
+    gets the null verdict rather than raising. Judge prompts land in
+    `dedup_prompts`, apart from `prompts`, so existing len(prompts)
+    assertions keep counting scoring spend only."""
 
     name = "fake"
 
-    def __init__(self, scores=None, search_results=None, model="fake-1"):
+    def __init__(self, scores=None, search_results=None, model="fake-1", dup_answers=None):
         super().__init__(model)
         self.scores = scores or {}
         self.search_results = search_results
         self.prompts = []
         self.search_prompts = []
+        self.dup_answers = dup_answers or {}
+        self.dedup_prompts = []
 
     def complete_json(self, system, prompt, schema, max_tokens=2000):
+        if "<already_stored>" in prompt:
+            return self._dedup_verdict(prompt)
         self.prompts.append(prompt)
         for needle, value in self.scores.items():
             if needle in prompt:
@@ -156,6 +166,15 @@ class FakeProvider(LLMProvider):
                     raise value
                 return self._payload(value)
         raise AssertionError(f"FakeProvider got an unexpected prompt:\n{prompt}")
+
+    def _dedup_verdict(self, prompt):
+        self.dedup_prompts.append(prompt)
+        for needle, value in self.dup_answers.items():
+            if needle in prompt:
+                if isinstance(value, Exception):
+                    raise value
+                return {"duplicate_of": value, "reason": "same story"}
+        return {"duplicate_of": None, "reason": "distinct"}
 
     def search_json(self, prompt, max_searches=5, max_tokens=8000):
         self.search_prompts.append(prompt)
@@ -285,6 +304,158 @@ class DedupTests(unittest.TestCase):
             an_item(url="https://other.com/x", title="Different", text="Different body.")
         )
         self.assertIsNone(dedup.find_duplicate(self.conn, fresh))
+
+
+class NearDupTests(unittest.TestCase):
+    """The fourth dedup layer: free lexical suspects, one small judge call to
+    confirm, and a confirmed repeat linked (duplicate_of) instead of scored."""
+
+    VPG_A = dict(
+        url="https://a.com/vpg", title="VPG stock plunges 25% after earnings miss",
+        text="Vishay Precision Group (VPG) shares dropped 25% on Tuesday after the "
+             "sensor maker reported quarterly revenue well below expectations.")
+    VPG_B = dict(
+        url="https://b.com/vishay", title="Vishay Precision Group falls by a quarter",
+        text="Shares of Vishay Precision Group tumbled about 25% following an "
+             "earnings miss, with revenue guidance cut for the year.")
+    VPG_C = dict(
+        url="https://c.com/sensors", title="Sensor maker VPG sinks 25% on weak guidance",
+        text="VPG stock lost a quarter of its value on Tuesday after quarterly "
+             "earnings missed estimates; the sensor maker also cut revenue guidance.")
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        db.upsert_interest(self.conn, an_interest())
+        self.interests = db.active_interests(self.conn)
+
+    def _ingest(self, provider, **kw):
+        return pipeline.ingest(self.conn, provider, CFG, an_item(**kw), self.interests, "k")
+
+    def test_the_same_story_retold_is_linked_and_never_scored(self):
+        provider = FakeProvider(
+            {"VPG stock plunges": 0.9},
+            dup_answers={"falls by a quarter": 1, "Sensor maker VPG sinks": 1},
+        )
+        first = self._ingest(provider, **self.VPG_A)
+        self.assertEqual(first.stage, "scored")
+        self.assertEqual(provider.dedup_prompts, [])  # nothing stored to compare against
+
+        second = self._ingest(provider, **self.VPG_B)
+        third = self._ingest(provider, **self.VPG_C)
+        self.assertEqual((second.stage, third.stage), ("near_duplicate", "near_duplicate"))
+        self.assertIn("same story as #1", second.detail)
+        self.assertEqual(len(provider.prompts), 1)       # only the first telling paid a score
+        self.assertEqual(len(provider.dedup_prompts), 2)
+        rows = self.conn.execute(
+            "SELECT id, duplicate_of FROM candidate_items ORDER BY id").fetchall()
+        self.assertEqual([(r["id"], r["duplicate_of"]) for r in rows],
+                         [(1, None), (2, 1), (3, 1)])
+        # The second repeat was compared against the ORIGINAL only -- a linked
+        # item leaves the judge's pool, so chains always point at the first telling.
+        self.assertNotIn("falls by a quarter", provider.dedup_prompts[1])
+
+    def test_a_distinct_development_about_the_same_company_still_scores(self):
+        provider = FakeProvider(
+            {"VPG stock plunges": 0.9, "VPG names next chief executive": 0.8})
+        self._ingest(provider, **self.VPG_A)
+        outcome = self._ingest(
+            provider, url="https://d.com/ceo",
+            title="VPG names next chief executive",
+            text="Vishay Precision Group appointed a new chief executive on Tuesday; "
+                 "shares of the sensor maker were little changed after the announcement.")
+        # Lexically suspicious (same company vocabulary), so the judge IS
+        # consulted -- and its null verdict lets the item through to scoring.
+        self.assertEqual(len(provider.dedup_prompts), 1)
+        self.assertEqual(outcome.stage, "scored")
+
+    def test_unrelated_stories_never_consult_the_judge(self):
+        provider = FakeProvider({"VPG stock plunges": 0.9, "Orexin agonist": 0.8})
+        self._ingest(provider, **self.VPG_A)
+        outcome = self._ingest(provider, url="https://e.com/orexin",
+                               title="Orexin agonist hits phase 2 endpoint", text=BODY)
+        self.assertEqual(outcome.stage, "scored")
+        self.assertEqual(provider.dedup_prompts, [])
+
+    def test_a_judge_outage_repeats_a_story_rather_than_losing_one(self):
+        provider = FakeProvider(
+            {"VPG stock plunges": 0.9, "Vishay Precision Group falls": 0.85},
+            dup_answers={"falls by a quarter": RuntimeError("provider down")},
+        )
+        self._ingest(provider, **self.VPG_A)
+        outcome = self._ingest(provider, **self.VPG_B)
+        self.assertEqual(outcome.stage, "scored")
+
+    def test_a_made_up_judge_id_is_ignored(self):
+        provider = FakeProvider(
+            {"VPG stock plunges": 0.9, "Vishay Precision Group falls": 0.85},
+            dup_answers={"falls by a quarter": 999},
+        )
+        self._ingest(provider, **self.VPG_A)
+        outcome = self._ingest(provider, **self.VPG_B)
+        self.assertEqual(outcome.stage, "scored")
+        row = self.conn.execute(
+            "SELECT duplicate_of FROM candidate_items WHERE id = 2").fetchone()
+        self.assertIsNone(row["duplicate_of"])
+
+    def test_a_shared_ticker_makes_a_suspect_even_with_disjoint_wording(self):
+        # The stocks collector stamps metadata.ticker on the articles it
+        # fetches to explain a move -- two explanations of the same move can
+        # share almost no words and must still meet the judge.
+        provider = FakeProvider(
+            {"Earnings shock": 0.9},
+            dup_answers={"Sharp fall follows results": 1},
+        )
+        first = self._ingest(
+            provider, source="stocks", url="https://s.com/a",
+            title="Earnings shock at a precision measurement group",
+            text="The company reported a steep quarterly loss, sending investors to the exits.",
+            metadata={"ticker": "VPG"})
+        self.assertEqual(first.stage, "scored")
+        second = self._ingest(
+            provider, source="stocks", url="https://s.com/b",
+            title="Sharp fall follows results",
+            text="Traders reacted badly and the share price slid in heavy volume on Tuesday.",
+            metadata={"ticker": "VPG"})
+        self.assertEqual(second.stage, "near_duplicate")
+
+    def test_a_linked_item_is_excluded_from_delivery(self):
+        original = stored_item(self.conn, url="https://x.com/1", title="First telling")
+        repeat = stored_item(self.conn, url="https://x.com/2", title="Second telling")
+        interest = self.interests[0]
+        db.save_score(self.conn, a_score(repeat.id, interest.id, 0.95))
+        self.assertEqual(len(db.pending_notifications(self.conn)), 1)
+        db.mark_near_duplicate(self.conn, repeat.id, original.id, "same story as #1")
+        self.assertEqual(db.pending_notifications(self.conn), [])
+
+    def test_the_backlog_rescorer_skips_linked_items(self):
+        original = stored_item(self.conn, url="https://x.com/1", title="First telling")
+        repeat = stored_item(self.conn, url="https://x.com/2", title="Second telling")
+        db.set_prefilter(self.conn, repeat.id, True, "")
+        db.mark_near_duplicate(self.conn, repeat.id, original.id, "same story as #1")
+        provider = FakeProvider()
+        scored = pipeline._score_backlog(
+            self.conn, provider, self.interests, pipeline.Budget(5))
+        self.assertEqual(scored["exploit"] + scored["explore"], 0)
+        self.assertEqual(provider.prompts, [])
+
+    # Frozen from production discovery.db items 11/173 and 22/174 -- two real
+    # stories each delivered twice on 2026-08-10 because the exact title
+    # hashes differ on a parenthetical suffix.
+    NEBIUS_DEBT = "Nebius raises $775 million in first secured debt financing to accelerate global buildout"
+    NEBIUS_META = "Nebius signs new AI infrastructure agreement with Meta (company newsroom)"
+    NEBIUS_DEBT_REPEAT = NEBIUS_DEBT + " (Form 6-K, Ex. 99.1)"
+    NEBIUS_META_REPEAT = "Nebius signs new AI infrastructure agreement with Meta (Form 6-K and press release)"
+
+    def test_the_prod_double_sends_are_now_retrieved_as_suspects(self):
+        stored_item(self.conn, url="https://n.com/debt", title=self.NEBIUS_DEBT, text="")
+        stored_item(self.conn, url="https://n.com/meta", title=self.NEBIUS_META, text="")
+        for title, expected_id in ((self.NEBIUS_DEBT_REPEAT, 1), (self.NEBIUS_META_REPEAT, 2)):
+            fresh = normalize.normalize(
+                an_item(url="https://other.com/x", title=title, text=""))
+            suspects = dedup.find_suspects(self.conn, fresh, CFG)
+            self.assertEqual([s["id"] for s in suspects], [expected_id])
 
 
 class MatchingTests(unittest.TestCase):
@@ -2643,8 +2814,9 @@ class PipelineTests(unittest.TestCase):
         summary = self._run(provider)
         self.assertEqual(
             summary,
-            {"collected": 2, "duplicate": 0, "filtered": 0, "already_scored": 0,
-             "scored": 2, "deferred": 0, "errors": 0, "notified": 0},
+            {"collected": 2, "duplicate": 0, "near_duplicate": 0, "filtered": 0,
+             "already_scored": 0, "scored": 2, "deferred": 0, "errors": 0,
+             "notified": 0},
         )
         self.assertEqual(pipeline.send_digest(self.conn, CFG, dry_run=True), 1)
 
@@ -3028,8 +3200,9 @@ class PipelineTests(unittest.TestCase):
         summary = self._run(provider)
         self.assertEqual(
             summary,
-            {"collected": 2, "duplicate": 0, "filtered": 0, "already_scored": 0,
-             "scored": 2, "deferred": 0, "errors": 0, "notified": 0},
+            {"collected": 2, "duplicate": 0, "near_duplicate": 0, "filtered": 0,
+             "already_scored": 0, "scored": 2, "deferred": 0, "errors": 0,
+             "notified": 0},
         )
         names = {r["name"] for r in self.conn.execute("SELECT DISTINCT name FROM metrics").fetchall()}
         self.assertFalse(any(n.startswith("explore_") for n in names))
@@ -3076,6 +3249,8 @@ class LaneProvider(FakeProvider):
         self.keys = keys or {}
 
     def complete_json(self, system, prompt, schema, max_tokens=2000):
+        if "<already_stored>" in prompt:
+            return self._dedup_verdict(prompt)
         self.prompts.append(prompt)
         for needle, value in self.scores.items():
             if needle in prompt:
@@ -6723,8 +6898,9 @@ class WebTickTests(unittest.TestCase):
             summary = pipeline.run_once(self.conn, provider, CFG, dry_run=True)
         self.assertEqual(
             summary,
-            {"collected": 1, "duplicate": 0, "filtered": 0, "already_scored": 0,
-             "scored": 1, "deferred": 0, "errors": 0, "notified": 0},   # "article" isn't an ALERT type
+            {"collected": 1, "duplicate": 0, "near_duplicate": 0, "filtered": 0,
+             "already_scored": 0, "scored": 1, "deferred": 0, "errors": 0,
+             "notified": 0},   # "article" isn't an ALERT type
         )
 
 

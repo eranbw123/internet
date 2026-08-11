@@ -65,6 +65,16 @@ class Config:
     immediate_max_per_cycle: int = 3
     immediate_max_per_day: int = 40
     immediate_fresh_seconds: int = 1800   # only discoveries scored in the last 30 min go out immediately
+    # LLM-confirmed near-duplicate detection (dedup.llm_near_duplicate). The
+    # exact-hash layers catch re-posts; this catches the same story re-told in
+    # different words ("VPG down 25%" from three outlets). A judge call is only
+    # spent when free lexical retrieval finds suspects among recently stored
+    # articles, and a confirmed repeat skips the larger scoring call it would
+    # otherwise buy. The window bounds how far back retrieval looks (cost),
+    # not what counts as a duplicate -- the judge sees dates and decides.
+    dedup_llm: bool = True
+    dedup_window_days: int = 30
+    dedup_max_candidates: int = 6
     # Failed-send retry policy (see db.pending_notifications); raised from the
     # smaller db.py module constants, which stay as that function's own
     # defaults so a call site that doesn't pass cfg still gets a sane policy.
@@ -142,6 +152,9 @@ def load():
         immediate_max_per_cycle=int(os.environ.get("DISCOVERY_IMMEDIATE_MAX_PER_CYCLE", "3")),
         immediate_max_per_day=int(os.environ.get("DISCOVERY_IMMEDIATE_MAX_PER_DAY", "40")),
         immediate_fresh_seconds=int(os.environ.get("DISCOVERY_IMMEDIATE_FRESH_SECONDS", str(30 * 60))),
+        dedup_llm=os.environ.get("DISCOVERY_DEDUP_LLM", "1").strip().lower() in ("1", "true"),
+        dedup_window_days=int(os.environ.get("DISCOVERY_DEDUP_WINDOW_DAYS", "30")),
+        dedup_max_candidates=int(os.environ.get("DISCOVERY_DEDUP_MAX_CANDIDATES", "6")),
         send_max_attempts=int(os.environ.get("DISCOVERY_SEND_MAX_ATTEMPTS", "5")),
         send_retry_seconds=int(os.environ.get("DISCOVERY_SEND_RETRY_SECONDS", str(30 * 60))),
         chrome_launch_cmd=os.environ.get("DISCOVERY_CHROME_LAUNCH_CMD", ""),
