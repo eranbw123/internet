@@ -7,7 +7,16 @@
                   collection to one collector; Alerts still send immediately,
                   Discovery items still just queue for `digest`). Gated by a
                   provider preflight (health.py) -- a dead Chrome/CDP exits 3
-                  before touching a single collector or LLM call.
+                  before touching a single collector or LLM call. stocks and
+                  youtube still run here; web discovery no longer does (see
+                  web-tick) -- `--source web_search` still works standalone.
+    web-tick      the continuous Council-driven web discovery tick (see
+                  discovery/council.py, discovery/missions.py): replenish at
+                  most one interest's mission queue, lease+execute a fair
+                  slice of pending missions, feed discoveries through the
+                  same pipeline. Meant to run every interval_web_seconds
+                  (default 60s); gated on the mission provider's own
+                  preflight, exit 3 on failure, same as run-once.
     discover      run one collector across all active interests, print
                   candidates and scores, never sends (e.g. `discover web_search`)
     score         push one candidate through the pipeline and print the verdict
@@ -17,9 +26,15 @@
     items         list recently scored items
     feedback      record feedback on an item, by item id
     stats         funnel, feedback and cost over a trailing window
+    interests     layered interest state (discovery/interest_state.py):
+                  list (owner rows first), --layer to filter, --why <key>
+                  for the provenance chain, --refresh to run
+                  promotion/decay (a no-op unless DISCOVERY_DYNAMIC_INTERESTS)
     health        job staleness, provider reachability, pending sends;
                   --notify alerts on degraded/recovery (rate-limited)
     personal-state  print the ai repo's personal-state contract artifact
+    teach         rank scored-but-unlabeled items by expected information
+                  value and record labels; --list/--explain/--send
 
 There is no `run`/scheduler loop -- an OS scheduler (see
 ops/install_tasks.py) calls the commands above on their own cadence instead;
@@ -32,12 +47,13 @@ from collections import Counter
 
 from datetime import datetime, timezone
 
-from . import config, db, feedback_listener, health, interests, personal_state, providers, stats
+from . import config, db, feedback_listener, health, interests, missions, personal_state, providers, stats, teach
 from .collectors import COLLECTORS
 from .models import CandidateItem
 from .notify import FEEDBACK_VERDICTS, print_safe
 from .personal_state import PersonalStateError
-from .pipeline import Budget, deliver, ingest, run_once, send_digest
+from .pipeline import Budget, deliver, ingest, outcome_metric, run_once, send_digest
+from . import interest_state
 
 
 def main(argv=None):
@@ -54,6 +70,9 @@ def main(argv=None):
     ro = sub.add_parser("run-once", help="one cycle")
     ro.add_argument(
         "--source", choices=sorted(COLLECTORS), help="collect only this collector's items"
+    )
+    sub.add_parser(
+        "web-tick", help="one continuous Council-driven web discovery tick (see PROJECT_STATE.md)"
     )
     sub.add_parser("digest", help="send the pending Discovery digest now")
     disc = sub.add_parser(
@@ -91,10 +110,28 @@ def main(argv=None):
         "--notify", action="store_true",
         help="alert on degraded/recovery over Telegram, rate-limited",
     )
+    it = sub.add_parser(
+        "interests", help="layered interest state: list, --why <key>, --refresh"
+    )
+    it.add_argument("--layer", choices=list(interest_state.LAYERS), help="filter the listing")
+    it.add_argument("--why", metavar="KEY", help="print the provenance chain for one interest")
+    it.add_argument(
+        "--refresh", action="store_true",
+        help="run promotion/decay and write changes (no-op unless DISCOVERY_DYNAMIC_INTERESTS)",
+    )
     ps = sub.add_parser(
         "personal-state", help="print the ai repo's personal-state contract artifact"
     )
     ps.add_argument("--path", help="override DISCOVERY_PERSONAL_STATE / cfg.personal_state_path")
+    te = sub.add_parser(
+        "teach", help="rank scored-but-unlabeled items by expected information value"
+    )
+    te.add_argument("--limit", type=int, help="default 10, or 5 for --send")
+    te.add_argument("--interest", help="restrict to one interest key")
+    mode = te.add_mutually_exclusive_group()
+    mode.add_argument("--list", action="store_true", help="print the ranked queue and exit")
+    mode.add_argument("--explain", action="store_true", help="print queue_metrics and exit")
+    mode.add_argument("--send", action="store_true", help="push the top items to Telegram")
 
     args = parser.parse_args(argv)
     cfg = config.load()
@@ -151,6 +188,8 @@ def _dispatch(conn, cfg, args, provider):
         return _run_job(
             conn, job_name, lambda: _run_once_cmd(conn, provider(), cfg, sources, args.dry_run, job_name)
         )
+    elif args.command == "web-tick":
+        return _run_job(conn, "web", lambda: _web_tick_cmd(conn, provider(), cfg, args.dry_run))
     elif args.command == "discover":
         return _discover(conn, provider(), cfg, args)
     elif args.command == "score":
@@ -177,8 +216,12 @@ def _dispatch(conn, cfg, args, provider):
         print_safe(stats.report(conn, args.days, cfg))
     elif args.command == "health":
         return _health_cmd(conn, cfg, provider(), args)
+    elif args.command == "interests":
+        return _interests_cmd(conn, cfg, args)
     elif args.command == "personal-state":
         return _personal_state(cfg, args)
+    elif args.command == "teach":
+        return _teach_cmd(conn, cfg, args)
     return 0
 
 
@@ -206,6 +249,19 @@ def _run_once_cmd(conn, provider, cfg, sources, dry_run, job_name):
     if not health.preflight_gate(conn, provider, cfg, job_name):
         return 3
     print(run_once(conn, provider, cfg, sources=sources, dry_run=dry_run))
+    return 0
+
+
+def _web_tick_cmd(conn, provider, cfg, dry_run):
+    """`provider` here is the scoring provider (built from cfg.provider by
+    the CLI's shared provider() closure, same as run-once) -- web_tick()
+    builds its own search-capable mission provider internally from
+    cfg.mission_provider and gates on that provider's own preflight, so
+    there is no separate health.preflight_gate() call here."""
+    result = missions.web_tick(conn, cfg, provider=provider, dry_run=dry_run)
+    if not result["preflight_ok"]:
+        return 3
+    print(result)
     return 0
 
 
@@ -248,6 +304,7 @@ def _discover(conn, provider, cfg, args):
     total = 0
     counts = Counter()
     budget = Budget(cfg.max_scores_per_cycle)
+    explore_budget = Budget(cfg.explore_max_scores_per_cycle if cfg.dynamic_interests else 0)
     for interest in active:
         try:
             candidates = collect(interest, cfg, provider, conn)
@@ -259,7 +316,7 @@ def _discover(conn, provider, cfg, args):
             counts["collected"] += 1
             outcome = ingest(
                 conn, provider, cfg, item, active,
-                origin_interest=interest.key, budget=budget,
+                origin_interest=interest.key, budget=budget, explore_budget=explore_budget,
             )
             counts[outcome.stage] += 1
             # Flushed per item rather than once at the end (see pipeline.py's
@@ -268,7 +325,7 @@ def _discover(conn, provider, cfg, args):
             # (a narrow console codepage choking on a model-generated
             # character) and silently lost every already-scored item's funnel
             # counts with it, even though their DB rows were already committed.
-            db.bump(conn, {"collected": 1, outcome.stage: 1})
+            db.bump(conn, {"collected": 1, outcome_metric(outcome): 1})
             _print_discovered(interest, item, outcome)
     print(f"\n{total} candidate(s) from '{args.source}'", file=sys.stderr)
     return 0
@@ -348,6 +405,64 @@ def _list_items(conn, limit, min_score):
         print_safe(f"      {row['url']}")
 
 
+def _interests_cmd(conn, cfg, args):
+    if args.why:
+        return _interests_why(conn, args.why)
+    if args.refresh:
+        return _interests_refresh(conn, cfg)
+    return _interests_list(conn, args.layer)
+
+
+def _interests_list(conn, layer):
+    rows = db.list_interests(conn, layer)
+    if not rows:
+        print_safe("no interests" + (f" at layer '{layer}'" if layer else ""))
+        return 0
+    for row in rows:
+        print_safe(
+            f"{row['key']}  layer={row['layer']}  active={row['active']}  "
+            f"min_score={row['min_score']:.2f}  last_observed_at={row['last_observed_at'] or '-'}"
+        )
+    return 0
+
+
+def _interests_why(conn, key):
+    events = db.interest_events(conn, key)
+    if not events:
+        row = conn.execute("SELECT 1 FROM interests WHERE key = ?", (key,)).fetchone()
+        if row is None:
+            print(f"no interest with key {key!r}", file=sys.stderr)
+            return 2
+        print_safe(f"{key}: no events recorded")
+        return 0
+    print_safe(f"{key}:")
+    for e in events:
+        print_safe(
+            f"  {e['at']}  {e['actor']}  {e['action']}  "
+            f"{e['from_layer'] or '-'} -> {e['to_layer'] or '-'}  {json.dumps(e['evidence'])}"
+        )
+    return 0
+
+
+def _interests_refresh(conn, cfg):
+    if not cfg.dynamic_interests:
+        print_safe("dynamic interests are off (DISCOVERY_DYNAMIC_INTERESTS)")
+        return 0
+    # apply_transitions() reads cfg.interests_path (blocked_derived_terms) via
+    # a bare open()/json.loads -- same failure modes as `init`'s interests.sync,
+    # so isolate them the same way rather than letting them traceback.
+    try:
+        summary = interest_state.apply_transitions(conn, cfg)
+    except FileNotFoundError:
+        print(f"interests file not found: {cfg.interests_path}", file=sys.stderr)
+        return 2
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        print(f"malformed interests file {cfg.interests_path}: {e}", file=sys.stderr)
+        return 2
+    print_safe(f"refresh: {json.dumps(summary)}")
+    return 0
+
+
 def _personal_state(cfg, args):
     """Human-checkable probe: load the ai repo's contract artifact and print
     what internet would see, without touching the pipeline."""
@@ -371,6 +486,25 @@ def _personal_state(cfg, args):
     for topic in state.topics[:10]:
         print_safe(f"  {topic.get('key')!r}  weight={topic.get('weight')}")
     return 0
+
+
+def _teach_cmd(conn, cfg, args):
+    """No provider() call anywhere on this path -- `teach` stays in the
+    no-provider command family alongside `items`/`feedback`/`stats`."""
+    limit = args.limit if args.limit is not None else (5 if args.send else 10)
+    if args.list:
+        print_safe(teach.format_queue(teach.build_queue(conn, limit, args.interest)))
+        return 0
+    if args.explain:
+        print_safe(teach.format_metrics(teach.queue_metrics(conn, limit, args.interest)))
+        return 0
+    if args.send:
+        teach.run_send(conn, cfg, limit, args.interest, dry_run=args.dry_run)
+        return 0
+    # `input` looked up here, not as teach.run_interactive's bound default --
+    # a default value is captured once at import time, so patching
+    # builtins.input in a test would never reach it.
+    return teach.run_interactive(conn, limit, args.interest, read=input)
 
 
 if __name__ == "__main__":

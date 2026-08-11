@@ -2,40 +2,86 @@
 
 Updated 2026-08-11. Imported by `CLAUDE.md`. Current state only — not a log.
 
-## appliance self-update + chatgpt latest-high model (2026-08-11)
-The appliance runs `python -m app` from the deployed checkout, so a merged fix
-only goes live once that checkout is fast-forwarded — nothing did it, so it sat
-stranded on stale `engine-lab` (live log: `unknown provider 'chatgpt_browser'`).
-Fixed two ways:
+## chatgpt_browser provider reconciliation (step-12 task 1)
+Ported verbatim from owner `main` (which predates steps 06-10, so was reconciled
+by hand, file by file, not merged): `discovery/providers/chatgpt_browser.py`
+(new — chatgpt.com via CDP, same "authenticated browser tab, no API key" shape
+as `claude_chat`; default model `latest-high`, a sentinel resolved live to
+chatgpt.com's newest version at its High/max-reasoning preset; sentinel
+proof-of-work solved in-page via an embedded pure-JS SHA3-512). `cdp.py` gained
+`find_chatgpt_tab` (checks `chatgpt.com` then `chat.openai.com`); registered in
+`discovery/providers/__init__.py` PROVIDERS and `config.DEFAULT_MODELS`
+(`"chatgpt_browser": "latest-high"`). Port is additive only — default provider
+is still `claude_chat`, `DEFAULT_MODELS['claude_chat']` unchanged. 25 ported
+tests (`ChatGPTBrowserProviderTests`, offline, fake CDP connection seam)
+appended to `test_discovery.py` (345 -> 370, all green).
 
-**Auto-update.** New 7th recurring task `internet-discovery-update` (30-min,
-`ops/update.cmd` → `ops/self_update.py`; added to `install_tasks._TASK_SPECS`
-with an optional 6th `script` element, `build_tasks` unpacks `spec[:5]` +
-default `run.cmd`). Each run: `git fetch`; **only when on
-`DISCOVERY_DEPLOY_BRANCH` (default `main`) AND clean** does it `merge --ff-only`
-then redeploy (`app init` + `install_tasks --install`). Never resets, never
-switches off a feature branch (same checkout authors PRs), never touches a
-dirty tree. Divergence/git-error → one Telegram alert deduped by
-`logs/.update_state.json`; success announced; "current" silent. `plan()` is a
-pure decision (unit-tested); `run()` takes injectable git/redeploy/notify.
-`--dry-run`/`--status` preview without changing anything. Exit 0 for routine
-outcomes, 2 for error/diverged.
+## continuous Council-driven web discovery (step-12 task 2)
+Web discovery's scheduled path is now a durable mission queue, not a
+periodic static-prompt batch. `discovery/council.py` (stdlib-only): the
+Council's reasoning architecture (5 advisor personas -> anonymized Stage-2
+peer review -> Chairman synthesis) is ported verbatim in substance from
+`ai`'s `council_bot.py` (`internet` never imports/execs/shells to `ai`); the
+ai-specific context paragraph and prose output are dropped in favor of N
+strict-JSON missions. `plan_missions()` makes one `complete_json` call,
+validates strictly (`CouncilError` on bad shape/empty prompt/<1
+mission/case-insensitive duplicate labels), truncates extras past N.
+`build_context()` feeds the Council the owner interest verbatim + recent
+frontier/feedback/mission-history, each bounded by a cfg value -- Goodhart
+firewall asserted by test: never `min_score`, a `models.WEIGHTS`
+name/dimension, `final_score` or `confidence`.
 
-**chatgpt_browser latest-high.** `DEFAULT_MODELS["chatgpt_browser"]` is now the
-sentinel `latest-high`, resolved live in the send JS from
-`/backend-api/models`: newest `versions[0]` → its thinking preset with the
-highest `thinking_effort` (currently `gpt-5-6-thinking`/`extended`), so a new
-generation needs no code change. `slug`/`slug:effort` in `DISCOVERY_MODEL`
-pins. Body carries `thinking_effort`. Thinking models return only a
-`stream_handoff` (no inline SSE text), so `_attempt` polls
-`/backend-api/conversation/{id}` (`_poll`/`_js_poll`, `/* poll */` marker for
-the test seam) until the assistant text message is `finished_successfully`.
-Fallback `gpt-5-6-thinking`/`extended` only if the model list can't be read.
-Applies thinking to scoring too (slower/heavier quota — documented; pin a bare
-slug to opt out). All live-verified against the owner's chatgpt.com tab.
-Tests: `ChatGPTBrowserProviderTests` (+resolution/handoff-poll/timeout),
-`SelfUpdatePlanTests`/`SelfUpdateRunTests`, updated `InstallTasksTests` (7
-tasks). 285 in `test_discovery.py`, all green.
+Durable state: `search_generations`/`search_missions` (schema.sql, additive)
++ thin db.py helpers, most notably `lease_missions()` (atomic `BEGIN
+IMMEDIATE` claim, PENDING-check inside the same transaction -- a post-UPDATE
+SELECT keyed on `leased_at` would misfire on two leases in the same
+wall-clock second) and `recover_stale_missions()` (expired `RUNNING` ->
+PENDING, or FAILED once `attempts` >= `mission_max_attempts`).
+`discovery/missions.py`'s `web_tick()` (`python -m app web-tick`, scheduled
+as `collect-web` every `interval_web_seconds`, now 60s default): recover
+stale leases -> replenish AT MOST ONE owner interest below
+`mission_low_water` (one Council call/tick -- self-populates an empty DB one
+interest at a time, never a burst) -> lease a fair round-robin slice
+(`missions_per_tick`) across owner interests -> execute each independently
+via `mission_provider` (default `chatgpt_browser`)'s `search_json`, framed
+as an iterative research mission, `_search.to_items()` -> stamp provenance
+(`generation_id`/`mission_id`/`mission_label`/`prompt_sha256`) into
+`item.metadata` -> `pipeline.ingest()`/`deliver()`, the same path every
+other collector uses (dedup/matching/scoring/budgets/Telegram untouched).
+One mission's failure never aborts another; a dead mission provider fails
+preflight and leases/spends nothing (scoring still uses `cfg.provider`,
+unchanged). `_score_backlog()` deliberately not called here (would spend
+`max_scores_per_cycle` every minute). `discovery/collectors/web_search.py`
+survives only as manual `discover`/`run-once --source web_search` plus a
+bounded fallback: one `static-fallback` mission queued after
+`council_max_consecutive_failures` Council failures in a row for an
+interest. `pipeline.budgets_for(cfg)` factors the exploit/explore `Budget`
+pair out of `run_once()`, now shared with `web_tick()` -- the one refactor
+this step allows itself. 14 new cfg knobs (`council_*`/`mission_*`,
+`DISCOVERY_*` env-backed), plus `interval_web_seconds` default 4h -> 60s.
+35 new offline tests (`CouncilTests`, `MissionDbTests`, `WebTickTests`,
+`StatsTests` -- fake mission + fake scoring providers, no Chrome/CDP/
+network), 370 -> 405, all green.
+
+Repair (review pass): `_generate_for()`'s except clause only caught
+`(CouncilError, ProviderError)`, but `build_context()` ran outside any
+try at all and a live provider's own response parsing can raise other
+exception types (e.g. `TypeError`/`JSONDecodeError` on a malformed non-dict
+reply) -- either would have propagated out of `web_tick()` and aborted
+every other interest's execution for the tick, and left the generation row
+orphaned at `PENDING` forever. `_generate_for()` now inserts the generation
+row first and wraps `build_context()` + `plan_missions()` in one `except
+Exception`. `_replenish()` also gained a cool-off (reusing
+`mission_retry_seconds`, no new knob): an interest whose latest generation
+just `FAILED` is skipped until the cool-off passes, so a broken Council
+can't burn one real provider call every single tick. `web_tick()`'s
+preflight check now goes through `health.preflight_gate()` instead of a
+bare `mission_provider.preflight()` call, so a dead mission provider gets
+the same `chrome_launch_cmd` relaunch attempt and `provider_down` counter
+run-once's own gate already gives the scoring provider. `stats.py` gained
+a MISSIONS section (generation done/failed counts in-window, mission queue
+status all-time) -- the queue side of this subsystem had no `stats.py`
+surface at all before this repair.
 
 ## service hardening (step-01): no more in-process scheduler
 `discovery/scheduler.py` and `run` are DELETED; `ops/install_tasks.py` is the
@@ -131,6 +177,66 @@ append the artifact's top N topic keys to `positive_signals`; absent the key
 readout. Not yet wired into `init`/production sync — this step only
 establishes the contract boundary.
 
+## layered interest state (step-07)
+`interests` gains `layer` (owner/inferred/emerging/exploratory/retired,
+default 'owner'), `provenance` (JSON), `last_observed_at`; append-only
+`interest_events` (indexed on `interest_key`) is the provenance log —
+nothing ever UPDATEs/DELETEs it. Off by default: `DISCOVERY_DYNAMIC_INTERESTS`
+(`cfg.dynamic_interests`, default False) gates everything —
+`interest_state.apply_transitions()` is a zeroed no-op with it off; no
+derived row, query, or LLM/network call happens either way. Owner rows are
+immutable to automation three ways: `db.upsert_interest`'s ON CONFLICT is
+`WHERE layer='owner'`; the two derived-only write helpers
+(`upsert_derived_interest`, `set_interest_layer`, in `db.py`, the ONLY
+functions allowed to write a non-owner row) carry `WHERE layer != 'owner'`
+and raise `OwnerInterestImmutable` on a zero rowcount; two SQLite triggers
+(`db.TRIGGERS_SQL`, applied in `db.init` AFTER the additive-ALTER pass since
+they reference `layer`) abort any raw UPDATE/DELETE touching an owner row.
+Derived keys are namespaced `derived:<term>` (`db.DERIVED_KEY_PREFIX`);
+`interests.load_file` raises ValueError if an owner key carries it —
+structurally prevents owner/derived collision.
+
+`discovery/interest_state.py` (stdlib only): `Rules` (frozen dataclass,
+8 thresholds, construct directly — no new env vars), `Evidence`
+(observations/distinct_days/first_seen/last_seen/pos+neg feedback/sources),
+`gather_evidence()` (title tokens only, via `matching._tokens` — no second
+tokenizer — of `candidate_items` in `evidence_window_days`, excluding
+owner-covered and already-tracked-non-retired terms, deterministic
+truncation to `max_candidates`), `decide()` (pure, no DB/clock: absent→
+exploratory→emerging→inferred on observations/distinct_days/feedback bars;
+idle `decay_idle_days` demotes one rung; negative-feedback-dominant retires
+immediately; retired re-enters only at exploratory at
+`promote_observations*reentry_multiplier` observations — anti-flapping;
+blocklisted terms never enter and retire if already tracked; NEVER emits
+layer='owner', asserted). `apply_transitions()` snapshots already-tracked
+rows before writing so one call advances a term at most one ladder rung
+(new-entry and progression are separate passes). Optional
+`personal_state`-seeded rows land at exploratory with zero observations —
+can never promote on their own (step-05's carried-forward constraint:
+knowledge-state signals stay non-predictive-validated). Staleness (repair:
+was measured off this-pass evidence alone, so a seeded or between-window
+row with no fresh observation this pass decayed on its very next
+re-evaluation regardless of `decay_idle_days` — a seed was actively
+counterproductive, harder to ever adopt than never seeding at all) is now
+measured against `interests.last_observed_at` as the fallback baseline
+(`apply_transitions()` merges it into `Evidence.last_seen` before calling
+`decide()`, which itself stays pure/DB-free); `upsert_derived_interest`
+stamps it on every write, seed included, precisely so a freshly written row
+isn't idle before it's ever had a chance to be observed. Operational meaning:
+exploratory/emerging are `active=0, sources='[]'` (reviewable, zero spend);
+inferred is `active=1, min_score=max(cfg.derived_min_score, owner floor),
+positive_signals=[term]` (participates in matching against items owner
+collectors already fetch — no new collector call); promotion past
+`cfg.derived_max_active` inferred rows is skipped and logged as
+`promotion_capped` rather than dropped silently. Config: exactly
+`dynamic_interests`/`derived_max_active` (5)/`derived_min_score` (0.80,
+at/above today's owner bars). CLI: `python -m app interests [--layer L]
+[--why KEY] [--refresh]` — list (owner first), provenance chain, or run
+`apply_transitions` (prints the off-message and changes nothing if the flag
+is off). `interests.sync` now appends one 'owner_sync' event per interest.
+Scheduling the refresh on a cadence is deferred to a later step — not
+wired into `ops/install_tasks.py` here.
+
 ## engine lab (`experiments/lab/`, branch `engine-lab`)
 Reusable prompt-optimization loop for the whole engine, generalized from the
 x prompt lab: `lab_common.py` (budget cap, runs.jsonl full-prompt log,
@@ -205,82 +311,49 @@ exp_discovery.py). New Lab("discovery") budget, cap 220. Validate + ntfy
 chained. Lab rules in CLAUDE.md: iterations run detached; every iteration
 must shrink the lab (also in the council brief).
 
-**E5 — connector evidence (step-09a, `exp_connectors.py`)**: read-only recon
-for step-09's connector decision (x, hackernews, reddit, arxiv, pubmed vs
-the 5 probed interests). Zero-spend lane RAN for real (14 free HTTP
-requests, 0 provider calls): hackernews 0 hits (the mechanical
-title+3-signals query is over-constrained for Algolia's AND-match, an
-honest low-recall result, not a bug), reddit blocked (403, likely
-datacenter-IP anti-bot), arxiv and pubmed reachable with real records
-(counts vary run to run with live network conditions). `marginal_unique_rate`
-now genuinely computes against `discovery.db` alone when it's reachable (the
-pre-registered offline-lane substitute baseline; repair fixed a bug where
-this was hardcoded unreachable with no code path to fix it) — still VOID
-here because this worktree has no `discovery.db`. Verdict
-**`VOID_NO_BASELINE`**. **The live lane is NOT YET IMPLEMENTED in the
-harness**, not just session-gated: no code calls `provider.search_json` for
-`x`, and there is no `web_search` baseline sampler, so
-`jaccard_overlap_with_web_search_sample` (needed for a decisive H1
-either way) stays void regardless of who runs `sample` or from where.
-Before re-running for real evidence: (1) implement an `x` sampler
-(`provider.search_json` + the same mechanical query rule) and a
-`web_search`-baseline sampler in `exp_connectors.py`, (2) then run
-`python experiments/lab/exp_connectors.py sample` from a live operator
-session (Chrome `--remote-debugging-port=9222`, logged into claude.ai) with
-`discovery.db` reachable. Spend: 14/40 HTTP requests, $0, 0 provider calls,
-0 YouTube quota. Follow-up: `exp_connectors.py` keeps its own local
-canonicalization/percentile helpers (never touched `exp_discovery.py`'s, to
-avoid disturbing `engine-lab-005` in flight) — collapse the two copies onto
-one shared module once 005 completes. Dossier:
-`experiments/lab/connector_evidence.json` (tracked).
-
-## chatgpt_browser provider: ChatGPT via CDP, no API key (2026-08-10)
-`discovery/providers/chatgpt_browser.py` — the ChatGPT twin of `claude_chat`,
-riding a logged-in chatgpt.com tab over CDP (same transport the `ai` repo reads
-history with). `DISCOVERY_PROVIDER=chatgpt_browser`, default model slug `auto`,
-port `CHATGPT_BROWSER_PORT`→`CLAUDE_BROWSER_PORT`→9222; no CLAUDE_ORG_ID, no
-key. Registered in `providers/__init__`, `config.DEFAULT_MODELS`. Reuses
-`claude_chat._extract_object`/`_validate` (no structured outputs; prompt-for-
-JSON + validate + one retry). `search_json` sets `system_hints:["search"]`
-(chatgpt.com's own web search); `complete_json` doesn't — so web_search/youtube
-discovery now run on ChatGPT too.
-
-The hard part vs claude.ai: chatgpt.com gates `/backend-api/conversation`
-behind a sentinel challenge. Per call, in-page JS: read token from
-`/api/auth/session` → POST `/backend-api/sentinel/chat-requirements` → if
-`proofofwork.required`, solve it (SHA3-512 prefix search; **SubtleCrypto has no
-SHA3**, so a compact BigInt keccak is embedded — cross-checked byte-for-byte
-against Python `hashlib.sha3_512` on 4 vectors; server only checks the answer's
-hash prefix, so the config array is pure entropy, iters capped ~150k≈8s with a
-graceful-fallback token) → **if `turnstile.required`, echo `turnstile.dx` back
-as `OpenAI-Sentinel-Turnstile-Token`** (live sessions set required:true but
-accept the echoed challenge — do NOT throw) → POST conversation with the
-sentinel headers, `history_and_training_disabled:true`, SSE read: assistant
-snapshots live in `message.content.parts` (cumulative; overwrite only on a
-non-empty join so a trailing empty can't wipe the answer); delta-v1
-(`o:add`/`append`, bare-`v`) kept as fallback → best-effort PATCH
-`is_visible:false`. Structure mirrors claude_chat: lazy connect, one reconnect
-on dropped socket, JS-exception/empty/None all → ProviderError.
-
-**LIVE-VERIFIED (2026-08-10)** against the owner's real chatgpt.com tab on :9222
-(plan_type plus, model resolved gpt-5-6): `complete_json` returned
-`{answer:4, word:'hello'}`; `web_search.collect` returned 3 real Nebius items
-(real URLs/titles/summaries) through ChatGPT's own search. First live run
-exposed the two bugs now fixed: turnstile was thrown on (chatgpt.com sets
-required:true) — fixed by echoing dx; and the SSE guard. Diagnostics captured
-the real frame shapes (see the two fixes). Offline: python suite stubs the CDP
-seam like claude_chat's (16 tests, incl. a JS-contract lock for the sentinel/
-turnstile/PoW tokens); the JS SSE+PoW core also executed in Node vs a simulated
-server. Direct `openai` API provider unchanged (scoring-only, no server-side
-search) — the point is ChatGPT discovery goes through the browser, not a key.
-
-## interests.json rewrite (2026-08-10, owner-supplied)
-Full owner rewrite: 40 interests, defaults `min_score` 0.8 / `sources` []
-(interests with explicit `sources: []` collect nothing but remain scoring
-targets). Owner's `max_videos: 1` translated to `max_transcript_fetches: 1`;
-unsupported empty `channels` dropped. New youtube knob added for it:
-`source_config.youtube.queries` — owner starting-point searches injected
-into the stage-1 discovery prompt as hints (absent key = prompt unchanged).
+**E5 — connector evidence (step-09a + step-09, `exp_connectors.py`)**:
+read-only recon for step-09's connector decision. step-09a's H1 pass (14
+free HTTP requests, 0 provider calls) returned `VOID_NO_BASELINE`, but its
+own records showed it had measured the query rule, not the connectors:
+title+3-signals concatenated into 300 chars was over-constrained for
+Algolia (hackernews 0 hits) and topically wrong for relevance-ranked
+arxiv/pubmed. **DECIDED.** step-09's separately pre-registered H2 pass
+(`PREREGISTRATION_PASS2`, frozen before any run) reran hackernews/arxiv/
+pubmed under a corrected mechanical rule (`build_query_v2`: first 4
+distinctive title tokens, `matching._tokens`' own rule) and measured
+`usable_yield` — records built into a `CandidateItem` with `origin_interest`
+UNSET (no free `ORIGIN_MATCH_FLOOR` pass) scoring ≥ `cfg.min_match_score`
+via `matching.match_interests`. Real run (10 HTTP requests, 0 provider
+calls): hackernews 2/20, arxiv 1/10 (2/3 queries timed out — recorded in the
+new `aborted_attempts`/`verdict_detail`, not retried per "no re-runs"),
+pubmed 6/20 — genuinely on-topic records (narcolepsy/orexin trials, EMDR
+studies). **Mixed, not an aggregate improvement**: the new rule helped
+hackernews (0→2) and pubmed (0→6) but arxiv REGRESSED (10→1, mostly from
+those 2/3 timeouts cutting n from a designed 30 to 10) — pooled new-rule
+yield is 9 vs the old rule's pooled 10. Under the identical USABLE
+definition the old-rule arxiv arm alone already clears the gate's 8-record
+bar (10 of 30); only the new-rule arm feeds the gate, per pre-registration,
+and every connector there stays under it. **Verdict `H2_FALSIFIED`** —
+decisive, not a shortfall.
+`apply_promotion_gate` (G1 unique max ≥8, G2 ≥2x runner-up, G3
+`marginal_unique_rate` ≥0.40 against a reachable corpus) returned
+**`NO_PROMOTION` (G1: max=6)**; G3 was separately unreachable too
+(`discovery.db` absent from this worktree). Dispositions: hackernews/arxiv/
+pubmed `NOT_PROMOTED_VOID_BASELINE`; reddit `RETIRED_UNREACHABLE` (403 on
+both step-09a's 5-interest sweep and step-09's one-request re-check —
+`reddit_url`/`parse_reddit` deleted, `sample_reddit_pass2` now a zero-network
+stub, so the current tree can no longer reproduce the persisted reddit
+entry's one live HTTP call; see the dossier's own `reproducibility_note`);
+x `DEFERRED_NEEDS_PROVIDER` (still needs a `provider.search_json`
+sampler + a live operator session; only the unreplicated `x_prompt_lab`
+prior exists). Gate returned NO_PROMOTION, so **no `discovery/` changes**.
+Before a decisive promotion is possible: a reachable `discovery.db`, and a
+`web_search` baseline sample (call the existing
+`discovery/collectors/web_search.py` `collect()` from a live claude.ai
+session — not a second sampler). `exp_connectors.py`'s local
+canonicalization/percentile helpers still duplicate `exp_discovery.py`'s
+(collapse once proposal 005 completes — unchanged this step). Dossier:
+`experiments/lab/connector_evidence.json` (tracked, both passes).
 
 ## youtube: graceful degradation to video-level items
 Stages 1–2 unchanged (LLM-first `search_json` discovery, 0 quota; one batched
@@ -328,6 +401,27 @@ cached strategist prompt + 2–4 angle searches, dedup_key=status id, add
 `experiments/x_prompt_lab/` (untracked). Fallback transports if ever needed:
 twitterapi.io ($0.15/1k) or t.me/s/walter_bloomberg scrape.
 
+## teach: information-value labeling queue (step-06)
+`discovery/teach.py` (no new table, no LLM call) ranks already-scored,
+not-yet-labeled items by expected `information` value — WEIGHTS-combined
+bar proximity (gap to `interests.min_score`, decaying over `BAND_WIDTH`),
+model self-uncertainty (`1 - confidence`), and per-interest label scarcity —
+rationale: proposals 003/004 found notify flips track bar proximity, not
+scorer variance, and corpus band_density is only .148. `build_queue`/
+`baseline_queue`/`queue_metrics` compare the ranker against the honest
+recency baseline over the same pool; both arms are always reported, even if
+the baseline wins. `python -m app teach` is the interactive labeling loop
+(records via the existing `db.add_feedback`, same call the Telegram
+listener makes); `--list` prints without prompting; `--explain` prints
+`queue_metrics`; `--send` pushes the top of the queue to Telegram by reusing
+`notify.format_message`/`feedback_keyboard`/`send`, so labels come back
+through the existing `listen`/`listen --drain` flow with no new callback
+format. The acceptance evidence (`band_lift >= 2.0`, band_share strictly
+higher) is measured on a **synthetic planted fixture** in `test_discovery.py`
+(recency deliberately anti-correlated with bar proximity) — this worktree
+has no `discovery.db`, so no real-corpus number is claimed. Live readout,
+once `discovery.db` exists: `python -m app teach --explain --limit 20`.
+
 ## Open decision
 `recency_days` is both prompt bias and HARD verify drop. Proposal (not
 implemented): per-interest `strict_recency` (default true); false = keep old
@@ -337,8 +431,7 @@ novelty judge instead. Awaiting user approval.
 ## Implemented
 `watch.py` Yahoo helper (library-only, no CLI/ntfy). `discovery/`:
 staged pipeline, 0–1 scoring, providers `claude_chat` (default; claude.ai via
-CDP Chrome :9222 + `CLAUDE_ORG_ID`, no key) / `chatgpt_browser` (chatgpt.com
-via CDP, no key) / `anthropic` / `openai`; score
+CDP Chrome :9222 + `CLAUDE_ORG_ID`, no key) / `anthropic` / `openai`; score
 budget; backlog rescore w/ 30-min backoff; Telegram ALERT (market_event,
 immediate) vs DISCOVERY digest (daily, capped); failed sends retried (15-min
 cool-off, max 3); feedback listener; scheduler (60s tick). Collectors:
@@ -351,7 +444,7 @@ All timestamps UTC via `db.now()`/`db.ago()`. No token metering on
 claude_chat (calls only).
 
 ## Tests
-`python test_discovery.py` (273) + `python test_watch.py` (10), offline, both
+`python test_discovery.py` (345) + `python test_watch.py` (10), offline, both
 green; CI on push/PR.
 
 ## Known issues
@@ -367,3 +460,111 @@ python test_discovery.py && python test_watch.py
 python -m app run-once   |   python -m app run   |   python -m app digest
 python -m app listen     |   python -m app stats --days 7
 ```
+
+## product loop closure + anti-self-amplification guard (step-08)
+The personal_state seed path (step-07) was already reachable from the CLI --
+`apply_transitions()` itself calls `personal_state.load_optional()` and
+`interests --refresh` already calls `apply_transitions()` -- so no new
+wiring was needed. What was missing was provenance and a proven guard:
+
+**Provenance.** Every seed's origin -- `origin='personal_state'`,
+`artifact_sha256` (sha256 of the artifact file's bytes, read fresh at seed
+time), the artifact's own `generated_at`/`contract_version`, the `topic_key`,
+and `seeded_at` -- is now recorded on BOTH the interest's `provenance` JSON
+column and its `interest_events` seed row (`interest_state._write_transition`'s
+new `provenance_extra` param, threaded from `apply_transitions()`'s seed
+loop). `interests --why <key>` already prints every event's evidence JSON
+verbatim, so the seed origin shows up there with no CLI change needed. A
+documented SQL query walking notification → score → item → interest →
+interest_events → seed event (with the artifact hash) is in README.md's new
+"Provenance chain" section, and a test executes that exact query and asserts
+every hop resolves.
+
+**Leakage guard (the core of this step).** `interest_state._window_stats()`
+was a pure title-token count, blind to *why* an item exists -- it didn't
+distinguish genuine independent corpus evidence from an item whose only
+attribution (via `item_interests`) is the derived interest's own matching.
+Structurally this can't yet fire in production (a lower-than-`inferred`
+layer is never in `active_interests()`, so it can't have matched anything
+yet), but a directly-constructed fixture proved the evidence-gathering path
+itself would have counted it as promotion evidence once it could. Fixed:
+`_window_stats()` now keeps per-item hits (not pre-aggregated counts), and
+`apply_transitions()`'s step 3 (progression of already-tracked rows) excludes,
+per term, any item whose ONLY `item_interests` row is a match to that same
+derived interest (`_self_matched_item_ids()`). A test drives the real
+`apply_transitions()` over 3 cycles of self-referential-only evidence with no
+feedback: the row never leaves `exploratory`, no `promote` event appears, no
+owner row or score row changes, and it demotes/retires on schedule once idle.
+A companion test proves the positive path is untouched: independent
+owner-collector evidence (no `item_interests` involved at all) plus feedback
+via `db.add_feedback` promotes `exploratory` → `emerging` → `inferred`, one
+rung per pass, and an above-bar match on the now-`inferred` interest is
+delivered through the real pipeline (`pipeline.send_digest`).
+
+**Default-off safety.** `test_default_off_is_a_true_noop` (step-07,
+unmodified) still passes: with the flag off, `apply_transitions()` never
+even calls `personal_state.load_optional()` or reads `item_interests`.
+
+**Real-data posture.** This worktree has no `discovery.db`/`personal_state.json`
+-- every test above is a synthetic fixture. The live-session command
+sequence for the real loop is in README.md's "Real-data loop demo" section;
+it has not been run here.
+
+## exploration engine (step-10)
+Exploitation (owner interests) and exploration (derived/inferred interests,
+see "layered interest state (step-07)" above) are now separated at the
+scoring boundary, not just at promotion time. Lane rule -- the one thing
+everything hangs on: an item is 'explore' iff `matches[0]` (the strongest
+match from `matching.match_interests()`, sorted strongest-first) is a
+non-owner interest; `pipeline.classify_lane()` is the single, trivially-total
+implementation, computed once per item before dedup so it's stable across
+that item's whole `ingest()` path. A weaker derived match alongside a
+stronger owner one still charges exploitation, byte-identical to before this
+step.
+
+Two `pipeline.Budget` instances per cycle (`run_once`/`__main__._discover`,
+the only construction sites): the existing exploit one (`DISCOVERY_MAX_SCORES`)
+and a new explore one (`explore_max_scores_per_cycle`, env
+`DISCOVERY_EXPLORE_MAX_SCORES`, default `5`) -- `Budget(cfg.explore_max_scores_per_cycle
+if cfg.dynamic_interests else 0)`, so the flag off makes it structurally
+zero, not merely filtered. `ingest()`'s `explore_budget=None` kwarg default
+preserves every pre-existing caller (`score`, `teach`, tests) untouched.
+`_score_backlog()` takes both budgets and pages through the backlog with an
+id cursor (repair: a single `ORDER BY id DESC LIMIT budget+explore_budget`
+select could permanently starve the exploit lane -- lane is only known
+after fetching+matching a row, so a batch that happened to be entirely
+explore-classified while explore_budget was 0/spent would `continue` past
+every row and return with the exploit backlog never even reached, and
+since a lane-blocked item is deferred rather than attempted it re-occupies
+that same newest-first window on every future cycle too); each page still
+`continue`s (not `break`s) past an exhausted lane's rows so the other lane
+keeps draining, and paging stops once both budgets are spent or a page
+returns fewer rows than requested (backlog exhausted). `Outcome.lane`
+(default 'exploit') drives `db.bump()`'s metric
+name (`explore_<stage>` vs `<stage>`; 'collected' stays unprefixed --
+collection is always owner-driven since a derived row's `sources` is always
+`[]`) at all three per-item/trailing bump sites. `deliver()`/`send_digest()`
+gained an optional `lane_counts` Counter (default None -- every existing
+caller's plain-int return is unchanged) so `run_once` can bump
+`notified`/`explore_notified` by the *actually persisted* score's interest
+layer (a join, not `Outcome.lane` -- the model can pick a different
+shortlisted interest than the match-time best).
+
+`stats.py`: `_funnel`'s `notified` scalar and `_per_interest` now join
+notifications -> scores -> interests and restrict to `layer = 'owner'` (a
+real repair -- before this step a derived/inferred notification silently
+inflated exploitation's own numbers). A new EXPLORATION section (interest
+counts by layer, `explore_scored`/`explore_deferred`/`explore_errors`/
+`explore_notified`, and a "NOTIFICATIONS PER DERIVED INTEREST" table shaped
+like the owner one) prints only when there's a non-owner interest row, an
+`explore_*` metric, or `cfg.dynamic_interests` -- a default-off report is
+byte-identical to before this step existed.
+
+**No new threshold.** `derived_min_score` (step-07, floor `0.80`) already
+gates which derived scores can notify at all; this step only needed distinct
+*budgets* and distinct *metrics*, not a distinct bar. Do not re-add one.
+
+**Real-data posture.** This worktree has no `discovery.db` -- every number
+in `test_discovery.py`'s `ExplorationLaneTests` is a synthetic in-memory
+fixture. Live readout once dynamic interests are running for real:
+`python -m app stats --days 7`, EXPLORATION section.

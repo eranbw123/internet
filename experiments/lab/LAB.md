@@ -73,14 +73,14 @@ maximizing AUC. Prints a proposal; below 30 labels it is directional only.
 python experiments/lab/exp_weights.py
 ```
 
-### E5 — connector evidence, read-only (`exp_connectors.py`)
-Step-09a: does any of the 5 candidate connectors (x, hackernews, reddit,
-arxiv, pubmed) reach items the engine can't already reach? Bounded free-HTTP
-probes (<=40 requests, <=10/connector) against the frozen probed-interest
-set; never registers a collector, edits `interests.json`, or writes
-`discovery.db`. `probe` = availability only; `sample` = bounded retrieval +
-analysis, persists the tracked `experiments/lab/connector_evidence.json`
-dossier; `report` = render the persisted dossier, zero spend.
+### E5 — connector evidence, read-only (`exp_connectors.py`) — DECIDED
+Does any candidate connector (x, hackernews, reddit, arxiv, pubmed) reach
+items the engine can't already reach? Answered in two pre-registered passes,
+both against the frozen 5-interest probed set, never registering a
+collector, editing `interests.json`, or writing `discovery.db`. `probe` =
+availability only; `sample` now runs ONLY the H2 (pass_2_e5b) pass against
+the already-frozen dossier (see below); `report` = render both passes, zero
+spend.
 
 ```bash
 python experiments/lab/exp_connectors.py probe
@@ -88,16 +88,47 @@ python experiments/lab/exp_connectors.py sample
 python experiments/lab/exp_connectors.py report
 ```
 
-The live lane (x sampling via `search_json`, a `web_search` baseline
-sampler, the above-bar sub-metric) is NOT YET IMPLEMENTED — `sample` only
-ever runs the zero-spend HTTP connectors; see PROJECT_STATE.md for what's
-still needed before a live re-run produces new evidence.
+**H1 (step-09a)**: measured the query rule, not the connectors — the frozen
+title+3-signals rule was over-constrained for Algolia (hackernews 0 hits)
+and topically wrong for relevance-ranked arxiv/pubmed. `VOID_NO_BASELINE`.
 
-Retires `blind_rate.py` (guardrail 8): proposal 002 was mothballed
+**H2 (step-09, `PREREGISTRATION_PASS2`)**: corrected, still-mechanical query
+rule (`build_query_v2`) + a code-computed `usable_yield` metric
+(`matching.match_interests`, `origin_interest` unset, no LLM). Real run: 10
+requests, 0 provider calls; hackernews 2/20, arxiv 1/10 (2/3 queries timed
+out — see `aborted_attempts`), pubmed 6/20 usable — real, on-topic records.
+**Mixed result, not an aggregate improvement**: the new rule helped
+hackernews (0→2) and pubmed (0→6) but arxiv REGRESSED (10→1, mostly from
+those timeouts cutting n from a designed 30 to 10) — pooled new-rule yield
+9 vs the old rule's pooled 10. Under the identical USABLE definition the
+old-rule arxiv arm alone already clears the gate's 8-record bar (10 of 30);
+only the new-rule arm feeds the gate, per pre-registration, and every
+connector there stays under it. **Verdict `H2_FALSIFIED`** (decisive, not a
+shortfall). `apply_promotion_gate` (G1 unique max≥8, G2 ≥2x runner-up, G3
+`marginal_unique_rate`≥0.40 against a reachable corpus): **`NO_PROMOTION`**
+(G1 failed on yield; G3 was separately unreachable — no `discovery.db` in
+this worktree). Dispositions: hackernews/arxiv/pubmed
+`NOT_PROMOTED_VOID_BASELINE`; reddit `RETIRED_UNREACHABLE` (403 on both
+passes — its sampler/parser are deleted, so the current tree can no longer
+reproduce the persisted reddit entry's one live HTTP call; see the
+dossier's `reproducibility_note`); x `DEFERRED_NEEDS_PROVIDER` (needs
+a `provider.search_json` sampler + a live session; still only the
+unreplicated `x_prompt_lab` prior). No `discovery/` change. Blocking work
+for a future decisive pass: a reachable `discovery.db`, and a `web_search`
+baseline sample via the existing collector's `collect()` from a live
+session — not a new sampler. Full numbers: PROJECT_STATE.md and
+`experiments/lab/connector_evidence.json` (tracked, both passes).
+
+Retires `blind_rate.py` (guardrail 8, step-09a): proposal 002 was mothballed
 indefinitely by owner decision ("proceed label-free"), every label-gated
 metric is already gated elsewhere, and the frozen 67-item batch under the
 gitignored `artifacts/blind_batch_002/` is untouched — git history retains
-the file if the rating pass is ever revived.
+the file if the rating pass is ever revived. Retires (guardrail 8, step-09)
+the `x` NOT_IMPLEMENTED scaffolding (`build_x_entry` → the compact
+`x_deferred_entry`), the reddit sampler/parser (`reddit_url`/`parse_reddit`,
+retired on a second independent 403), and the one-shot `run_sample()`
+dossier builder (unreachable once `sample` stopped rebuilding step-09a's
+frozen results from scratch).
 
 ## Golden set
 

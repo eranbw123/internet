@@ -7,6 +7,7 @@ the pipeline holds an LLMProvider, so a fake object with `complete_json` /
 `search_json` is the whole seam.
 """
 import dataclasses
+import hashlib
 import io
 import json
 import os
@@ -22,19 +23,24 @@ from unittest import mock
 
 from discovery import (
     config,
+    council,
     db,
     dedup,
     feedback_listener,
     health,
+    interest_state,
     interests,
     matching,
+    missions,
     models,
     normalize,
     notify,
     personal_state,
     pipeline,
+    providers,
     scoring,
     stats,
+    teach,
 )
 from discovery.personal_state import PersonalState, PersonalStateError
 from discovery.collectors import COLLECTORS, stocks, web_search, youtube
@@ -549,6 +555,84 @@ class DBTests(unittest.TestCase):
         # A live retry candidate (under the cap) is not "abandoned".
         self.assertEqual(db.abandoned_notifications(self.conn, max_attempts=10), 0)
 
+    # --- layered interest state: owner immutability + provenance -----------
+
+    def test_owner_row_survives_a_derived_write_attempt_by_key_collision(self):
+        """Structurally impossible in production (interests.load_file()
+        rejects an owner key carrying DERIVED_KEY_PREFIX), but guarded here
+        too -- upsert_derived_interest() refuses a non-prefixed key outright."""
+        db.upsert_interest(self.conn, an_interest(key="owner1"))
+        with self.assertRaises(ValueError):
+            db.upsert_derived_interest(
+                self.conn, an_interest(key="owner1", layer="inferred"), {}
+            )
+        stored = db.interest_by_key(self.conn, "owner1")
+        self.assertEqual(stored.layer, "owner")
+
+    def test_set_interest_layer_refuses_an_owner_row(self):
+        db.upsert_interest(self.conn, an_interest(key="owner1"))
+        with self.assertRaises(db.OwnerInterestImmutable):
+            db.set_interest_layer(self.conn, "owner1", "inferred", {})
+        self.assertEqual(db.interest_by_key(self.conn, "owner1").layer, "owner")
+
+    def test_set_interest_layer_refuses_a_key_that_does_not_exist(self):
+        with self.assertRaises(db.OwnerInterestImmutable):
+            db.set_interest_layer(self.conn, "derived:nope", "emerging", {})
+
+    def test_the_owner_layer_trigger_aborts_a_raw_update(self):
+        db.upsert_interest(self.conn, an_interest(key="owner1"))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("UPDATE interests SET layer = 'inferred' WHERE key = 'owner1'")
+        self.assertEqual(db.interest_by_key(self.conn, "owner1").layer, "owner")
+
+    def test_the_owner_delete_trigger_aborts_a_raw_delete(self):
+        db.upsert_interest(self.conn, an_interest(key="owner1"))
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.conn.execute("DELETE FROM interests WHERE key = 'owner1'")
+        self.assertIsNotNone(db.interest_by_key(self.conn, "owner1"))
+
+    def test_upsert_derived_interest_round_trips_layer_and_provenance(self):
+        interest = an_interest(
+            key="derived:gizmo", title="gizmo", positive_signals=["gizmo"], layer="exploratory"
+        )
+        db.upsert_derived_interest(self.conn, interest, {"source": "corpus", "term": "gizmo"})
+        stored = db.interest_by_key(self.conn, "derived:gizmo")
+        self.assertEqual(stored.layer, "exploratory")
+        self.assertEqual(stored.provenance, {"source": "corpus", "term": "gizmo"})
+        row = self.conn.execute(
+            "SELECT active FROM interests WHERE key = 'derived:gizmo'"
+        ).fetchone()
+        self.assertEqual(row["active"], 0)   # exploratory never spends provider budget
+
+    def test_upsert_derived_interest_inferred_is_active(self):
+        interest = an_interest(key="derived:gizmo", layer="inferred", min_score=0.8)
+        db.upsert_derived_interest(self.conn, interest, {})
+        row = self.conn.execute(
+            "SELECT active FROM interests WHERE key = 'derived:gizmo'"
+        ).fetchone()
+        self.assertEqual(row["active"], 1)
+
+    def test_interest_events_is_append_only_and_ordered(self):
+        db.add_interest_event(self.conn, "derived:x", "automation", "enter", None, "exploratory", {"observations": 1})
+        db.add_interest_event(self.conn, "derived:x", "automation", "promote", "exploratory", "emerging", {"observations": 5})
+        events = db.interest_events(self.conn, "derived:x")
+        self.assertEqual([e["action"] for e in events], ["enter", "promote"])
+        self.assertEqual(events[0]["to_layer"], "exploratory")
+        self.assertEqual(events[1]["evidence"], {"observations": 5})
+        self.assertEqual(db.interest_events(self.conn, "derived:nothing-here"), [])
+
+    def test_list_interests_filters_by_layer_and_puts_owner_first(self):
+        db.upsert_interest(self.conn, an_interest(key="owner1"))
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:x", layer="exploratory"), {}
+        )
+        keys = [r["key"] for r in db.list_interests(self.conn)]
+        self.assertEqual(keys, ["owner1", "derived:x"])
+        self.assertEqual(
+            [r["key"] for r in db.list_interests(self.conn, layer="exploratory")], ["derived:x"]
+        )
+        self.assertEqual(db.list_interests(self.conn, layer="inferred"), [])
+
 
 class StatsTests(unittest.TestCase):
     def setUp(self):
@@ -573,6 +657,27 @@ class StatsTests(unittest.TestCase):
         self.assertIn("candidates collected", text)
         self.assertIn("nothing rated yet", text)
         self.assertIn("no usage recorded", text)
+        self.assertNotIn("MISSIONS", text)   # nothing in search_generations/search_missions yet
+
+    def test_missions_section_shows_generation_and_queue_status(self):
+        gen_id = db.insert_generation(self.conn, "k", "fake_mission", "m1", 2)
+        db.insert_missions(self.conn, gen_id, "k", [
+            {"label": "a", "rationale": "r", "prompt": "do a"},
+            {"label": "b", "rationale": "r", "prompt": "do b"},
+        ])
+        db.finish_generation(self.conn, gen_id, "DONE", 2)
+        bad_gen = db.insert_generation(self.conn, "k", "fake_mission", "m1", 1)
+        db.finish_generation(self.conn, bad_gen, "FAILED", 0, "boom")
+        mission_id = self.conn.execute(
+            "SELECT id FROM search_missions WHERE label = 'a'"
+        ).fetchone()["id"]
+        db.lease_missions(self.conn, [mission_id], 900)
+        db.finish_mission(self.conn, mission_id, 3)
+
+        text = stats.report(self.conn, days=7)
+        self.assertIn("MISSIONS (continuous web discovery)", text)
+        self.assertIn("generations in window: done=1 failed=1", text)
+        self.assertIn("missions (all time): pending=1 running=0 done=1 failed=0", text)
 
     def test_funnel_shows_survivors_and_what_reached_the_llm(self):
         db.bump(self.conn, {"collected": 100, "duplicate": 40, "filtered": 30,
@@ -885,6 +990,21 @@ class InterestsFileTests(unittest.TestCase):
         self.assertEqual(with_state, no_state)
         self.assertEqual(with_state, plain)
 
+    def test_an_owner_key_carrying_the_derived_prefix_is_rejected(self):
+        with self.assertRaises(ValueError) as ctx:
+            self._load({"interests": [{"key": "derived:x", "title": "X"}]})
+        self.assertIn("derived:x", str(ctx.exception))
+
+    def test_load_blocked_reads_the_optional_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "i.json")
+            with open(path, "w", encoding="utf-8") as fh:
+                json.dump({"interests": [], "blocked_derived_terms": ["spam", "clickbait"]}, fh)
+            self.assertEqual(interests.load_blocked(path), ["spam", "clickbait"])
+
+    def test_load_blocked_defaults_to_empty_list_when_absent(self):
+        self.assertEqual(interests.load_blocked("interests.json"), [])
+
 
 class PersonalStateTests(unittest.TestCase):
     def _write(self, data):
@@ -976,6 +1096,605 @@ class PersonalStateTests(unittest.TestCase):
         with self.assertRaises(PersonalStateError):
             personal_state.load(missing_key)
         self.assertIsNone(personal_state.load_optional(missing_key))
+
+
+NOW = datetime(2026, 8, 10, tzinfo=timezone.utc)
+FRESH = (NOW - timedelta(days=1)).isoformat(timespec="seconds")
+STALE = (NOW - timedelta(days=40)).isoformat(timespec="seconds")
+
+
+class InterestStateDecideTests(unittest.TestCase):
+    """decide() is pure -- no DB, no clock of its own -- so the whole ladder
+    is exercised as a table, current_layer/evidence/blocked in, Transition
+    (or None) out."""
+
+    RULES = interest_state.Rules()
+
+    CASES = [
+        ("absent, never observed -> stays absent",
+         None, dict(observations=0), False, None),
+        ("absent, observed once -> enters exploratory",
+         None, dict(observations=1, last_seen=FRESH), False, ("exploratory", "enter")),
+        ("absent, blocked -> never enters even though observed",
+         None, dict(observations=9, last_seen=FRESH), True, None),
+        ("exploratory, below the observation bar -> stays",
+         "exploratory", dict(observations=4, distinct_days=3, last_seen=FRESH), False, None),
+        ("exploratory, below the distinct-day bar -> stays",
+         "exploratory", dict(observations=5, distinct_days=2, last_seen=FRESH), False, None),
+        ("exploratory, both bars cleared -> promotes to emerging",
+         "exploratory", dict(observations=5, distinct_days=3, last_seen=FRESH), False,
+         ("emerging", "promote")),
+        ("emerging, feedback bar not cleared -> stays",
+         "emerging", dict(observations=5, distinct_days=3, positive_feedback=1,
+                           negative_feedback=0, last_seen=FRESH), False, None),
+        ("emerging, feedback tied (not strictly positive) -> stays",
+         "emerging", dict(observations=5, distinct_days=3, positive_feedback=2,
+                           negative_feedback=2, last_seen=FRESH), False, None),
+        ("emerging, observation bar regressed even with feedback -> stays",
+         "emerging", dict(observations=4, distinct_days=3, positive_feedback=5,
+                           negative_feedback=0, last_seen=FRESH), False, None),
+        ("emerging, every bar cleared -> promotes to inferred",
+         "emerging", dict(observations=5, distinct_days=3, positive_feedback=2,
+                           negative_feedback=0, last_seen=FRESH), False,
+         ("inferred", "promote")),
+        ("inferred, nothing above it and still fresh -> stays",
+         "inferred", dict(observations=5, distinct_days=3, last_seen=FRESH), False, None),
+        ("inferred, idle -> decays one rung to emerging",
+         "inferred", dict(last_seen=STALE), False, ("emerging", "decay")),
+        ("emerging, idle -> decays one rung to exploratory",
+         "emerging", dict(last_seen=STALE), False, ("exploratory", "decay")),
+        ("exploratory, idle -> decays to retired",
+         "exploratory", dict(last_seen=STALE), False, ("retired", "decay")),
+        ("exploratory, never actually observed this evidence -> treated as idle",
+         "exploratory", dict(last_seen=None), False, ("retired", "decay")),
+        ("exploratory, negative feedback dominates -> immediate retire",
+         "exploratory", dict(negative_feedback=3, positive_feedback=0, last_seen=FRESH), False,
+         ("retired", "retire_negative_feedback")),
+        ("inferred, negative feedback dominates -> immediate retire even though active",
+         "inferred", dict(negative_feedback=3, positive_feedback=1, last_seen=FRESH), False,
+         ("retired", "retire_negative_feedback")),
+        ("inferred, negative feedback at the bar but not dominant -> stays",
+         "inferred", dict(negative_feedback=3, positive_feedback=3, last_seen=FRESH), False, None),
+        ("retired, re-entry evidence below the anti-flap multiplier -> stays retired",
+         "retired", dict(observations=9), False, None),
+        ("retired, re-entry evidence clears the multiplier -> re-enters at exploratory",
+         "retired", dict(observations=10), False, ("exploratory", "reentry")),
+        ("exploratory, blocked -> retired",
+         "exploratory", dict(last_seen=FRESH), True, ("retired", "retire_blocked")),
+        ("retired, blocked -> stays retired, no duplicate event",
+         "retired", dict(observations=100), True, None),
+    ]
+
+    def test_the_ladder(self):
+        for name, current_layer, evidence_kwargs, blocked, expected in self.CASES:
+            with self.subTest(name):
+                evidence = interest_state.Evidence(**evidence_kwargs)
+                transition = interest_state.decide(current_layer, evidence, self.RULES, NOW, blocked)
+                if expected is None:
+                    self.assertIsNone(transition, name)
+                else:
+                    to_layer, action = expected
+                    self.assertEqual((transition.to_layer, transition.action), (to_layer, action), name)
+                    self.assertEqual(transition.from_layer, current_layer)
+
+    def test_decide_never_emits_a_transition_into_owner(self):
+        """Never any transition to OWNER, from any state, ever."""
+        evidences = [
+            interest_state.Evidence(),
+            interest_state.Evidence(observations=100, distinct_days=50, last_seen=FRESH),
+            interest_state.Evidence(positive_feedback=10, negative_feedback=0, last_seen=FRESH),
+            interest_state.Evidence(negative_feedback=10, positive_feedback=0, last_seen=FRESH),
+            interest_state.Evidence(last_seen=STALE),
+        ]
+        for current_layer in (None, "exploratory", "emerging", "inferred", "retired"):
+            for evidence in evidences:
+                for blocked in (False, True):
+                    transition = interest_state.decide(current_layer, evidence, self.RULES, NOW, blocked)
+                    if transition is not None:
+                        self.assertNotEqual(transition.to_layer, "owner")
+
+    def test_personal_state_seed_evidence_can_never_promote_on_its_own(self):
+        """Zero observations (what a seed transition's Evidence carries) can
+        never clear the exploratory -> emerging bar by itself -- it may only
+        decay (never observed = stale), never promote."""
+        seeded = interest_state.Evidence()
+        transition = interest_state.decide("exploratory", seeded, self.RULES, NOW, blocked=False)
+        self.assertTrue(transition is None or transition.action != "promote")
+
+
+class InterestStateEvidenceTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.rules = interest_state.Rules()
+
+    _counter = 0
+
+    def _item(self, title, days_ago=0):
+        InterestStateEvidenceTests._counter += 1
+        seen = (NOW - timedelta(days=days_ago)).isoformat(timespec="seconds")
+        item = normalize.normalize(an_item(title=title, url=f"https://e.com/{self._counter}"))
+        self.conn.execute(
+            "INSERT INTO candidate_items (source, type, title, text, url, dedup_key, url_hash,"
+            " title_hash, content_hash, first_seen_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (item.source, item.type, item.title, item.text, item.url, item.dedup_key,
+             item.url_hash, item.title_hash, item.content_hash, seen),
+        )
+        self.conn.commit()
+
+    def test_gather_evidence_counts_observations_and_distinct_days(self):
+        self._item("Gizmo breakthrough announced", days_ago=1)
+        self._item("Another gizmo update lands", days_ago=1)
+        self._item("Gizmo momentum continues", days_ago=3)
+        evidence = interest_state.gather_evidence(self.conn, self.rules, NOW)
+        self.assertEqual(evidence["gizmo"].observations, 3)
+        self.assertEqual(evidence["gizmo"].distinct_days, 2)
+
+    def test_gather_evidence_excludes_owner_covered_terms(self):
+        db.upsert_interest(self.conn, an_interest(title="Gizmo watch", positive_signals=["gizmo"]))
+        self._item("Gizmo breakthrough announced", days_ago=1)
+        evidence = interest_state.gather_evidence(self.conn, self.rules, NOW)
+        self.assertNotIn("gizmo", evidence)
+
+    def test_gather_evidence_excludes_an_existing_non_retired_derived_term_but_not_a_retired_one(self):
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="exploratory"), {}
+        )
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:widget", layer="retired"), {}
+        )
+        self._item("Gizmo breakthrough announced", days_ago=1)
+        self._item("Widget breakthrough announced", days_ago=1)
+        evidence = interest_state.gather_evidence(self.conn, self.rules, NOW)
+        self.assertNotIn("gizmo", evidence)
+        self.assertIn("widget", evidence)   # retired terms are still reconsidered (re-entry)
+
+    def test_gather_evidence_ignores_items_outside_the_window(self):
+        self._item("Gizmo breakthrough announced", days_ago=200)
+        evidence = interest_state.gather_evidence(self.conn, self.rules, NOW)
+        self.assertNotIn("gizmo", evidence)
+
+    def test_gather_evidence_counts_feedback_on_matching_titles(self):
+        item = normalize.normalize(an_item(title="Gizmo breakthrough announced", url="https://e.com/g1"))
+        item.id = db.insert_item(self.conn, item)
+        db.add_feedback(self.conn, item.id, None, "up")
+        db.add_feedback(self.conn, item.id, None, "trash")
+        self._item("Gizmo momentum continues", days_ago=1)
+        evidence = interest_state.gather_evidence(self.conn, self.rules, NOW)
+        self.assertEqual(evidence["gizmo"].positive_feedback, 1)
+        self.assertEqual(evidence["gizmo"].negative_feedback, 1)
+
+    def test_gather_evidence_skips_a_verdict_outside_feedback_verdicts_rather_than_assuming_positive(self):
+        item = normalize.normalize(an_item(title="Gizmo breakthrough announced", url="https://e.com/g1"))
+        item.id = db.insert_item(self.conn, item)
+        db.add_feedback(self.conn, item.id, None, "not-a-real-verdict")
+        self._item("Gizmo momentum continues", days_ago=1)
+        evidence = interest_state.gather_evidence(self.conn, self.rules, NOW)
+        self.assertEqual(evidence["gizmo"].positive_feedback, 0)
+        self.assertEqual(evidence["gizmo"].negative_feedback, 0)
+
+    def test_gather_evidence_is_truncated_deterministically(self):
+        rules = dataclasses.replace(self.rules, max_candidates=1)
+        self._item("Gizmo news today", days_ago=1)
+        self._item("Gizmo update lands", days_ago=1)
+        self._item("Widget only mention here", days_ago=1)
+        evidence = interest_state.gather_evidence(self.conn, rules, NOW)
+        # "gizmo" (2 observations) beats every single-observation term.
+        self.assertEqual(list(evidence), ["gizmo"])
+
+
+class InterestStateApplyTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.cfg = dataclasses.replace(CFG, dynamic_interests=False)
+
+    def _seed_items(self, title, n, distinct_days=3):
+        for i in range(n):
+            day = i % distinct_days
+            seen = (NOW - timedelta(days=day)).isoformat(timespec="seconds")
+            self.conn.execute(
+                "INSERT INTO candidate_items (source, type, title, text, url, dedup_key,"
+                " url_hash, title_hash, content_hash, first_seen_at)"
+                " VALUES ('web_search', 'article', ?, 'body', ?, ?, ?, ?, NULL, ?)",
+                (title, f"https://e.com/{title}-{i}", f"k{title}-{i}", f"u{title}-{i}",
+                 f"t{title}-{i}", seen),
+            )
+        self.conn.commit()
+
+    def _positive_feedback(self, term, up=0, fire=0):
+        """Feedback rows on an item whose title contains `term` -- gathered
+        regardless of the evidence window (see interest_state._feedback_index)."""
+        item = normalize.normalize(an_item(title=f"{term} feedback item", url=f"https://fb/{term}"))
+        item.id = db.insert_item(self.conn, item)
+        for _ in range(up):
+            db.add_feedback(self.conn, item.id, None, "up")
+        for _ in range(fire):
+            db.add_feedback(self.conn, item.id, None, "fire")
+
+    def test_default_off_is_a_true_noop(self):
+        """Byte-identical to today with the flag off: no row, no query, no
+        write -- not just a filtered result."""
+        self._seed_items("Gizmo breakthrough", 10)
+        before = self.conn.execute("SELECT COUNT(*) c FROM interests").fetchone()["c"]
+        summary = interest_state.apply_transitions(self.conn, self.cfg)
+        after = self.conn.execute("SELECT COUNT(*) c FROM interests").fetchone()["c"]
+        self.assertEqual(summary, {
+            "enabled": False, "seeded": 0, "entered": 0, "promoted": 0,
+            "decayed": 0, "retired": 0, "reentered": 0, "capped": 0,
+        })
+        self.assertEqual(before, after)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM interest_events").fetchone()["c"], 0)
+
+    def test_a_fresh_term_enters_exploratory_then_needs_a_second_pass_to_promote(self):
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True)
+        # "Gizmo breakthrough" also seeds a "breakthrough" candidate; only
+        # "gizmo" is asserted on below, the point being one ladder rung per
+        # apply_transitions() call, not a specific candidate count.
+        self._seed_items("Gizmo breakthrough", 5, distinct_days=3)
+
+        first = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertGreaterEqual(first["entered"], 1)
+        self.assertEqual(first["promoted"], 0)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = 'derived:gizmo'").fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("exploratory", 0))
+
+        second = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertGreaterEqual(second["promoted"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = 'derived:gizmo'").fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("emerging", 0))
+
+        events = db.interest_events(self.conn, "derived:gizmo")
+        self.assertEqual([e["action"] for e in events], ["enter", "promote"])
+
+    def test_promotion_to_inferred_is_capped_and_recorded(self):
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True, derived_max_active=0)
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="emerging"), {}
+        )
+        self._seed_items("Gizmo breakthrough", 5, distinct_days=3)
+        self._positive_feedback("gizmo", up=1, fire=1)
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary["promoted"], 0)
+        self.assertEqual(summary["capped"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = 'derived:gizmo'").fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("emerging", 0))
+        events = db.interest_events(self.conn, "derived:gizmo")
+        self.assertEqual(events[-1]["action"], "promotion_capped")
+
+    def test_inferred_interest_carries_the_derived_min_score_floor(self):
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True, derived_min_score=0.9)
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="emerging"), {}
+        )
+        self._seed_items("Gizmo breakthrough", 5, distinct_days=3)
+        self._positive_feedback("gizmo", up=1, fire=1)   # clears the emerging -> inferred bar
+        interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        row = self.conn.execute(
+            "SELECT layer, active, min_score, positive_signals FROM interests WHERE key = 'derived:gizmo'"
+        ).fetchone()
+        self.assertEqual(row["layer"], "inferred")
+        self.assertEqual(row["active"], 1)
+        self.assertEqual(row["min_score"], 0.9)
+        self.assertEqual(json.loads(row["positive_signals"]), ["gizmo"])
+
+    def test_idle_derived_interest_decays_one_rung(self):
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True)
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="inferred"), {}
+        )
+        # upsert_derived_interest() always stamps last_observed_at = db.now()
+        # (real wall-clock); backdate it past decay_idle_days so this test's
+        # "idle" is genuine rather than an artifact of a fixed injected `now`.
+        stale = (NOW - timedelta(days=40)).isoformat(timespec="seconds")
+        self.conn.execute(
+            "UPDATE interests SET last_observed_at = ? WHERE key = 'derived:gizmo'", (stale,)
+        )
+        self.conn.commit()
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary["decayed"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = 'derived:gizmo'").fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("emerging", 0))
+
+    def test_a_freshly_written_derived_interest_is_not_immediately_idle(self):
+        """Regression: last_observed_at is the decay-staleness baseline for a
+        row with no corpus evidence this pass (see upsert_derived_interest's
+        docstring) -- a row written moments ago must not decay on its very
+        next re-evaluation just because it has no fresh window evidence."""
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True)
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="inferred"), {}
+        )
+        fresh = NOW.isoformat(timespec="seconds")
+        self.conn.execute(
+            "UPDATE interests SET last_observed_at = ? WHERE key = 'derived:gizmo'", (fresh,)
+        )
+        self.conn.commit()
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary["decayed"], 0)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = 'derived:gizmo'").fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("inferred", 1))
+
+    def test_blocked_term_already_tracked_is_retired(self):
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True)
+        path = os.path.join(tempfile.mkdtemp(), "interests.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({"interests": [], "blocked_derived_terms": ["gizmo"]}, fh)
+        cfg = dataclasses.replace(cfg, interests_path=path)
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="exploratory"), {}
+        )
+        self._seed_items("Gizmo breakthrough", 5, distinct_days=3)
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary["retired"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = 'derived:gizmo'").fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("retired", 0))
+
+    def test_personal_state_seed_never_promotes_by_itself(self):
+        cfg = dataclasses.replace(
+            self.cfg, dynamic_interests=True,
+            personal_state_path=self._personal_state_artifact(["nocorpusterm"]),
+        )
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary["seeded"], 1)
+        row = self.conn.execute(
+            "SELECT layer, active FROM interests WHERE key = 'derived:nocorpusterm'"
+        ).fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("exploratory", 0))
+        # Pin last_observed_at to this test's own fixed clock -- production
+        # apply_transitions()'s `now` and db.upsert_derived_interest()'s
+        # db.now() are both real wall-clock and so agree, but here `now` is
+        # injected and fixed, so pin the row to match rather than lean on
+        # the sandbox's real clock happening to agree with NOW.
+        self.conn.execute(
+            "UPDATE interests SET last_observed_at = ? WHERE key = 'derived:nocorpusterm'",
+            (NOW.isoformat(timespec="seconds"),),
+        )
+        self.conn.commit()
+        # A second pass, same instant, no new corpus evidence: must never
+        # promote it (the hard requirement), and -- since no idle time has
+        # actually elapsed since the seed -- must not decay it either. Zero
+        # observations can only ever demote/hold, never advance the ladder.
+        summary2 = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary2["promoted"], 0)
+        row2 = self.conn.execute(
+            "SELECT layer FROM interests WHERE key = 'derived:nocorpusterm'"
+        ).fetchone()
+        self.assertEqual(row2["layer"], "exploratory")
+
+    def _personal_state_artifact(self, terms):
+        tmp = tempfile.mkdtemp()
+        path = os.path.join(tmp, "personal_state.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump({
+                "contract_version": 1,
+                "generated_at": "2026-08-10T00:00:00Z",
+                "topics": [{"key": t, "weight": 1.0} for t in terms],
+            }, fh)
+        return path
+
+    def test_personal_state_seed_records_full_provenance_on_the_row_and_the_event(self):
+        """Work item 1: the seed's origin -- artifact identity, contract
+        version, topic key, seeded_at -- lands on BOTH the interest's own
+        provenance JSON and its interest_events seed row, and seeding writes
+        no score row (zero LLM/network calls -- apply_transitions() doesn't
+        even take a provider argument)."""
+        term = "zzqleaktest"
+        path = self._personal_state_artifact([term])
+        cfg = dataclasses.replace(self.cfg, dynamic_interests=True, personal_state_path=path)
+        expected_hash = hashlib.sha256(open(path, "rb").read()).hexdigest()
+
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(summary["seeded"], 1)
+
+        row = self.conn.execute(
+            "SELECT provenance FROM interests WHERE key = ?", (f"derived:{term}",)
+        ).fetchone()
+        provenance = json.loads(row["provenance"])
+        self.assertEqual(provenance["origin"], "personal_state")
+        self.assertEqual(provenance["artifact_sha256"], expected_hash)
+        self.assertEqual(provenance["generated_at"], "2026-08-10T00:00:00Z")
+        self.assertEqual(provenance["contract_version"], 1)
+        self.assertEqual(provenance["topic_key"], term)
+        self.assertEqual(provenance["seeded_at"], NOW.isoformat(timespec="seconds"))
+
+        events = db.interest_events(self.conn, f"derived:{term}")
+        self.assertEqual([e["action"] for e in events], ["seed"])
+        seed_evidence = events[0]["evidence"]
+        self.assertEqual(seed_evidence["artifact_sha256"], expected_hash)
+        self.assertEqual(seed_evidence["generated_at"], "2026-08-10T00:00:00Z")
+        self.assertEqual(seed_evidence["contract_version"], 1)
+        self.assertEqual(seed_evidence["topic_key"], term)
+
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM scores").fetchone()["c"], 0)
+
+    def test_personal_state_seeded_term_never_promotes_on_self_referential_matching_alone(self):
+        """Work item 2 (the core of this step): the only legal influence
+        channel of personal_state on discovery is a zero-weight exploratory
+        seed (PROJECT_STATE.md's step-05 gate) -- prove the row can never
+        promote off evidence that is only attributable to its own matching
+        (an item whose ONLY row in item_interests points back at this very
+        derived interest), with no independent corpus signal and no human
+        feedback anywhere. Drives the real apply_transitions() over 3 cycles,
+        not a mock of decide()."""
+        term = "zzqleaktest"
+        key = f"derived:{term}"
+        cfg = dataclasses.replace(
+            self.cfg, dynamic_interests=True,
+            personal_state_path=self._personal_state_artifact([term]),
+        )
+        interest_state.apply_transitions(self.conn, cfg, now=NOW)  # pass 0: seeds
+        row = self.conn.execute("SELECT id, layer, active FROM interests WHERE key = ?", (key,)).fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("exploratory", 0))
+        # Pin last_observed_at to the fixed test clock (see
+        # test_personal_state_seed_never_promotes_by_itself for why).
+        self.conn.execute(
+            "UPDATE interests SET last_observed_at = ? WHERE key = ?",
+            (NOW.isoformat(timespec="seconds"), key),
+        )
+        self.conn.commit()
+        owner_before = [
+            dict(r) for r in self.conn.execute("SELECT * FROM interests WHERE layer = 'owner'").fetchall()
+        ]
+
+        for cycle in range(3):
+            derived_interest = db.interest_by_key(self.conn, key)
+            # Well past the ordinary observation/distinct-day bars by the
+            # last cycle, but every single item's ONLY matched interest (via
+            # item_interests -- the matching pipeline's own attribution) is
+            # the seeded interest itself: self-referential, not independent.
+            for day in range(cycle * 2, cycle * 2 + 2):
+                seen = (NOW - timedelta(days=day)).isoformat(timespec="seconds")
+                # Title is the term alone -- no second shared word, so this
+                # fixture can't accidentally promote some *other* incidental
+                # term (e.g. a repeated second word) instead of proving
+                # anything about the seeded one.
+                item = normalize.normalize(an_item(
+                    title=term, url=f"https://e.com/{term}-{cycle}-{day}"
+                ))
+                item.id = db.insert_item(self.conn, item)
+                self.conn.execute(
+                    "UPDATE candidate_items SET first_seen_at = ? WHERE id = ?", (seen, item.id)
+                )
+                self.conn.commit()
+                db.save_matches(self.conn, item.id, [(derived_interest, 0.5, [term])])
+
+            summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+            self.assertEqual(summary["promoted"], 0)
+            row = self.conn.execute("SELECT layer FROM interests WHERE key = ?", (key,)).fetchone()
+            self.assertEqual(row["layer"], "exploratory")
+
+        events = db.interest_events(self.conn, key)
+        self.assertNotIn("promote", [e["action"] for e in events])
+        self.assertEqual(
+            [dict(r) for r in self.conn.execute("SELECT * FROM interests WHERE layer = 'owner'").fetchall()],
+            owner_before,
+        )
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM scores").fetchone()["c"], 0)
+
+        # Now let it go genuinely idle (no fresh self-referential item this
+        # pass) past decay_idle_days -- must demote/retire per the ordinary
+        # decide() rules, exactly like any other exploratory row.
+        stale = (NOW - timedelta(days=interest_state.Rules().decay_idle_days + 1)).isoformat(timespec="seconds")
+        self.conn.execute("UPDATE interests SET last_observed_at = ? WHERE key = ?", (stale, key))
+        self.conn.commit()
+        summary = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        # exploratory decays straight to retired (nothing below it); the
+        # summary bucket is "decayed" -- see _summary_key(), which only
+        # counts an explicit retire_* action (blocked/negative-feedback) as
+        # "retired".
+        self.assertEqual(summary["decayed"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = ?", (key,)).fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("retired", 0))
+
+    def _promote_seeded_term_to_inferred_and_notify(self, term):
+        """The companion, positive-path fixture to the leakage test above:
+        same seed, but with independent owner-collector corpus evidence (no
+        item_interests involved at all) plus positive human feedback
+        recorded through the existing db.add_feedback path -- promotes
+        exploratory -> emerging -> inferred, one rung per
+        apply_transitions() call, and then delivers an above-bar match on it
+        through the real pipeline. Returns (key, item_id, score_id,
+        notification_id)."""
+        key = f"derived:{term}"
+        cfg = dataclasses.replace(
+            self.cfg, dynamic_interests=True,
+            personal_state_path=self._personal_state_artifact([term]),
+        )
+        interest_state.apply_transitions(self.conn, cfg, now=NOW)  # pass 1: seeds
+        self.conn.execute(
+            "UPDATE interests SET last_observed_at = ? WHERE key = ?",
+            (NOW.isoformat(timespec="seconds"), key),
+        )
+        self.conn.commit()
+
+        # Independent corpus evidence: plain items, exactly as an owner
+        # collector would have stored them -- no item_interests row at all.
+        self._seed_items(term, 6, distinct_days=3)
+        pass2 = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(pass2["promoted"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = ?", (key,)).fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("emerging", 0))
+
+        # Positive human feedback, through the existing recording path.
+        self._positive_feedback(term, up=2)
+        pass3 = interest_state.apply_transitions(self.conn, cfg, now=NOW)
+        self.assertEqual(pass3["promoted"], 1)
+        row = self.conn.execute("SELECT layer, active FROM interests WHERE key = ?", (key,)).fetchone()
+        self.assertEqual((row["layer"], row["active"]), ("inferred", 1))
+
+        events = db.interest_events(self.conn, key)
+        self.assertEqual([e["action"] for e in events], ["seed", "promote", "promote"])
+
+        active = db.active_interests(self.conn)
+        self.assertIn(key, [i.key for i in active])
+        provider = FakeProvider({f"{term} breaks through": 0.95})
+        item = an_item(
+            title=f"{term} breaks through", url=f"https://e.com/{term}-notify", text=BODY
+        )
+        outcome = pipeline.ingest(self.conn, provider, cfg, item, active, origin_interest=key)
+        self.assertEqual(outcome.stage, "scored")
+        sent = pipeline.send_digest(self.conn, cfg, dry_run=True)
+        self.assertEqual(sent, 1)
+        notification = self.conn.execute(
+            "SELECT n.id, n.ok FROM notifications n JOIN scores s ON s.id = n.score_id"
+            " WHERE s.item_id = ?",
+            (outcome.item.id,),
+        ).fetchone()
+        self.assertEqual(notification["ok"], 1)
+        return key, outcome.item.id, outcome.score.id, notification["id"]
+
+    def test_personal_state_seeded_term_promotes_on_independent_evidence_plus_feedback(self):
+        """Work item 3: the loop closes positively -- same seeded term as the
+        leakage test, but with real independent evidence. once inferred, an
+        above-bar match yields a notification through the real pipeline."""
+        self._promote_seeded_term_to_inferred_and_notify("zzqleaktest")
+
+    # The documented chain query from README.md's "Provenance chain" section
+    # -- kept byte-identical to what's published there so this test proves
+    # the exact query a human would copy-paste actually resolves every hop.
+    PROVENANCE_CHAIN_QUERY = """
+        SELECT
+          n.id                                            AS notification_id,
+          s.id                                            AS score_id,
+          s.final_score                                   AS score,
+          ci.id                                            AS item_id,
+          ci.title                                         AS item_title,
+          it.key                                           AS interest_key,
+          it.layer                                         AS interest_layer,
+          ev.id                                            AS seed_event_id,
+          json_extract(ev.evidence, '$.artifact_sha256')   AS artifact_sha256,
+          json_extract(ev.evidence, '$.generated_at')      AS artifact_generated_at,
+          json_extract(ev.evidence, '$.contract_version')  AS contract_version
+        FROM notifications n
+        JOIN scores s           ON s.id = n.score_id
+        JOIN candidate_items ci ON ci.id = s.item_id
+        JOIN interests it       ON it.id = s.interest_id
+        JOIN interest_events ev ON ev.interest_key = it.key AND ev.action = 'seed'
+        WHERE n.id = ?
+    """
+
+    def test_provenance_chain_query_resolves_every_hop(self):
+        """Work item 4: the documented SQL query walks notification -> score
+        -> item -> matched interest -> interest_events -> seed event with
+        the artifact hash, and every hop resolves non-empty against the
+        positive-path fixture."""
+        key, item_id, score_id, notification_id = self._promote_seeded_term_to_inferred_and_notify(
+            "zzqleaktest"
+        )
+        row = self.conn.execute(self.PROVENANCE_CHAIN_QUERY, (notification_id,)).fetchone()
+        self.assertIsNotNone(row)
+        self.assertEqual(row["notification_id"], notification_id)
+        self.assertEqual(row["score_id"], score_id)
+        self.assertEqual(row["item_id"], item_id)
+        self.assertEqual(row["interest_key"], key)
+        self.assertEqual(row["interest_layer"], "inferred")
+        self.assertIsNotNone(row["seed_event_id"])
+        self.assertTrue(row["artifact_sha256"])
+        self.assertEqual(row["artifact_generated_at"], "2026-08-10T00:00:00Z")
+        self.assertEqual(row["contract_version"], 1)
 
 
 class ScoringTests(unittest.TestCase):
@@ -2256,6 +2975,306 @@ class PipelineTests(unittest.TestCase):
         )
         self.assertEqual(self._pending_titles(), [])
 
+    # --- exploration lane (step-10): default-off no-op ------------------------
+
+    def test_default_off_never_writes_an_explore_metric_or_shows_the_section(self):
+        """With DISCOVERY_DYNAMIC_INTERESTS off (CFG's default) and no derived
+        interest anywhere in play, run_once is byte-identical to before this
+        step: same summary shape, and the metrics table never grows an
+        explore_* name; stats.report has no EXPLORATION section either."""
+        provider = FakeProvider({"Good": 0.9, "Meh": 0.2})
+        summary = self._run(provider)
+        self.assertEqual(
+            summary,
+            {"collected": 2, "duplicate": 0, "filtered": 0, "already_scored": 0,
+             "scored": 2, "deferred": 0, "errors": 0, "notified": 0},
+        )
+        names = {r["name"] for r in self.conn.execute("SELECT DISTINCT name FROM metrics").fetchall()}
+        self.assertFalse(any(n.startswith("explore_") for n in names))
+        self.assertNotIn("EXPLORATION", stats.report(self.conn, days=7, cfg=CFG))
+
+    def test_default_off_a_stray_active_derived_row_still_cannot_spend_explore_budget(self):
+        """Defense in depth: interest_state.py never creates a non-owner row
+        while the flag is off, but even a manually-inserted active derived
+        row can't spend an exploration score -- explore_budget is
+        Budget(0) whenever cfg.dynamic_interests is False, structurally, not
+        merely filtered out afterwards."""
+        db.upsert_derived_interest(
+            self.conn,
+            an_interest(
+                key="derived:zeta", title="Zeta signal", layer="inferred", sources=[],
+                positive_signals=["exclusive zeta research"],
+            ),
+            {},
+        )
+
+        def collector(interest, cfg, provider, conn=None):
+            return [an_item(source="fake", title="Exclusive zeta research finding",
+                             url="https://e.com/zeta")]
+
+        provider = FakeProvider({"zeta": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            summary = pipeline.run_once(self.conn, provider, CFG, dry_run=True)
+        self.assertEqual((summary["deferred"], summary["scored"]), (1, 0))
+
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("explore_deferred"), 1)
+        self.assertNotIn("deferred", metrics)
+        self.assertNotIn("scored", metrics)
+
+
+class LaneProvider(FakeProvider):
+    """Like FakeProvider, but each needle can also pick which interest_key
+    the model claims (default 'k') -- the exploration tests need a score
+    landing on a *specific* interest (owner vs. derived) to prove
+    notification attribution stays split, not just the match-time lane."""
+
+    def __init__(self, scores, keys=None):
+        super().__init__(scores)
+        self.keys = keys or {}
+
+    def complete_json(self, system, prompt, schema, max_tokens=2000):
+        self.prompts.append(prompt)
+        for needle, value in self.scores.items():
+            if needle in prompt:
+                if isinstance(value, Exception):
+                    raise value
+                return self._payload(value, self.keys.get(needle, "k"))
+        raise AssertionError(f"LaneProvider got an unexpected prompt:\n{prompt}")
+
+
+class ExplorationLaneTests(unittest.TestCase):
+    """step-10: exploit (owner-layer) vs explore (derived/inferred-layer)
+    lane separation at the scoring boundary. classify_lane()'s rule: an
+    item's lane is 'explore' iff matches[0] (match_interests()'s own
+    strongest-first order) is a non-owner interest."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        db.upsert_interest(self.conn, an_interest(
+            key="k", positive_signals=["good stuff"], min_score=0.70, sources=["fake"],
+        ))
+        db.upsert_derived_interest(
+            self.conn,
+            an_interest(
+                key="derived:zeta", title="Zeta signal", layer="inferred", sources=[],
+                positive_signals=["exclusive zeta research"], min_score=0.80,
+            ),
+            {},
+        )
+        self.cfg = dataclasses.replace(CFG, dynamic_interests=True, explore_max_scores_per_cycle=2)
+
+    def _owner_item(self, n):
+        return an_item(source="fake", title=f"Owner item {n}", url=f"https://e.com/owner-{n}")
+
+    def _explore_item(self, n):
+        return an_item(
+            source="fake", title=f"Exclusive zeta research finding {n}",
+            url=f"https://e.com/explore-{n}",
+        )
+
+    # --- budget cap + isolation ------------------------------------------------
+
+    def test_explore_budget_cap_is_enforced_without_starving_owner_items(self):
+        owner_items = [self._owner_item(n) for n in range(3)]
+        explore_items = [self._explore_item(n) for n in range(5)]  # cap is 2
+
+        def collector(interest, cfg, provider, conn=None):
+            return owner_items + explore_items if interest.key == "k" else []
+
+        provider = FakeProvider({"Owner item": 0.9, "Exclusive zeta research": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            pipeline.run_once(self.conn, provider, self.cfg, dry_run=True)
+
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("explore_scored"), 2)     # the cap, exactly
+        self.assertEqual(metrics.get("explore_deferred"), 3)   # 5 - 2 overflow
+        self.assertEqual(metrics.get("scored"), 3)             # every owner item, untouched
+        self.assertNotIn("deferred", metrics)                  # exploit budget never ran dry
+        explore_calls = sum(1 for p in provider.prompts if "Exclusive zeta research" in p)
+        self.assertEqual(explore_calls, 2)
+
+    def test_exhausted_exploit_budget_does_not_draw_from_explore_budget(self):
+        cfg = dataclasses.replace(self.cfg, max_scores_per_cycle=1)
+        owner_items = [self._owner_item(n) for n in range(3)]
+        explore_items = [self._explore_item(n) for n in range(2)]
+
+        def collector(interest, cfg, provider, conn=None):
+            return owner_items + explore_items if interest.key == "k" else []
+
+        provider = FakeProvider({"Owner item": 0.9, "Exclusive zeta research": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            pipeline.run_once(self.conn, provider, cfg, dry_run=True)
+
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("scored"), 1)             # the exploit cap, exactly
+        self.assertEqual(metrics.get("deferred"), 2)           # 3 owner - 1 scored
+        self.assertEqual(metrics.get("explore_scored"), 2)     # both explore items, untouched
+        self.assertNotIn("explore_deferred", metrics)
+
+    # --- metrics isolation -------------------------------------------------------
+
+    def test_metrics_isolation_owner_and_derived_notifications_split(self):
+        owner_item = an_item(
+            source="fake", type="market_event", title="Owner alert",
+            url="https://e.com/owner-alert",
+        )
+        explore_item = an_item(
+            source="fake", type="market_event",
+            title="Exclusive zeta research breakthrough",
+            url="https://e.com/explore-alert",
+        )
+
+        def collector(interest, cfg, provider, conn=None):
+            return [owner_item, explore_item] if interest.key == "k" else []
+
+        provider = LaneProvider(
+            {"Owner alert": 0.95, "Exclusive zeta research": 0.95},
+            keys={"Owner alert": "k", "Exclusive zeta research": "derived:zeta"},
+        )
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            summary = pipeline.run_once(self.conn, provider, self.cfg, dry_run=True)
+        self.assertEqual(summary["notified"], 2)   # both attempted, neither dropped
+
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("notified"), 1)
+        self.assertEqual(metrics.get("explore_notified"), 1)
+
+        text = stats.report(self.conn, days=7)
+        self.assertRegex(text, r"notifications sent\s+1\s")           # FUNNEL: owner only
+        self.assertRegex(text, r"(?m)^k\s+1\s+1\s+100%")              # owner-only per-interest table
+        self.assertIn("EXPLORATION", text)
+        self.assertRegex(text, r"(?m)^derived:zeta\s+1\s+1\s+100%")   # derived-only table
+
+    def test_containment_explore_error_does_not_touch_exploit(self):
+        owner_item = an_item(
+            source="fake", type="market_event", title="Owner alert",
+            url="https://e.com/owner-alert",
+        )
+        explore_item = self._explore_item(0)
+
+        def collector(interest, cfg, provider, conn=None):
+            return [owner_item, explore_item] if interest.key == "k" else []
+
+        provider = FakeProvider({
+            "Owner alert": 0.95,
+            "Exclusive zeta research": RuntimeError("boom"),
+        })
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            summary = pipeline.run_once(self.conn, provider, self.cfg, dry_run=True)
+
+        self.assertEqual(summary["errors"], 1)
+        self.assertEqual(summary["notified"], 1)
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("explore_errors"), 1)
+        self.assertNotIn("errors", metrics)
+        self.assertEqual(metrics.get("scored"), 1)
+
+    # --- backlog lane fairness ---------------------------------------------------
+
+    def test_backlog_lane_fairness_zero_explore_budget_still_drains_owner(self):
+        # Owner rows inserted first (lower ids); explore rows inserted after
+        # (higher ids, so they sort newest-first) and outnumber the exploit
+        # budget -- a fixture with 1-of-each can't distinguish a correct
+        # per-lane page from a single `ORDER BY id DESC LIMIT
+        # budget+explore_budget` pass that happens to land entirely on the
+        # unbudgeted lane and never even reaches the owner rows.
+        cfg = dataclasses.replace(self.cfg, explore_max_scores_per_cycle=0, max_scores_per_cycle=2)
+        owner_items = []
+        for n in range(3):
+            item = stored_item(self.conn, url=f"https://e.com/owner-b{n}", title=f"Owner item {n}")
+            db.set_prefilter(self.conn, item.id, True, "ok")
+            owner_items.append(item)
+        explore_items = []
+        for n in range(5):  # > the exploit budget (2), all newer than every owner row
+            item = stored_item(
+                self.conn, url=f"https://e.com/explore-b{n}",
+                title=f"Exclusive zeta research finding {n}",
+            )
+            db.set_prefilter(self.conn, item.id, True, "ok")
+            explore_items.append(item)
+
+        def scored_ids(items):
+            return {
+                item.id for item in items
+                if self.conn.execute(
+                    "SELECT 1 FROM scores WHERE item_id = ?", (item.id,)
+                ).fetchone()
+            }
+
+        provider = FakeProvider({"Owner item": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": lambda i, c, p, conn=None: []}):
+            summary = pipeline.run_once(self.conn, provider, cfg, dry_run=True)
+        # The exploit budget (2) caps how many owner items land this cycle --
+        # the point being that it drains at all despite the newer, unbudgeted
+        # explore rows sitting on top of the backlog.
+        self.assertEqual(summary["scored"], 2)
+        self.assertEqual(len(scored_ids(owner_items)), 2)
+        self.assertEqual(scored_ids(explore_items), set())
+
+        # Next cycle: raise the exploit budget so the remaining owner item
+        # drains too, still with explore budget at 0.
+        cfg2 = dataclasses.replace(cfg, max_scores_per_cycle=5)
+        with mock.patch.dict(COLLECTORS, {"fake": lambda i, c, p, conn=None: []}):
+            pipeline.run_once(self.conn, provider, cfg2, dry_run=True)
+        self.assertEqual(scored_ids(owner_items), {i.id for i in owner_items})
+        self.assertEqual(scored_ids(explore_items), set())
+
+        # Explore budget is back (self.cfg's cap of 2) -- skipped items are
+        # scored, never dropped.
+        provider2 = FakeProvider({"Exclusive zeta research": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": lambda i, c, p, conn=None: []}):
+            summary2 = pipeline.run_once(self.conn, provider2, self.cfg, dry_run=True)
+        self.assertEqual(summary2["scored"], 2)
+        self.assertEqual(len(scored_ids(explore_items)), 2)
+
+    # --- classification ------------------------------------------------------
+
+    def test_classification_owner_best_match_wins_even_with_a_weaker_derived_match(self):
+        item = an_item(
+            source="fake", title="Good stuff about zeta research trends",
+            url="https://e.com/mixed",
+        )
+
+        def collector(interest, cfg, provider, conn=None):
+            return [item] if interest.key == "k" else []
+
+        provider = FakeProvider({"Good stuff": 0.8})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            summary = pipeline.run_once(self.conn, provider, self.cfg, dry_run=True)
+
+        self.assertEqual(summary["scored"], 1)
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("scored"), 1)
+        self.assertNotIn("explore_scored", metrics)
+        row = self.conn.execute(
+            "SELECT n.key FROM scores s JOIN interests n ON n.id = s.interest_id"
+        ).fetchone()
+        self.assertEqual(row["key"], "k")
+
+    # --- _discover CLI path ---------------------------------------------------
+
+    def test_discover_cli_path_enforces_both_budgets(self):
+        from discovery.__main__ import _discover
+
+        def collector(interest, cfg, provider, conn=None):
+            if interest.key != "k":
+                return []
+            return [self._explore_item(n) for n in range(4)]  # cap is 2
+
+        provider = FakeProvider({"Exclusive zeta research": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}), \
+             mock.patch("sys.stdout", new_callable=io.StringIO):
+            code = _discover(self.conn, provider, self.cfg, SimpleNamespace(source="fake"))
+        self.assertEqual(code, 0)
+
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("explore_scored"), 2)
+        self.assertEqual(metrics.get("explore_deferred"), 2)
+        self.assertNotIn("scored", metrics)
+
 
 class FeedbackListenerTests(unittest.TestCase):
     def setUp(self):
@@ -2351,6 +3370,204 @@ class FeedbackListenerTests(unittest.TestCase):
             {"run_failed": 1},
         )
         self.assertIsNone(db.state_get(self.conn, "telegram_offset"))  # never advanced
+
+
+class TeachTests(unittest.TestCase):
+    """teach.py's WEIGHTS/BAND_WIDTH are set from the documented rationale
+    (lab proposals 003/004: notify flips track bar proximity, not scorer
+    variance) *before* this fixture was written, and are never adjusted
+    afterwards to make these assertions pass -- that would be Goodharting
+    the acceptance test. If the first honest measurement had shown
+    band_lift < 2.0, the honest thing to do was report that, not tune the
+    weights; it didn't, and what follows is that first honest measurement.
+
+    Fixture: two interests with bars at 0.70 and 0.50. Five near-bar,
+    low-confidence items are inserted FIRST (so recency ranks them last);
+    three far-from-bar, high-confidence items are inserted LAST (so recency
+    ranks them first). Recency is deliberately anti-correlated with bar
+    proximity.
+    """
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        db.upsert_interest(self.conn, an_interest(key="a", min_score=0.70))
+        db.upsert_interest(self.conn, an_interest(key="b", min_score=0.50))
+        self.a = db.interest_by_key(self.conn, "a")
+        self.b = db.interest_by_key(self.conn, "b")
+        self.near = [
+            self._plant("near-a1", self.a, 0.705, 0.40),
+            self._plant("near-a2", self.a, 0.695, 0.45),
+            self._plant("near-b1", self.b, 0.505, 0.40),
+            self._plant("near-b2", self.b, 0.495, 0.45),
+            self._plant("near-b3", self.b, 0.510, 0.50),
+        ]
+        self.far = [
+            self._plant("far-a1", self.a, 0.99, 0.95),
+            self._plant("far-a2", self.a, 0.20, 0.95),
+            self._plant("far-b1", self.b, 0.98, 0.95),
+        ]
+
+    def _plant(self, url, interest_row, final_score, confidence):
+        item = stored_item(self.conn, url=url, title=url)
+        score = a_score(item.id, interest_row.id, final_score, interest_key=interest_row.key)
+        score.confidence = confidence
+        db.save_score(self.conn, score)
+        return item
+
+    def test_build_queue_ranks_planted_near_bar_low_confidence_items_first(self):
+        rows = teach.build_queue(self.conn, limit=100)
+        near_ids = {item.id for item in self.near}
+        far_ids = {item.id for item in self.far}
+        positions = {row["item_id"]: i for i, row in enumerate(rows)}
+        self.assertEqual(set(positions), near_ids | far_ids)
+        self.assertLess(max(positions[i] for i in near_ids), min(positions[i] for i in far_ids))
+
+    def test_queue_metrics_beats_the_recency_baseline_on_band_share(self):
+        metrics = teach.queue_metrics(self.conn, limit=4)
+        self.assertEqual(metrics["pool_size"], 8)
+        self.assertEqual(metrics["n"], 4)
+        self.assertGreater(metrics["queue"]["band_share"], metrics["baseline"]["band_share"])
+        self.assertGreaterEqual(metrics["band_lift"], 2.0)
+
+    def test_determinism_across_repeated_calls(self):
+        self.assertEqual(
+            teach.build_queue(self.conn, limit=4), teach.build_queue(self.conn, limit=4)
+        )
+        self.assertEqual(
+            teach.queue_metrics(self.conn, limit=4), teach.queue_metrics(self.conn, limit=4)
+        )
+
+
+class TeachLabelFlowTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        db.upsert_interest(self.conn, an_interest())
+        self.interest = db.interest_by_key(self.conn, "k")
+        self.items = [
+            stored_item(self.conn, url=f"https://e.com/t{i}", title=f"t{i}") for i in range(4)
+        ]
+        for i, item in enumerate(self.items):
+            db.save_score(self.conn, a_score(item.id, self.interest.id, 0.90 - i * 0.01))
+
+    def _feed(self, tokens):
+        reader = iter(tokens)
+        return lambda prompt="": next(reader)
+
+    def test_labeling_the_four_verdicts_writes_one_feedback_row_each(self):
+        rows_before = teach.build_queue(self.conn, limit=4)
+        codes = list(notify.FEEDBACK_VERDICTS)
+        code = teach.run_interactive(self.conn, limit=4, read=self._feed(codes))
+        self.assertEqual(code, 0)
+        feedback_rows = self.conn.execute(
+            "SELECT item_id, interest_id, verdict, original_score FROM feedback ORDER BY id"
+        ).fetchall()
+        self.assertEqual(len(feedback_rows), 4)
+        for expected, verdict, fb in zip(rows_before, codes, feedback_rows):
+            self.assertEqual(fb["item_id"], expected["item_id"])
+            self.assertEqual(fb["interest_id"], expected["interest_id"])
+            self.assertEqual(fb["verdict"], verdict)
+            self.assertAlmostEqual(fb["original_score"], expected["final_score"])
+
+    def test_skip_writes_nothing_quit_stops_early(self):
+        code = teach.run_interactive(self.conn, limit=4, read=self._feed(["s", "q"]))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 0)
+        self.assertEqual(len(teach.build_queue(self.conn, limit=10)), 4)
+
+    def test_an_unrecognized_token_reprompts_instead_of_crashing(self):
+        code = teach.run_interactive(self.conn, limit=1, read=self._feed(["bogus", "fire"]))
+        self.assertEqual(code, 0)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1)
+
+    def test_eof_from_the_reader_exits_cleanly_with_zero(self):
+        def raise_eof(prompt=""):
+            raise EOFError
+
+        code = teach.run_interactive(self.conn, limit=4, read=raise_eof)
+        self.assertEqual(code, 0)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 0)
+
+    def test_a_labeled_item_is_absent_from_the_next_build_queue(self):
+        teach.run_interactive(self.conn, limit=1, read=self._feed(["fire"]))
+        remaining = {row["item_id"] for row in teach.build_queue(self.conn, limit=10)}
+        self.assertEqual(len(remaining), 3)
+
+    def test_an_item_labeled_via_the_telegram_listener_is_also_excluded(self):
+        score_id = self.conn.execute(
+            "SELECT id FROM scores WHERE item_id = ?", (self.items[0].id,)
+        ).fetchone()["id"]
+        callback = {"id": "cb1", "data": f"fb:up:{score_id}", "message": {"chat": {"id": 1}}}
+        with mock.patch.object(feedback_listener, "api_call"):
+            self.assertTrue(feedback_listener._handle_callback(self.conn, "tok", callback))
+        remaining = {row["item_id"] for row in teach.build_queue(self.conn, limit=10)}
+        self.assertNotIn(self.items[0].id, remaining)
+
+
+class TeachIsolationTests(unittest.TestCase):
+    """Labeling must grow `feedback` and touch nothing else -- no
+    `notifications` row (that table drives delivery accounting, not
+    teaching), no `metrics`/`service_state` write, no `scores`/
+    `candidate_items` mutation."""
+
+    TABLES = ("notifications", "metrics", "service_state", "scores", "candidate_items")
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        db.upsert_interest(self.conn, an_interest())
+        interest = db.interest_by_key(self.conn, "k")
+        self.items = [
+            stored_item(self.conn, url=f"https://e.com/i{i}", title=f"i{i}") for i in range(3)
+        ]
+        for item in self.items:
+            db.save_score(self.conn, a_score(item.id, interest.id, 0.9))
+
+    def _snapshot(self):
+        return {t: [tuple(r) for r in self.conn.execute(f"SELECT * FROM {t}").fetchall()]
+                for t in self.TABLES}
+
+    def test_a_full_run_only_grows_feedback(self):
+        before = self._snapshot()
+        reader = iter(["fire", "s", "q"])
+        teach.run_interactive(self.conn, limit=3, read=lambda prompt="": next(reader))
+        after = self._snapshot()
+        self.assertEqual(before, after)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1)
+
+
+class TeachDegenerateTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def _no_read(self, prompt=""):
+        raise AssertionError("an empty pool must never prompt for input")
+
+    def test_an_empty_pool_exits_cleanly_everywhere(self):
+        self.assertEqual(teach.build_queue(self.conn), [])
+        self.assertEqual(teach.run_interactive(self.conn, read=self._no_read), 0)
+        metrics = teach.queue_metrics(self.conn)
+        self.assertEqual(metrics["pool_size"], 0)
+        self.assertIn("nothing to teach on", teach.format_queue([]))
+        self.assertIn("nothing to teach on", teach.format_metrics(metrics))
+
+    def test_an_unknown_interest_key_behaves_like_an_empty_pool(self):
+        db.upsert_interest(self.conn, an_interest())
+        item = stored_item(self.conn)
+        db.save_score(self.conn, a_score(item.id, db.interest_by_key(self.conn, "k").id, 0.9))
+        self.assertEqual(teach.build_queue(self.conn, interest="nope"), [])
+
+    def test_a_pool_smaller_than_the_limit_returns_the_whole_pool(self):
+        db.upsert_interest(self.conn, an_interest())
+        item = stored_item(self.conn)
+        db.save_score(self.conn, a_score(item.id, db.interest_by_key(self.conn, "k").id, 0.9))
+        self.assertEqual(len(teach.build_queue(self.conn, limit=10)), 1)
 
 
 class FakeCDPConnection:
@@ -3125,6 +4342,281 @@ class CLITests(unittest.TestCase):
         ]
         self.assertEqual(listed_keys, [f"t{i}" for i in range(10)])
 
+    def test_interests_list_is_empty_before_init(self):
+        code, out, _err = self._main("interests")
+        self.assertEqual(code, 0)
+        self.assertIn("no interests", out)
+
+    def test_interests_why_on_an_owner_key_shows_the_sync_event(self):
+        path = self._interests_file('{"interests": [{"key": "x", "title": "X"}]}')
+        self._main("init", env={"DISCOVERY_INTERESTS": path})
+        code, out, _err = self._main("interests", "--why", "x")
+        self.assertEqual(code, 0)
+        self.assertIn("owner_sync", out)
+        self.assertIn("-> owner", out)
+
+    def test_interests_why_on_an_unknown_key_exits_cleanly(self):
+        code, _out, err = self._main("interests", "--why", "nope")
+        self.assertEqual(code, 2)
+        self.assertIn("no interest with key", err)
+
+    def test_interests_layer_filter(self):
+        path = self._interests_file('{"interests": [{"key": "x", "title": "X"}]}')
+        self._main("init", env={"DISCOVERY_INTERESTS": path})
+        code, out, _err = self._main("interests", "--layer", "owner")
+        self.assertEqual(code, 0)
+        self.assertIn("layer=owner", out)
+        code, out, _err = self._main("interests", "--layer", "inferred")
+        self.assertEqual(code, 0)
+        self.assertIn("no interests", out)
+
+    def test_interests_refresh_is_a_noop_when_the_flag_is_off(self):
+        code, out, _err = self._main("interests", "--refresh")
+        self.assertEqual(code, 0)
+        self.assertIn("dynamic interests are off", out)
+
+    def test_interests_refresh_runs_apply_transitions_when_the_flag_is_on(self):
+        code, out, _err = self._main(
+            "interests", "--refresh", env={"DISCOVERY_DYNAMIC_INTERESTS": "1"}
+        )
+        self.assertEqual(code, 0)
+        self.assertIn('"enabled": true', out)
+
+    def test_interests_refresh_with_a_missing_interests_file_exits_cleanly(self):
+        missing = os.path.join(self.tmp.name, "nope.json")
+        code, _out, err = self._main(
+            "interests", "--refresh",
+            env={"DISCOVERY_DYNAMIC_INTERESTS": "1", "DISCOVERY_INTERESTS": missing},
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("not found", err)
+
+    def test_interests_refresh_with_a_malformed_interests_file_exits_cleanly(self):
+        path = self._interests_file("{ not json")
+        code, _out, err = self._main(
+            "interests", "--refresh",
+            env={"DISCOVERY_DYNAMIC_INTERESTS": "1", "DISCOVERY_INTERESTS": path},
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("malformed interests file", err)
+
+    def test_interests_refresh_seeds_from_personal_state_without_ever_building_a_provider(self):
+        """Work items 1 + 4 at the CLI layer: `interests --refresh` seeds a
+        personal-state topic (already reachable -- apply_transitions() calls
+        personal_state.load_optional() itself, no separate wiring needed),
+        never touches the provider factory (zero LLM/network calls), and
+        `--why` on the seeded key prints the full seed origin."""
+        path = self._interests_file('{"interests": []}')
+        ps_path = os.path.join(self.tmp.name, "ps.json")
+        with open(ps_path, "w", encoding="utf-8") as fh:
+            json.dump(
+                {
+                    "contract_version": 1, "generated_at": "2026-08-10T00:00:00Z",
+                    "topics": [{"key": "zzqleaktest", "weight": 1.0}],
+                },
+                fh,
+            )
+        self._main("init", env={"DISCOVERY_INTERESTS": path})
+
+        with mock.patch.object(providers, "get_provider", side_effect=AssertionError("provider built")):
+            code, out, _err = self._main(
+                "interests", "--refresh",
+                env={
+                    "DISCOVERY_DYNAMIC_INTERESTS": "1", "DISCOVERY_INTERESTS": path,
+                    "DISCOVERY_PERSONAL_STATE": ps_path,
+                },
+            )
+        self.assertEqual(code, 0)
+        self.assertIn('"seeded": 1', out)
+
+        code, out, _err = self._main("interests", "--why", "derived:zzqleaktest")
+        self.assertEqual(code, 0)
+        self.assertIn("seed", out)
+        self.assertIn("artifact_sha256", out)
+        self.assertIn('"generated_at": "2026-08-10T00:00:00Z"', out)
+        self.assertIn('"contract_version": 1', out)
+        self.assertIn('"topic_key": "zzqleaktest"', out)
+
+
+class TeachCLITests(unittest.TestCase):
+    """`python -m app teach` wiring: --list/--explain, provider isolation,
+    the interactive default, and --send reusing the existing Telegram flow
+    end to end (see FeedbackListenerTests for the flow it reuses)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = os.path.join(self.tmp.name, "t.db")
+        conn = db.connect(self.db_path)
+        db.init(conn)
+        db.upsert_interest(conn, an_interest())
+        interest = db.interest_by_key(conn, "k")
+        item = stored_item(conn)
+        db.save_score(conn, a_score(item.id, interest.id, 0.8))
+        conn.close()
+
+    def _main(self, *argv, read_inputs=None):
+        import contextlib
+
+        from discovery.__main__ import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(out))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            if read_inputs is not None:
+                stack.enter_context(mock.patch("builtins.input", side_effect=iter(read_inputs)))
+            code = main(["--db", self.db_path, *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_list_prints_the_ranked_queue_and_exits_zero(self):
+        code, out, _err = self._main("teach", "--list")
+        self.assertEqual(code, 0)
+        self.assertIn("queued item(s)", out)
+
+    def test_explain_prints_queue_metrics_and_exits_zero(self):
+        code, out, _err = self._main("teach", "--explain")
+        self.assertEqual(code, 0)
+        self.assertIn("pool_size=", out)
+        self.assertIn("band_lift", out)
+
+    def test_teach_never_constructs_a_provider(self):
+        with mock.patch.object(
+            providers, "get_provider", side_effect=AssertionError("must not build a provider")
+        ):
+            code, _out, _err = self._main("teach", "--list")
+        self.assertEqual(code, 0)
+
+    def test_interactive_default_records_a_label_via_the_injected_reader(self):
+        code, _out, _err = self._main("teach", "--limit", "1", read_inputs=["fire"])
+        self.assertEqual(code, 0)
+        conn = db.connect(self.db_path)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1)
+
+    def test_send_reuses_format_message_and_the_feedback_keyboard(self):
+        sent = []
+
+        def fake_send(cfg, text, reply_markup=None, dry_run=False):
+            sent.append((text, reply_markup))
+            return True
+
+        with mock.patch.object(notify, "send", side_effect=fake_send):
+            code, _out, _err = self._main("teach", "--send", "--limit", "1")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sent), 1)
+        text, markup = sent[0]
+        self.assertIn("DISCOVERY", text)
+        callback_datas = [b["callback_data"] for row in markup["inline_keyboard"] for b in row]
+        self.assertEqual(len(callback_datas), 4)
+        score_id = callback_datas[0].split(":")[2]
+        self.assertTrue(all(cd.endswith(f":{score_id}") for cd in callback_datas))
+
+        # Proof the send path reuses the existing flow, not a new one: feed
+        # one of those exact payloads into the real listener callback.
+        callback = {"id": "cb", "data": callback_datas[0], "message": {"chat": {"id": 1}}}
+        conn = db.connect(self.db_path)
+        self.addCleanup(conn.close)
+        with mock.patch.object(feedback_listener, "api_call"):
+            self.assertTrue(feedback_listener._handle_callback(conn, "tok", callback))
+        self.assertEqual(conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1)
+
+    def test_dry_run_send_never_touches_the_network(self):
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            code, _out, _err = self._main("--dry-run", "teach", "--send")
+        self.assertEqual(code, 0)
+        urlopen.assert_not_called()
+
+
+class TeachCLITests(unittest.TestCase):
+    """`python -m app teach` wiring: --list/--explain, provider isolation,
+    the interactive default, and --send reusing the existing Telegram flow
+    end to end (see FeedbackListenerTests for the flow it reuses)."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = os.path.join(self.tmp.name, "t.db")
+        conn = db.connect(self.db_path)
+        db.init(conn)
+        db.upsert_interest(conn, an_interest())
+        interest = db.interest_by_key(conn, "k")
+        item = stored_item(conn)
+        db.save_score(conn, a_score(item.id, interest.id, 0.8))
+        conn.close()
+
+    def _main(self, *argv, read_inputs=None):
+        import contextlib
+
+        from discovery.__main__ import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.ExitStack() as stack:
+            stack.enter_context(contextlib.redirect_stdout(out))
+            stack.enter_context(contextlib.redirect_stderr(err))
+            if read_inputs is not None:
+                stack.enter_context(mock.patch("builtins.input", side_effect=iter(read_inputs)))
+            code = main(["--db", self.db_path, *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_list_prints_the_ranked_queue_and_exits_zero(self):
+        code, out, _err = self._main("teach", "--list")
+        self.assertEqual(code, 0)
+        self.assertIn("queued item(s)", out)
+
+    def test_explain_prints_queue_metrics_and_exits_zero(self):
+        code, out, _err = self._main("teach", "--explain")
+        self.assertEqual(code, 0)
+        self.assertIn("pool_size=", out)
+        self.assertIn("band_lift", out)
+
+    def test_teach_never_constructs_a_provider(self):
+        with mock.patch.object(
+            providers, "get_provider", side_effect=AssertionError("must not build a provider")
+        ):
+            code, _out, _err = self._main("teach", "--list")
+        self.assertEqual(code, 0)
+
+    def test_interactive_default_records_a_label_via_the_injected_reader(self):
+        code, _out, _err = self._main("teach", "--limit", "1", read_inputs=["fire"])
+        self.assertEqual(code, 0)
+        conn = db.connect(self.db_path)
+        self.addCleanup(conn.close)
+        self.assertEqual(conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1)
+
+    def test_send_reuses_format_message_and_the_feedback_keyboard(self):
+        sent = []
+
+        def fake_send(cfg, text, reply_markup=None, dry_run=False):
+            sent.append((text, reply_markup))
+            return True
+
+        with mock.patch.object(notify, "send", side_effect=fake_send):
+            code, _out, _err = self._main("teach", "--send", "--limit", "1")
+        self.assertEqual(code, 0)
+        self.assertEqual(len(sent), 1)
+        text, markup = sent[0]
+        self.assertIn("DISCOVERY", text)
+        callback_datas = [b["callback_data"] for row in markup["inline_keyboard"] for b in row]
+        self.assertEqual(len(callback_datas), 4)
+        score_id = callback_datas[0].split(":")[2]
+        self.assertTrue(all(cd.endswith(f":{score_id}") for cd in callback_datas))
+
+        # Proof the send path reuses the existing flow, not a new one: feed
+        # one of those exact payloads into the real listener callback.
+        callback = {"id": "cb", "data": callback_datas[0], "message": {"chat": {"id": 1}}}
+        conn = db.connect(self.db_path)
+        self.addCleanup(conn.close)
+        with mock.patch.object(feedback_listener, "api_call"):
+            self.assertTrue(feedback_listener._handle_callback(conn, "tok", callback))
+        self.assertEqual(conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1)
+
+    def test_dry_run_send_never_touches_the_network(self):
+        with mock.patch("urllib.request.urlopen") as urlopen:
+            code, _out, _err = self._main("--dry-run", "teach", "--send")
+        self.assertEqual(code, 0)
+        urlopen.assert_not_called()
+
 
 class CLIPrintSafetyTests(unittest.TestCase):
     """Regression: __main__.py's own output helpers must survive a narrow
@@ -3647,6 +5139,21 @@ class _FakeHTTPResponse:
         return False
 
 
+def _write_recon_interests_fixture(dirpath):
+    """Write a minimal interests.json whose keys are exactly the ones
+    exp_connectors.APPLICABILITY samples, so the connector-recon pass2 tests
+    reproduce the step-09 pre-registered sample independently of the live
+    product interests.json -- whose keys the owner's 40-interest rewrite
+    renamed. Only key/title are required by discovery.interests.load_file;
+    everything else defaults."""
+    keys = sorted({k for vals in exp_connectors.APPLICABILITY.values() for k in vals})
+    path = os.path.join(dirpath, "interests.json")
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump({"defaults": {}, "interests":
+                   [{"key": k, "title": k.replace("-", " ")} for k in keys]}, f)
+    return path
+
+
 class ConnectorReconTests(unittest.TestCase):
     """exp_connectors.py (step-09a): offline, no network, no provider, no
     real DB -- every test injects a fake fetcher into _http_get or exercises
@@ -3762,21 +5269,6 @@ class ConnectorReconTests(unittest.TestCase):
         self.assertIsNone(urls)
         self.assertFalse(status["available"])
         self.assertIn(missing, status["reason"])
-
-    def test_build_x_entry_not_implemented_regardless_of_provider_ok(self):
-        # x has no sampler at all in this harness version -- the status must
-        # say so plainly and identically whether or not a live provider is
-        # reachable (repair: it used to say PENDING unconditionally, implying
-        # a live session alone would resolve it).
-        for provider_ok, provider_why in ((False, "CLAUDE_ORG_ID is not set"), (True, "")):
-            with self.subTest(provider_ok=provider_ok):
-                entry = exp_connectors.build_x_entry(["ai-agents-dev-tools"], provider_ok, provider_why)
-                self.assertEqual(entry["availability"]["status"], "NOT_IMPLEMENTED")
-                self.assertEqual(entry["sample"]["status"], "NOT_IMPLEMENTED")
-                self.assertIsNone(entry["metrics"]["marginal_unique_rate"])
-                self.assertEqual(entry["metrics"]["marginal_unique_rate_status"], "NOT_IMPLEMENTED")
-                self.assertIsNone(entry["command_to_complete"])
-                self.assertTrue(entry["follow_up"])
 
     def test_http_connector_entry_void_when_endpoint_unreachable(self):
         def boom(url, timeout=15, connector=None):
@@ -3913,6 +5405,1245 @@ class ConnectorReconTests(unittest.TestCase):
         self.assertTrue(status["available"])
         self.assertIn("https://e.com/x", urls)
         self.assertIn("mode=ro", captured["uri"])
+
+    # (g) E5b / H2 (step-09): revised query rule, USABLE definition, gate ---
+
+    def test_build_query_v2_first_four_distinctive_tokens_in_title_order(self):
+        interest = an_interest(title="Zebra Quantum Coding Wizard Extra Words Here")
+        self.assertEqual(exp_connectors.build_query_v2(interest), "zebra quantum coding wizard")
+
+    def test_build_query_v2_dedupes_within_title(self):
+        interest = an_interest(title="Coding Coding Quantum Wizard")
+        self.assertEqual(exp_connectors.build_query_v2(interest), "coding quantum wizard")
+
+    def test_build_query_v2_extends_from_positive_signals_until_two(self):
+        interest = an_interest(title="AI", positive_signals=["Great Learning Systems Here"])
+        self.assertEqual(exp_connectors.build_query_v2(interest), "great learning")
+
+    def test_build_query_v2_extend_stops_at_two_not_four(self):
+        interest = an_interest(title="Zebra", positive_signals=["Wizard Coding Extra"])
+        self.assertEqual(exp_connectors.build_query_v2(interest), "zebra wizard")
+
+    def test_usable_records_rejects_missing_url_or_title(self):
+        interest = an_interest(key="k", title="Zebra Quantum Coding")
+        per_interest = [{"interest": "k", "records": [
+            {"title": "Zebra quantum coding release", "url": None},
+            {"title": None, "url": "https://e.com/1"},
+        ]}]
+        self.assertEqual(exp_connectors.usable_records(per_interest, {"k": interest}, CFG), [])
+
+    def test_usable_records_rejects_weak_match_and_grants_no_origin_floor(self):
+        # If origin_interest were mistakenly set, matching.ORIGIN_MATCH_FLOOR
+        # (0.5) would pass this record despite zero shared tokens -- proves
+        # the metric isn't made vacuous.
+        interest = an_interest(key="k", title="Alpha Beta Gamma", positive_signals=[])
+        per_interest = [{"interest": "k", "records": [
+            {"title": "Totally unrelated words nothing shared", "url": "https://e.com/3"},
+        ]}]
+        self.assertEqual(exp_connectors.usable_records(per_interest, {"k": interest}, CFG), [])
+
+    def test_usable_records_accepts_strong_match(self):
+        interest = an_interest(key="k", title="Zebra Quantum Coding")
+        per_interest = [{"interest": "k", "records": [
+            {"title": "Zebra quantum coding release", "url": "https://e.com/1"},
+        ]}]
+        usable = exp_connectors.usable_records(per_interest, {"k": interest}, CFG)
+        self.assertEqual(len(usable), 1)
+        self.assertGreaterEqual(usable[0]["match_score"], CFG.min_match_score)
+
+    def test_usable_records_dedups_pooled_across_interests_by_url_and_title(self):
+        interest = an_interest(key="k", title="Zebra Quantum Coding")
+        per_interest = [
+            {"interest": "k", "records": [
+                {"title": "Zebra quantum coding launch", "url": "https://e.com/x?ref=1"}]},
+            {"interest": "k", "records": [
+                {"title": "ZEBRA QUANTUM CODING LAUNCH", "url": "https://e.com/x?ref=2"}]},
+        ]
+        usable = exp_connectors.usable_records(per_interest, {"k": interest}, CFG)
+        self.assertEqual(len(usable), 1)
+
+    def test_apply_h2_falsification_rule(self):
+        self.assertEqual(exp_connectors.apply_h2_falsification_rule({"a": 3, "b": 7}), "H2_FALSIFIED")
+        self.assertEqual(exp_connectors.apply_h2_falsification_rule({"a": 9, "b": 2}), "H2_SUPPORTED")
+
+    def test_gate_promote_when_all_three_clear(self):
+        metrics = {"a": {"usable_yield": 10, "marginal_unique_rate": 0.5},
+                  "b": {"usable_yield": 3, "marginal_unique_rate": 0.9}}
+        result = exp_connectors.apply_promotion_gate(metrics, True)
+        self.assertEqual(result["result"], "PROMOTE")
+        self.assertEqual(result["winner"], "a")
+        self.assertIsNone(result["failing_gate"])
+
+    def test_gate_no_promotion_g1_tie(self):
+        metrics = {"a": {"usable_yield": 8, "marginal_unique_rate": 0.9},
+                  "b": {"usable_yield": 8, "marginal_unique_rate": 0.9}}
+        result = exp_connectors.apply_promotion_gate(metrics, True)
+        self.assertEqual(result["result"], "NO_PROMOTION")
+        self.assertEqual(result["failing_gate"], "G1")
+
+    def test_gate_no_promotion_g1_below_eight(self):
+        metrics = {"a": {"usable_yield": 7, "marginal_unique_rate": 0.9}}
+        result = exp_connectors.apply_promotion_gate(metrics, True)
+        self.assertEqual(result["failing_gate"], "G1")
+
+    def test_gate_no_promotion_g2_not_clear_winner(self):
+        metrics = {"a": {"usable_yield": 10, "marginal_unique_rate": 0.9},
+                  "b": {"usable_yield": 6, "marginal_unique_rate": 0.1}}
+        result = exp_connectors.apply_promotion_gate(metrics, True)
+        self.assertEqual(result["failing_gate"], "G2")
+
+    def test_gate_no_promotion_g3_void_baseline(self):
+        metrics = {"a": {"usable_yield": 10, "marginal_unique_rate": 0.9}}
+        result = exp_connectors.apply_promotion_gate(metrics, False)
+        self.assertEqual(result["result"], "NO_PROMOTION")
+        self.assertEqual(result["failing_gate"], "G3")
+
+    def test_gate_no_promotion_g3_below_threshold(self):
+        metrics = {"a": {"usable_yield": 10, "marginal_unique_rate": 0.1}}
+        result = exp_connectors.apply_promotion_gate(metrics, True)
+        self.assertEqual(result["failing_gate"], "G3")
+
+    def test_x_deferred_entry_shape(self):
+        entry = exp_connectors.x_deferred_entry()
+        self.assertEqual(entry["status"], "DEFERRED_NEEDS_PROVIDER")
+        self.assertTrue(entry["detail"])
+
+    def test_uniqueness_among_candidates(self):
+        by_connector = {"a": {"u1", "u2"}, "b": {"u2", "u3"}}
+        self.assertAlmostEqual(exp_connectors.uniqueness_among_candidates("a", by_connector), 0.5)
+        self.assertIsNone(exp_connectors.uniqueness_among_candidates("c", by_connector))
+
+    def test_sample_reddit_pass2_is_retired_and_makes_no_network_call(self):
+        # step-09's own re-check 403'd (a second independent 403 after
+        # step-09a's 5-interest sweep), so reddit_url/parse_reddit were
+        # deleted and this always returns the retired state with zero HTTP.
+        interests_by_key = {f"i{n}": an_interest(key=f"i{n}", title=f"Topic Number {n} Words")
+                            for n in range(3)}
+
+        def boom(*a, **kw):
+            raise AssertionError("reddit is retired -- must not call _http_get")
+
+        with mock.patch("exp_connectors._http_get", side_effect=boom):
+            per_interest, availability = exp_connectors.sample_reddit_pass2(
+                list(interests_by_key), interests_by_key)
+        self.assertEqual(per_interest, [])
+        self.assertFalse(availability["reachable"])
+        self.assertIn("RETIRED_UNREACHABLE", availability["detail"])
+
+    def test_build_connector_pass2_entry_computes_both_arms(self):
+        interest = an_interest(key="k", title="Zebra Quantum Coding")
+        old_per_interest = [{"interest": "k", "records": [
+            {"title": "Zebra old quantum coding record", "url": "https://e.com/old1"},
+            {"title": "unrelated old record entirely", "url": "https://e.com/old2"},
+        ]}]
+
+        def two_hits(url, timeout=15, connector=None):
+            hits = [
+                {"title": "Zebra quantum coding new release", "url": "https://e.com/new1",
+                 "created_at": "2026-08-01T00:00:00.000Z", "objectID": "1"},
+                {"title": "unrelated new item entirely", "url": "https://e.com/new2",
+                 "created_at": "2026-08-01T00:00:00.000Z", "objectID": "2"},
+            ]
+            return 200, json.dumps({"hits": hits}).encode(), {}
+
+        with mock.patch("exp_connectors._http_get", side_effect=two_hits):
+            entry, usable_urls = exp_connectors.build_connector_pass2_entry(
+                "hackernews", ["k"], {"k": interest}, CFG, old_per_interest,
+                set(), False, datetime.now(timezone.utc), 0)
+
+        self.assertEqual(entry["arm_new_rule"]["usable_yield"], 1)
+        self.assertEqual(entry["arm_old_rule_recomputed"]["usable_yield"], 1)
+        self.assertIsNone(entry["arm_new_rule"]["marginal_unique_rate"])
+        self.assertEqual(entry["arm_new_rule"]["marginal_unique_rate_status"], "VOID_NO_BASELINE")
+        self.assertEqual(usable_urls, {"https://e.com/new1"})
+        # repair: promised by PREREGISTRATION_PASS2 but previously never emitted.
+        self.assertIsNone(entry["arm_new_rule"]["jaccard_overlap_with_web_search_sample"])
+        self.assertEqual(entry["arm_new_rule"]["jaccard_overlap_status"], "VOID_NO_WEB_SEARCH_SAMPLE")
+
+    def test_query_level_network_failures_only_flags_no_status_errors(self):
+        # A read timeout (no http_status at all) is a network failure; a
+        # reachable-but-blocked response (e.g. reddit's 403, which DOES carry
+        # a status) is not -- it's already surfaced via disposition/
+        # availability and must not double up in aborted_attempts.
+        per_interest = [
+            {"interest": "a", "query": "q1", "http_status": None,
+             "error": "host: The read operation timed out", "collected_at": "t1"},
+            {"interest": "b", "query": "q2", "http_status": 403,
+             "error": "http 403", "collected_at": "t2"},
+            {"interest": "c", "query": "q3", "http_status": 200, "error": None, "collected_at": "t3"},
+        ]
+        failures = exp_connectors.query_level_network_failures("arxiv", per_interest)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["interest"], "a")
+        self.assertEqual(failures[0]["connector"], "arxiv")
+
+    def test_degraded_arms_note(self):
+        self.assertEqual(exp_connectors.degraded_arms_note([]), "")
+        note = exp_connectors.degraded_arms_note([
+            {"connector": "arxiv", "interest": "a", "query": "q", "reason": "timeout", "at": "t"},
+            {"connector": "arxiv", "interest": "b", "query": "q", "reason": "timeout", "at": "t"},
+        ])
+        self.assertIn("arxiv", note)
+        self.assertIn("2 query failure(s)", note)
+
+    def test_run_pass2_e5b_records_query_level_network_failures(self):
+        # repair: a query-level network failure (no http_status at all, e.g.
+        # a read timeout) used to only land in per_interest['error'] --
+        # never in aborted_attempts or verdict_detail.
+        def fake_http_get(url, timeout=15, connector=None):
+            host = urllib.parse.urlparse(url).netloc
+            if host == "hn.algolia.com":
+                return 200, json.dumps({"hits": []}).encode(), {}
+            if host == "export.arxiv.org":
+                raise exp_connectors.ConnectorUnreachable(
+                    "export.arxiv.org: The read operation timed out")
+            if host == "eutils.ncbi.nlm.nih.gov":
+                return 200, json.dumps({"esearchresult": {"idlist": []}}).encode(), {}
+            raise AssertionError(f"unexpected host {host}")
+
+        with tempfile.TemporaryDirectory() as d:
+            missing_db = os.path.join(d, "discovery.db")
+            # Pin the interest keys this pass samples to a fixture, not the live
+            # product interests.json: exp_connectors.APPLICABILITY maps each
+            # connector to the interest keys the step-09 experiment was
+            # pre-registered against, and the owner's 40-interest rewrite renamed
+            # those keys. Reading the live file would leave arxiv with zero
+            # applicable interests, so the query-level failure under test never
+            # fires. The fixture keeps this test reproducing the pre-registered
+            # sample regardless of how the product interest set evolves.
+            interests_path = _write_recon_interests_fixture(d)
+            cfg = dataclasses.replace(CFG, db_path=missing_db, interests_path=interests_path)
+            empty_dossier = {"connectors": [{"name": n, "sample": {"per_interest": []}}
+                                            for n in ("hackernews", "arxiv", "pubmed", "reddit")]}
+            with mock.patch("exp_connectors._http_get", side_effect=fake_http_get), \
+                 mock.patch("exp_connectors.time.sleep"):
+                pass2 = exp_connectors.run_pass2_e5b(empty_dossier, cfg)
+
+        self.assertTrue(pass2["aborted_attempts"])
+        self.assertTrue(all(a["connector"] == "arxiv" for a in pass2["aborted_attempts"]))
+        self.assertIn("Degraded arms", pass2["verdict_detail"])
+        self.assertIn("arxiv", pass2["verdict_detail"])
+
+    def test_run_pass2_e5b_end_to_end_offline_no_promotion_on_void_baseline(self):
+        # Fully offline: patches _http_get for every host the real pass would
+        # hit, reads the real tracked dossier (read-only, for old-rule
+        # baseline records) and a real interests.json, but never touches the
+        # network or writes the dossier file.
+        hn_bodies = iter([
+            json.dumps({"hits": [{"title": "New AI coding agents automation research",
+                                  "url": "https://e.com/hn1", "created_at": "2026-08-01T00:00:00.000Z",
+                                  "objectID": "1"}]}).encode(),
+            json.dumps({"hits": [{"title": "Personal knowledge memory learning system launch",
+                                  "url": "https://e.com/hn2", "created_at": "2026-08-01T00:00:00.000Z",
+                                  "objectID": "2"}]}).encode(),
+        ])
+
+        def atom(url_, title_):
+            return (
+                '<?xml version="1.0"?><feed xmlns="http://www.w3.org/2005/Atom">'
+                f"<entry><id>{url_}</id><title>{title_}</title>"
+                "<published>2026-01-01T00:00:00Z</published></entry></feed>"
+            ).encode()
+
+        arxiv_bodies = iter([
+            atom("https://arxiv.org/abs/1", "Human interaction attraction behavioral study"),
+            atom("https://arxiv.org/abs/2", "Personal knowledge memory learning systems"),
+            atom("https://arxiv.org/abs/3", "Agents coding automation for personal tools"),
+        ])
+        pubmed_bodies = iter([
+            json.dumps({"esearchresult": {"idlist": ["101"]}}).encode(),
+            json.dumps({"result": {"uids": ["101"], "101": {
+                "title": "Narcolepsy wakefulness orexin trial", "pubdate": "2026 Jan"}}}).encode(),
+            json.dumps({"esearchresult": {"idlist": ["201"]}}).encode(),
+            json.dumps({"result": {"uids": ["201"], "201": {
+                "title": "EMDR trauma processing mechanisms study", "pubdate": "2026 Feb"}}}).encode(),
+        ])
+
+        def fake_http_get(url, timeout=15, connector=None):
+            # reddit is retired (sample_reddit_pass2 makes no HTTP call at
+            # all) -- www.reddit.com deliberately has no branch here.
+            host = urllib.parse.urlparse(url).netloc
+            if host == "hn.algolia.com":
+                return 200, next(hn_bodies), {}
+            if host == "export.arxiv.org":
+                return 200, next(arxiv_bodies), {}
+            if host == "eutils.ncbi.nlm.nih.gov":
+                return 200, next(pubmed_bodies), {}
+            raise AssertionError(f"unexpected host {host}")
+
+        with tempfile.TemporaryDirectory() as d:
+            missing_db = os.path.join(d, "discovery.db")
+            cfg = dataclasses.replace(CFG, db_path=missing_db, interests_path="interests.json")
+            dossier = json.loads(exp_connectors.DOSSIER_PATH.read_text(encoding="utf-8"))
+            with mock.patch("exp_connectors._http_get", side_effect=fake_http_get), \
+                 mock.patch("exp_connectors.time.sleep"):
+                pass2 = exp_connectors.run_pass2_e5b(dossier, cfg)
+
+        self.assertEqual(pass2["x"]["status"], "DEFERRED_NEEDS_PROVIDER")
+        self.assertEqual(pass2["aborted_attempts"], [])
+        self.assertFalse(pass2["corpus"]["available"])
+        self.assertEqual(pass2["dispositions"]["reddit"], "RETIRED_UNREACHABLE")
+        for name in ("hackernews", "arxiv", "pubmed"):
+            self.assertEqual(pass2["dispositions"][name], "NOT_PROMOTED_VOID_BASELINE")
+        self.assertEqual(pass2["gate"]["result"], "NO_PROMOTION")
+        self.assertIn(pass2["verdict"], ("H2_SUPPORTED", "H2_FALSIFIED"))
+
+
+class FakeChatGPTConnection:
+    """Stands in for cdp.CDPConnection for the chatgpt.com provider. The whole
+    send is one evaluate() (session + sentinel + PoW + conversation SSE), so a
+    completion reply is a JSON string/dict `{text, conversation_id}` (or an
+    Exception to raise); the follow-up hide is a second evaluate. Dispatch is on
+    the JS the provider actually builds, and every js string is kept so a test
+    can assert the reverse-engineered contract stays in the payload."""
+
+    def __init__(self, replies, hide_error=None, poll_results=None):
+        self.replies = list(replies)
+        # Handed-off (thinking-model) answers are read back by polling; each
+        # entry is one GET result {text, done}. Left empty for the inline path.
+        self.poll_results = list(poll_results or [])
+        self.calls = []
+        self.js = []
+        self.closed = False
+        self.hide_error = hide_error
+
+    def evaluate(self, js, timeout=None, **_kw):
+        self.js.append(js)
+        if "is_visible" in js:
+            self.calls.append("hide")
+            if self.hide_error is not None:
+                raise self.hide_error
+            return True
+        if "/* poll */" in js:
+            self.calls.append("poll")
+            if self.poll_results:
+                nxt = self.poll_results.pop(0)
+                if isinstance(nxt, Exception):
+                    raise nxt
+                return nxt if isinstance(nxt, str) else json.dumps(nxt)
+            return json.dumps({"text": "", "done": True})
+        if "text/event-stream" in js:
+            self.calls.append("completion")
+            reply = self.replies.pop(0)
+            if isinstance(reply, Exception):
+                raise reply
+            return reply
+        self.calls.append("other")
+        return True
+
+    def close(self):
+        self.closed = True
+
+
+def chatgpt_reply(text, conversation_id="c1"):
+    return json.dumps({"text": text, "conversation_id": conversation_id})
+
+
+def chatgpt_handoff(conversation_id="c1"):
+    """A thinking-model send: the POST returns a stream_handoff with a
+    conversation id but no inline text, so the provider must poll for the
+    answer (see FakeChatGPTConnection.poll_results)."""
+    return json.dumps({"text": "", "conversation_id": conversation_id, "handoff": True})
+
+
+class ChatGPTBrowserProviderTests(unittest.TestCase):
+    """The chatgpt.com-over-CDP provider, with the browser faked out entirely.
+    The novel core it shares with no other provider -- the sentinel proof-of-
+    work handshake and the delta-encoded SSE accumulation -- runs as JS inside
+    the page, so it's verified separately at execution level; here the seam is
+    the same as claude_chat's: the Python orchestration around evaluate()."""
+
+    SCHEMA = {
+        "type": "object",
+        "properties": {
+            "a": {"type": "number"},
+            "kind": {"type": "string", "enum": ["x", "y"]},
+        },
+        "required": ["a"],
+        "additionalProperties": False,
+    }
+
+    def _provider(self, *replies, connections=None, hide_error=None,
+                  poll_results=None, model="auto"):
+        conns = connections if connections is not None else [
+            FakeChatGPTConnection(replies, hide_error=hide_error, poll_results=poll_results)
+        ]
+        remaining = list(conns)
+        self.connections = conns
+        return chatgpt_browser.ChatGPTBrowserProvider(
+            model, port=9222, connect=lambda: remaining.pop(0),
+        )
+
+    def test_registered_and_constructable_without_touching_chrome(self):
+        self.assertIn("chatgpt_browser", PROVIDERS)
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
+        self.assertEqual(provider.name, "chatgpt_browser")  # lazy: no connection yet
+
+    def test_complete_json_parses_a_clean_reply_and_hides_the_conversation(self):
+        provider = self._provider(chatgpt_reply('{"a": 0.5, "kind": "x"}'))
+        data = provider.complete_json("sys", "prompt", self.SCHEMA)
+        self.assertEqual(data, {"a": 0.5, "kind": "x"})
+        (conn,) = self.connections
+        self.assertEqual(conn.calls, ["completion", "hide"])
+        self.assertEqual(provider.usage["calls"], 1)
+        self.assertEqual(provider.usage["input_tokens"], 0)  # not reported, never guessed
+
+    def test_complete_json_survives_prose_and_fences_around_the_object(self):
+        provider = self._provider(
+            chatgpt_reply('Sure! Here it is:\n```json\n{"a": 1.0}\n```\nHope that helps.')
+        )
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 1.0})
+
+    def test_a_malformed_reply_is_retried_once_then_succeeds(self):
+        provider = self._provider(
+            chatgpt_reply("I cannot answer in JSON, sorry."),
+            chatgpt_reply('{"a": 0.25}'),
+        )
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 0.25})
+        (conn,) = self.connections
+        self.assertEqual(conn.calls.count("completion"), 2)
+
+    def test_two_malformed_replies_fail_gracefully(self):
+        provider = self._provider(
+            chatgpt_reply('{"wrong": true}'),        # missing required "a"
+            chatgpt_reply('{"a": "not a number"}'),
+        )
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("attempt 2", str(ctx.exception))
+
+    def test_an_enum_violation_counts_as_malformed(self):
+        provider = self._provider(
+            chatgpt_reply('{"a": 1, "kind": "zebra"}'),
+            chatgpt_reply('{"a": 1, "kind": "zebra"}'),
+        )
+        with self.assertRaises(ProviderError):
+            provider.complete_json("s", "p", self.SCHEMA)
+
+    def test_search_json_returns_the_embedded_array_and_garbage_becomes_empty(self):
+        provider = self._provider(
+            chatgpt_reply('I searched.\n[{"title": "T", "url": "https://e.com"}]\nDone.'),
+            chatgpt_reply("no array here at all"),
+        )
+        self.assertEqual(
+            provider.search_json("find things"),
+            [{"title": "T", "url": "https://e.com"}],
+        )
+        self.assertEqual(provider.search_json("find things"), [])
+
+    def test_search_json_asks_for_the_search_tool_but_complete_json_does_not(self):
+        provider = self._provider(
+            chatgpt_reply("[]"), chatgpt_reply('{"a": 1}'),
+        )
+        provider.search_json("find things")
+        provider.complete_json("s", "p", self.SCHEMA)
+        (conn,) = self.connections
+        search_js, complete_js = conn.js[0], conn.js[2]  # [0]=search, [1]=its hide, [2]=complete
+        self.assertIn('system_hints: ["search"]', search_js)
+        self.assertIn("system_hints: []", complete_js)
+
+    def test_the_completion_js_carries_the_sentinel_and_pow_contract(self):
+        provider = self._provider(chatgpt_reply('{"a": 1}'))
+        provider.complete_json("s", "p", self.SCHEMA)
+        js = self.connections[0].js[0]
+        for token in ("sha3_512_hex", "/sentinel/chat-requirements",
+                      "OpenAI-Sentinel-Chat-Requirements-Token",
+                      "OpenAI-Sentinel-Proof-Token",
+                      "OpenAI-Sentinel-Turnstile-Token",  # forwarded, not thrown on
+                      "/api/auth/session"):
+            self.assertIn(token, js, f"completion JS lost {token!r}")
+        # turnstile.required must NOT abort the send -- echoing dx works live
+        self.assertNotIn("throw new Error('chatgpt.com demanded", js)
+
+    def test_the_send_js_resolves_latest_high_and_carries_the_reasoning_contract(self):
+        provider = self._provider(chatgpt_reply('{"a": 1}'))
+        provider.complete_json("s", "p", self.SCHEMA)
+        js = self.connections[0].js[0]
+        for token in ("/backend-api/models",          # resolves the newest model live
+                      "intelligence_presets",          # ...from the version's presets
+                      "'thinking'",                    # ...picking the thinking lane
+                      "body.thinking_effort = effort", # ...and sending its (High) effort
+                      "stream_handoff"):               # ...and noticing the handoff
+            self.assertIn(token, js, f"send JS lost {token!r}")
+
+    def test_a_handoff_answer_is_polled_until_finished(self):
+        # Thinking model: the send returns only a handoff, then two polls -- the
+        # first still streaming, the second finished with the JSON answer.
+        provider = self._provider(
+            chatgpt_handoff("c9"),
+            poll_results=[{"text": "", "done": False}, {"text": '{"a": 5}', "done": True}],
+        )
+        with mock.patch.object(chatgpt_browser.time, "sleep"):
+            self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 5})
+        (conn,) = self.connections
+        self.assertEqual(conn.calls, ["completion", "poll", "poll", "hide"])
+
+    def test_search_json_reads_a_handed_off_array_back_by_polling(self):
+        provider = self._provider(
+            chatgpt_handoff("c1"),
+            poll_results=[{"text": '[{"title": "T", "url": "https://e.com"}]', "done": True}],
+        )
+        with mock.patch.object(chatgpt_browser.time, "sleep"):
+            self.assertEqual(
+                provider.search_json("find things"),
+                [{"title": "T", "url": "https://e.com"}],
+            )
+
+    def test_a_handoff_that_never_finishes_times_out_to_a_provider_error(self):
+        # Poll keeps returning unfinished; the deadline passes and it surfaces as
+        # a normal empty-completion ProviderError rather than looping forever.
+        provider = self._provider(
+            chatgpt_handoff("c1"),
+            poll_results=[{"text": "", "done": False}] * 50,
+        )
+        clock = iter([0.0, 1.0, 2.0, 999.0])  # monotonic: enters loop once, then past deadline
+        with mock.patch.object(chatgpt_browser.time, "sleep"), \
+                mock.patch.object(chatgpt_browser.time, "monotonic", lambda: next(clock)):
+            with self.assertRaises(ProviderError) as ctx:
+                provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("empty completion", str(ctx.exception))
+
+    def test_an_explicit_slug_effort_spec_is_passed_through(self):
+        provider = self._provider(chatgpt_reply('{"a": 1}'), model="gpt-5-6-thinking:extended")
+        provider.complete_json("s", "p", self.SCHEMA)
+        js = self.connections[0].js[0]
+        self.assertIn('"gpt-5-6-thinking:extended"', js)  # the pin reaches the page verbatim
+
+    def test_no_chrome_endpoint_is_a_clean_provider_error(self):
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
+        with mock.patch.object(
+            chatgpt_browser.cdp, "find_chatgpt_tab", side_effect=ConnectionRefusedError("refused")
+        ):
+            with self.assertRaises(ProviderError) as ctx:
+                provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("Chrome DevTools endpoint", str(ctx.exception))
+
+    def test_no_chatgpt_tab_is_a_clean_provider_error(self):
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
+        with mock.patch.object(chatgpt_browser.cdp, "find_chatgpt_tab", return_value=None):
+            with self.assertRaises(ProviderError) as ctx:
+                provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("chatgpt.com tab", str(ctx.exception))
+
+    def test_a_js_exception_in_the_tab_is_a_provider_error_not_a_crash(self):
+        provider = self._provider(RuntimeError("JS exception: conversation HTTP 429"))
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("HTTP 429", str(ctx.exception))
+
+    def test_a_dropped_connection_reconnects_once_and_recovers(self):
+        dead = FakeChatGPTConnection([ConnectionError("websocket closed")])
+        alive = FakeChatGPTConnection([chatgpt_reply('{"a": 0.75}')])
+        provider = self._provider(connections=[dead, alive])
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 0.75})
+        self.assertTrue(dead.closed)     # reset closed the dead connection
+        self.assertFalse(alive.closed)
+
+    def test_a_connection_that_keeps_dropping_fails_gracefully(self):
+        dead1 = FakeChatGPTConnection([ConnectionError("closed")])
+        dead2 = FakeChatGPTConnection([ConnectionError("closed again")])
+        provider = self._provider(connections=[dead1, dead2])
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("twice", str(ctx.exception))
+
+    def test_a_null_completion_result_blames_the_tab(self):
+        provider = self._provider(None)
+        with self.assertRaises(ProviderError) as ctx:
+            provider.complete_json("s", "p", self.SCHEMA)
+        self.assertIn("no text", str(ctx.exception))
+
+    def test_a_dict_reply_from_cdp_is_accepted_as_is(self):
+        # Some Chrome/CDP combinations hand back the JS return value already
+        # deserialized; no conversation_id here, so no hide fires.
+        provider = self._provider({"text": '{"a": 2}', "conversation_id": None})
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 2})
+        self.assertEqual(self.connections[0].calls, ["completion"])
+
+    def test_a_hide_failure_never_breaks_the_reply(self):
+        provider = self._provider(
+            chatgpt_reply('{"a": 3}'), hide_error=RuntimeError("hide blew up")
+        )
+        self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 3})
+        self.assertIn("hide", self.connections[0].calls)
+
+    def test_preflight_fails_cleanly_with_no_chrome_endpoint(self):
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
+        with mock.patch.object(
+            chatgpt_browser.cdp, "find_chatgpt_tab", side_effect=ConnectionRefusedError("refused")
+        ):
+            ok, detail = provider.preflight()
+        self.assertFalse(ok)
+        self.assertIn("Chrome DevTools endpoint", detail)
+
+    def test_preflight_fails_cleanly_with_no_chatgpt_tab(self):
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
+        with mock.patch.object(chatgpt_browser.cdp, "find_chatgpt_tab", return_value=None):
+            ok, detail = provider.preflight()
+        self.assertFalse(ok)
+        self.assertIn("chatgpt.com tab", detail)
+
+    def test_preflight_succeeds_when_the_tab_is_open(self):
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222)
+        with mock.patch.object(
+            chatgpt_browser.cdp, "find_chatgpt_tab", return_value={"id": "1"}
+        ):
+            self.assertEqual(provider.preflight(), (True, ""))
+
+
+# --- step-12 task 2: continuous Council-driven web discovery ------------------
+
+def mission_batch(*labels):
+    """Council response shape: {"missions": [{label, rationale, prompt}, ...]}.
+    Each mission's prompt embeds its own label so FakeCouncilProvider's
+    search_results dict can key a canned search result off it."""
+    return {"missions": [
+        {"label": label, "rationale": f"why {label}", "prompt": f"research {label} thoroughly"}
+        for label in labels
+    ]}
+
+
+def search_hits(*urls, title_prefix="Result"):
+    return [
+        {"title": f"{title_prefix} {n}", "url": url, "summary": "Enough body text. " * 10}
+        for n, url in enumerate(urls, 1)
+    ]
+
+
+class FakeCouncilProvider(LLMProvider):
+    """Fake search-capable provider standing in for cfg.mission_provider.
+    complete_json serves queued Council mission batches, one consumed per
+    call (queue exhaustion raises -- proves at most one generation call
+    happened); search_json serves a canned result keyed by a needle in the
+    executor prompt (which always embeds the mission's own prompt text)."""
+
+    name = "fake_mission"
+
+    def __init__(self, mission_batches=None, search_results=None, preflight_ok=True,
+                 model="fake-mission-1"):
+        super().__init__(model)
+        self.mission_batches = list(mission_batches or [])
+        self.search_results = dict(search_results or {})
+        self._preflight_ok = preflight_ok
+        self.complete_prompts = []
+        self.search_prompts = []
+
+    def complete_json(self, system, prompt, schema, max_tokens=8000):
+        self.complete_prompts.append(prompt)
+        if not self.mission_batches:
+            raise AssertionError("FakeCouncilProvider ran out of queued mission batches")
+        batch = self.mission_batches.pop(0)
+        if isinstance(batch, Exception):
+            raise batch
+        return batch
+
+    def search_json(self, prompt, max_searches=5, max_tokens=16000):
+        self.search_prompts.append(prompt)
+        for needle, value in self.search_results.items():
+            if needle in prompt:
+                if isinstance(value, Exception):
+                    raise value
+                return value
+        raise AssertionError(f"FakeCouncilProvider got an unexpected search prompt:\n{prompt}")
+
+    def preflight(self):
+        return (self._preflight_ok, "" if self._preflight_ok else "mission provider down")
+
+
+class CouncilTests(unittest.TestCase):
+    """discovery/council.py: mission planning + validation + the Goodhart
+    firewall, independent of the tick that drives it."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.interest = an_interest(
+            key="narcolepsy", title="Narcolepsy research",
+            description="Orexin agonists and MWT trial results.",
+            positive_signals=["orexin agonist", "MWT"], negative_signals=["sleep hygiene listicle"],
+            min_score=0.78,
+        )
+        db.upsert_interest(self.conn, self.interest)
+        self.interest = db.interest_by_key(self.conn, "narcolepsy")
+
+    def _context(self):
+        return council.build_context(self.conn, self.interest, CFG)
+
+    def test_plan_missions_returns_validated_missions(self):
+        provider = FakeCouncilProvider(mission_batches=[mission_batch("trial-registries", "patent-filings")])
+        missions_out = council.plan_missions(provider, self.interest, self._context(), 2)
+        self.assertEqual([m["label"] for m in missions_out], ["trial-registries", "patent-filings"])
+        for m in missions_out:
+            self.assertTrue(m["rationale"])
+            self.assertTrue(m["prompt"])
+        self.assertEqual(len(provider.complete_prompts), 1)   # exactly one call
+
+    def test_plan_missions_truncates_extras_past_count_without_failing(self):
+        provider = FakeCouncilProvider(mission_batches=[mission_batch("a", "b", "c")])
+        missions_out = council.plan_missions(provider, self.interest, self._context(), 2)
+        self.assertEqual([m["label"] for m in missions_out], ["a", "b"])
+
+    def test_plan_missions_raises_on_missing_missions_key(self):
+        provider = FakeCouncilProvider(mission_batches=[{"nope": []}])
+        with self.assertRaises(council.CouncilError):
+            council.plan_missions(provider, self.interest, self._context(), 2)
+
+    def test_plan_missions_raises_on_non_dict_response(self):
+        provider = FakeCouncilProvider(mission_batches=[["not", "a", "dict"]])
+        with self.assertRaises(council.CouncilError):
+            council.plan_missions(provider, self.interest, self._context(), 2)
+
+    def test_plan_missions_raises_on_empty_prompt(self):
+        provider = FakeCouncilProvider(mission_batches=[
+            {"missions": [{"label": "x", "rationale": "r", "prompt": "   "}]}
+        ])
+        with self.assertRaises(council.CouncilError):
+            council.plan_missions(provider, self.interest, self._context(), 1)
+
+    def test_plan_missions_raises_on_missing_field(self):
+        provider = FakeCouncilProvider(mission_batches=[
+            {"missions": [{"label": "x", "prompt": "do the thing"}]}
+        ])
+        with self.assertRaises(council.CouncilError):
+            council.plan_missions(provider, self.interest, self._context(), 1)
+
+    def test_plan_missions_raises_on_duplicate_labels_case_insensitive(self):
+        provider = FakeCouncilProvider(mission_batches=[mission_batch("Angle-One", "angle-one")])
+        with self.assertRaises(council.CouncilError):
+            council.plan_missions(provider, self.interest, self._context(), 2)
+
+    def test_plan_missions_raises_on_zero_missions(self):
+        provider = FakeCouncilProvider(mission_batches=[{"missions": []}])
+        with self.assertRaises(council.CouncilError):
+            council.plan_missions(provider, self.interest, self._context(), 2)
+
+    def test_build_context_is_bounded_by_cfg(self):
+        for n in range(5):
+            item = stored_item(
+                self.conn, source="web_search", title=f"Frontier item {n}",
+                url=f"https://e.com/f{n}", origin_interest="narcolepsy",
+            )
+        cfg = dataclasses.replace(CFG, council_frontier_items=2)
+        ctx = council.build_context(self.conn, self.interest, cfg)
+        self.assertEqual(len(ctx["frontier"]), 2)
+
+    def test_build_context_includes_feedback_and_history(self):
+        item = stored_item(self.conn, title="Some item", url="https://e.com/x")
+        db.add_feedback(self.conn, item.id, self.interest.id, "up", note="great find")
+        gen_id = db.insert_generation(self.conn, "narcolepsy", "fake_mission", "m1", 1)
+        db.insert_missions(self.conn, gen_id, "narcolepsy", [
+            {"label": "past-angle", "rationale": "worked before", "prompt": "do it"}
+        ])
+        ctx = council.build_context(self.conn, self.interest, CFG)
+        self.assertEqual(ctx["feedback"][0]["verdict"], "up")
+        self.assertEqual(ctx["history"][0]["label"], "past-angle")
+
+    def test_goodhart_firewall_prompt_has_no_scoring_machinery(self):
+        """The rendered planning prompt (system + user) must never leak
+        downstream scoring machinery to the Council."""
+        ctx = self._context()
+        system = council.COUNCIL_INSTRUCTIONS.format(count=4)
+        prompt = council.render_prompt(ctx, 4)
+        rendered = system + "\n" + prompt
+
+        self.assertNotIn(str(self.interest.min_score), rendered)
+        self.assertNotIn("min_score", rendered)
+        self.assertNotIn("derived_min_score", rendered)
+        self.assertNotIn("final_score", rendered)
+        self.assertNotIn("confidence", rendered)
+        self.assertNotIn("notification", rendered.lower())
+        for weight_name in models.WEIGHTS:
+            self.assertNotIn(weight_name, rendered)
+        for dim in models.DIMENSIONS:
+            self.assertNotIn(dim, rendered)
+
+
+class MissionDbTests(unittest.TestCase):
+    """discovery/db.py's search_generations/search_missions helpers, in
+    isolation from council.py and missions.py."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def _seed_mission(self, interest_key="k", label="m1"):
+        gen_id = db.insert_generation(self.conn, interest_key, "fake_mission", "m1", 1)
+        db.insert_missions(self.conn, gen_id, interest_key, [
+            {"label": label, "rationale": "r", "prompt": f"do {label}"}
+        ])
+        row = self.conn.execute(
+            "SELECT id FROM search_missions WHERE interest_key = ? AND label = ?",
+            (interest_key, label),
+        ).fetchone()
+        return gen_id, row["id"]
+
+    def test_lease_missions_claims_only_pending_and_is_atomic(self):
+        _, mid = self._seed_mission()
+        leased = db.lease_missions(self.conn, [mid], 900)
+        self.assertEqual(leased, [mid])
+        row = db.mission_by_id(self.conn, mid)
+        self.assertEqual(row["status"], "RUNNING")
+        self.assertEqual(row["attempts"], 1)
+        self.assertIsNotNone(row["started_at"])
+        self.assertIsNotNone(row["lease_expires_at"])
+
+        # Already RUNNING -- a second overlapping lease attempt claims nothing.
+        self.assertEqual(db.lease_missions(self.conn, [mid], 900), [])
+
+    def test_lease_missions_returns_only_the_actually_claimed_subset(self):
+        _, mid1 = self._seed_mission(label="m1")
+        _, mid2 = self._seed_mission(label="m2")
+        db.lease_missions(self.conn, [mid1], 900)   # mid1 already RUNNING
+        leased = db.lease_missions(self.conn, [mid1, mid2], 900)
+        self.assertEqual(leased, [mid2])
+
+    def test_recover_stale_missions_reclaims_expired_lease_to_pending(self):
+        _, mid = self._seed_mission()
+        db.lease_missions(self.conn, [mid], -1)   # already-expired lease
+        db.recover_stale_missions(self.conn, max_attempts=3)
+        row = db.mission_by_id(self.conn, mid)
+        self.assertEqual(row["status"], "PENDING")
+        self.assertIsNone(row["leased_at"])
+        self.assertEqual(row["attempts"], 1)   # preserved, not reset
+
+        # No longer RUNNING, so it can be leased again -- no duplicate concurrent execution.
+        self.assertEqual(db.lease_missions(self.conn, [mid], 900), [mid])
+
+    def test_recover_stale_missions_retires_exhausted_attempts_to_failed(self):
+        _, mid = self._seed_mission()
+        db.lease_missions(self.conn, [mid], -1)
+        db.recover_stale_missions(self.conn, max_attempts=1)   # attempts already at 1
+        row = db.mission_by_id(self.conn, mid)
+        self.assertEqual(row["status"], "FAILED")
+
+    def test_fail_mission_retries_then_retires_at_max_attempts(self):
+        _, mid = self._seed_mission()
+        db.lease_missions(self.conn, [mid], 900)   # attempts -> 1
+        db.fail_mission(self.conn, mid, "boom", max_attempts=2, retry_seconds=1800)
+        row = db.mission_by_id(self.conn, mid)
+        self.assertEqual(row["status"], "PENDING")
+        self.assertIsNotNone(row["next_attempt_at"])
+
+        db.lease_missions(self.conn, [mid], 900)   # attempts -> 2
+        db.fail_mission(self.conn, mid, "boom again", max_attempts=2, retry_seconds=1800)
+        row = db.mission_by_id(self.conn, mid)
+        self.assertEqual(row["status"], "FAILED")
+        self.assertEqual(row["last_error"], "boom again")
+
+    def test_pending_mission_count_recent_missions_mission_by_id(self):
+        self._seed_mission(label="m1")
+        self._seed_mission(label="m2")
+        self.assertEqual(db.pending_mission_count(self.conn, "k"), 2)
+        history = db.recent_missions(self.conn, "k", 10)
+        self.assertEqual([r["label"] for r in history], ["m2", "m1"])   # newest first
+
+
+class WebTickTests(unittest.TestCase):
+    """discovery/missions.py's web_tick(): the whole continuous
+    Council-driven web discovery tick, offline (fake mission provider +
+    fake scoring provider, no Chrome/CDP/network)."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.cfg = dataclasses.replace(
+            CFG,
+            mission_provider="fake_mission",
+            mission_low_water=1,
+            missions_per_tick=2,
+            council_missions_per_generation=2,
+            mission_max_attempts=2,
+            mission_retry_seconds=1800,
+            council_max_consecutive_failures=2,
+        )
+
+    def _interest(self, key):
+        db.upsert_interest(self.conn, an_interest(key=key, title=key, sources=["web_search"]))
+        return db.interest_by_key(self.conn, key)
+
+    def _tick(self, mission_provider, scoring_provider=None, cfg=None, dry_run=False):
+        scoring_provider = scoring_provider or FakeProvider({"Result": 0.9})
+        with mock.patch.object(providers, "get_provider", return_value=mission_provider):
+            return missions.web_tick(self.conn, cfg or self.cfg, provider=scoring_provider, dry_run=dry_run)
+
+    def _seed_mission(self, interest_key, label, generation_id=None):
+        db.insert_missions(self.conn, generation_id, interest_key, [
+            {"label": label, "rationale": "seeded directly", "prompt": f"research {label}"}
+        ])
+        return self.conn.execute(
+            "SELECT id FROM search_missions WHERE interest_key = ? AND label = ?",
+            (interest_key, label),
+        ).fetchone()["id"]
+
+    def _generation_statuses(self, interest_key):
+        return [
+            r["status"] for r in self.conn.execute(
+                "SELECT status FROM search_generations WHERE interest_key = ? ORDER BY id",
+                (interest_key,),
+            ).fetchall()
+        ]
+
+    # --- replenish: at most one interest per tick, only below low water -------
+
+    def test_empty_startup_refill_plans_one_interest_per_tick_never_bursts(self):
+        # missions_per_tick=0 -- this test is only about *how many interests
+        # get a Council call per tick*, not mission execution.
+        cfg = dataclasses.replace(self.cfg, missions_per_tick=0)
+        self._interest("alpha")
+        self._interest("bravo")
+        self._interest("charlie")
+
+        mp1 = FakeCouncilProvider(mission_batches=[mission_batch("a1", "a2")])
+        self._tick(mp1, cfg=cfg)
+        self.assertEqual(len(mp1.complete_prompts), 1)
+        self.assertEqual(self._generation_statuses("alpha"), ["DONE"])
+        self.assertEqual(self._generation_statuses("bravo"), [])
+        self.assertEqual(self._generation_statuses("charlie"), [])
+
+        mp2 = FakeCouncilProvider(mission_batches=[mission_batch("b1", "b2")])
+        self._tick(mp2, cfg=cfg)
+        self.assertEqual(len(mp2.complete_prompts), 1)
+        self.assertEqual(self._generation_statuses("bravo"), ["DONE"])
+        self.assertEqual(self._generation_statuses("charlie"), [])
+
+        mp3 = FakeCouncilProvider(mission_batches=[mission_batch("c1", "c2")])
+        self._tick(mp3, cfg=cfg)
+        self.assertEqual(len(mp3.complete_prompts), 1)
+        self.assertEqual(self._generation_statuses("charlie"), ["DONE"])
+
+    def test_replenish_only_triggers_below_low_water_mark(self):
+        cfg = dataclasses.replace(self.cfg, mission_low_water=2, missions_per_tick=0)
+        self._interest("alpha")
+        gen_id = db.insert_generation(self.conn, "alpha", "fake_mission", "m1", 1)
+        self._seed_mission("alpha", "already-queued", generation_id=gen_id)
+        db.finish_generation(self.conn, gen_id, "DONE", 1)
+        # 1 PENDING mission, low_water=2 -- still under water, so a fresh
+        # generation is still due.
+        mp = FakeCouncilProvider(mission_batches=[mission_batch("x1")])
+        self._tick(mp, cfg=cfg)
+        self.assertEqual(len(mp.complete_prompts), 1)
+
+        # Now at/above the low-water mark -- no further Council call.
+        cfg2 = dataclasses.replace(cfg, mission_low_water=2)
+        mp2 = FakeCouncilProvider(mission_batches=[])
+        result = self._tick(mp2, cfg=cfg2)
+        self.assertEqual(len(mp2.complete_prompts), 0)
+        self.assertTrue(result["preflight_ok"])
+
+    # --- fair selection ----------------------------------------------------
+
+    def test_round_robin_fairness_across_interests_with_lopsided_queue(self):
+        cfg = dataclasses.replace(self.cfg, missions_per_tick=2)
+        self._interest("alpha")
+        self._interest("bravo")
+        for n in range(5):
+            self._seed_mission("alpha", f"alpha-{n}")
+        self._seed_mission("bravo", "bravo-0")
+
+        mp = FakeCouncilProvider(search_results={
+            "alpha-0": search_hits("https://e.com/a0"),
+            "bravo-0": search_hits("https://e.com/b0"),
+        })
+        self._tick(mp, cfg=cfg)
+
+        # missions_per_tick=2: one from each interest, not two from alpha --
+        # bravo's single mission is never starved by alpha's queue of 5.
+        alpha_done = self.conn.execute(
+            "SELECT COUNT(*) c FROM search_missions WHERE interest_key='alpha' AND status='DONE'"
+        ).fetchone()["c"]
+        bravo_done = self.conn.execute(
+            "SELECT COUNT(*) c FROM search_missions WHERE interest_key='bravo' AND status='DONE'"
+        ).fetchone()["c"]
+        self.assertEqual((alpha_done, bravo_done), (1, 1))
+
+    # --- crash / recovery ----------------------------------------------------
+
+    def test_crash_recovery_mission_resumes_and_executes_exactly_once(self):
+        cfg = dataclasses.replace(self.cfg, missions_per_tick=1, mission_lease_seconds=-1)
+        self._interest("alpha")
+        self._seed_mission("alpha", "m1")
+
+        mp = FakeCouncilProvider(search_results={"m1": search_hits("https://e.com/m1")})
+        with mock.patch.object(providers, "get_provider", return_value=mp), \
+             mock.patch.object(missions, "_execute_mission", side_effect=RuntimeError("simulated crash")):
+            with self.assertRaises(RuntimeError):
+                missions.web_tick(self.conn, cfg, provider=FakeProvider({"Result": 0.9}))
+
+        row = self.conn.execute("SELECT status FROM search_missions WHERE label='m1'").fetchone()
+        self.assertEqual(row["status"], "RUNNING")   # leased before the simulated crash
+        self.assertEqual(len(mp.search_prompts), 0)   # never actually executed
+
+        # Fresh tick, same conn: the expired lease is reclaimed and this
+        # time the mission actually runs -- exactly once.
+        self._tick(mp, cfg=dataclasses.replace(cfg, mission_lease_seconds=900))
+        row = self.conn.execute("SELECT status, items_returned FROM search_missions WHERE label='m1'").fetchone()
+        self.assertEqual(row["status"], "DONE")
+        self.assertEqual(row["items_returned"], 1)
+        self.assertEqual(len(mp.search_prompts), 1)   # executed exactly once total
+
+    def test_stale_lease_recovery_reclaims_running_mission_no_duplicate_execution(self):
+        self._interest("alpha")
+        mid = self._seed_mission("alpha", "m1")
+        leased = db.lease_missions(self.conn, [mid], -1)   # already expired the moment it's leased
+        self.assertEqual(leased, [mid])
+
+        db.recover_stale_missions(self.conn, self.cfg.mission_max_attempts)
+        row = self.conn.execute("SELECT status FROM search_missions WHERE id=?", (mid,)).fetchone()
+        self.assertEqual(row["status"], "PENDING")
+
+        # Reclaimed -- can be leased again; a second concurrent lease attempt
+        # on the still-RUNNING copy (before recovery) would have claimed nothing.
+        self.assertEqual(db.lease_missions(self.conn, [mid], 900), [mid])
+        self.assertEqual(db.lease_missions(self.conn, [mid], 900), [])   # no duplicate claim
+
+    # --- failure isolation ---------------------------------------------------
+
+    def test_planner_failure_on_one_interest_leaves_others_executing(self):
+        cfg = dataclasses.replace(self.cfg, missions_per_tick=1, mission_low_water=1)
+        self._interest("alpha")   # will fail to plan
+        self._interest("bravo")   # already has pending work
+        self._seed_mission("bravo", "bravo-0")
+
+        mp = FakeCouncilProvider(
+            mission_batches=[providers.ProviderError("planner exploded")],
+            search_results={"bravo-0": search_hits("https://e.com/b0")},
+        )
+        self._tick(mp, cfg=cfg)
+
+        self.assertEqual(self._generation_statuses("alpha"), ["FAILED"])
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT status FROM search_missions WHERE interest_key='alpha'"
+            ).fetchall(),
+            [],
+        )
+        bravo_row = self.conn.execute(
+            "SELECT status FROM search_missions WHERE interest_key='bravo'"
+        ).fetchone()
+        self.assertEqual(bravo_row["status"], "DONE")
+
+    def test_planner_failure_with_a_non_provider_exception_leaves_others_executing(self):
+        """A live provider's own response parsing can raise something other
+        than CouncilError/ProviderError (e.g. TypeError/JSONDecodeError on a
+        malformed non-dict reply) -- that must be isolated exactly like a
+        ProviderError, not propagate out of web_tick() and abort every
+        other interest's execution for the tick."""
+        cfg = dataclasses.replace(self.cfg, missions_per_tick=1, mission_low_water=1)
+        self._interest("alpha")   # will fail to plan, with a bare exception
+        self._interest("bravo")   # already has pending work
+        self._seed_mission("bravo", "bravo-0")
+
+        mp = FakeCouncilProvider(
+            mission_batches=[TypeError("unexpected non-dict CDP reply")],
+            search_results={"bravo-0": search_hits("https://e.com/b0")},
+        )
+        self._tick(mp, cfg=cfg)
+
+        self.assertEqual(self._generation_statuses("alpha"), ["FAILED"])
+        bravo_row = self.conn.execute(
+            "SELECT status FROM search_missions WHERE interest_key='bravo'"
+        ).fetchone()
+        self.assertEqual(bravo_row["status"], "DONE")
+
+    def test_build_context_failure_still_finalizes_the_generation_and_others_execute(self):
+        """A failure in council.build_context() itself (before plan_missions
+        is even called) must not leave an orphan PENDING search_generations
+        row, and must not abort other interests' execution either."""
+        cfg = dataclasses.replace(self.cfg, missions_per_tick=1, mission_low_water=1)
+        self._interest("alpha")
+        self._interest("bravo")
+        self._seed_mission("bravo", "bravo-0")
+
+        mp = FakeCouncilProvider(search_results={"bravo-0": search_hits("https://e.com/b0")})
+        with mock.patch.object(council, "build_context", side_effect=RuntimeError("db blew up")):
+            self._tick(mp, cfg=cfg)
+
+        self.assertEqual(self._generation_statuses("alpha"), ["FAILED"])   # never orphaned at PENDING
+        bravo_row = self.conn.execute(
+            "SELECT status FROM search_missions WHERE interest_key='bravo'"
+        ).fetchone()
+        self.assertEqual(bravo_row["status"], "DONE")
+
+    def test_replenish_backs_off_after_a_recent_council_failure(self):
+        """A Council that keeps failing must not burn one real provider call
+        every single tick -- only cfg.mission_retry_seconds after the most
+        recent failure is a retry due."""
+        cfg = dataclasses.replace(self.cfg, mission_low_water=1, missions_per_tick=0,
+                                   mission_retry_seconds=1800)
+        self._interest("alpha")
+
+        mp1 = FakeCouncilProvider(mission_batches=[providers.ProviderError("down")])
+        self._tick(mp1, cfg=cfg)
+        self.assertEqual(len(mp1.complete_prompts), 1)
+        self.assertEqual(self._generation_statuses("alpha"), ["FAILED"])
+
+        # Still within the cool-off -- no second Council call this tick.
+        mp2 = FakeCouncilProvider(mission_batches=[mission_batch("should-not-be-requested")])
+        self._tick(mp2, cfg=cfg)
+        self.assertEqual(len(mp2.complete_prompts), 0)
+        self.assertEqual(self._generation_statuses("alpha"), ["FAILED"])
+
+        # Cool-off elapsed -- back-date the failed generation and retry succeeds.
+        self.conn.execute(
+            "UPDATE search_generations SET created_at = ? WHERE interest_key = 'alpha'",
+            (db.ago(cfg.mission_retry_seconds + 60),),
+        )
+        mp3 = FakeCouncilProvider(mission_batches=[mission_batch("recovered")])
+        self._tick(mp3, cfg=cfg)
+        self.assertEqual(len(mp3.complete_prompts), 1)
+        self.assertEqual(self._generation_statuses("alpha"), ["FAILED", "DONE"])
+
+    def test_malformed_council_output_records_failed_generation_and_enqueues_nothing(self):
+        self._interest("alpha")
+        mp = FakeCouncilProvider(mission_batches=[{"missions": "not-a-list"}])
+        self._tick(mp)
+        self.assertEqual(self._generation_statuses("alpha"), ["FAILED"])
+        self.assertEqual(db.pending_mission_count(self.conn, "alpha"), 0)
+
+    def test_executor_failure_on_one_mission_does_not_abort_others(self):
+        cfg = dataclasses.replace(self.cfg, missions_per_tick=2)
+        self._interest("alpha")
+        self._seed_mission("alpha", "bad-mission")
+        self._seed_mission("alpha", "good-mission")
+
+        mp = FakeCouncilProvider(search_results={
+            "bad-mission": RuntimeError("search blew up"),
+            "good-mission": search_hits("https://e.com/good"),
+        })
+        self._tick(mp, cfg=cfg)
+
+        bad = self.conn.execute("SELECT status FROM search_missions WHERE label='bad-mission'").fetchone()
+        good = self.conn.execute("SELECT status FROM search_missions WHERE label='good-mission'").fetchone()
+        self.assertIn(bad["status"], ("PENDING", "FAILED"))   # never DONE
+        self.assertEqual(good["status"], "DONE")
+
+    def test_duplicate_discoveries_across_missions_dedup(self):
+        cfg = dataclasses.replace(self.cfg, missions_per_tick=2)
+        self._interest("alpha")
+        self._seed_mission("alpha", "m1")
+        self._seed_mission("alpha", "m2")
+
+        same_hit = search_hits("https://e.com/same")
+        mp = FakeCouncilProvider(search_results={"m1": same_hit, "m2": same_hit})
+        self._tick(mp, cfg=cfg)
+
+        rows = self.conn.execute(
+            "SELECT COUNT(*) c FROM candidate_items WHERE url = ?", ("https://e.com/same",)
+        ).fetchone()
+        self.assertEqual(rows["c"], 1)   # one stored item
+        metrics = dict(self.conn.execute("SELECT name, count FROM metrics").fetchall())
+        self.assertEqual(metrics.get("duplicate"), 1)
+
+    # --- provenance ------------------------------------------------------------
+
+    def test_provenance_resolves_generation_mission_label_prompt(self):
+        interest = self._interest("alpha")
+        mp = FakeCouncilProvider(
+            mission_batches=[mission_batch("provenance-check")],
+            search_results={"provenance-check": search_hits("https://e.com/prov")},
+        )
+        self._tick(mp, cfg=dataclasses.replace(self.cfg, council_missions_per_generation=1, missions_per_tick=1))
+
+        item_row = self.conn.execute(
+            "SELECT metadata FROM candidate_items WHERE url = ?", ("https://e.com/prov",)
+        ).fetchone()
+        metadata = json.loads(item_row["metadata"])
+        mission = db.mission_by_id(self.conn, metadata["mission_id"])
+        self.assertEqual(mission["label"], "provenance-check")
+        self.assertEqual(metadata["mission_label"], "provenance-check")
+        self.assertEqual(metadata["prompt_sha256"], mission["prompt_sha256"])
+        self.assertEqual(
+            hashlib.sha256(mission["prompt"].encode("utf-8")).hexdigest(), mission["prompt_sha256"]
+        )
+        generation = self.conn.execute(
+            "SELECT interest_key FROM search_generations WHERE id = ?", (metadata["generation_id"],)
+        ).fetchone()
+        self.assertEqual(generation["interest_key"], "alpha")
+
+    # --- provider outage -----------------------------------------------------
+
+    def test_provider_outage_leases_nothing_and_spends_nothing(self):
+        self._interest("alpha")
+        self._seed_mission("alpha", "m1")
+        mp = FakeCouncilProvider(preflight_ok=False)
+        result = self._tick(mp)
+        self.assertFalse(result["preflight_ok"])
+        self.assertEqual(len(mp.complete_prompts), 0)
+        self.assertEqual(len(mp.search_prompts), 0)
+        row = self.conn.execute("SELECT status FROM search_missions WHERE label='m1'").fetchone()
+        self.assertEqual(row["status"], "PENDING")   # never leased
+
+    # --- end to end + fallback + default-behaviour ----------------------------
+
+    def test_stubbed_end_to_end_web_tick_through_the_real_pipeline(self):
+        self._interest("alpha")
+        mp = FakeCouncilProvider(
+            mission_batches=[mission_batch("e2e")],
+            search_results={"e2e": search_hits("https://e.com/e2e")},
+        )
+        scoring = FakeProvider({"Result": 0.95})
+        cfg = dataclasses.replace(self.cfg, council_missions_per_generation=1, missions_per_tick=1)
+        self._tick(mp, scoring_provider=scoring, cfg=cfg, dry_run=True)
+
+        # web_tick(), like run_once(), only *delivers* immediate ALERT-type
+        # items here -- this default "article" item is DISCOVERY-lane and
+        # stays pending for the digest, so the real assertion is that it
+        # made it all the way to notification_ready() through the real
+        # pipeline (matched -> scored -> above its interest's bar).
+        ready = pipeline.notification_ready(self.conn, cfg)
+        self.assertEqual(len(ready), 1)
+        self.assertEqual(ready[0][1].url, "https://e.com/e2e")
+        score_row = self.conn.execute(
+            "SELECT final_score FROM scores s JOIN candidate_items i ON i.id = s.item_id"
+            " WHERE i.url = ?", ("https://e.com/e2e",)
+        ).fetchone()
+        self.assertAlmostEqual(score_row["final_score"], 0.95)
+
+    def test_static_fallback_enqueued_only_after_consecutive_council_failures(self):
+        cfg = dataclasses.replace(
+            self.cfg, council_max_consecutive_failures=2, mission_low_water=1, missions_per_tick=0,
+            mission_retry_seconds=0,   # no replenish cooldown between these back-to-back ticks
+        )
+        interest = self._interest("alpha")
+
+        # 1st failure: not enough yet -- no fallback.
+        mp1 = FakeCouncilProvider(mission_batches=[providers.ProviderError("down")])
+        self._tick(mp1, cfg=cfg)
+        self.assertEqual(db.pending_mission_count(self.conn, "alpha"), 0)
+
+        # 2nd consecutive failure: threshold reached -- fallback enqueued.
+        mp2 = FakeCouncilProvider(mission_batches=[providers.ProviderError("still down")])
+        self._tick(mp2, cfg=cfg)
+        fallback = self.conn.execute(
+            "SELECT label, generation_id FROM search_missions WHERE interest_key='alpha' AND status='PENDING'"
+        ).fetchone()
+        self.assertEqual(fallback["label"], missions.FALLBACK_LABEL)
+        self.assertIsNone(fallback["generation_id"])
+
+    def test_run_once_budgets_refactor_is_behavior_preserving(self):
+        """budgets_for() is the only refactor pipeline.py permits itself
+        this step -- run_once() for stocks/youtube-shaped collectors stays
+        byte-identical to before it existed."""
+        budget, explore_budget = pipeline.budgets_for(CFG)
+        self.assertEqual(budget.remaining, CFG.max_scores_per_cycle)
+        self.assertEqual(explore_budget.remaining, 0)   # dynamic_interests off by default
+
+        db.upsert_interest(self.conn, an_interest(key="k", sources=["fake"]))
+
+        def collector(interest, cfg, provider, conn=None):
+            return [an_item(source="fake", title="Good stuff here", url="https://e.com/1")]
+
+        provider = FakeProvider({"Good stuff": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            summary = pipeline.run_once(self.conn, provider, CFG, dry_run=True)
+        self.assertEqual(
+            summary,
+            {"collected": 1, "duplicate": 0, "filtered": 0, "already_scored": 0,
+             "scored": 1, "deferred": 0, "errors": 0, "notified": 0},   # "article" isn't an ALERT type
+        )
 
 
 import importlib.util as _ilu  # noqa: E402
