@@ -742,25 +742,6 @@ def parse_hn(body):
     return out
 
 
-def reddit_url(query, n=N_PER_QUERY):
-    qs = urllib.parse.urlencode({"q": query, "sort": "new", "limit": n, "t": "year"})
-    return f"https://www.reddit.com/search.json?{qs}"
-
-
-def parse_reddit(body):
-    data = json.loads(body)
-    out = []
-    for child in data.get("data", {}).get("children", []):
-        d = child.get("data", {})
-        permalink = d.get("permalink")
-        url = f"https://www.reddit.com{permalink}" if permalink else d.get("url")
-        created = d.get("created_utc")
-        published = (datetime.fromtimestamp(created, tz=timezone.utc).isoformat(timespec="seconds")
-                     if created else None)
-        out.append({"url": url, "title": d.get("title"), "published_at": published})
-    return out
-
-
 def arxiv_url(query, n=N_PER_QUERY):
     qs = urllib.parse.urlencode({"search_query": f"all:{query}", "start": 0, "max_results": n})
     return f"https://export.arxiv.org/api/query?{qs}"
@@ -868,9 +849,13 @@ def sample_pubmed(query, n=N_PER_QUERY):
     return entry
 
 
+# reddit has no sampler anymore (step-09, RETIRED_UNREACHABLE -- see
+# sample_reddit_pass2): two independent passes (step-09a's own 5-interest
+# zero-spend sweep, and this step's one-request availability re-check) both
+# got HTTP 403, so its sampler+parser were deleted rather than kept around to
+# 403 a third time. The dossier retains both passes' 403 evidence.
 CONNECTOR_SAMPLERS = {
     "hackernews": lambda q, n=N_PER_QUERY: _sample(hn_url(q, n), parse_hn, connector="hackernews"),
-    "reddit": lambda q, n=N_PER_QUERY: _sample(reddit_url(q, n), parse_reddit, connector="reddit"),
     "arxiv": lambda q, n=N_PER_QUERY: _sample(arxiv_url(q, n), parse_arxiv, connector="arxiv"),
     "pubmed": sample_pubmed,
 }
@@ -940,40 +925,23 @@ def sample_connector_pass2(name, applicable, interests_by_key):
     return per_interest
 
 
+REDDIT_RETIRED_DETAIL = (
+    "RETIRED_UNREACHABLE: two independent passes both got HTTP 403 -- "
+    "step-09a's own 5-interest zero-spend sweep, and this step's one-request "
+    "availability re-check. No sampler is called anymore (reddit_url/"
+    "parse_reddit were deleted); see connector_evidence.json's connectors[] "
+    "(step-09a) and pass_2_e5b.connectors[] (this step) for the recorded "
+    "evidence of both 403s."
+)
+
+
 def sample_reddit_pass2(applicable, interests_by_key):
-    """CONNECTOR SCOPE: one availability re-check request only (its own
-    first applicable interest's query_v2), sampled further ONLY if that
-    re-check succeeds. A second independent 403 (it 403'd on all 5 interests
-    in step-09a) is a retirement signal, not retried."""
-    if not applicable:
-        return [], {"reachable": None, "detail": "no applicable probed interest"}
-
-    first_key = applicable[0]
-    query = build_query_v2(interests_by_key[first_key])
-    result = CONNECTOR_SAMPLERS["reddit"](query, N_PER_QUERY)
-    recheck = {
-        "interest": first_key, "query": query, "endpoint": result["endpoint"],
-        "http_status": result["http_status"], "error": result["error"],
-        "records": result["records"], "n_records": len(result["records"]),
-        "rate_limit_headers": result.get("rate_limit_headers") or {},
-        "collected_at": now(), "lane": "pass_2_e5b",
-    }
-    if result["error"] is not None:
-        return [recheck], {"reachable": False,
-                           "detail": f"availability re-check failed: {result['error']}"}
-
-    per_interest = [recheck]
-    for key in applicable[1:]:
-        query = build_query_v2(interests_by_key[key])
-        r = CONNECTOR_SAMPLERS["reddit"](query, N_PER_QUERY)
-        per_interest.append({
-            "interest": key, "query": query, "endpoint": r["endpoint"],
-            "http_status": r["http_status"], "error": r["error"],
-            "records": r["records"], "n_records": len(r["records"]),
-            "rate_limit_headers": r.get("rate_limit_headers") or {},
-            "collected_at": now(), "lane": "pass_2_e5b",
-        })
-    return per_interest, {"reachable": True, "detail": "availability re-check succeeded (http 200)"}
+    """reddit is RETIRED_UNREACHABLE as of this step (see
+    REDDIT_RETIRED_DETAIL): the CONNECTOR SCOPE re-check this function used
+    to perform already ran, for real, and 403'd again -- a second
+    independent 403 after step-09a's own 5-interest sweep. No further HTTP
+    call is made; this always returns the retired state."""
+    return [], {"reachable": False, "detail": REDDIT_RETIRED_DETAIL}
 
 
 def x_deferred_entry():
@@ -1044,6 +1012,12 @@ def build_connector_pass2_entry(name, applicable, interests_by_key, cfg, old_per
         "usable_records": new_usable,
         "marginal_unique_rate": mur,
         "marginal_unique_rate_status": mur_status,
+        # Promised by PREREGISTRATION_PASS2.marginal_uniqueness_vs_corpus:
+        # stays VOID_NO_WEB_SEARCH_SAMPLE (never a computed value) unless a
+        # live provider lane actually ran one -- no lane here ran one, same
+        # as every H1 connector entry's identically-named field.
+        "jaccard_overlap_with_web_search_sample": None,
+        "jaccard_overlap_status": "VOID_NO_WEB_SEARCH_SAMPLE",
         "median_age_days": median_age_days(all_records, now_dt),
         "sample_validity_rate": validity_rate(all_records),
         "requests_spent": _connector_request_count.get(name, 0) - requests_before,
@@ -1063,13 +1037,51 @@ def build_connector_pass2_entry(name, applicable, interests_by_key, cfg, old_per
         "usable_records": old_usable,
     }
 
+    # `reachable` normally follows whether any per_interest fetch succeeded;
+    # reddit's stub returns per_interest=[] (no fetch attempted at all,
+    # RETIRED_UNREACHABLE) so its own availability dict's explicit False is
+    # authoritative there instead of falling through to None.
+    reachable = availability["reachable"] if availability is not None else (
+        bool(successes) if per_interest else None)
+
     return {
         "name": name,
         "applicable_interests": list(applicable),
-        "reachable": bool(successes) if per_interest else None,
+        "reachable": reachable,
         "arm_new_rule": arm_new_rule,
         "arm_old_rule_recomputed": arm_old_rule_recomputed,
     }, dedup_urls(new_usable)
+
+
+def query_level_network_failures(name, per_interest):
+    """(connector, interest) queries that failed with NO http_status at all
+    -- a connection-level failure (e.g. a read timeout), distinct from a
+    reachable-but-blocked response (e.g. reddit's 403, which does carry a
+    status). Per the pre-registration's 'if a pass aborts (crash, network
+    failure), record it in an aborted_attempts list ... rather than silently
+    re-running' -- these are exactly that, at query rather than whole-
+    connector granularity (repair: they used to only ever land in
+    per_interest['error'], not in aborted_attempts)."""
+    return [
+        {"connector": name, "interest": pi["interest"], "query": pi["query"],
+         "reason": pi["error"], "at": pi["collected_at"]}
+        for pi in per_interest if pi["error"] and pi["http_status"] is None
+    ]
+
+
+def degraded_arms_note(aborted_attempts):
+    """Human-readable addendum to verdict_detail naming any connector whose
+    new-rule arm is under-sampled because of a query_level_network_failures
+    entry -- so a reader doesn't have to cross-reference aborted_attempts to
+    notice a connector's n_sampled fell short of its designed sample."""
+    if not aborted_attempts:
+        return ""
+    by_conn = {}
+    for a in aborted_attempts:
+        by_conn.setdefault(a["connector"], []).append(a["interest"])
+    parts = [f"{c} ({len(v)} query failure(s): {', '.join(v)})" for c, v in by_conn.items()]
+    return (" Degraded arms (network failures during sampling, not retried per "
+            "the stopping condition's 'no re-runs'): " + "; ".join(parts) + ".")
 
 
 def run_pass2_e5b(dossier, cfg):
@@ -1095,6 +1107,8 @@ def run_pass2_e5b(dossier, cfg):
         except Exception as e:
             aborted_attempts.append({"connector": name, "reason": str(e), "at": now()})
             continue
+        aborted_attempts.extend(
+            query_level_network_failures(name, entry["arm_new_rule"]["per_interest"]))
         sampled_connectors.append(entry)
         usable_urls_by_connector[name] = usable_urls
 
@@ -1149,7 +1163,8 @@ def run_pass2_e5b(dossier, cfg):
         "verdict_detail": (
             f"H2 gate: {gate['detail']}. " +
             (f"H2 {verdict.split('_')[1].lower()}: "
-             f"{ {n: m['usable_yield'] for n, m in gate_metrics.items()} }.")
+             f"{ {n: m['usable_yield'] for n, m in gate_metrics.items()} }.") +
+            degraded_arms_note(aborted_attempts)
         ),
     }
 
@@ -1321,7 +1336,8 @@ def run_probe(cfg):
     provider = get_provider(cfg)
     provider_ok, provider_why = provider.preflight()
     print(f"x: provider.preflight() = {provider_ok} ({provider_why or 'reachable'})")
-    for name in ("hackernews", "reddit", "arxiv", "pubmed"):
+    print("reddit: RETIRED_UNREACHABLE (see REDDIT_RETIRED_DETAIL) -- not probed")
+    for name in ("hackernews", "arxiv", "pubmed"):
         applicable = [k for k in APPLICABILITY[name] if k in interests_by_key]
         if not applicable:
             print(f"{name}: no applicable probed interest")

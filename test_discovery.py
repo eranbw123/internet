@@ -5147,31 +5147,22 @@ class ConnectorReconTests(unittest.TestCase):
         self.assertAlmostEqual(exp_connectors.uniqueness_among_candidates("a", by_connector), 0.5)
         self.assertIsNone(exp_connectors.uniqueness_among_candidates("c", by_connector))
 
-    def test_sample_reddit_pass2_stops_after_failed_recheck(self):
+    def test_sample_reddit_pass2_is_retired_and_makes_no_network_call(self):
+        # step-09's own re-check 403'd (a second independent 403 after
+        # step-09a's 5-interest sweep), so reddit_url/parse_reddit were
+        # deleted and this always returns the retired state with zero HTTP.
         interests_by_key = {f"i{n}": an_interest(key=f"i{n}", title=f"Topic Number {n} Words")
                             for n in range(3)}
 
-        def always_403(url, timeout=15, connector=None):
-            return 403, b"blocked", {"Retry-After": "0"}
+        def boom(*a, **kw):
+            raise AssertionError("reddit is retired -- must not call _http_get")
 
-        with mock.patch("exp_connectors._http_get", side_effect=always_403):
+        with mock.patch("exp_connectors._http_get", side_effect=boom):
             per_interest, availability = exp_connectors.sample_reddit_pass2(
                 list(interests_by_key), interests_by_key)
-        self.assertEqual(len(per_interest), 1)
+        self.assertEqual(per_interest, [])
         self.assertFalse(availability["reachable"])
-
-    def test_sample_reddit_pass2_continues_after_successful_recheck(self):
-        interests_by_key = {f"i{n}": an_interest(key=f"i{n}", title=f"Topic Number {n} Words")
-                            for n in range(3)}
-
-        def empty_hits(url, timeout=15, connector=None):
-            return 200, json.dumps({"data": {"children": []}}).encode(), {}
-
-        with mock.patch("exp_connectors._http_get", side_effect=empty_hits):
-            per_interest, availability = exp_connectors.sample_reddit_pass2(
-                list(interests_by_key), interests_by_key)
-        self.assertEqual(len(per_interest), len(interests_by_key))
-        self.assertTrue(availability["reachable"])
+        self.assertIn("RETIRED_UNREACHABLE", availability["detail"])
 
     def test_build_connector_pass2_entry_computes_both_arms(self):
         interest = an_interest(key="k", title="Zebra Quantum Coding")
@@ -5199,6 +5190,64 @@ class ConnectorReconTests(unittest.TestCase):
         self.assertIsNone(entry["arm_new_rule"]["marginal_unique_rate"])
         self.assertEqual(entry["arm_new_rule"]["marginal_unique_rate_status"], "VOID_NO_BASELINE")
         self.assertEqual(usable_urls, {"https://e.com/new1"})
+        # repair: promised by PREREGISTRATION_PASS2 but previously never emitted.
+        self.assertIsNone(entry["arm_new_rule"]["jaccard_overlap_with_web_search_sample"])
+        self.assertEqual(entry["arm_new_rule"]["jaccard_overlap_status"], "VOID_NO_WEB_SEARCH_SAMPLE")
+
+    def test_query_level_network_failures_only_flags_no_status_errors(self):
+        # A read timeout (no http_status at all) is a network failure; a
+        # reachable-but-blocked response (e.g. reddit's 403, which DOES carry
+        # a status) is not -- it's already surfaced via disposition/
+        # availability and must not double up in aborted_attempts.
+        per_interest = [
+            {"interest": "a", "query": "q1", "http_status": None,
+             "error": "host: The read operation timed out", "collected_at": "t1"},
+            {"interest": "b", "query": "q2", "http_status": 403,
+             "error": "http 403", "collected_at": "t2"},
+            {"interest": "c", "query": "q3", "http_status": 200, "error": None, "collected_at": "t3"},
+        ]
+        failures = exp_connectors.query_level_network_failures("arxiv", per_interest)
+        self.assertEqual(len(failures), 1)
+        self.assertEqual(failures[0]["interest"], "a")
+        self.assertEqual(failures[0]["connector"], "arxiv")
+
+    def test_degraded_arms_note(self):
+        self.assertEqual(exp_connectors.degraded_arms_note([]), "")
+        note = exp_connectors.degraded_arms_note([
+            {"connector": "arxiv", "interest": "a", "query": "q", "reason": "timeout", "at": "t"},
+            {"connector": "arxiv", "interest": "b", "query": "q", "reason": "timeout", "at": "t"},
+        ])
+        self.assertIn("arxiv", note)
+        self.assertIn("2 query failure(s)", note)
+
+    def test_run_pass2_e5b_records_query_level_network_failures(self):
+        # repair: a query-level network failure (no http_status at all, e.g.
+        # a read timeout) used to only land in per_interest['error'] --
+        # never in aborted_attempts or verdict_detail.
+        def fake_http_get(url, timeout=15, connector=None):
+            host = urllib.parse.urlparse(url).netloc
+            if host == "hn.algolia.com":
+                return 200, json.dumps({"hits": []}).encode(), {}
+            if host == "export.arxiv.org":
+                raise exp_connectors.ConnectorUnreachable(
+                    "export.arxiv.org: The read operation timed out")
+            if host == "eutils.ncbi.nlm.nih.gov":
+                return 200, json.dumps({"esearchresult": {"idlist": []}}).encode(), {}
+            raise AssertionError(f"unexpected host {host}")
+
+        with tempfile.TemporaryDirectory() as d:
+            missing_db = os.path.join(d, "discovery.db")
+            cfg = dataclasses.replace(CFG, db_path=missing_db, interests_path="interests.json")
+            empty_dossier = {"connectors": [{"name": n, "sample": {"per_interest": []}}
+                                            for n in ("hackernews", "arxiv", "pubmed", "reddit")]}
+            with mock.patch("exp_connectors._http_get", side_effect=fake_http_get), \
+                 mock.patch("exp_connectors.time.sleep"):
+                pass2 = exp_connectors.run_pass2_e5b(empty_dossier, cfg)
+
+        self.assertTrue(pass2["aborted_attempts"])
+        self.assertTrue(all(a["connector"] == "arxiv" for a in pass2["aborted_attempts"]))
+        self.assertIn("Degraded arms", pass2["verdict_detail"])
+        self.assertIn("arxiv", pass2["verdict_detail"])
 
     def test_run_pass2_e5b_end_to_end_offline_no_promotion_on_void_baseline(self):
         # Fully offline: patches _http_get for every host the real pass would
@@ -5236,6 +5285,8 @@ class ConnectorReconTests(unittest.TestCase):
         ])
 
         def fake_http_get(url, timeout=15, connector=None):
+            # reddit is retired (sample_reddit_pass2 makes no HTTP call at
+            # all) -- www.reddit.com deliberately has no branch here.
             host = urllib.parse.urlparse(url).netloc
             if host == "hn.algolia.com":
                 return 200, next(hn_bodies), {}
@@ -5243,8 +5294,6 @@ class ConnectorReconTests(unittest.TestCase):
                 return 200, next(arxiv_bodies), {}
             if host == "eutils.ncbi.nlm.nih.gov":
                 return 200, next(pubmed_bodies), {}
-            if host == "www.reddit.com":
-                return 403, b"blocked", {"Retry-After": "0"}
             raise AssertionError(f"unexpected host {host}")
 
         with tempfile.TemporaryDirectory() as d:

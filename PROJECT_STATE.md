@@ -230,34 +230,49 @@ exp_discovery.py). New Lab("discovery") budget, cap 220. Validate + ntfy
 chained. Lab rules in CLAUDE.md: iterations run detached; every iteration
 must shrink the lab (also in the council brief).
 
-**E5 — connector evidence (step-09a, `exp_connectors.py`)**: read-only recon
-for step-09's connector decision (x, hackernews, reddit, arxiv, pubmed vs
-the 5 probed interests). Zero-spend lane RAN for real (14 free HTTP
-requests, 0 provider calls): hackernews 0 hits (the mechanical
-title+3-signals query is over-constrained for Algolia's AND-match, an
-honest low-recall result, not a bug), reddit blocked (403, likely
-datacenter-IP anti-bot), arxiv and pubmed reachable with real records
-(counts vary run to run with live network conditions). `marginal_unique_rate`
-now genuinely computes against `discovery.db` alone when it's reachable (the
-pre-registered offline-lane substitute baseline; repair fixed a bug where
-this was hardcoded unreachable with no code path to fix it) — still VOID
-here because this worktree has no `discovery.db`. Verdict
-**`VOID_NO_BASELINE`**. **The live lane is NOT YET IMPLEMENTED in the
-harness**, not just session-gated: no code calls `provider.search_json` for
-`x`, and there is no `web_search` baseline sampler, so
-`jaccard_overlap_with_web_search_sample` (needed for a decisive H1
-either way) stays void regardless of who runs `sample` or from where.
-Before re-running for real evidence: (1) implement an `x` sampler
-(`provider.search_json` + the same mechanical query rule) and a
-`web_search`-baseline sampler in `exp_connectors.py`, (2) then run
-`python experiments/lab/exp_connectors.py sample` from a live operator
-session (Chrome `--remote-debugging-port=9222`, logged into claude.ai) with
-`discovery.db` reachable. Spend: 14/40 HTTP requests, $0, 0 provider calls,
-0 YouTube quota. Follow-up: `exp_connectors.py` keeps its own local
-canonicalization/percentile helpers (never touched `exp_discovery.py`'s, to
-avoid disturbing `engine-lab-005` in flight) — collapse the two copies onto
-one shared module once 005 completes. Dossier:
-`experiments/lab/connector_evidence.json` (tracked).
+**E5 — connector evidence (step-09a + step-09, `exp_connectors.py`)**:
+read-only recon for step-09's connector decision. step-09a's H1 pass (14
+free HTTP requests, 0 provider calls) returned `VOID_NO_BASELINE`, but its
+own records showed it had measured the query rule, not the connectors:
+title+3-signals concatenated into 300 chars was over-constrained for
+Algolia (hackernews 0 hits) and topically wrong for relevance-ranked
+arxiv/pubmed. **DECIDED.** step-09's separately pre-registered H2 pass
+(`PREREGISTRATION_PASS2`, frozen before any run) reran hackernews/arxiv/
+pubmed under a corrected mechanical rule (`build_query_v2`: first 4
+distinctive title tokens, `matching._tokens`' own rule) and measured
+`usable_yield` — records built into a `CandidateItem` with `origin_interest`
+UNSET (no free `ORIGIN_MATCH_FLOOR` pass) scoring ≥ `cfg.min_match_score`
+via `matching.match_interests`. Real run (10 HTTP requests, 0 provider
+calls): hackernews 2/20, arxiv 1/10 (2/3 queries timed out — recorded in the
+new `aborted_attempts`/`verdict_detail`, not retried per "no re-runs"),
+pubmed 6/20 — genuinely on-topic records (narcolepsy/orexin trials, EMDR
+studies). **Mixed, not an aggregate improvement**: the new rule helped
+hackernews (0→2) and pubmed (0→6) but arxiv REGRESSED (10→1, mostly from
+those 2/3 timeouts cutting n from a designed 30 to 10) — pooled new-rule
+yield is 9 vs the old rule's pooled 10. Under the identical USABLE
+definition the old-rule arxiv arm alone already clears the gate's 8-record
+bar (10 of 30); only the new-rule arm feeds the gate, per pre-registration,
+and every connector there stays under it. **Verdict `H2_FALSIFIED`** —
+decisive, not a shortfall.
+`apply_promotion_gate` (G1 unique max ≥8, G2 ≥2x runner-up, G3
+`marginal_unique_rate` ≥0.40 against a reachable corpus) returned
+**`NO_PROMOTION` (G1: max=6)**; G3 was separately unreachable too
+(`discovery.db` absent from this worktree). Dispositions: hackernews/arxiv/
+pubmed `NOT_PROMOTED_VOID_BASELINE`; reddit `RETIRED_UNREACHABLE` (403 on
+both step-09a's 5-interest sweep and step-09's one-request re-check —
+`reddit_url`/`parse_reddit` deleted, `sample_reddit_pass2` now a zero-network
+stub, so the current tree can no longer reproduce the persisted reddit
+entry's one live HTTP call; see the dossier's own `reproducibility_note`);
+x `DEFERRED_NEEDS_PROVIDER` (still needs a `provider.search_json`
+sampler + a live operator session; only the unreplicated `x_prompt_lab`
+prior exists). Gate returned NO_PROMOTION, so **no `discovery/` changes**.
+Before a decisive promotion is possible: a reachable `discovery.db`, and a
+`web_search` baseline sample (call the existing
+`discovery/collectors/web_search.py` `collect()` from a live claude.ai
+session — not a second sampler). `exp_connectors.py`'s local
+canonicalization/percentile helpers still duplicate `exp_discovery.py`'s
+(collapse once proposal 005 completes — unchanged this step). Dossier:
+`experiments/lab/connector_evidence.json` (tracked, both passes).
 
 ## youtube: graceful degradation to video-level items
 Stages 1–2 unchanged (LLM-first `search_json` discovery, 0 quota; one batched
