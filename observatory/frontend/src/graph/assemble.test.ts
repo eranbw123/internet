@@ -123,12 +123,12 @@ describe("formatEdgeLabel", () => {
     expect(formatEdgeLabel({ from: 1, to: 2, relationship: "duplicate_of", ordinal: null }, undefined)).toBe("duplicate of");
   });
 
-  it("prefers the target node's summary for a threshold/match/rejection edge", () => {
+  it("keeps threshold/match/rejection edges to the relationship word (card shows the summary)", () => {
     const label = formatEdgeLabel(
       { from: 1, to: 20, relationship: "cleared_threshold", ordinal: null },
       node({ summary: "0.84 >= historical threshold 0.75" }),
     );
-    expect(label).toBe("0.84 >= historical threshold 0.75");
+    expect(label).toBe("cleared threshold");
   });
 
   it("falls back to a humanized relationship when the target node is missing", () => {

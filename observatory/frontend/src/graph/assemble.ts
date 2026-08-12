@@ -96,7 +96,10 @@ export function formatEdgeLabel(edge: GraphEdge, toNode: NodeSummary | undefined
     case "failed":
     case "selected":
     case "executed":
-      return toNode?.summary || toNode?.label || edge.relationship.replace(/_/g, " ");
+      // The target card already renders its own label/summary -- repeating it
+      // on the edge painted long unreadable text strips across the canvas, so
+      // the edge carries only the relationship word.
+      return edge.relationship.replace(/_/g, " ");
     default:
       return edge.relationship.replace(/_/g, " ");
   }

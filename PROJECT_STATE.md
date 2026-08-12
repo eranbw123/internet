@@ -580,6 +580,29 @@ tests, all green; no code changed, README.md is the only file touched by
 this pass.
 
 ## observatory frontend (step-13 task 3) -- BUILD UNBLOCKED, DONE
+
+**Readability pass (2026-08-12, live-verified via CDP screenshots on desktop
+1440px / mobile 390px / tall close-up):** the flowchart was unreadable --
+same-flow nodes floated far apart as disconnected clusters. Root causes and
+fixes, all in `observatory/frontend/`: (1) `NodeCard` had no React Flow
+`<Handle>` components, so NO edges were ever drawn (custom nodes can't anchor
+edges without them) -- added left/target + right/source handles, smoothstep
+edges with arrowheads; (2) edge labels for scored/sent/matched/etc dumped the
+target node's full summary as long text strips across the canvas -- now the
+relationship word only (target card already shows its summary;
+`assemble.test.ts` updated to match); (3) `elkLayout.ts` fixed 160px lane
+bands with even-spread caused both overlap in busy lanes and dead vertical
+space -- lanes are now content-sized rows packed greedily by x-collision
+(`LayoutResult.lanes` carries computed tops); (4) lane labels were a
+screen-space overlay that drifted off alignment on any pan/zoom -- now
+non-interactive `lane`-type nodes inside the flow; (5) minimap was a giant
+blank white box on phones -- styled + hidden under 768px. `.edge-emphasized`
+now scopes stroke to the path (a bare group stroke painted label rects blue).
+CDP-emulation gotcha (screenshot automation only): changing viewport via
+`Emulation.setDeviceMetricsOverride` mid-session leaves React Flow's internal
+dims stale, so fitView fits the OLD viewport -- reload per viewport when
+screenshotting. Frontend tests 20/20 green; `npm run build` output landed in
+`observatory/static/` (served live on :8010).
 (See the final "Repair (build unblocked...)" paragraph below for the
 current, accurate state -- the "BUILD BLOCKED"/npm-refused narrative that
 follows was true for four prior sessions and is kept as history, but its

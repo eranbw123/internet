@@ -3,16 +3,18 @@
 // layering + crossing-minimized ordering; swimlanes are a CROSS-axis
 // (vertical band) concern ELK's layered algorithm doesn't natively express,
 // so this module lets ELK own x (and a within-lane ordering hint) and then
-// remaps y into fixed swimlane bands as a post-pass -- a standard technique
-// for swimlane graphs on top of a layered layout engine.
+// remaps y into content-sized swimlane bands (row-packed by x-collision) as
+// a post-pass -- a standard technique for swimlane graphs on top of a
+// layered layout engine.
 import type { DisplayGraph } from "./assemble";
 import { swimlaneRank } from "./assemble";
 import type { ID, NodeSummary } from "../types";
 
 export const NODE_WIDTH = 220;
 export const NODE_HEIGHT = 72;
-export const LANE_HEIGHT = 160;
-export const LANE_GAP = 24;
+const ROW_GAP = 12;
+const LANE_GAP = 32;
+const H_GAP = 24;
 
 export interface PositionedNode extends NodeSummary {
   x: number;
@@ -25,6 +27,8 @@ export interface LayoutResult {
   nodes: PositionedNode[];
   width: number;
   height: number;
+  /** Swimlane bands in display order with their computed y offsets, for the lane labels. */
+  lanes: { lane: string; top: number }[];
 }
 
 // Minimal shape of what we actually read back from ELK -- avoids depending
@@ -51,8 +55,8 @@ export async function computeLayout(graph: DisplayGraph, elk: ElkLike): Promise<
     layoutOptions: {
       "elk.algorithm": "layered",
       "elk.direction": "RIGHT",
-      "elk.spacing.nodeNode": "32",
-      "elk.layered.spacing.nodeNodeBetweenLayers": "80",
+      "elk.spacing.nodeNode": "24",
+      "elk.layered.spacing.nodeNodeBetweenLayers": "48",
       "elk.layered.crossingMinimization.strategy": "LAYER_SWEEP",
     },
     children: graph.nodes.map((n) => ({
@@ -83,32 +87,51 @@ export async function computeLayout(graph: DisplayGraph, elk: ElkLike): Promise<
   }
 
   const laneOrder = [...byLane.keys()].sort((a, b) => swimlaneRank(a) - swimlaneRank(b));
-  const laneY = new Map<string, number>();
-  laneOrder.forEach((lane, i) => laneY.set(lane, i * (LANE_HEIGHT + LANE_GAP)));
 
-  const nodes: PositionedNode[] = graph.nodes.map((n) => {
-    const elkNode = elkById.get(String(n.id));
-    const laneNodes = byLane.get(n.swimlane)!;
-    const withinLaneIndex = laneNodes.indexOf(n);
-    const laneNodeCount = laneNodes.length;
-    const bandTop = laneY.get(n.swimlane) ?? 0;
-    // Spread nodes evenly within their lane's vertical band so a lane with
-    // several concurrently-active nodes doesn't overlap itself.
-    const withinBandY = laneNodeCount > 1
-      ? (withinLaneIndex / (laneNodeCount - 1)) * (LANE_HEIGHT - NODE_HEIGHT)
-      : (LANE_HEIGHT - NODE_HEIGHT) / 2;
-    return {
-      ...n,
-      x: elkNode?.x ?? 0,
-      y: bandTop + withinBandY,
-      width: NODE_WIDTH,
-      height: NODE_HEIGHT,
-    };
+  // Pack each lane into rows: a node stays on the first row where it doesn't
+  // horizontally collide with the row's previous node, so a left-to-right
+  // chain sits on one tight line and the lane only grows when nodes genuinely
+  // overlap in x. Lane heights are content-sized, keeping connected nodes in
+  // adjacent lanes close instead of centered in fixed 160px bands.
+  const rowByNode = new Map<ID, number>();
+  const laneRows = new Map<string, number>();
+  for (const [lane, list] of byLane) {
+    const rowEnds: number[] = []; // rightmost occupied x per row
+    for (const n of list) {
+      const x = elkById.get(String(n.id))?.x ?? 0;
+      let row = rowEnds.findIndex((end) => end + H_GAP <= x);
+      if (row === -1) {
+        row = rowEnds.length;
+        rowEnds.push(x + NODE_WIDTH);
+      } else {
+        rowEnds[row] = x + NODE_WIDTH;
+      }
+      rowByNode.set(n.id, row);
+    }
+    laneRows.set(lane, rowEnds.length);
+  }
+
+  const laneY = new Map<string, number>();
+  let cursor = 0;
+  const lanes = laneOrder.map((lane) => {
+    laneY.set(lane, cursor);
+    const top = cursor;
+    const rows = laneRows.get(lane) ?? 1;
+    cursor += rows * (NODE_HEIGHT + ROW_GAP) - ROW_GAP + LANE_GAP;
+    return { lane, top };
   });
 
+  const nodes: PositionedNode[] = graph.nodes.map((n) => ({
+    ...n,
+    x: elkById.get(String(n.id))?.x ?? 0,
+    y: (laneY.get(n.swimlane) ?? 0) + (rowByNode.get(n.id) ?? 0) * (NODE_HEIGHT + ROW_GAP),
+    width: NODE_WIDTH,
+    height: NODE_HEIGHT,
+  }));
+
   const width = Math.max(0, ...nodes.map((n) => n.x + n.width)) + 40;
-  const height = laneOrder.length * (LANE_HEIGHT + LANE_GAP);
-  return { nodes, width, height };
+  const height = Math.max(0, cursor - LANE_GAP);
+  return { nodes, width, height, lanes };
 }
 
 let _defaultElk: ElkLike | null = null;
