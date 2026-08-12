@@ -42,25 +42,50 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 
 /* --- graph canvas --- */
 .graph-canvas { position: relative; height: 100%; }
-.graph-toolbar { position: absolute; z-index: 5; top: 8px; left: 8px; display: flex; gap: 6px; }
-.graph-lanes { position: absolute; left: 0; top: 60px; z-index: 1; pointer-events: none; }
-.lane-label { position: absolute; font-size: 11px; color: #889; writing-mode: horizontal-tb; padding-left: 4px; }
+.graph-toolbar { position: absolute; z-index: 5; top: 8px; left: 8px; right: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+.graph-toolbar button {
+  font-size: 11px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 4px;
+  background: rgba(255,255,255,.92); cursor: pointer;
+}
+.graph-toolbar button:hover { border-color: var(--accent); }
+.lane-label {
+  position: absolute; font-size: 10px; font-weight: 600; text-transform: uppercase;
+  letter-spacing: .05em; color: #7c8794; padding: 2px 8px; margin-left: 4px;
+  background: rgba(255,255,255,.85); border: 1px solid var(--border); border-radius: 10px;
+  white-space: nowrap;
+}
 .graph-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #889; }
 
 .node-card {
-  border: 1px solid var(--border); border-radius: 6px; background: #fff;
+  border: 1px solid var(--border); border-left-width: 3px; border-radius: 6px;
+  background: #fff; box-shadow: 0 1px 2px rgba(28,37,48,.08);
   padding: 6px 8px; font-size: 11px; width: 220px; height: 72px; overflow: hidden;
 }
 .node-card.emphasized { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(47,111,235,.3); }
-.node-card.status-active { border-color: var(--active); }
-.node-card.status-error { border-color: var(--error); }
-.node-card.status-ok { border-color: var(--ok); }
-.node-card.node-group { background: #f6f4ff; cursor: pointer; }
-.node-type { font-size: 10px; text-transform: uppercase; color: #889; }
+.node-card.status-active { border-left-color: var(--active); }
+.node-card.status-error { border-left-color: var(--error); background: #fff6f5; }
+.node-card.status-ok { border-left-color: var(--ok); }
+.node-card.node-group { background: #f6f4ff; cursor: pointer; border-style: dashed; }
+.node-type { font-size: 9px; text-transform: uppercase; letter-spacing: .04em; color: #98a2b0; }
 .node-label { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .node-summary { color: #556; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.node-meta { display: flex; gap: 6px; font-size: 10px; color: #778; }
-.edge-emphasized { stroke: var(--accent) !important; stroke-width: 2 !important; }
+.node-meta { display: flex; gap: 6px; font-size: 10px; color: #778; white-space: nowrap; overflow: hidden; }
+/* Scope to the path: the class lands on the edge's whole <g>, and a bare
+   stroke there also paints the label's background rect blue. */
+.edge-emphasized .react-flow__edge-path { stroke: var(--accent) !important; stroke-width: 2 !important; }
+
+/* Edge anchors exist only so React Flow can draw edges -- keep them as
+   near-invisible dots, and never show the "connectable" cursor. */
+.node-card .react-flow__handle,
+.react-flow__node .react-flow__handle {
+  width: 5px; height: 5px; min-width: 5px; min-height: 5px;
+  background: #c3ccd8; border: none; pointer-events: none;
+}
+.react-flow__edge-path { stroke: #8b98a9; stroke-width: 1.25; }
+.react-flow__edge.selected .react-flow__edge-path { stroke: var(--accent); }
+.react-flow__edge-textbg { fill: rgba(255,255,255,.85); }
+.react-flow__edge-text { font-size: 9px; fill: #66707d; }
+.graph-minimap { width: 160px !important; height: 110px !important; }
 
 /* --- inspector --- */
 .inspector { display: flex; flex-direction: column; height: 100%; }
@@ -92,6 +117,10 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .diff-section h4 { margin: 4px 8px; }
 
 /* --- mobile --- */
+@media (max-width: 768px) {
+  /* The minimap is screen real estate the flowchart needs on a phone. */
+  .graph-minimap { display: none; }
+}
 @media (max-width: 480px) {
   .drawer-toggle { display: inline-block; }
   .app-body { position: relative; }

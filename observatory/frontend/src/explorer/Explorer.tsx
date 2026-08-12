@@ -18,7 +18,11 @@ interface Props {
 export function Explorer({ onSelectDiscovery, onOpenRawDb }: Props) {
   const [tab, setTab] = useState<Tab>("discoveries");
   const [search, setSearch] = useState("");
-  const [filters, setFilters] = useState<ListFilters>({});
+  // Default to trace-complete discoveries: most rows in a live discovery.db
+  // predate the trace backbone (step-13 task 1) and have no trace graph
+  // behind them -- showing them by default just buries the ones you can
+  // actually inspect. The dropdown below still overrides this per visit.
+  const [filters, setFilters] = useState<ListFilters>({ trace_complete: "yes" });
   const [offset, setOffset] = useState(0);
   const [limit] = useState(50);
   const [result, setResult] = useState<ListResponse | null>(null);
