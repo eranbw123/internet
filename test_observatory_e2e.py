@@ -260,16 +260,6 @@ class _E2EFixture:
             }})()
         """)
 
-    def double_click(self, selector):
-        self.js(f"""
-            (() => {{
-                const el = document.querySelector({json.dumps(selector)});
-                if (!el) throw new Error('selector not found: {selector}');
-                el.dispatchEvent(new MouseEvent('dblclick', {{bubbles: true}}));
-                return true;
-            }})()
-        """)
-
     def click_text(self, tag, text):
         self.js(f"""
             (() => {{
@@ -333,6 +323,10 @@ class ObservatoryE2EDesktopTests(_E2EFixture, unittest.TestCase):
                 self.assertIn(expected, node_types)
 
     def test_02_group_expand_collapse(self):
+        # Single click, not double: a group's id is a synthetic pseudo-id
+        # that was never resolvable via /api/node/<id>, so GraphCanvas.tsx no
+        # longer treats a single click on a group as "select this node" --
+        # it expands/collapses it directly, same as the old double-click did.
         self.set_viewport(DESKTOP_VIEWPORT)
         self.navigate("/observatory/")
         self.wait_for("document.querySelectorAll('.explorer-row').length > 0")
@@ -342,10 +336,13 @@ class ObservatoryE2EDesktopTests(_E2EFixture, unittest.TestCase):
         if not group:
             self.skipTest("this discovery's own trace has no sibling set past COLLAPSE_THRESHOLD to expand")
         before = self.js("document.querySelectorAll('.node-card').length")
-        self.double_click(".node-group")
+        self.click(".node-group")
         self.wait_for(f"document.querySelectorAll('.node-card').length > {before}", message="expand added nodes")
+        # A single click on a group must never trigger the Inspector to fetch
+        # a fake node id -- the pre-fix bug this test now also guards against.
+        self.assertFalse(self.js("!!document.querySelector('.inspector-error')"))
         after_expand = self.js("document.querySelectorAll('.node-card').length")
-        self.double_click(".node-group")  # collapses whichever child card is now first in DOM order -- re-query
+        self.click(".node-group")  # collapses whichever child card is now first in DOM order -- re-query
         # A collapsed-again graph must NOT still show more cards than the
         # pre-expand baseline (the group returns, its children hide again).
         self.wait_for(f"document.querySelectorAll('.node-card').length <= {after_expand}")
