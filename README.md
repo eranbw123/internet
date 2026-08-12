@@ -644,6 +644,17 @@ logs.
 
 ## Observatory
 
+**Launching it:** `ops\observatory.cmd` -- one command, no flags needed. It
+`cd`s to the repo root and starts the real UI on `127.0.0.1:8010` (see
+[Running it as an appliance](#running-it-as-an-appliance) for why `ops/*.cmd`
+scripts always `cd` first). 8010, not the CLI's own 8001 default, because
+that's the port a standing external ngrok tunnel already forwards to on this
+machine -- override with `ops\observatory.cmd --port 9000` or
+`ops\observatory.cmd --public` (any arg is passed straight through to `ui`,
+last flag wins). This replaces pointing bare `datasette discovery.db` at the
+port by hand, which serves the raw tables with none of this section's
+auth/graph/redaction layer.
+
 `python -m app ui [--host 127.0.0.1] [--port 8001] [--public]` serves the
 trace backbone above as a browsable, queryable UI: an in-repo Datasette
 plugin (`observatory/`) over `discovery.db`, bound to localhost by default.

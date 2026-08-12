@@ -808,6 +808,17 @@ Canonical suites unaffected and re-verified green: `python
 test_discovery.py`/`test_watch.py`/`test_observatory.py` (458 + 10 + 65,
 unchanged -- nothing in `discovery/` touched by any of the above).
 
+**Trivial launcher (`ops/observatory.cmd`):** the standing deployment had
+been running bare `datasette discovery.db` on a manually-chosen port instead
+of `python -m app ui` -- no auth layer, no graph/redaction, and a recurring
+source of confusion about which port to point ngrok at. New `ops/observatory.cmd`
+(same `cd`-to-repo-root convention as `ops/run.cmd`) starts the real `ui`
+command on `127.0.0.1:8010` with no flags needed; 8010 matches a standing
+external ngrok tunnel already forwarding there on the deployment machine, not
+a new app default (`ui --port` itself is still 8001). README's Observatory
+section leads with this as the one-liner. Ops-only change, no `discovery/`/
+`observatory/` code touched.
+
 ## LLM-confirmed near-duplicate dedup
 The three exact-hash layers miss the same story RE-TOLD (prod double-sends:
 items 11↔173, 22↔174 differ only by a title suffix; owner complaint: "VPG
