@@ -624,6 +624,31 @@ CDP-emulation gotcha (screenshot automation only): changing viewport via
 dims stale, so fitView fits the OLD viewport -- reload per viewport when
 screenshotting. Frontend tests 20/20 green; `npm run build` output landed in
 `observatory/static/` (served live on :8010).
+
+**Inspector redesign (2026-08-12, same session, UI-only -- `/api/node`
+payload untouched):** the right pane was 9 always-visible tab buttons, most
+empty for any given node. Now: tabs are computed per node and only non-empty
+ones render (Timing/usage and Database rows tabs are gone -- durations/
+per-call provider/model/validation live in the Overview facts grid, row
+links in an Overview "Database rows" section); Overview is a facts grid
+(status chip, started, duration, LLM-call line per attempt) + summary prose
++ NEW "Came from"/"Led to" clickable connection lists (inbound_edges/
+outbound_edges were fetched but never displayed; clicking navigates the
+inspector via App's own selectNode) + an inline primary-payload preview
+(first of exact_text -> output -> raw response -> input, in MonospaceViewer
+so Copy/Download/Full-screen come along; `exact_text` was previously never
+shown anywhere) + "No payloads recorded" empty state; usage JSON moved into
+Reasoning record per-attempt details. e2e contract preserved: "Reasoning
+record" tab label and its "Exact system + user prompt" summary kept
+verbatim (test_04), Copy button present via the Overview preview (test_05).
+The desktop inspector is also resizable: `.pane-resizer` (App.tsx) is a
+6px col-resize handle on its left edge -- pointer-drag sets the pane width
+(clamped 280..window-480), persisted in localStorage
+(`observatory-inspector-width`); `.app.resizing` disables pane
+pointer-events during the drag. Verified with a real CDP
+`Input.dispatchMouseEvent` drag (380px -> 740px, persisted). Mobile
+(bottom sheet) unaffected. 20/20 unit + 7/7 e2e (1 env clipboard skip)
+green after rebuild.
 (See the final "Repair (build unblocked...)" paragraph below for the
 current, accurate state -- the "BUILD BLOCKED"/npm-refused narrative that
 follows was true for four prior sessions and is kept as history, but its
