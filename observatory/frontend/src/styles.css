@@ -25,7 +25,17 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .pane { min-width: 0; overflow: auto; }
 .pane-explorer { width: 320px; border-right: 1px solid var(--border); }
 .pane-graph { flex: 1; position: relative; }
-.pane-inspector { width: 380px; border-left: 1px solid var(--border); }
+.pane-inspector { width: 380px; }
+
+/* Left-edge drag handle for the inspector: the visible pane divider IS the
+   handle (its own border draws the separator line). */
+.pane-resizer {
+  flex: 0 0 6px; cursor: col-resize; border-left: 1px solid var(--border);
+  background: transparent; transition: background .1s ease;
+}
+.pane-resizer:hover, .app.resizing .pane-resizer { background: rgba(47, 111, 235, .25); }
+.app.resizing { user-select: none; cursor: col-resize; }
+.app.resizing .pane { pointer-events: none; }
 
 /* --- explorer --- */
 .explorer { display: flex; flex-direction: column; height: 100%; }
@@ -89,10 +99,52 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 
 /* --- inspector --- */
 .inspector { display: flex; flex-direction: column; height: 100%; }
-.inspector-header { display: flex; justify-content: space-between; padding: 6px; border-bottom: 1px solid var(--border); }
-.inspector-tabs { display: flex; flex-wrap: wrap; gap: 2px; padding: 4px; }
+.inspector-empty, .inspector-loading { display: flex; align-items: center; justify-content: center; color: #889; padding: 16px; }
+.inspector-header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
+.inspector-title { min-width: 0; }
+.inspector-node-type {
+  display: inline-block; font-size: 9px; text-transform: uppercase; letter-spacing: .04em;
+  color: #66707d; background: #eef1f5; border-radius: 8px; padding: 1px 7px; margin-right: 6px;
+  vertical-align: middle;
+}
+.inspector-label { font-weight: 600; }
+.inspector-tabs { display: flex; flex-wrap: wrap; gap: 2px; padding: 4px; border-bottom: 1px solid var(--border); }
 .inspector-tabs button[aria-selected="true"] { font-weight: 700; border-bottom: 2px solid var(--accent); }
-.inspector-body { flex: 1; overflow: auto; padding: 6px; }
+.inspector-body { flex: 1; overflow: auto; padding: 8px 10px; }
+
+.overview-error {
+  background: #fdecea; color: var(--error); border: 1px solid #f2b8b5;
+  border-radius: 4px; padding: 6px 8px; margin-bottom: 8px; word-break: break-word;
+}
+.overview-summary { margin: 0 0 8px; }
+.overview-facts {
+  display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px;
+  margin: 0 0 10px; font-size: 12px;
+}
+.overview-facts dt { color: #778; }
+.overview-facts dd { margin: 0; min-width: 0; word-break: break-word; }
+.status-chip {
+  display: inline-block; font-size: 10px; font-weight: 600; border-radius: 8px; padding: 0 8px;
+  background: #eef1f5; color: #556;
+}
+.status-chip-ok { background: #e3f4e8; color: var(--ok); }
+.status-chip-error { background: #fdecea; color: var(--error); }
+.status-chip-active { background: #fdf3dc; color: #9a6b00; }
+.overview-section-title {
+  font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
+  color: #98a2b0; margin: 10px 0 4px;
+}
+.overview-connections ul { list-style: none; margin: 0; padding: 0; }
+.overview-connections li { display: flex; gap: 6px; align-items: baseline; padding: 1px 0; min-width: 0; }
+.connection-rel { font-size: 10px; color: #98a2b0; white-space: nowrap; }
+.connection-link {
+  border: none; background: none; padding: 0; font: inherit; color: var(--accent);
+  cursor: pointer; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.connection-link:hover { text-decoration: underline; }
+.overview-preview .monospace-viewer:not(.fullscreen) .viewer-content { max-height: 45vh; }
+.overview-nothing { color: #98a2b0; font-style: italic; margin: 10px 0; }
+.overview-links { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; }
 
 .monospace-viewer { display: flex; flex-direction: column; height: 100%; }
 .monospace-viewer.fullscreen { position: fixed; inset: 0; z-index: 1000; background: #fff; }

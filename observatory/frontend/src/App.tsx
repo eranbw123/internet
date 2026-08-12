@@ -8,6 +8,8 @@ import type { GraphSeed } from "./graph/useGraphData";
 import type { ID, Tab } from "./types";
 
 const MOBILE_BREAKPOINT = 480; // iPhone-width class of device
+const MIN_INSPECTOR_WIDTH = 280;
+const INSPECTOR_WIDTH_KEY = "observatory-inspector-width";
 
 function useIsMobile() {
   const [isMobile, setIsMobile] = useState(() => window.innerWidth <= MOBILE_BREAKPOINT);
@@ -31,6 +33,34 @@ export function App() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
   const isMobile = useIsMobile();
+  const [inspectorWidth, setInspectorWidth] = useState(() => {
+    const saved = Number(localStorage.getItem(INSPECTOR_WIDTH_KEY));
+    return Number.isFinite(saved) && saved >= MIN_INSPECTOR_WIDTH ? saved : 380;
+  });
+  const [resizing, setResizing] = useState(false);
+
+  useEffect(() => {
+    localStorage.setItem(INSPECTOR_WIDTH_KEY, String(inspectorWidth));
+  }, [inspectorWidth]);
+
+  function startInspectorResize(e: React.PointerEvent) {
+    e.preventDefault();
+    setResizing(true);
+    const onMove = (ev: PointerEvent) => {
+      // The inspector is the rightmost pane, so its width is the distance
+      // from the pointer to the right window edge; keep enough room for the
+      // graph pane no matter how far left the user drags.
+      const max = Math.max(MIN_INSPECTOR_WIDTH, window.innerWidth - 480);
+      setInspectorWidth(Math.min(Math.max(window.innerWidth - ev.clientX, MIN_INSPECTOR_WIDTH), max));
+    };
+    const onUp = () => {
+      setResizing(false);
+      window.removeEventListener("pointermove", onMove);
+      window.removeEventListener("pointerup", onUp);
+    };
+    window.addEventListener("pointermove", onMove);
+    window.addEventListener("pointerup", onUp);
+  }
 
   function selectDiscovery(row: Record<string, unknown>, tab: Tab) {
     // Each explorer tab's row.id is a primary key from a DIFFERENT table
@@ -68,7 +98,7 @@ export function App() {
   }
 
   return (
-    <div className={`app ${isMobile ? "mobile" : "desktop"}`} data-testid="app">
+    <div className={`app ${isMobile ? "mobile" : "desktop"} ${resizing ? "resizing" : ""}`} data-testid="app">
       <header className="app-header">
         <button className="drawer-toggle" onClick={() => setDrawerOpen((v) => !v)} aria-label="Toggle explorer">☰</button>
         <span className="app-title">Observatory</span>
@@ -87,15 +117,18 @@ export function App() {
           )}
         </div>
         {!isMobile && (
-          <div className="pane pane-inspector">
-            <Inspector nodeId={selectedNodeId} />
-          </div>
+          <>
+            <div className="pane-resizer" title="Drag to resize" onPointerDown={startInspectorResize} />
+            <div className="pane pane-inspector" style={{ width: inspectorWidth }}>
+              <Inspector nodeId={selectedNodeId} onSelectNode={selectNode} />
+            </div>
+          </>
         )}
       </div>
       {isMobile && (
         <div className={`bottom-sheet ${sheetOpen ? "open" : ""}`} data-testid="bottom-sheet">
           <div className="bottom-sheet-handle" onClick={() => setSheetOpen(false)} />
-          <Inspector nodeId={selectedNodeId} onClose={() => setSheetOpen(false)} />
+          <Inspector nodeId={selectedNodeId} onClose={() => setSheetOpen(false)} onSelectNode={selectNode} />
         </div>
       )}
     </div>
