@@ -19,3 +19,10 @@
 # lazily inside discovery/collectors/youtube.py; without it, that collector
 # logs and skips every video instead of failing the cycle.
 # youtube-transcript-api>=1.2.4
+
+# Required only for `python -m app ui` (the Observatory, observatory/, step-13
+# task 2) and for running test_observatory.py -- the ONE sanctioned new
+# dependency this repo takes on (see PROJECT_STATE.md). Imported lazily,
+# inside observatory/ and discovery/__main__.py's `ui` command handler only;
+# discovery/ and test_discovery.py stay importable/green without it.
+# datasette>=0.65

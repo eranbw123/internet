@@ -35,17 +35,32 @@ def is_alert(item):
     return item.type in ALERT_TYPES
 
 
-def feedback_keyboard(score_id):
+def feedback_keyboard(score_id, observatory_base_url=""):
     """Telegram `reply_markup` for the four feedback buttons, two per row.
     `score_id` (not item_id) is embedded because it's the one id that gets
     the listener straight to item_id + interest_id + final_score in one
-    lookup (db.score_by_id) -- see feedback_listener.py."""
+    lookup (db.score_by_id) -- see feedback_listener.py.
+
+    `observatory_base_url` (cfg.observatory_base_url, empty by default) adds
+    a fifth, third-row URL button linking to that score's full trace in the
+    Observatory (step-13 task 2) -- '<base>/observatory/trace/score/<id>'.
+    Empty (the default) leaves the keyboard byte-identical to before this
+    button existed: every existing feedback button + callback_data is
+    unchanged either way. A base URL missing its http(s) scheme (an easy
+    operator typo, e.g. 'localhost:8001') is skipped rather than embedded --
+    Telegram rejects the ENTIRE sendMessage (BUTTON_URL_INVALID) for a
+    malformed inline URL button, which would otherwise silently kill every
+    digest/alert, not just the button."""
     codes = list(FEEDBACK_VERDICTS)
     buttons = [
         {"text": FEEDBACK_VERDICTS[code], "callback_data": f"fb:{code}:{score_id}"}
         for code in codes
     ]
-    return {"inline_keyboard": [buttons[:2], buttons[2:]]}
+    rows = [buttons[:2], buttons[2:]]
+    if observatory_base_url.startswith(("http://", "https://")):
+        url = f"{observatory_base_url.rstrip('/')}/observatory/trace/score/{score_id}"
+        rows.append([{"text": "🔬 Open full trace", "url": url}])
+    return {"inline_keyboard": rows}
 
 
 def _timestamp_range(item):

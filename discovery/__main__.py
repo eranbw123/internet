@@ -35,6 +35,10 @@
     personal-state  print the ai repo's personal-state contract artifact
     teach         rank scored-but-unlabeled items by expected information
                   value and record labels; --list/--explain/--send
+    ui            serve the Observatory (step-13 task 2): a read-only
+                  Datasette UI + JSON API over the trace tables, bound to
+                  localhost by default; --public additionally requires
+                  DISCOVERY_UI_TOKEN and DISCOVERY_NGROK_CMD (see README)
 
 There is no `run`/scheduler loop -- an OS scheduler (see
 ops/install_tasks.py) calls the commands above on their own cadence instead;
@@ -42,12 +46,13 @@ a session-child tick loop gets reaped the moment the SSH session disconnects.
 """
 import argparse
 import json
+import subprocess
 import sys
 from collections import Counter
 
 from datetime import datetime, timezone
 
-from . import config, db, feedback_listener, health, interests, missions, personal_state, providers, stats, teach
+from . import config, db, feedback_listener, health, interests, missions, personal_state, providers, stats, teach, trace
 from .collectors import COLLECTORS
 from .models import CandidateItem
 from .notify import FEEDBACK_VERDICTS, print_safe
@@ -132,8 +137,39 @@ def main(argv=None):
     mode.add_argument("--list", action="store_true", help="print the ranked queue and exit")
     mode.add_argument("--explain", action="store_true", help="print queue_metrics and exit")
     mode.add_argument("--send", action="store_true", help="push the top items to Telegram")
+    tf = sub.add_parser(
+        "trace-fixture",
+        help="build the deterministic trace acceptance fixture (offline, fake providers)",
+    )
+    # default=SUPPRESS: a subparser argument's own default is written into
+    # the namespace even when the flag isn't given on the command line,
+    # which would silently blow away a --db already parsed before the
+    # subcommand (e.g. `python -m app --db PATH trace-fixture`). SUPPRESS
+    # means "leave the namespace alone unless this flag is actually passed",
+    # so both `--db PATH trace-fixture` and `trace-fixture --db PATH` work.
+    tf.add_argument(
+        "--db", default=argparse.SUPPRESS,
+        help="required -- path to a fresh/fixture-only db, never the production default",
+    )
+    ui = sub.add_parser(
+        "ui", help="serve the Observatory: read-only Datasette UI + JSON API over the trace tables"
+    )
+    ui.add_argument("--host", default="127.0.0.1", help="bind address (default: localhost only)")
+    ui.add_argument("--port", type=int, default=8001)
+    ui.add_argument(
+        "--public", action="store_true",
+        help="expose via ngrok, token-gated -- requires DISCOVERY_UI_TOKEN and DISCOVERY_NGROK_CMD",
+    )
 
     args = parser.parse_args(argv)
+    if args.command == "trace-fixture" and not args.db:
+        # trace_fixture.build() inserts fixture interests/items/scores/a real
+        # feedback row through the real production code paths -- refusing to
+        # fall back to cfg.db_path's default (REPO_ROOT/discovery.db) is what
+        # stops an unflagged invocation from writing fixture rows into the
+        # real database.
+        print("trace-fixture requires --db PATH -- refusing to default to the production db", file=sys.stderr)
+        return 2
     cfg = config.load()
     if args.db:
         cfg.db_path = args.db
@@ -222,6 +258,12 @@ def _dispatch(conn, cfg, args, provider):
         return _personal_state(cfg, args)
     elif args.command == "teach":
         return _teach_cmd(conn, cfg, args)
+    elif args.command == "trace-fixture":
+        from . import trace_fixture
+
+        print(trace_fixture.build(conn, cfg))
+    elif args.command == "ui":
+        return _ui_cmd(cfg, args)
     return 0
 
 
@@ -266,7 +308,21 @@ def _web_tick_cmd(conn, provider, cfg, dry_run):
 
 
 def _digest_cmd(conn, cfg, dry_run):
-    print(f"sent {send_digest(conn, cfg, dry_run=dry_run)} digest item(s)")
+    """Same run-level trace_runs wrapping run-once/web-tick get (kind='digest',
+    a no-op end to end when cfg.trace_enabled is off) -- this is the only
+    production path that ever sends a DISCOVERY item, so without it the
+    render/notification trace nodes real feedback would need to link back to
+    (see feedback_listener._handle_callback) never existed outside the
+    fixture's own hand-rolled run."""
+    tracer = trace.Tracer(conn, cfg)
+    run_id = tracer.begin_run("digest", provider=cfg.provider, model=cfg.model)
+    try:
+        sent = send_digest(conn, cfg, dry_run=dry_run, tracer=tracer)
+    except Exception as e:  # noqa: BLE001 -- re-raised as-is right after
+        tracer.finish_run(run_id, status="error", error=str(e))
+        raise
+    tracer.finish_run(run_id, status="done")
+    print(f"sent {sent} digest item(s)")
     return 0
 
 
@@ -505,6 +561,78 @@ def _teach_cmd(conn, cfg, args):
     # a default value is captured once at import time, so patching
     # builtins.input in a test would never reach it.
     return teach.run_interactive(conn, limit, args.interest, read=input)
+
+
+def _ui_cmd(cfg, args):
+    """Serves the Observatory (step-13 task 2). `datasette`/`observatory/`
+    are imported lazily, here and only here (plus inside observatory/ itself)
+    -- every other discovery/ module, and test_discovery.py, must stay
+    importable on a machine without datasette installed (see
+    PROJECT_STATE.md)."""
+    if args.public:
+        if not cfg.ui_token:
+            print(
+                "ui --public requires DISCOVERY_UI_TOKEN -- refusing to expose the db without a token",
+                file=sys.stderr,
+            )
+            return 2
+        if not cfg.ngrok_cmd:
+            print(
+                "ui --public requires DISCOVERY_NGROK_CMD (a working ngrok binary/config)",
+                file=sys.stderr,
+            )
+            return 2
+
+    try:
+        from observatory.app import build_datasette
+    except ImportError as e:
+        print(f"ui: datasette is not installed ({e}) -- see requirements.txt", file=sys.stderr)
+        return 2
+
+    ds = build_datasette(cfg, public=args.public)
+
+    if args.public:
+        if not _launch_ngrok(cfg, args.port):
+            return 3
+        print(
+            "ui --public: ngrok launch requested -- live tunnel/token verification is an "
+            "operator-session step, not exercised by this process or its tests",
+            file=sys.stderr,
+        )
+
+    import uvicorn
+
+    print(f"Observatory: http://{args.host}:{args.port}/observatory/"
+          + (" (public -- token required)" if args.public else " (localhost only)"))
+    # `--public` accepts the token as `?token=` (the only form a plain
+    # Telegram URL button can carry -- it can't set a header) -- uvicorn's
+    # access log records the full path+query, which would otherwise persist
+    # the token to disk on every request, violating "never persist ...
+    # tokens anywhere". access_log stays on in private mode (nothing
+    # sensitive to leak there) and only turns off once a token exists.
+    uvicorn.run(
+        ds.app(), host=args.host, port=args.port, log_level="info",
+        access_log=not args.public, lifespan="on", workers=1,
+    )
+    return 0
+
+
+def _launch_ngrok(cfg, port):
+    """`cmd /d /c` -- see health.py's own chrome_launch_cmd for why /d
+    matters on this machine (an AutoRun hook breaks shell=True's cwd
+    handling). `{port}` in DISCOVERY_NGROK_CMD, if present, is substituted;
+    a command with no such placeholder is run as-is (e.g. one that already
+    reads the port from its own ngrok.yml). Detached (`start ""...`) is the
+    caller's responsibility, same convention as DISCOVERY_CHROME_LAUNCH_CMD --
+    this never runs live in this worktree (no ngrok binary/network here);
+    see PROJECT_STATE.md."""
+    cmd_str = cfg.ngrok_cmd.replace("{port}", str(port))
+    try:
+        subprocess.Popen(["cmd", "/d", "/c", cmd_str], close_fds=True)
+    except OSError as e:
+        print(f"ui --public: failed to launch ngrok ({cmd_str!r}): {e}", file=sys.stderr)
+        return False
+    return True
 
 
 if __name__ == "__main__":

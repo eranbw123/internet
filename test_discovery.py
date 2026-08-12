@@ -41,6 +41,8 @@ from discovery import (
     scoring,
     stats,
     teach,
+    trace,
+    trace_fixture,
 )
 from discovery.personal_state import PersonalState, PersonalStateError
 from discovery.collectors import COLLECTORS, stocks, web_search, youtube
@@ -163,8 +165,13 @@ class FakeProvider(LLMProvider):
         for needle, value in self.scores.items():
             if needle in prompt:
                 if isinstance(value, Exception):
+                    self._emit_call(None, 1, system, prompt, schema, None, None, None,
+                                     "error", str(value), "t0", "t1")
                     raise value
-                return self._payload(value)
+                payload = self._payload(value)
+                self._emit_call(None, 1, system, prompt, schema, None, json.dumps(payload),
+                                 payload, "valid", None, "t0", "t1")
+                return payload
         raise AssertionError(f"FakeProvider got an unexpected prompt:\n{prompt}")
 
     def _dedup_verdict(self, prompt):
@@ -180,6 +187,8 @@ class FakeProvider(LLMProvider):
         self.search_prompts.append(prompt)
         if self.search_results is None:
             raise UnsupportedCapability("fake provider has no search")
+        self._emit_call(None, 1, None, prompt, None, None, json.dumps(self.search_results),
+                         self.search_results, "array", None, "t0", "t1")
         return self.search_results
 
     @staticmethod
@@ -2785,6 +2794,40 @@ class NotifyTests(unittest.TestCase):
         self.assertEqual(codes, set(notify.FEEDBACK_VERDICTS))
         self.assertTrue(all(b["callback_data"].endswith(":42") for b in buttons))
 
+    def test_feedback_keyboard_with_no_observatory_url_is_byte_identical_to_before(self):
+        # Default (empty observatory_base_url): same as calling with just a
+        # score id -- no fifth button, no third row, byte-identical keyboard.
+        self.assertEqual(notify.feedback_keyboard(42), notify.feedback_keyboard(42, ""))
+        markup = notify.feedback_keyboard(42, "")
+        self.assertEqual(len(markup["inline_keyboard"]), 2)
+        self.assertEqual(sum(len(row) for row in markup["inline_keyboard"]), 4)
+
+    def test_feedback_keyboard_appends_a_trace_button_when_observatory_url_is_set(self):
+        markup = notify.feedback_keyboard(42, "https://observatory.example.com")
+        # The original four feedback buttons + their callback_data are
+        # untouched -- only a new third row is appended.
+        self.assertEqual(markup["inline_keyboard"][:2], notify.feedback_keyboard(42)["inline_keyboard"])
+        self.assertEqual(len(markup["inline_keyboard"]), 3)
+        trace_button = markup["inline_keyboard"][2][0]
+        self.assertEqual(trace_button["url"], "https://observatory.example.com/observatory/trace/score/42")
+        self.assertNotIn("callback_data", trace_button)
+
+    def test_feedback_keyboard_strips_a_trailing_slash_on_the_base_url(self):
+        markup = notify.feedback_keyboard(1, "https://observatory.example.com/")
+        self.assertEqual(
+            markup["inline_keyboard"][2][0]["url"],
+            "https://observatory.example.com/observatory/trace/score/1",
+        )
+
+    def test_feedback_keyboard_skips_the_trace_button_for_a_schemeless_base_url(self):
+        # Telegram rejects the WHOLE sendMessage (BUTTON_URL_INVALID) for a
+        # malformed inline URL button -- an operator typo like
+        # DISCOVERY_OBSERVATORY_BASE_URL='localhost:8001' (no scheme) must
+        # not reach the keyboard at all; the other four buttons stay intact.
+        markup = notify.feedback_keyboard(1, "localhost:8001")
+        self.assertEqual(markup, notify.feedback_keyboard(1))
+        self.assertEqual(len(markup["inline_keyboard"]), 2)
+
 
 class PipelineTests(unittest.TestCase):
     def setUp(self):
@@ -3943,6 +3986,31 @@ class ClaudeChatProviderTests(unittest.TestCase):
         with self.assertRaises(ProviderError):
             provider.complete_json("s", "p", self.SCHEMA)
 
+    def test_complete_json_accepts_a_score_reply_with_no_debug_fields(self):
+        """The real production schemas (scoring.SCORE_SCHEMA/council.MISSION_
+        SCHEMA), not a hand-shrunk test schema, through the real provider --
+        repair 2 broke this by putting the optional debug/deliberation
+        fields into these schemas' top-level `required`, which claude_chat's
+        _validate() enforces verbatim. A reply with only the production
+        fields must succeed in one attempt, not fall back to the retry
+        suffix or raise."""
+        good_score = {
+            "interest_key": "x",
+            **{name: 0.5 for name in models.DIMENSIONS},
+            "confidence": 0.5, "reason": "r", "why_better_than_generic": "w",
+        }
+        provider = self._provider(completion_reply(json.dumps(good_score)))
+        self.assertEqual(provider.complete_json("s", "p", scoring.SCORE_SCHEMA), good_score)
+        (conn,) = self.connections
+        self.assertEqual(conn.calls.count("completion"), 1)  # no retry needed
+
+    def test_complete_json_accepts_missions_reply_with_no_deliberation(self):
+        good_missions = {"missions": [{"label": "a", "rationale": "b", "prompt": "c"}]}
+        provider = self._provider(completion_reply(json.dumps(good_missions)))
+        self.assertEqual(provider.complete_json("s", "p", council.MISSION_SCHEMA), good_missions)
+        (conn,) = self.connections
+        self.assertEqual(conn.calls.count("completion"), 1)  # no retry needed
+
     def test_search_json_returns_the_embedded_array_and_garbage_becomes_empty(self):
         provider = self._provider(
             completion_reply('I searched.\n[{"title": "T", "url": "https://e.com"}]\nDone.'),
@@ -4463,6 +4531,89 @@ class SchemaContractTests(unittest.TestCase):
         for schema in (scoring.SCORE_SCHEMA, stocks_module.EXPLAIN_SCHEMA):
             self.assertIs(schema.get("additionalProperties"), False, schema)
 
+    def test_default_provider_validate_accepts_score_missing_all_debug_fields(self):
+        """claude_chat/chatgpt_browser's hand-rolled _validate() is the ONLY
+        schema enforcement the two default browser providers have, and it
+        enforces `required` verbatim with no tolerance. The six debug fields
+        (scoring.DEBUG_FIELDS) are documented as 'absent => unavailable, not
+        an error' -- so a reply carrying every production field but none of
+        the debug ones must still pass _validate() through the real
+        SCORE_SCHEMA, on the real default provider's validator, not just via
+        _debug_payload()'s own tolerant parsing."""
+        good = {
+            "interest_key": "x",
+            **{name: 0.5 for name in models.DIMENSIONS},
+            "confidence": 0.5, "reason": "r", "why_better_than_generic": "w",
+        }
+        claude_chat._validate(good, scoring.SCORE_SCHEMA)  # must not raise
+
+    def test_default_provider_validate_accepts_missions_missing_deliberation(self):
+        """Same contract on the Council side: a valid missions array with no
+        deliberation object at all must still pass the real _validate()
+        against the real MISSION_SCHEMA -- _extract_deliberation()'s
+        {'unavailable': True, ...} fallback is only reachable if validation
+        doesn't reject the reply first."""
+        good = {"missions": [{"label": "a", "rationale": "b", "prompt": "c"}]}
+        claude_chat._validate(good, council.MISSION_SCHEMA)  # must not raise
+
+    def test_default_provider_validate_tolerates_wrong_typed_debug_fields(self):
+        """The 'never fatal' contract's other half: a PRESENT-but-wrong-typed
+        optional debug/deliberation field must not raise either. scoring.
+        _debug_payload()/council._extract_deliberation() already tolerate
+        None/wrong shapes on these fields (turning them into an
+        {'unavailable': True, ...} marker) -- but that tolerant code is only
+        reached if _validate() lets the reply through. Before this fix,
+        _validate() type-checked every PRESENT property regardless of
+        `required`, so a model returning e.g. uncertainties=None or
+        dimension_rationale as a plain string burned a retry attempt (and a
+        repeat on retry raised ProviderError outright)."""
+        good_score = {
+            "interest_key": "x",
+            **{name: 0.5 for name in models.DIMENSIONS},
+            "confidence": 0.5, "reason": "r", "why_better_than_generic": "w",
+            "uncertainties": None,
+            "evidence_used": ["a", "b"],
+            "dimension_rationale": "mostly on topic",
+        }
+        claude_chat._validate(good_score, scoring.SCORE_SCHEMA)  # must not raise
+
+        good_missions = {
+            "missions": [{"label": "a", "rationale": "b", "prompt": "c"}],
+            "deliberation": "none to report",
+        }
+        claude_chat._validate(good_missions, council.MISSION_SCHEMA)  # must not raise
+
+    def test_openai_strict_transport_still_requires_every_property(self):
+        """The inverse guarantee: OpenAI's structured-outputs API 400s unless
+        every object in the schema has `required` == all of its properties.
+        The shared schema constants are lenient (see the two tests above),
+        so openai_provider must build its own strict copy for the wire, not
+        rely on the shared constant."""
+        from discovery.providers.openai_provider import _strict_schema
+
+        for schema in (scoring.SCORE_SCHEMA, council.MISSION_SCHEMA):
+            strict = _strict_schema(schema)
+            self._assert_fully_strict(strict)
+
+    def _assert_fully_strict(self, node):
+        if not isinstance(node, dict):
+            return
+        if node.get("type") == "object" and "properties" in node:
+            self.assertEqual(set(node["required"]), set(node["properties"]), node)
+            self.assertIs(node.get("additionalProperties"), False, node)
+            for prop in node["properties"].values():
+                self._assert_fully_strict(prop)
+        if "items" in node:
+            self._assert_fully_strict(node["items"])
+
+    def test_openai_strict_conversion_does_not_mutate_the_shared_schema(self):
+        from discovery.providers.openai_provider import _strict_schema
+
+        _strict_schema(scoring.SCORE_SCHEMA)
+        _strict_schema(council.MISSION_SCHEMA)
+        self.assertNotIn("evidence_used", scoring.SCORE_SCHEMA["required"])
+        self.assertNotIn("deliberation", council.MISSION_SCHEMA["required"])
+
 
 class CLITests(unittest.TestCase):
     """Config mistakes surface as clean exit codes, not tracebacks."""
@@ -4558,6 +4709,120 @@ class CLITests(unittest.TestCase):
             line.split("'")[1] for line in out.splitlines() if line.strip().startswith("'t")
         ]
         self.assertEqual(listed_keys, [f"t{i}" for i in range(10)])
+
+    def test_trace_fixture_without_db_refuses_to_run(self):
+        # trace_fixture.build() writes fixture interests/items/scores and a
+        # real feedback row through the production code paths -- without
+        # this guard, an unflagged `trace-fixture` would silently fall back
+        # to cfg.db_path's default (REPO_ROOT/discovery.db, the real db).
+        import contextlib
+        import io
+
+        from discovery.__main__ import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(["trace-fixture"])
+        self.assertEqual(code, 2)
+        self.assertIn("--db", err.getvalue())
+
+    def test_ui_public_without_a_token_refuses_to_start(self):
+        # This guard fires before observatory/datasette is ever imported, so
+        # it's exercised here (test_discovery.py must stay importable/green
+        # without datasette installed) rather than in test_observatory.py.
+        code, _out, err = self._main(
+            "ui", "--public", env={"DISCOVERY_UI_TOKEN": "", "DISCOVERY_NGROK_CMD": "ngrok http {port}"}
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("DISCOVERY_UI_TOKEN", err)
+
+    def test_ui_public_without_ngrok_cmd_refuses_to_start(self):
+        code, _out, err = self._main(
+            "ui", "--public", env={"DISCOVERY_UI_TOKEN": "tok", "DISCOVERY_NGROK_CMD": ""}
+        )
+        self.assertEqual(code, 2)
+        self.assertIn("DISCOVERY_NGROK_CMD", err)
+
+    def test_discovery_modules_import_cleanly_without_datasette_installed(self):
+        # datasette must stay confined to observatory/ + __main__.py's `ui`
+        # command handler (see PROJECT_STATE.md's Observatory section) -- a
+        # subprocess with `sys.modules['datasette'] = None` (the standard
+        # trick that makes any `import datasette`/`import datasette.x` raise
+        # ImportError, exactly as if the package were never installed) is
+        # what actually proves it: the modules under test haven't been
+        # imported yet in that fresh interpreter, so this can't pass by
+        # accident off an already-cached import in this test process.
+        import subprocess
+
+        script = (
+            "import sys\n"
+            "sys.modules['datasette'] = None\n"
+            "import discovery.__main__\n"
+            "import discovery.trace\n"
+            "import discovery.trace_fixture\n"
+            "import discovery.notify\n"
+            "import discovery.pipeline\n"
+            "import discovery.teach\n"
+            "import discovery.config\n"
+            "print('IMPORTS_OK')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(config.REPO_ROOT), capture_output=True, text=True, timeout=30,
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("IMPORTS_OK", result.stdout)
+
+    def test_observatory_app_genuinely_requires_datasette(self):
+        # The converse of the test above -- proves the blocking trick itself
+        # actually blocks (observatory/app.py DOES import datasette), so a
+        # bug that silently no-ops the import couldn't make the previous
+        # test pass vacuously.
+        import subprocess
+
+        script = (
+            "import sys\n"
+            "sys.modules['datasette'] = None\n"
+            "try:\n"
+            "    import observatory.app\n"
+            "    print('IMPORTED_UNEXPECTEDLY')\n"
+            "except ImportError:\n"
+            "    print('BLOCKED_AS_EXPECTED')\n"
+        )
+        result = subprocess.run(
+            [sys.executable, "-c", script],
+            cwd=str(config.REPO_ROOT), capture_output=True, text=True, timeout=30,
+        )
+        self.assertIn("BLOCKED_AS_EXPECTED", result.stdout)
+
+    def test_trace_fixture_db_override_works_before_and_after_the_subcommand(self):
+        # Repair-2 regression: `tf.add_argument("--db")` on the trace-fixture
+        # subparser wrote its own default (None) over an already-parsed
+        # global --db, so `--db PATH trace-fixture` silently fell back to
+        # cfg.db_path's real default (REPO_ROOT/discovery.db) instead of
+        # PATH. _main() always puts --db before the subcommand, which is
+        # exactly the form that broke -- exercise both orders directly
+        # against discovery.__main__.main so this can't go blind again.
+        import contextlib
+        import io
+
+        from discovery.__main__ import main
+
+        for argv in (
+            ["--db", self.db_path, "trace-fixture"],
+            ["trace-fixture", "--db", self.db_path],
+        ):
+            with self.subTest(argv=argv):
+                out, err = io.StringIO(), io.StringIO()
+                with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+                    code = main(argv)
+                self.assertEqual(code, 0, err.getvalue())
+                conn = db.connect(self.db_path)
+                self.addCleanup(conn.close)
+                count = conn.execute("SELECT COUNT(*) c FROM trace_runs").fetchone()["c"]
+                self.assertGreater(count, 0, "fixture did not write to the overridden --db path")
+                conn.close()
+                os.remove(self.db_path)
 
     def test_interests_list_is_empty_before_init(self):
         code, out, _err = self._main("interests")
@@ -6329,16 +6594,20 @@ class CouncilTests(unittest.TestCase):
 
     def test_plan_missions_returns_validated_missions(self):
         provider = FakeCouncilProvider(mission_batches=[mission_batch("trial-registries", "patent-filings")])
-        missions_out = council.plan_missions(provider, self.interest, self._context(), 2)
+        missions_out, deliberation = council.plan_missions(provider, self.interest, self._context(), 2)
         self.assertEqual([m["label"] for m in missions_out], ["trial-registries", "patent-filings"])
         for m in missions_out:
             self.assertTrue(m["rationale"])
             self.assertTrue(m["prompt"])
         self.assertEqual(len(provider.complete_prompts), 1)   # exactly one call
+        # No "deliberation" object in mission_batch()'s fixture response --
+        # lenient, every section marked unavailable, never fatal.
+        for name in council.DELIBERATION_SECTIONS:
+            self.assertTrue(deliberation[name].get("unavailable"))
 
     def test_plan_missions_truncates_extras_past_count_without_failing(self):
         provider = FakeCouncilProvider(mission_batches=[mission_batch("a", "b", "c")])
-        missions_out = council.plan_missions(provider, self.interest, self._context(), 2)
+        missions_out, _deliberation = council.plan_missions(provider, self.interest, self._context(), 2)
         self.assertEqual([m["label"] for m in missions_out], ["a", "b"])
 
     def test_plan_missions_raises_on_missing_missions_key(self):
@@ -6902,6 +7171,814 @@ class WebTickTests(unittest.TestCase):
              "already_scored": 0, "scored": 1, "deferred": 0, "errors": 0,
              "notified": 0},   # "article" isn't an ALERT type
         )
+
+
+# --- step-13 task 1: trace backbone -------------------------------------------
+
+class TraceRedactionTests(unittest.TestCase):
+    def test_redact_replaces_only_matching_env_values(self):
+        with mock.patch.dict(os.environ, {"MY_SECRET_TOKEN": "abc123456"}, clear=False):
+            text = trace.redact("token is abc123456 but the interest text stays intact")
+        self.assertNotIn("abc123456", text)
+        self.assertIn("[REDACTED:MY_SECRET_TOKEN]", text)
+        self.assertIn("the interest text stays intact", text)
+
+    def test_redact_ignores_short_secret_looking_values(self):
+        """A short value on a secret-shaped name (e.g. a flag, not a real
+        token) must not be substring-replaced -- that would silently rewrite
+        unrelated text anywhere it happens to appear."""
+        with mock.patch.dict(os.environ, {"MY_AUTH_MODE": "on"}, clear=False):
+            text = trace.redact("auth mode is on for this interest")
+        self.assertEqual(text, "auth mode is on for this interest")
+
+    def test_redact_is_a_noop_without_matching_env_vars(self):
+        with mock.patch.dict(os.environ, {}, clear=True):
+            self.assertEqual(trace.redact("nothing secret here"), "nothing secret here")
+
+    def test_redact_json_recurses_through_nested_structures(self):
+        with mock.patch.dict(os.environ, {"THE_API_KEY": "sekrit-value"}, clear=False):
+            out = trace.redact_json({"a": ["sekrit-value", {"b": "sekrit-value"}], "c": 1})
+        self.assertEqual(out["a"][0], "[REDACTED:THE_API_KEY]")
+        self.assertEqual(out["a"][1]["b"], "[REDACTED:THE_API_KEY]")
+        self.assertEqual(out["c"], 1)
+
+    def test_non_string_input_is_returned_unchanged(self):
+        self.assertIsNone(trace.redact(None))
+        self.assertEqual(trace.redact_json(42), 42)
+
+    def test_longest_matching_value_wins_when_one_is_a_substring_of_another(self):
+        with mock.patch.dict(
+            os.environ, {"SHORT_KEY": "sek", "LONG_KEY": "sekrit-full"}, clear=False
+        ):
+            text = trace.redact("value: sekrit-full")
+        self.assertEqual(text, "value: [REDACTED:LONG_KEY]")
+
+
+class TraceConfigSnapshotFieldMaskingTests(unittest.TestCase):
+    """value-substitution redact()/redact_json() misses two real cases for a
+    Config snapshot: a short DISCOVERY_UI_TOKEN (under redact()'s 8-char
+    floor) and DISCOVERY_NGROK_CMD (a free-form command whose field name
+    doesn't match the secret-name regex, but which commonly embeds an inline
+    --authtoken). _cfg_snapshot masks both by FIELD NAME, independent of the
+    value's shape/length."""
+
+    def test_short_ui_token_is_masked_by_field_name_not_left_verbatim(self):
+        cfg = dataclasses.replace(CFG, ui_token="abc12")  # 5 chars: under redact()'s floor
+        snapshot = trace._cfg_snapshot(cfg)
+        self.assertEqual(snapshot["ui_token"], "[REDACTED:FIELD:ui_token]")
+
+    def test_ngrok_cmd_with_inline_authtoken_is_masked_wholesale(self):
+        cfg = dataclasses.replace(
+            CFG, ngrok_cmd="ngrok http {port} --authtoken 2abcSecretTunnelToken"
+        )
+        snapshot = trace._cfg_snapshot(cfg)
+        self.assertEqual(snapshot["ngrok_cmd"], "[REDACTED:FIELD:ngrok_cmd]")
+
+    def test_empty_secret_named_fields_stay_empty_not_masked(self):
+        snapshot = trace._cfg_snapshot(dataclasses.replace(CFG, ui_token="", ngrok_cmd=""))
+        self.assertEqual(snapshot["ui_token"], "")
+        self.assertEqual(snapshot["ngrok_cmd"], "")
+
+    def test_non_secret_fields_survive_a_snapshot_unmasked(self):
+        snapshot = trace._cfg_snapshot(dataclasses.replace(CFG, provider="claude_chat"))
+        self.assertEqual(snapshot["provider"], "claude_chat")
+
+    def test_masked_config_snapshot_reaches_trace_runs_and_stays_masked(self):
+        conn = db.connect(":memory:")
+        db.init(conn)
+        self.addCleanup(conn.close)
+        cfg = dataclasses.replace(
+            CFG, trace_enabled=True, ui_token="abc12",
+            ngrok_cmd="ngrok http {port} --authtoken tunnel-secret-xyz",
+        )
+        tracer = trace.Tracer(conn, cfg)
+        run_id = tracer.begin_run("test")
+        row = conn.execute("SELECT config_json FROM trace_runs WHERE id = ?", (run_id,)).fetchone()
+        stored = json.loads(row["config_json"])
+        self.assertEqual(stored["ui_token"], "[REDACTED:FIELD:ui_token]")
+        self.assertEqual(stored["ngrok_cmd"], "[REDACTED:FIELD:ngrok_cmd]")
+        self.assertNotIn("abc12", row["config_json"])
+        self.assertNotIn("tunnel-secret-xyz", row["config_json"])
+
+
+class _ProxyConn:
+    """Forwards to a real sqlite3 connection, except that any statement
+    containing `fail_on` raises -- used to prove Tracer._guard's fail-soft
+    behavior without depending on whether sqlite3.Connection itself can be
+    monkeypatched."""
+
+    def __init__(self, real, fail_on):
+        self._real = real
+        self._fail_on = fail_on
+
+    def execute(self, sql, *a, **kw):
+        if self._fail_on in sql:
+            raise sqlite3.OperationalError("disk full")
+        return self._real.execute(sql, *a, **kw)
+
+    def executemany(self, sql, *a, **kw):
+        if self._fail_on in sql:
+            raise sqlite3.OperationalError("disk full")
+        return self._real.executemany(sql, *a, **kw)
+
+    def commit(self):
+        return self._real.commit()
+
+
+class TraceEnableSwitchTests(unittest.TestCase):
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def test_disabled_tracer_writes_nothing_and_returns_none(self):
+        cfg = dataclasses.replace(CFG, trace_enabled=False)
+        tracer = trace.Tracer(self.conn, cfg)
+        run_id = tracer.begin_run("test")
+        self.assertIsNone(run_id)
+        node_id = tracer.node(run_id, "x", label="y")
+        self.assertIsNone(node_id)
+        self.assertIsNone(tracer.edge(1, 2, "generated"))
+        tracer.finish_node(node_id, status="ok")
+        tracer.finish_run(run_id)
+        for table in ("trace_runs", "trace_nodes", "trace_edges", "model_calls"):
+            self.assertEqual(self.conn.execute(f"SELECT COUNT(*) c FROM {table}").fetchone()["c"], 0)
+
+    def test_enabled_tracer_writes_a_run_and_a_node(self):
+        cfg = dataclasses.replace(CFG, trace_enabled=True)
+        tracer = trace.Tracer(self.conn, cfg)
+        run_id = tracer.begin_run("test")
+        self.assertIsNotNone(run_id)
+        node_id = tracer.node(run_id, "x", label="y")
+        self.assertIsNotNone(node_id)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM trace_runs").fetchone()["c"], 1)
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM trace_nodes").fetchone()["c"], 1)
+
+    def test_a_trace_write_failure_is_swallowed_and_bumps_a_metric(self):
+        cfg = dataclasses.replace(CFG, trace_enabled=True)
+        proxy = _ProxyConn(self.conn, "INSERT INTO trace_nodes")
+        tracer = trace.Tracer(proxy, cfg)
+        run_id = tracer.begin_run("test")
+        node_id = tracer.node(run_id, "x", label="y")   # the write that fails
+        self.assertIsNone(node_id)
+        self.assertEqual(
+            dict(self.conn.execute("SELECT name, count FROM metrics").fetchall()),
+            {"trace_write_failed": 1},
+        )
+        # And the tick itself is untouched -- no exception escaped.
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM trace_runs").fetchone()["c"], 1)
+
+
+class TraceModelCallsTests(unittest.TestCase):
+    """(a) byte-exact prompts including retry-suffix framing, and
+    (b) a scoring failure + retry yields two model_calls rows, the failed
+    one intact -- both via claude_chat's real provider/attempt machinery,
+    not a hand-rolled stand-in."""
+
+    SCHEMA = {
+        "type": "object",
+        "properties": {"a": {"type": "number"}},
+        "required": ["a"],
+        "additionalProperties": False,
+    }
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.cfg = dataclasses.replace(CFG, trace_enabled=True)
+        self.tracer = trace.Tracer(self.conn, self.cfg)
+        self.run_id = self.tracer.begin_run("test")
+        self.node_id = self.tracer.node(self.run_id, "score-attempt", label="x")
+
+    def _provider(self, *replies):
+        conn = FakeCDPConnection(list(replies))
+        return claude_chat.ClaudeChatProvider(
+            "claude-opus-5", org_id="org-123", port=9222, connect=lambda: conn,
+        )
+
+    def test_model_calls_store_the_byte_exact_prompt_including_retry_suffix(self):
+        provider = self._provider(
+            completion_reply("not json at all"), completion_reply('{"a": 1}'),
+        )
+        provider.trace_sink = self.tracer.sink
+        with self.tracer.calls("scoring", self.node_id):
+            provider.complete_json("SYS", "PROMPT", self.SCHEMA)
+
+        rows = self.conn.execute(
+            "SELECT attempt, exact_user_prompt, raw_response_text, validation_result "
+            "FROM model_calls WHERE trace_node_id = ? ORDER BY attempt",
+            (self.node_id,),
+        ).fetchall()
+        self.assertEqual(len(rows), 2)
+        expected_base = "SYS\n\nPROMPT" + claude_chat.STRICT_JSON_SUFFIX.format(
+            schema=json.dumps(self.SCHEMA)
+        )
+        self.assertEqual(rows[0]["exact_user_prompt"], expected_base)
+        self.assertEqual(rows[1]["exact_user_prompt"], expected_base + claude_chat.RETRY_SUFFIX)
+
+    def test_a_scoring_failure_and_retry_yields_two_rows_the_failed_one_intact(self):
+        provider = self._provider(
+            completion_reply("garbage, not an object"), completion_reply('{"a": 1}'),
+        )
+        provider.trace_sink = self.tracer.sink
+        with self.tracer.calls("scoring", self.node_id):
+            provider.complete_json("SYS", "PROMPT", self.SCHEMA)
+
+        rows = self.conn.execute(
+            "SELECT attempt, raw_response_text, validation_result, parsed_response_json, error "
+            "FROM model_calls WHERE trace_node_id = ? ORDER BY attempt",
+            (self.node_id,),
+        ).fetchall()
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["raw_response_text"], "garbage, not an object")
+        self.assertIn("invalid", rows[0]["validation_result"])
+        self.assertIsNone(rows[0]["parsed_response_json"])
+        self.assertEqual(rows[1]["raw_response_text"], '{"a": 1}')
+        self.assertEqual(rows[1]["validation_result"], "valid")
+        self.assertEqual(json.loads(rows[1]["parsed_response_json"]), {"a": 1})
+
+    def test_call_role_comes_from_the_tracer_context_not_the_provider(self):
+        provider = self._provider(completion_reply('{"a": 1}'))
+        provider.trace_sink = self.tracer.sink
+        with self.tracer.calls("mission_search", self.node_id):
+            provider.complete_json("SYS", "PROMPT", self.SCHEMA)
+        row = self.conn.execute(
+            "SELECT call_role FROM model_calls WHERE trace_node_id = ?", (self.node_id,)
+        ).fetchone()
+        self.assertEqual(row["call_role"], "mission_search")
+
+    def test_a_provider_call_outside_any_calls_context_is_simply_unattributed(self):
+        provider = self._provider(completion_reply('{"a": 1}'))
+        provider.trace_sink = self.tracer.sink
+        provider.complete_json("SYS", "PROMPT", self.SCHEMA)   # no tracer.calls() active
+        self.assertEqual(self.conn.execute("SELECT COUNT(*) c FROM model_calls").fetchone()["c"], 0)
+
+
+class TraceOnOffParityTests(unittest.TestCase):
+    """(c) tracing ON vs OFF changes zero provider calls / production rows."""
+
+    def _run(self, trace_enabled):
+        conn = db.connect(":memory:")
+        db.init(conn)
+        cfg = dataclasses.replace(
+            CFG, trace_enabled=trace_enabled, telegram_bot_token="", telegram_chat_id="",
+        )
+        db.upsert_interest(conn, an_interest(min_score=0.5))
+        interests = db.active_interests(conn)
+        provider = FakeProvider({"Good": 0.9, "Meh": 0.2})
+        tracer = trace.Tracer(conn, cfg)
+        provider.trace_sink = tracer.sink
+        run_id = tracer.begin_run("test")
+
+        items = [
+            an_item(title="Good", url="https://e.com/good"),
+            an_item(title="Good", url="https://e.com/good"),   # duplicate
+            an_item(title="Meh", url="https://e.com/meh"),      # below threshold
+            an_item(title="x", url="https://e.com/short", text="short"),   # filtered
+        ]
+        for item in items:
+            node = tracer.node(run_id, "raw-result", label=item.title)
+            outcome = pipeline.ingest(
+                conn, provider, cfg, item, interests, origin_interest="k",
+                tracer=tracer, source_node_id=node,
+            )
+            db.bump(conn, {"collected": 1, pipeline.outcome_metric(outcome): 1})
+        pipeline.send_digest(conn, cfg, dry_run=True, tracer=tracer)
+        tracer.finish_run(run_id)
+        return conn, provider
+
+    def test_tracing_on_or_off_changes_nothing_about_pipeline_behavior(self):
+        conn_on, provider_on = self._run(True)
+        conn_off, provider_off = self._run(False)
+
+        self.assertEqual(len(provider_on.prompts), len(provider_off.prompts))
+        self.assertGreater(len(provider_on.prompts), 0)
+
+        volatile = ("created_at", "sent_at", "first_seen_at", "score_attempted_at")
+        for table in ("candidate_items", "scores", "notifications", "feedback"):
+            rows_on = [dict(r) for r in conn_on.execute(f"SELECT * FROM {table}")]
+            rows_off = [dict(r) for r in conn_off.execute(f"SELECT * FROM {table}")]
+            for row in rows_on + rows_off:
+                for key in volatile:
+                    row.pop(key, None)
+            self.assertEqual(rows_on, rows_off, table)
+
+        metrics_on = dict(conn_on.execute(
+            "SELECT name, count FROM metrics WHERE name != 'trace_write_failed'"
+        ).fetchall())
+        metrics_off = dict(conn_off.execute(
+            "SELECT name, count FROM metrics WHERE name != 'trace_write_failed'"
+        ).fetchall())
+        self.assertEqual(metrics_on, metrics_off)
+
+        self.assertEqual(conn_off.execute("SELECT COUNT(*) c FROM trace_runs").fetchone()["c"], 0)
+        self.assertEqual(conn_off.execute("SELECT COUNT(*) c FROM trace_nodes").fetchone()["c"], 0)
+        self.assertEqual(conn_off.execute("SELECT COUNT(*) c FROM trace_edges").fetchone()["c"], 0)
+        self.assertEqual(conn_off.execute("SELECT COUNT(*) c FROM model_calls").fetchone()["c"], 0)
+        self.assertGreater(conn_on.execute("SELECT COUNT(*) c FROM trace_nodes").fetchone()["c"], 0)
+        self.assertGreater(conn_on.execute("SELECT COUNT(*) c FROM model_calls").fetchone()["c"], 0)
+        conn_on.close()
+        conn_off.close()
+
+
+class TracePlantedSecretTests(unittest.TestCase):
+    """(d) planted secret values never appear in any trace table."""
+
+    def test_planted_secrets_are_redacted_everywhere_they_could_land(self):
+        secrets = {
+            "TELEGRAM_BOT_TOKEN": "tg-planted-secret-001",
+            "ANTHROPIC_API_KEY": "anthropic-planted-secret-002",
+            "FIXTURE_SESSION_COOKIE": "cookie-planted-secret-003",
+        }
+        with mock.patch.dict(os.environ, secrets, clear=False):
+            conn = db.connect(":memory:")
+            db.init(conn)
+            self.addCleanup(conn.close)
+            cfg = dataclasses.replace(CFG, trace_enabled=True, telegram_bot_token=secrets["TELEGRAM_BOT_TOKEN"])
+            tracer = trace.Tracer(conn, cfg)
+            run_id = tracer.begin_run(
+                "test", config_json={"telegram_bot_token": secrets["TELEGRAM_BOT_TOKEN"]},
+            )
+            node_id = tracer.node(
+                run_id, "note", label=secrets["ANTHROPIC_API_KEY"],
+                summary=f"contains {secrets['FIXTURE_SESSION_COOKIE']}",
+                input_json={"k": secrets["TELEGRAM_BOT_TOKEN"]},
+                output_json={"k": secrets["ANTHROPIC_API_KEY"]},
+                exact_text=f"{secrets['TELEGRAM_BOT_TOKEN']} and {secrets['FIXTURE_SESSION_COOKIE']}",
+            )
+            tracer.finish_node(
+                node_id, summary=f"done, saw {secrets['ANTHROPIC_API_KEY']}",
+                error=f"failed with {secrets['FIXTURE_SESSION_COOKIE']}",
+            )
+            tracer.set_call_context("scoring", node_id)
+            tracer.sink(
+                attempt=1, provider="fake", model="fake-1",
+                system=f"sys {secrets['ANTHROPIC_API_KEY']}",
+                prompt=f"prompt {secrets['TELEGRAM_BOT_TOKEN']}",
+                schema=None, params=None,
+                raw_text=f"raw {secrets['FIXTURE_SESSION_COOKIE']}",
+                parsed={"a": secrets["ANTHROPIC_API_KEY"]}, validation="valid",
+                error=None, started="t1", finished="t2",
+            )
+            tracer.finish_run(run_id, error=f"run failed: {secrets['TELEGRAM_BOT_TOKEN']}")
+
+        checks = (
+            ("trace_runs", ("config_json", "error")),
+            ("trace_nodes", ("label", "summary", "input_json", "output_json", "exact_text", "error")),
+            ("model_calls", (
+                "exact_system_prompt", "exact_user_prompt", "raw_response_text",
+                "parsed_response_json", "error",
+            )),
+        )
+        for table, cols in checks:
+            for row in conn.execute(f"SELECT * FROM {table}").fetchall():
+                for col in cols:
+                    value = row[col]
+                    if value is None:
+                        continue
+                    for secret_value in secrets.values():
+                        self.assertNotIn(secret_value, value, f"{table}.{col}: {value!r}")
+
+
+class TracePipelineWiringTests(unittest.TestCase):
+    """(e) duplicate persistence + duplicate_of edge, (i) threshold snapshot."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.cfg = dataclasses.replace(CFG, trace_enabled=True)
+        db.upsert_interest(self.conn, an_interest(min_score=0.5))
+        self.interests = db.active_interests(self.conn)
+        self.tracer = trace.Tracer(self.conn, self.cfg)
+        self.run_id = self.tracer.begin_run("test")
+
+    def test_a_duplicate_raw_result_gets_a_persistent_node_and_duplicate_of_edge(self):
+        provider = FakeProvider({"Good": 0.9})
+        first_source = self.tracer.node(self.run_id, "raw-result", label="first")
+        pipeline.ingest(
+            self.conn, provider, self.cfg, an_item(title="Good", url="https://e.com/g"),
+            self.interests, origin_interest="k", tracer=self.tracer, source_node_id=first_source,
+        )
+        second_source = self.tracer.node(self.run_id, "raw-result", label="second")
+        outcome = pipeline.ingest(
+            self.conn, provider, self.cfg, an_item(title="Good", url="https://e.com/g"),
+            self.interests, origin_interest="k", tracer=self.tracer, source_node_id=second_source,
+        )
+        self.assertEqual(outcome.stage, "duplicate")
+
+        dup_node = self.conn.execute(
+            "SELECT id FROM trace_nodes WHERE node_type = 'duplicate'"
+        ).fetchone()
+        self.assertIsNotNone(dup_node)
+        edges = self.conn.execute(
+            "SELECT relationship FROM trace_edges WHERE from_node_id = ?", (dup_node["id"],)
+        ).fetchall()
+        self.assertIn("duplicate_of", [r["relationship"] for r in edges])
+        # And the raw-result -> duplicate branch itself survives (normalized_to).
+        normalized = self.conn.execute(
+            "SELECT COUNT(*) c FROM trace_edges WHERE from_node_id = ? AND relationship = 'normalized_to'",
+            (second_source,),
+        ).fetchone()["c"]
+        self.assertEqual(normalized, 1)
+
+    def test_threshold_snapshot_survives_a_later_interest_bar_change(self):
+        provider = FakeProvider({"Good": 0.6})   # clears 0.5, would NOT clear 0.9
+        source = self.tracer.node(self.run_id, "raw-result", label="src")
+        pipeline.ingest(
+            self.conn, provider, self.cfg, an_item(title="Good", url="https://e.com/g"),
+            self.interests, origin_interest="k", tracer=self.tracer, source_node_id=source,
+        )
+        threshold_node = self.conn.execute(
+            "SELECT output_json FROM trace_nodes WHERE node_type = 'threshold'"
+        ).fetchone()
+        before = json.loads(threshold_node["output_json"])
+        self.assertAlmostEqual(before["threshold"], 0.5)
+        self.assertAlmostEqual(before["final_score"], 0.6)
+
+        # Raise the bar well past the score that already cleared it.
+        self.conn.execute("UPDATE interests SET min_score = 0.9 WHERE key = 'k'")
+        self.conn.commit()
+
+        after_node = self.conn.execute(
+            "SELECT output_json FROM trace_nodes WHERE node_type = 'threshold'"
+        ).fetchone()
+        after = json.loads(after_node["output_json"])
+        self.assertEqual(before, after)   # untouched -- append-only, no live re-query
+        edge = self.conn.execute(
+            "SELECT relationship FROM trace_edges WHERE relationship IN ('cleared_threshold', 'rejected')"
+        ).fetchone()
+        self.assertEqual(edge["relationship"], "cleared_threshold")   # true at the time it was scored
+
+
+class TraceCouncilDeliberationTests(unittest.TestCase):
+    """(f) deliberation nodes persisted when well-formed; missions stay
+    strict and every section reads 'unavailable' when malformed."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.cfg = dataclasses.replace(
+            CFG, trace_enabled=True, mission_provider="fake_mission",
+            council_missions_per_generation=2, missions_per_tick=0, mission_low_water=1,
+        )
+        db.upsert_interest(self.conn, an_interest(key="alpha", title="alpha", sources=["web_search"]))
+
+    def _tick(self, mission_provider):
+        scoring_provider = FakeProvider()
+        with mock.patch.object(providers, "get_provider", return_value=mission_provider):
+            missions.web_tick(self.conn, self.cfg, provider=scoring_provider, dry_run=True)
+
+    def test_well_formed_deliberation_is_persisted_as_trace_nodes(self):
+        batch = mission_batch("a", "b")
+        batch["deliberation"] = {
+            "advisors": [{"name": f"Advisor {i}", "persona": "p", "analysis": "x"} for i in range(1, 6)],
+            "peer_review": [{"reviewer": f"Advisor {i}", "critiques": "c", "ranking": ["A"]} for i in range(1, 6)],
+            "aggregate_ranking": ["A", "B"],
+            "disagreements": "none material",
+            "rejected_angles": [{"angle": "social-sentiment", "reason": "too noisy"}],
+            "chairman_synthesis": "go with A and B",
+            "selection_rationale": "A generalizes best",
+        }
+        self._tick(FakeCouncilProvider(mission_batches=[batch]))
+
+        counts = dict(self.conn.execute(
+            "SELECT node_type, COUNT(*) c FROM trace_nodes GROUP BY node_type"
+        ).fetchall())
+        self.assertEqual(counts.get("advisor"), 5)
+        self.assertEqual(counts.get("peer-review"), 5)
+        self.assertEqual(counts.get("aggregate-ranking"), 1)
+        self.assertEqual(counts.get("rejected-angle"), 1)
+        self.assertEqual(counts.get("chairman"), 1)
+        chairman = self.conn.execute(
+            "SELECT output_json FROM trace_nodes WHERE node_type = 'chairman'"
+        ).fetchone()
+        self.assertIn("go with A and B", json.loads(chairman["output_json"])["chairman_synthesis"])
+        # Missions themselves: strict, exactly what the batch specified.
+        labels = [r["label"] for r in self.conn.execute(
+            "SELECT label FROM search_missions ORDER BY id"
+        ).fetchall()]
+        self.assertEqual(labels, ["a", "b"])
+
+    def test_malformed_deliberation_marks_every_section_unavailable_missions_stay_strict(self):
+        batch = mission_batch("a", "b")
+        batch["deliberation"] = {"advisors": "not-a-list"}   # everything else missing too
+        self._tick(FakeCouncilProvider(mission_batches=[batch]))
+
+        labels = [r["label"] for r in self.conn.execute(
+            "SELECT label FROM search_missions ORDER BY id"
+        ).fetchall()]
+        self.assertEqual(labels, ["a", "b"])   # strict validation untouched by deliberation
+
+        for node_type in ("advisor", "peer-review", "aggregate-ranking", "rejected-angle"):
+            row = self.conn.execute(
+                "SELECT output_json FROM trace_nodes WHERE node_type = ?", (node_type,)
+            ).fetchone()
+            self.assertIsNotNone(row, node_type)
+            payload = json.loads(row["output_json"])
+            self.assertTrue(payload.get("unavailable"), (node_type, payload))
+        chairman = self.conn.execute(
+            "SELECT output_json FROM trace_nodes WHERE node_type = 'chairman'"
+        ).fetchone()
+        chairman_payload = json.loads(chairman["output_json"])
+        self.assertTrue(chairman_payload["chairman_synthesis"]["unavailable"])
+
+
+class TraceMissionToolEventTests(unittest.TestCase):
+    """(g) 'not exposed by provider' node when the mission provider surfaces
+    no tool events for a search_json call."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.cfg = dataclasses.replace(
+            CFG, trace_enabled=True, mission_provider="fake_mission",
+            council_missions_per_generation=1, missions_per_tick=1, mission_low_water=1,
+        )
+        db.upsert_interest(self.conn, an_interest(key="alpha", title="alpha", sources=["web_search"]))
+
+    def test_no_events_from_the_provider_writes_one_explicit_node(self):
+        mp = FakeCouncilProvider(
+            mission_batches=[mission_batch("solo")],
+            search_results={"solo": search_hits("https://e.com/solo")},
+        )
+        self.assertIsNone(mp.last_events)   # FakeCouncilProvider never sets it
+        with mock.patch.object(providers, "get_provider", return_value=mp):
+            missions.web_tick(self.conn, self.cfg, provider=FakeProvider({"Result": 0.9}), dry_run=True)
+
+        node = self.conn.execute(
+            "SELECT label FROM trace_nodes WHERE node_type = 'tool-event'"
+        ).fetchone()
+        self.assertEqual(node["label"], "not exposed by provider")
+
+    def test_events_the_provider_does_expose_become_one_node_each(self):
+        mp = FakeCouncilProvider(
+            mission_batches=[mission_batch("solo")],
+            search_results={"solo": search_hits("https://e.com/solo")},
+        )
+        real_search_json = mp.search_json
+
+        def search_json_with_events(prompt, **kw):
+            result = real_search_json(prompt, **kw)
+            mp.last_events = [{"type": "server_tool_use", "name": "web_search"}]
+            return result
+
+        mp.search_json = search_json_with_events
+        with mock.patch.object(providers, "get_provider", return_value=mp):
+            missions.web_tick(self.conn, self.cfg, provider=FakeProvider({"Result": 0.9}), dry_run=True)
+
+        rows = self.conn.execute(
+            "SELECT label FROM trace_nodes WHERE node_type = 'tool-event'"
+        ).fetchall()
+        self.assertEqual([r["label"] for r in rows], ["server_tool_use"])
+
+
+class TraceMissionJunkResultTests(unittest.TestCase):
+    """A raw mission result that to_items() silently drops (non-dict,
+    missing url, or past mission_max_results) still gets a terminal
+    outcome node/edge, not just the inbound 'returned' edge."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.cfg = dataclasses.replace(
+            CFG, trace_enabled=True, mission_provider="fake_mission",
+            council_missions_per_generation=1, missions_per_tick=1, mission_low_water=1,
+        )
+        db.upsert_interest(self.conn, an_interest(key="alpha", title="alpha", sources=["web_search"]))
+
+    def _tick(self, raw_results):
+        mp = FakeCouncilProvider(
+            mission_batches=[mission_batch("solo")],
+            search_results={"solo": raw_results},
+        )
+        with mock.patch.object(providers, "get_provider", return_value=mp):
+            missions.web_tick(self.conn, self.cfg, provider=FakeProvider({"Result": 0.9}), dry_run=True)
+
+    def test_a_no_url_result_gets_a_rejected_edge_not_a_dead_end(self):
+        self._tick([
+            {"title": "no url here", "url": "", "summary": "x" * 40},
+            {"title": "Good", "url": "https://e.com/g", "summary": "x" * 40},
+        ])
+        dropped = self.conn.execute(
+            "SELECT id, summary FROM trace_nodes WHERE node_type = 'raw-result-dropped'"
+        ).fetchone()
+        self.assertIsNotNone(dropped)
+        self.assertEqual(dropped["summary"], "missing url")
+
+        raw_node = self.conn.execute(
+            "SELECT id FROM trace_nodes WHERE node_type = 'raw-result' AND label = 'no url here'"
+        ).fetchone()
+        edge = self.conn.execute(
+            "SELECT relationship, to_node_id FROM trace_edges WHERE from_node_id = ?",
+            (raw_node["id"],),
+        ).fetchone()
+        self.assertEqual(edge["relationship"], "rejected")
+        self.assertEqual(edge["to_node_id"], dropped["id"])
+
+    def test_a_non_dict_result_gets_a_rejected_edge(self):
+        self._tick(["just a string, not an object"])
+        dropped = self.conn.execute(
+            "SELECT summary FROM trace_nodes WHERE node_type = 'raw-result-dropped'"
+        ).fetchone()
+        self.assertEqual(dropped["summary"], "not a JSON object")
+
+    def test_a_result_past_mission_max_results_gets_a_rejected_edge(self):
+        cfg = dataclasses.replace(self.cfg, mission_max_results=1)
+        mp = FakeCouncilProvider(
+            mission_batches=[mission_batch("solo")],
+            search_results={"solo": [
+                {"title": "Kept", "url": "https://e.com/kept", "summary": "x" * 40},
+                {"title": "Overflow", "url": "https://e.com/overflow", "summary": "x" * 40},
+            ]},
+        )
+        with mock.patch.object(providers, "get_provider", return_value=mp):
+            missions.web_tick(self.conn, cfg, provider=FakeProvider({"Result": 0.9}), dry_run=True)
+
+        dropped = self.conn.execute(
+            "SELECT summary FROM trace_nodes WHERE node_type = 'raw-result-dropped'"
+        ).fetchone()
+        self.assertIn("mission_max_results", dropped["summary"])
+
+
+class TraceFixtureTests(unittest.TestCase):
+    """(h) the fixture is structurally deterministic: two builds against
+    fresh DBs produce the same node/edge/model_call counts and labels."""
+
+    def _build(self):
+        conn = db.connect(":memory:")
+        db.init(conn)
+        cfg = dataclasses.replace(CFG, trace_enabled=True)
+        result = trace_fixture.build(conn, cfg)
+        return conn, result
+
+    def test_two_builds_produce_the_same_shape(self):
+        conn1, result1 = self._build()
+        conn2, result2 = self._build()
+        self.addCleanup(conn1.close)
+        self.addCleanup(conn2.close)
+
+        self.assertEqual(result1, result2)
+
+        def shape(conn):
+            node_counts = dict(conn.execute(
+                "SELECT node_type, COUNT(*) c FROM trace_nodes GROUP BY node_type"
+            ).fetchall())
+            edge_counts = dict(conn.execute(
+                "SELECT relationship, COUNT(*) c FROM trace_edges GROUP BY relationship"
+            ).fetchall())
+            call_role_counts = dict(conn.execute(
+                "SELECT call_role, COUNT(*) c FROM model_calls GROUP BY call_role"
+            ).fetchall())
+            labels = sorted(r["label"] for r in conn.execute(
+                "SELECT label FROM trace_nodes"
+            ).fetchall())
+            return node_counts, edge_counts, call_role_counts, labels
+
+        self.assertEqual(shape(conn1), shape(conn2))
+
+    def test_fixture_exercises_every_required_branch(self):
+        conn, result = self._build()
+        self.addCleanup(conn.close)
+        self.assertEqual(result["missions_generated"], 3)
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) c FROM trace_nodes WHERE node_type = 'duplicate'").fetchone()["c"], 1,
+        )
+        self.assertEqual(
+            conn.execute(
+                "SELECT COUNT(*) c FROM trace_nodes WHERE node_type = 'prefilter' AND status = 'ok'"
+            ).fetchone()["c"],
+            1,
+        )
+        scoring_calls = conn.execute(
+            "SELECT COUNT(*) c FROM model_calls WHERE call_role = 'scoring'"
+        ).fetchone()["c"]
+        self.assertEqual(scoring_calls, 4)   # 3 score-attempts, one retried once
+        self.assertEqual(result["digest_sent"], 1)
+        self.assertTrue(result["feedback_recorded"])
+        self.assertEqual(
+            conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"], 1,
+        )
+        # tracing off is not exercised by the fixture itself -- it always
+        # runs with cfg.trace_enabled True (see _build()).
+
+    def test_the_trace_graph_is_a_single_connected_component(self):
+        """Repair regression: interest-state -> generation, mission ->
+        mission-execution, score-attempt -> score-debug and threshold ->
+        render edges were all missing, leaving the fixture's 54 nodes in 8
+        disconnected islands -- a UI could never draw one connected graph
+        from a candidate/score/notification back to the Council that
+        planned it."""
+        conn, _result = self._build()
+        self.addCleanup(conn.close)
+        node_ids = [r["id"] for r in conn.execute("SELECT id FROM trace_nodes")]
+        adjacency = {n: set() for n in node_ids}
+        for row in conn.execute("SELECT from_node_id, to_node_id FROM trace_edges"):
+            adjacency[row["from_node_id"]].add(row["to_node_id"])
+            adjacency[row["to_node_id"]].add(row["from_node_id"])
+
+        seen = set()
+        stack = [node_ids[0]]
+        while stack:
+            node = stack.pop()
+            if node in seen:
+                continue
+            seen.add(node)
+            stack.extend(adjacency[node] - seen)
+        self.assertEqual(seen, set(node_ids))
+
+    def test_both_raw_results_sharing_a_url_get_their_own_outcome_edge(self):
+        """Repair regression: raw_node_by_url was first-wins, so BOTH raw
+        results with the same (duplicate) url resolved to the first raw
+        node -- the second (the one actually flagged as a duplicate) had no
+        normalized_to edge of its own at all."""
+        conn, _result = self._build()
+        self.addCleanup(conn.close)
+        raw_rows = conn.execute(
+            "SELECT id, label FROM trace_nodes "
+            "WHERE node_type = 'raw-result' AND label LIKE 'Duplicate Topic Finding%'"
+        ).fetchall()
+        self.assertEqual(len(raw_rows), 2)
+        for row in raw_rows:
+            outgoing = conn.execute(
+                "SELECT relationship FROM trace_edges WHERE from_node_id = ? AND relationship = 'normalized_to'",
+                (row["id"],),
+            ).fetchall()
+            self.assertEqual(len(outgoing), 1, row["label"])
+
+    def test_notification_node_entity_id_is_the_notifications_row_not_the_score(self):
+        conn, _result = self._build()
+        self.addCleanup(conn.close)
+        node = conn.execute(
+            "SELECT entity_id FROM trace_nodes WHERE node_type = 'notification'"
+        ).fetchone()
+        notification_row = conn.execute("SELECT id, score_id FROM notifications").fetchone()
+        self.assertEqual(int(node["entity_id"]), notification_row["id"])
+        self.assertNotEqual(notification_row["id"], notification_row["score_id"])
+
+
+class TraceDigestCmdTests(unittest.TestCase):
+    """Repair regression: the CLI's `digest` command called send_digest()
+    with no tracer/begin_run at all -- the only production path that ever
+    delivers a DISCOVERY item was completely untraced, unlike run-once and
+    web-tick which wrap themselves internally."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def test_digest_cmd_opens_and_closes_a_trace_run(self):
+        from discovery.__main__ import _digest_cmd
+
+        cfg = dataclasses.replace(CFG, trace_enabled=True)
+        code = _digest_cmd(self.conn, cfg, True)
+        self.assertEqual(code, 0)
+        row = self.conn.execute("SELECT kind, status FROM trace_runs").fetchone()
+        self.assertEqual((row["kind"], row["status"]), ("digest", "done"))
+
+
+class TraceRunOnceCollectorItemRootTests(unittest.TestCase):
+    """Repair regression: _run_once() called ingest() with no source_node_id,
+    so candidate_node's 'normalized_to' edge had a None from-endpoint and
+    Tracer.edge() silently skipped it (no-ops on a None endpoint) -- every
+    candidate's subtree was reachable only by run_id, not by any edge. A
+    'collector-item' root node per collected item, passed through as
+    source_node_id, is what the ingest wiring spec means by 'the raw-result
+    (or collector-item) node'."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.cfg = dataclasses.replace(CFG, trace_enabled=True)
+        db.upsert_interest(self.conn, an_interest(key="k", sources=["fake"]))
+
+    def test_candidate_node_is_reachable_from_a_collector_item_node(self):
+        def collector(interest, cfg, provider, conn=None):
+            return [an_item(source="fake", title="Good stuff here", url="https://e.com/1")]
+
+        provider = FakeProvider({"Good stuff": 0.9})
+        with mock.patch.dict(COLLECTORS, {"fake": collector}):
+            pipeline.run_once(self.conn, provider, self.cfg, dry_run=True)
+
+        source_node = self.conn.execute(
+            "SELECT id FROM trace_nodes WHERE node_type = 'collector-item' AND label = 'Good stuff here'"
+        ).fetchone()
+        self.assertIsNotNone(source_node)
+        edge = self.conn.execute(
+            "SELECT to_node_id FROM trace_edges WHERE from_node_id = ? AND relationship = 'normalized_to'",
+            (source_node["id"],),
+        ).fetchone()
+        self.assertIsNotNone(edge, "collector-item node has no outgoing normalized_to edge")
+        candidate_node = self.conn.execute(
+            "SELECT node_type FROM trace_nodes WHERE id = ?", (edge["to_node_id"],)
+        ).fetchone()
+        self.assertEqual(candidate_node["node_type"], "candidate")
 
 
 import importlib.util as _ilu  # noqa: E402

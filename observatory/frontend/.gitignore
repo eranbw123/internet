@@ -1,0 +1,10 @@
+node_modules/
+.vite/
+*.tsbuildinfo
+coverage/
+
+# tsconfig.node.json is a composite project (required for project references
+# -- "may not disable emit") so `tsc -b` emits vite.config's compiled JS +
+# declaration file alongside the source; only vite.config.ts is authored.
+vite.config.js
+vite.config.d.ts

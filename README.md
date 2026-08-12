@@ -57,10 +57,12 @@ a long-lived session.
 | `items` | List recently scored items |
 | `feedback <id> <verdict>` | Rate an item from the CLI |
 | `stats [--days N]` | Funnel, feedback rates, estimated cost and a HEALTH section — see [Stats](#stats) |
+| `ui [--host] [--port] [--public]` | Serve the Observatory: a read-only Datasette UI + JSON API over the trace tables — see [Observatory](#observatory) |
 | `interests [--layer L] [--why KEY] [--refresh]` | Layered interest state: list (owner rows first, `--layer` filters), `--why <key>` prints the append-only provenance chain, `--refresh` runs promotion/decay — a no-op unless `DISCOVERY_DYNAMIC_INTERESTS` is set — see [Layered interest state](#layered-interest-state) |
 | `health [--notify]` | Job staleness, provider reachability, pending/abandoned sends; `--notify` alerts on degraded/recovery, rate-limited |
 | `personal-state [--path]` | Print the sibling `ai` repo's personal-state artifact as this repo would read it — see [Personal-state contract](#personal-state-contract) |
 | `teach [--list\|--explain\|--send]` | Label the highest information-value scored-but-unlabeled items — see [Teach](#teach) |
+| `trace-fixture --db PATH` | Build the deterministic trace acceptance fixture (offline, fake providers) at `PATH`. `--db` is required — refuses (exit 2) rather than defaulting to the production `discovery.db`, since the fixture writes real interests/items/scores/feedback through production code paths — see [Trace backbone](#trace-backbone) |
 
 Run it from the repo root — the `stocks` collector imports `watch.py`.
 `python -m app` and `python -m discovery` are the same CLI. Global flags
@@ -522,8 +524,78 @@ day, so a window is just a date filter.
 | `DISCOVERY_MISSION_MAX_ATTEMPTS` | `3` | Attempts before a mission is retired to `FAILED` |
 | `DISCOVERY_MISSION_RETRY_SECONDS` | `1800` | Cool-off before a failed mission is retried; also how long an interest whose latest Council planning call just failed is skipped by replenish |
 | `DISCOVERY_COUNCIL_MAX_CONSECUTIVE_FAILURES` | `3` | Consecutive Council planning failures for one interest before the static fallback mission is queued |
+| `DISCOVERY_TRACE` | `1` (on) | Enables the trace backbone (`discovery/trace.py`) — see [Trace backbone](#trace-backbone). `0`/`false` is the rollback lever: every Tracer method becomes a no-op and no `trace_*` table is written |
+| `DISCOVERY_OBSERVATORY_BASE_URL` | *(empty)* | Base URL of a running `ui` instance — set it to make `feedback_keyboard()` append a "🔬 Open full trace" Telegram button; see [Observatory](#observatory) |
+| `DISCOVERY_UI_TOKEN` | *(empty)* | Bearer token `ui --public` requires (refuses to start without it) — every route, ours and Datasette's native ones alike, is 403 without it |
+| `DISCOVERY_NGROK_CMD` | *(empty)* | `cmd /d /c` command `ui --public` launches ngrok with (`{port}` substituted); also required for `--public` to start — see [Observatory](#observatory) |
 
 `--provider`, `--model` and `--db` override the environment for one run.
+
+## Trace backbone
+
+Every `run-once`/`web-tick` cycle is recorded, at the same seams the pipeline
+already has, into four append-only tables so a later question ("why didn't
+this get notified?") can be answered by reading, not by adding print
+statements:
+
+- **`trace_runs`** — one row per command invocation (`kind`: `web-tick`,
+  `run-once`, `digest`, `feedback`, `fixture`, ...).
+- **`trace_nodes`** — one row per step (a candidate, a match, a score, a
+  Council advisor, a mission, a Telegram send, ...). Nodes that correspond to
+  a DB row carry `entity_type`/`entity_id` (`candidate_items`, `scores`,
+  `search_missions`, `search_generations`, `interests`, `notifications`,
+  `feedback`) so a UI can deep-link straight to it.
+- **`trace_edges`** — `from_node_id -> to_node_id`, one of a fixed
+  relationship vocabulary (`generated`, `selected`, `executed`, `returned`,
+  `normalized_to`, `duplicate_of`, `matched`, `rejected`, `deferred`,
+  `scored`, `cleared_threshold`, `rendered`, `sent`, `failed`, `retried_as`,
+  `feedback_on`).
+- **`model_calls`** — one row per provider call **attempt** (a JSON-retry or
+  a connection-level reconnect each get their own row; nothing is ever
+  overwritten), with the exact final prompt actually sent (after every
+  framing/schema/retry suffix), the raw reply, the parsed result, and the
+  validation outcome. Central: every provider funnels through
+  `LLMProvider._emit_call()` (`discovery/providers/base.py`), so
+  council.py/missions.py/scoring.py never write their own logging — they only
+  set which node a provider call belongs to, via `tracer.calls(role, node_id)`.
+
+A threshold node snapshots `final_score` and the interest's `min_score` **as
+they were at scoring time** — a later change to an interest's bar never
+rewrites what an old trace says happened.
+
+Redaction (`discovery/trace.py`'s `redact`/`redact_json`): every environment
+variable whose name matches `(?i)(token|secret|key|password|cookie|auth)` and
+whose value is at least 8 characters has its literal *value* substituted with
+`[REDACTED:<VARNAME>]` everywhere it would otherwise appear in a trace row
+(config snapshots, prompts, responses) — the length floor keeps a short
+secret-shaped value (e.g. `AUTH_MODE=on`) from substring-rewriting unrelated
+stored text. Everything else — prompt/interest content — is stored byte-exact.
+Two config fields are masked by NAME instead, independent of their value's
+shape or length, before a config snapshot is stored: `ui_token` (the only
+access credential in `ui --public`, and often short) and `ngrok_cmd` (a
+free-form shell command that commonly embeds an inline `--authtoken`, so its
+field name alone never matches the secret-name pattern above) both become
+`[REDACTED:FIELD:<name>]` in `trace_runs.config_json`.
+
+**Council deliberation and scoring reasoning** ride the SAME `complete_json`
+call the missions/score already needed — no extra spend. The Council's
+five-advisor analysis, anonymized peer review, aggregate ranking, rejected
+angles and Chairman synthesis are requested alongside the missions array; the
+missions array itself stays strictly validated exactly as before this step,
+and a missing/malformed deliberation section is recorded as
+`{"unavailable": true, "reason": ...}` rather than invented or treated as an
+error. Scoring similarly returns (and stores, never scores on) its evidence,
+alternative interpretation, and uncertainties.
+
+`python -m app trace-fixture --db PATH` builds a small, structurally
+deterministic fixture (one interest, one Council generation with three
+missions, a duplicate, a prefilter rejection, a scoring failure + retry, a
+below-bar score, and one delivered + feedback-rated discovery) against fake
+providers — offline, for the Datasette plugin and React UI (see
+[Observatory](#observatory)) to build and test against without a live
+Chrome/CDP session. `--db` is
+required; the command exits 2 rather than silently writing this fixture
+data — including a real feedback row — into the production `discovery.db`.
 
 ## Running it as an appliance
 
@@ -570,15 +642,198 @@ propagating the exit code. `python -m app health` (or
 fastest way to check the appliance is actually alive without digging through
 logs.
 
+## Observatory
+
+`python -m app ui [--host 127.0.0.1] [--port 8001] [--public]` serves the
+trace backbone above as a browsable, queryable UI: an in-repo Datasette
+plugin (`observatory/`) over `discovery.db`, bound to localhost by default.
+`datasette` is the one sanctioned new dependency this step adds (see
+`requirements.txt`) — it's imported lazily, only inside `observatory/` and
+`ui`'s own command handler, so `discovery/` and `test_discovery.py` stay
+importable and green on a machine that never installs it.
+
+- **Pages/APIs** (`observatory/plugin.py`, `register_routes()`): `/observatory/`
+  (serves the built React frontend — see
+  [Observatory frontend](#observatory-frontend-observatoryfrontend)) and JSON
+  APIs — `api/list?tab=discoveries|interests|generations|missions|failed`
+  (paginated, `limit` capped at 50, filters for date range/interest/layer/
+  source/provider/model/mission/sent/feedback verdict/failure stage/trace
+  completeness, `search` spanning titles/URLs/summaries and linked
+  `model_calls` prompts+responses), `api/graph?entity_type=&entity_id=` or
+  `?run_id=` (the full connected trace graph reachable by following
+  `trace_edges` in either direction — edges legitimately cross `trace_runs`,
+  e.g. a web-tick's `threshold` node `rendered`-links to a later digest
+  run's `render` node, which `feedback_on`-links to a still-later listener
+  run's `feedback` node, so a single discovery's story usually spans 2-3
+  runs), `api/children?node_id=` or `?group=` (lazy-loads a collapsed
+  sibling group, capped at 500 rows), `api/node/<id>` (full inspector: exact
+  input/output, every `model_calls` row with byte-exact prompts + raw/parsed
+  responses, redacted
+  run config, direct `/discovery/<table>/<pk>` row URLs), `api/interest/<key>`
+  (definition, provenance, `interest_events`, generations/missions/
+  discoveries/failures/feedback), `api/compare?a=&b=&kind=run|model_call`
+  (line-level `difflib` prompt/response diffs, or added/removed/changed
+  nodes+edges — nodes keyed by `(node_type, label, inbound_relationship,
+  inbound_ordinal)` so same-labelled siblings stay distinct, edges keyed by
+  `(from_key, to_key, relationship, ordinal)`), and
+  `trace/score/<score_id>` (an HTML deep link — resolves the score's
+  `threshold` trace node, serves the shell with a `focus` bootstrap script
+  tag the frontend reads). **Known gap:** `api/compare`'s `kind` is
+  `run|model_call` only — `kind=generation` (named alongside runs/model_calls
+  in the step objective) isn't implemented and returns 400, same as any other
+  unrecognized `kind`; a generation doesn't correlate 1:1 with a `trace_runs`
+  row (one web-tick run can carry several interests' generations), so it
+  can't just alias the `run` diff. Rejecting outright is deliberate — it's
+  what replaced a silent wrong-answer fallback in an earlier repair — but a
+  real generation-vs-generation diff is unimplemented, not yet attempted.
+- **Swimlanes** (`observatory/db.py`'s `SWIMLANES`): every `node_type` maps to
+  one of `interest-state`, `council`, `mission`, `candidate-pipeline`,
+  `scoring`, `delivery-feedback`.
+- **Collapsed groups**: sibling nodes sharing the same parent, relationship
+  AND node_type (e.g. a Council generation's 5 advisor analyses) collapse to
+  one `{group, child_count}` placeholder once there are more than 3 — never
+  mixing different node types into one group, so a generation's 3 real
+  mission branches never hide behind an advisor group's count. `api/children`
+  loads the real rows only when asked.
+- **Read-only, always**: Datasette is given `files=[cfg.db_path]` — no
+  `immutables=`, so `discovery.db` keeps changing live while the UI is open —
+  which is what makes Datasette open its own read connections as
+  `file:...?mode=ro`; `observatory/db.py` additionally opens its own
+  independent `mode=ro` connection per request. The plugin registers no
+  write route. `default_allow_sql` stays on (native `/discovery/<table>`,
+  `/discovery/<table>/<pk>` and `/discovery/<db>?sql=...` query pages all
+  work — datasette 0.65's native SQL surface is `/{db}?sql=...`, not
+  `/{db}/-/query`), but any write attempt through them is rejected before
+  execution (Datasette's own "Statement must be a SELECT" check), not just
+  by convention — proven by a table-row-count-unchanged test plus the
+  rejection status code, not just the status code alone. The plugin's own
+  `permission_allowed` hook also denies Datasette's write actions
+  (insert/update/delete row, create/drop/alter table) outright in both
+  modes — inert against 0.65 (none of those routes exist yet), hardening
+  against an unpinned future Datasette version adding one.
+- **Redaction, twice**: every API response is passed through
+  `discovery.trace.redact_json` on the way OUT, independent of task 1's
+  at-write redaction — defense in depth, proven with a secret planted
+  directly into raw DB bytes (bypassing write-time redaction entirely).
+- **Auth** (`DISCOVERY_UI_TOKEN`): the default (`ui`, no `--public`) is open —
+  binding to `127.0.0.1` IS the boundary. `--public` refuses to start unless
+  BOTH `DISCOVERY_UI_TOKEN` and `DISCOVERY_NGROK_CMD` are set (a `cmd /d /c`
+  command, same convention as `DISCOVERY_CHROME_LAUNCH_CMD`; `{port}` in it
+  is substituted). In public mode, a Datasette `actor_from_request`/
+  `permission_allowed` hook pair becomes a single shared gate: only a
+  correct `Authorization: Bearer <token>` (or `?token=`) resolves an actor,
+  and only a resolved actor is granted anything — covering our own
+  `/observatory/*` routes (checked explicitly) AND every native Datasette
+  table/row/SQL page (gated for free, since core already calls
+  `permission_allowed` before serving any of them). **Live tunnel
+  verification is deferred to an operator session** — this worktree has no
+  ngrok binary or network to verify the tunnel itself against; the auth
+  boundary above is what the offline tests prove. Since the token in
+  `--public` mode can only be carried as `?token=` (a plain URL button can't
+  set a header), `ui` disables uvicorn's access log in that mode
+  (`access_log=not args.public`) so the token never gets written to a log
+  file on disk; private-mode logging is unchanged.
+- **Telegram deep link** (`discovery/notify.py`): when `DISCOVERY_OBSERVATORY_BASE_URL`
+  is set, `feedback_keyboard()` appends one `🔬 Open full trace` URL button
+  (`<base>/observatory/trace/score/<id>`) as a third row, after the four
+  existing feedback buttons — byte-identical `callback_data`. Unset (the
+  default): byte-identical keyboard to before this button existed.
+  **Known limitation: the button and `--public` don't compose on their
+  own.** The emitted URL carries no token, and `--public` 403s anonymous
+  requests to every route including `/observatory/trace/score/<id>` — so
+  tapping the button from Telegram against a public (ngrok) base URL lands
+  on a bare 403, not the trace. There is no login route or cookie flow.
+  Today the button is only directly usable pointed at a private,
+  operator-reachable `DISCOVERY_OBSERVATORY_BASE_URL` (e.g. a VPN/LAN host,
+  or manually appending `?token=<DISCOVERY_UI_TOKEN>` to the tapped link in
+  the browser once it 403s). Building a real browser-auth path (a
+  token-setting entry route, or a signed short-lived link per notification)
+  is deferred — same posture as the ngrok live-tunnel deferral above, not
+  yet implemented.
+
+Tests: `python test_observatory.py` — offline, via Datasette's own ASGI test
+client (`Datasette(...).client`, `httpx` over `ASGITransport`, no socket, no
+network) against a fixture db built by the real `discovery/trace_fixture.py`.
+Skips every test with a loud message (not a failure) if `datasette` genuinely
+isn't installed.
+
+### Observatory frontend (`observatory/frontend/`)
+
+React + TypeScript + React Flow (`@xyflow/react`) + ELK.js (`elkjs`), built
+with Vite. Node/npm is a **build-time only** dependency — the built output is
+committed to `observatory/static/` (deterministic, non-content-hashed
+filenames), so serving it (`python -m app ui`) needs no Node at runtime.
+
+```bash
+cd observatory/frontend
+npm install
+npm run build       # emits into ../static (tsc -b type-check + vite build)
+npm test             # vitest: graph assembly, edge labels, diffs, deep links
+```
+
+`npm run dev` (Vite dev server, hot reload) works against a running
+`python -m app ui` backend for iteration — the dev server itself doesn't
+serve the API, only proxy your fetches manually or run against
+`http://localhost:8001` directly by adjusting `fetch`'s base if needed. Only
+`observatory/frontend/{src,index.html,package.json,vite.config.ts,tsconfig*.json}`
+are source; `node_modules/` and Vite's cache are gitignored.
+
+**Mobile**: under a 480px viewport (iPhone width) the explorer becomes a
+slide-out drawer (☰ toggle in the header) and the inspector becomes a
+full-screen bottom sheet opened by tapping a node; the graph itself stays
+touch-pan/pinch-zoom via React Flow's own gesture handling. A
+`/observatory/trace/score/<id>` deep link lands directly on the graph with
+the sent path highlighted, on both viewport classes. Live iPhone-device and
+public-ngrok verification remain deferred to a live operator session — the
+iPhone-*sized* viewport (390×844, via CDP `Emulation.setDeviceMetricsOverride`)
+covered by the e2e test below is the in-repo evidence.
+
+**E2E smoke test**: `python test_observatory_e2e.py` — stdlib only, drives a
+real local headless Chrome over CDP (the same websocket approach
+`discovery/providers/cdp.py` uses, pointed at a Chrome instance the test
+launches itself rather than an existing authenticated tab). Builds the trace
+fixture db, starts `python -m app ui` on an ephemeral localhost port, and at
+both a desktop and an iPhone-width viewport: loads the app, selects the
+fixture's successful discovery, asserts the duplicate/prefilter-rejection/
+scoring-retry/below-threshold/sent branches are all present as real nodes,
+expands/collapses a group, pans/zooms, opens the inspector and asserts the
+displayed prompt is byte-equal to the fixture's own `model_calls` row,
+exercises the copy button, and opens the score deep link and asserts the
+sent path is highlighted. No network beyond localhost. Skips (loudly, not a
+failure) only when no Chrome/Chromium binary is found — set
+`DISCOVERY_UI_E2E_CHROME` to point at a non-standard install path. **A
+missing `observatory/static/` build does NOT skip this test — it fails**,
+since that's a real gap the test exists to catch, not an environment
+limitation.
+
 ## Tests
 
 ```bash
 python test_discovery.py
 ```
 
-405 tests, network fully stubbed — they never hit an LLM API, Telegram, or
+445 tests, network fully stubbed — they never hit an LLM API, Telegram, or
 Yahoo. The provider seam is the whole stub: a fake object with `complete_json`
 and `search_json`.
+
+This task (observatory) adds 6 more of its own on top of that count —
+`test_discovery.py` actually runs 458 in this branch; the `445` above is
+`automation/integration`'s own count as of its last docs-sync commit and is
+expected to be corrected by a follow-up sync once this branch lands, the
+same way integration's own count was corrected before (see PROJECT_STATE.md
+for the authoritative current total). Also run `python test_watch.py`
+(10 tests, the Yahoo helper) and `python test_observatory.py` (65 tests,
+offline via Datasette's own ASGI test client — see
+[Observatory](#observatory)); both are separate suites, so
+`test_discovery.py` stays importable and green on a machine without
+`datasette` installed. `test_observatory.py` skips itself with a loud
+message instead of failing if `datasette` isn't installed.
+
+A fourth, separate suite — `python test_observatory_e2e.py` (real headless
+Chrome over CDP) — is not part of this always-run list: it needs a built
+`observatory/static/` bundle (see
+[Observatory frontend](#observatory-frontend-observatoryfrontend)) to pass,
+and only skips (rather than failing) when no Chrome binary exists.
 
 ## Provenance chain (step-08)
 

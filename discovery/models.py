@@ -85,3 +85,7 @@ class ScoreResult:
     model: str
     prompt_hash: str = ""         # scoring.prompt_fingerprint(); "" on legacy rows
     id: int = None
+    # scoring.DEBUG_FIELDS, tolerantly parsed from the same scoring call --
+    # never persisted to the `scores` table (db.save_score doesn't read it),
+    # only handed to the tracer. See scoring.score_candidate/_debug_payload.
+    debug: dict = field(default_factory=dict)

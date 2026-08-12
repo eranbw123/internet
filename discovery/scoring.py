@@ -58,7 +58,38 @@ actually see of the item
 naming the specific thing that earned the score
 - why_better_than_generic: one sentence on what this has that generic coverage \
 of the same topic does not. Empty string if it has nothing.
+
+Finally, show your work -- the same judgement above, made explicit:
+- evidence_used: the specific facts/passages in the item you actually relied on
+- why_this_interest: why you chose that interest over the others on the shortlist
+- dimension_rationale: one short phrase per dimension (personal_relevance, novelty, \
+depth, specificity, importance, surprise) explaining that dimension's rating
+- alternative_interpretation: the next most plausible reading of this item, and why you \
+didn't score it that way instead
+- why_not_higher: what's missing that would have earned a higher rating
+- uncertainties: what you couldn't verify or don't have enough evidence for
 """
+
+# Debug/reasoning-contract fields (see PROMPT above) -- parsed tolerantly by
+# _debug_payload(): absent or malformed becomes {'unavailable': True, ...} in
+# that field's place, never an error. Never affects final_score, confidence,
+# reason, why_better_than_generic or models.WEIGHTS -- those stay exactly as
+# scored above.
+DEBUG_FIELDS = (
+    "evidence_used", "why_this_interest", "dimension_rationale",
+    "alternative_interpretation", "why_not_higher", "uncertainties",
+)
+
+# dimension_rationale is one short phrase per DIMENSIONS name -- spelled out
+# (not a bare {"type": "object"}) so OpenAI strict structured outputs, which
+# require every object to declare properties/required/additionalProperties,
+# can accept SCORE_SCHEMA at all.
+DIMENSION_RATIONALE_SCHEMA = {
+    "type": "object",
+    "properties": {name: {"type": "string"} for name in DIMENSIONS},
+    "required": list(DIMENSIONS),
+    "additionalProperties": False,
+}
 
 SCORE_SCHEMA = {
     "type": "object",
@@ -68,7 +99,21 @@ SCORE_SCHEMA = {
         "confidence": {"type": "number"},
         "reason": {"type": "string"},
         "why_better_than_generic": {"type": "string"},
+        "evidence_used": {"type": "string"},
+        "why_this_interest": {"type": "string"},
+        "dimension_rationale": DIMENSION_RATIONALE_SCHEMA,
+        "alternative_interpretation": {"type": "string"},
+        "why_not_higher": {"type": "string"},
+        "uncertainties": {"type": "string"},
     },
+    # Only the production fields are required here. OpenAI strict structured
+    # outputs need every property required, but that's a transport-specific
+    # constraint enforced by openai_provider._strict_schema() on a copy of
+    # this schema -- NOT here. claude_chat/chatgpt_browser's hand-rolled
+    # _validate() enforces this list verbatim as the only schema check they
+    # have, so putting the six debug fields in `required` here would turn
+    # every one of them from "tolerantly parsed, absent => unavailable" into
+    # a hard ProviderError on the default provider.
     "required": ["interest_key", *DIMENSIONS, "confidence", "reason", "why_better_than_generic"],
     "additionalProperties": False,
 }
@@ -101,6 +146,7 @@ def score_candidate(provider, item, matches, feedback=()):
         interest_id=interest.id,
         interest_key=interest.key,
         dimensions=dimensions,
+        debug=_debug_payload(data),
         final_score=final_score(dimensions),
         confidence=clamp01(data.get("confidence")),
         reason=str(data.get("reason") or "").strip(),
@@ -109,6 +155,18 @@ def score_candidate(provider, item, matches, feedback=()):
         model=provider.model,
         prompt_hash=prompt_fingerprint(),
     )
+
+
+def _debug_payload(data):
+    """Tolerant extraction of DEBUG_FIELDS from the same scoring response:
+    absent or wrong-typed becomes {'unavailable': True, ...} for that field
+    alone, never an error -- this is a debugging trail for the tracer, not
+    something any production code branches on."""
+    out = {}
+    for name in DEBUG_FIELDS:
+        value = data.get(name) if isinstance(data, dict) else None
+        out[name] = value if value is not None else {"unavailable": True, "reason": f"'{name}' missing from scoring response"}
+    return out
 
 
 def _resolve_interest(key, matches):

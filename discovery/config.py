@@ -113,6 +113,21 @@ class Config:
     council_max_consecutive_failures: int = 3    # generation failures before the static fallback kicks in
     mission_provider: str = "chatgpt_browser"    # search-capable provider the tick executes missions with
     mission_model: str = ""                      # resolved from DEFAULT_MODELS at load() time
+    # Trace backbone (discovery/trace.py). On by default -- the rollback
+    # lever is turning it off, not deleting anything. observatory_base_url
+    # is unused by this task (task 1 is storage + instrumentation only) but
+    # threaded through now so the Datasette plugin/UI (tasks 2-3) don't need
+    # a config change to find where their own read-only views live.
+    trace_enabled: bool = True
+    observatory_base_url: str = ""
+    # Observatory server (discovery/../observatory/, step-13 task 2). Empty
+    # ui_token is fine for `ui`'s default localhost-bound mode; `ui --public`
+    # refuses to start without one (see __main__.py's `_ui_cmd`) -- there is
+    # no default token, on purpose, so public exposure always requires an
+    # explicit operator choice. ngrok_cmd is likewise empty by default (never
+    # spawns anything) and only read by `ui --public`.
+    ui_token: str = ""
+    ngrok_cmd: str = ""
 
 
 def load():
@@ -190,4 +205,8 @@ def load():
         mission_model=os.environ.get(
             "DISCOVERY_MISSION_MODEL", DEFAULT_MODELS.get(mission_provider, "")
         ),
+        trace_enabled=os.environ.get("DISCOVERY_TRACE", "1").strip().lower() in ("1", "true"),
+        observatory_base_url=os.environ.get("DISCOVERY_OBSERVATORY_BASE_URL", ""),
+        ui_token=os.environ.get("DISCOVERY_UI_TOKEN", ""),
+        ngrok_cmd=os.environ.get("DISCOVERY_NGROK_CMD", ""),
     )

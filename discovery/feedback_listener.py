@@ -23,7 +23,7 @@ import sys
 import time
 import urllib.error
 
-from . import db
+from . import db, trace
 from .notify import FEEDBACK_VERDICTS, api_call
 
 POLL_TIMEOUT = 30
@@ -61,7 +61,7 @@ def listen(conn, cfg):
             if not callback or str(callback["message"]["chat"]["id"]) != chat_id:
                 continue
             try:
-                _handle_callback(conn, token, callback)
+                _handle_callback(conn, token, callback, cfg)
             except Exception as e:  # noqa: BLE001
                 # answerCallbackQuery fails routinely -- Telegram expires a
                 # callback id after ~a minute -- and the feedback is already
@@ -103,7 +103,7 @@ def drain(conn, cfg):
         if not callback or str(callback["message"]["chat"]["id"]) != chat_id:
             continue
         try:
-            if _handle_callback(conn, token, callback):
+            if _handle_callback(conn, token, callback, cfg):
                 count += 1
         except Exception as e:  # noqa: BLE001
             print(f"feedback callback failed: {e}", file=sys.stderr)
@@ -114,14 +114,22 @@ def drain(conn, cfg):
     return count
 
 
-def _handle_callback(conn, token, callback):
+def _handle_callback(conn, token, callback, cfg=None):
     """callback_data is `fb:<verdict>:<score_id>` from feedback_keyboard().
     Returns True if feedback was actually recorded, False for a garbage
     payload or an untracked score id -- both are acked either way, but only
-    a real recording should count towards `feedback_recorded`."""
+    a real recording should count towards `feedback_recorded`.
+
+    Traced as its own tiny run (kind='feedback'; a no-op when cfg is None or
+    tracing is off) rather than needing listen()/drain() to carry a Tracer
+    of their own through every call -- a button press is a self-contained
+    unit of work, same reasoning as run_once()/web_tick()'s own wrapping."""
+    tracer = trace.Tracer(conn, cfg) if cfg is not None else trace.NULL_TRACER
+    run_id = tracer.begin_run("feedback")
     parts = callback.get("data", "").split(":")
     if len(parts) != 3 or parts[0] != "fb" or parts[1] not in FEEDBACK_VERDICTS:
         api_call(token, "answerCallbackQuery", {"callback_query_id": callback["id"]})
+        tracer.finish_run(run_id, status="rejected")
         return False
 
     _, verdict, score_id = parts
@@ -131,11 +139,28 @@ def _handle_callback(conn, token, callback):
             token, "answerCallbackQuery",
             {"callback_query_id": callback["id"], "text": "That item is no longer tracked."},
         )
+        tracer.finish_run(run_id, status="untracked")
         return False
 
-    db.add_feedback(conn, row["item_id"], row["interest_id"], verdict, original_score=row["final_score"])
+    feedback_id = db.add_feedback(
+        conn, row["item_id"], row["interest_id"], verdict, original_score=row["final_score"]
+    )
+    feedback_node = tracer.node(
+        run_id, "feedback", entity_type="feedback", entity_id=feedback_id,
+        label=verdict, input_json={"score_id": int(score_id)},
+    )
+    # "threshold" is the node type pipeline._score() creates that's actually
+    # entity-linked to entity_type='scores' (the pre-persist scoring-attempt
+    # node can't be -- score.id doesn't exist yet when it's created, and a
+    # trace node's entity link can't be changed after the fact).
+    score_node = tracer.find_entity_node("scores", score_id, node_type="threshold")
+    tracer.edge(feedback_node, score_node, "feedback_on")
+    notification_id = db.notification_id_for_score(conn, int(score_id))
+    notification_node = tracer.find_entity_node("notifications", notification_id, node_type="notification")
+    tracer.edge(feedback_node, notification_node, "feedback_on")
     api_call(
         token, "answerCallbackQuery",
         {"callback_query_id": callback["id"], "text": f"Recorded: {FEEDBACK_VERDICTS[verdict]}"},
     )
+    tracer.finish_run(run_id, status="done")
     return True

@@ -539,7 +539,10 @@ def successful_notifications_since(conn, ts, channel=None):
 
 def record_notification(conn, score_id, channel, ok):
     """One row per score. A repeat attempt updates the row and bumps
-    `attempts`, so pending_notifications() can cap and pace retries."""
+    `attempts`, so pending_notifications() can cap and pace retries.
+    Returns the notifications row's own id (score_id is UNIQUE, so a
+    follow-up SELECT resolves it whether this call inserted or updated) --
+    the trace 'notification' node's entity_id, not the score's own id."""
     conn.execute(
         """
         INSERT INTO notifications (score_id, channel, sent_at, ok, attempts)
@@ -553,10 +556,18 @@ def record_notification(conn, score_id, channel, ok):
         (score_id, channel, now(), 1 if ok else 0),
     )
     conn.commit()
+    return notification_id_for_score(conn, score_id)
+
+
+def notification_id_for_score(conn, score_id):
+    """The notifications row id for a given score, or None if it was never
+    (even attempted to be) sent. score_id is UNIQUE on notifications."""
+    row = conn.execute("SELECT id FROM notifications WHERE score_id = ?", (score_id,)).fetchone()
+    return row["id"] if row else None
 
 
 def add_feedback(conn, item_id, interest_id, verdict, note="", original_score=None):
-    conn.execute(
+    cur = conn.execute(
         """
         INSERT INTO feedback (item_id, interest_id, verdict, note, original_score, created_at)
         VALUES (?, ?, ?, ?, ?, ?)
@@ -564,6 +575,7 @@ def add_feedback(conn, item_id, interest_id, verdict, note="", original_score=No
         (item_id, interest_id, verdict, note, original_score, now()),
     )
     conn.commit()
+    return cur.lastrowid
 
 
 def score_by_id(conn, score_id):

@@ -60,10 +60,15 @@ No org id, no API key.
 import json
 import os
 import time
+from datetime import datetime, timezone
 
 from . import cdp
 from .base import LLMProvider, ProviderError, parse_json_array, parse_json_object
-from .claude_chat import _extract_object, _validate  # same "JSON out of a chat" helpers
+from .claude_chat import _extract_object, _trace_parse_object, _validate  # shared "JSON out of a chat" helpers
+
+
+def _now_iso():
+    return datetime.now(timezone.utc).isoformat(timespec="seconds")
 
 DEFAULT_PORT = 9222
 PREFLIGHT_TIMEOUT_SECONDS = 5  # a port that accepts but never answers must not hang the free check
@@ -115,6 +120,10 @@ class ChatGPTBrowserProvider(LLMProvider):
         # injectable so tests never open a socket.
         self._connect = connect or self._connect_chrome
         self._connection = None
+        # See claude_chat.py's own _attempt_seq -- same purpose: numbers
+        # model_calls rows within one top-level complete_json()/search_json()
+        # call, reset at the start of each.
+        self._attempt_seq = 0
 
     # --- preflight ------------------------------------------------------------
 
@@ -136,9 +145,14 @@ class ChatGPTBrowserProvider(LLMProvider):
         # max_tokens is part of the contract but chatgpt.com's endpoint has no
         # output cap parameter; accepted and ignored.
         base = f"{system}\n\n{prompt}" + STRICT_JSON_SUFFIX.format(schema=json.dumps(schema))
+        self._attempt_seq = 0
+        self.last_events = None
         last_error = None
         for attempt in range(2):
-            text = self._completion(base if attempt == 0 else base + RETRY_SUFFIX, search=False)
+            text = self._completion(
+                base if attempt == 0 else base + RETRY_SUFFIX, search=False,
+                trace_parse=lambda t: _trace_parse_object(t, schema), schema=schema,
+            )
             try:
                 data = parse_json_object(_extract_object(text))
                 _validate(data, schema)
@@ -150,54 +164,78 @@ class ChatGPTBrowserProvider(LLMProvider):
     def search_json(self, prompt, max_searches=5, max_tokens=16000):
         # No hard search cap on this endpoint -- state it in the prompt instead.
         full = f"{prompt}\n\nUse web search (at most {max_searches} searches)."
-        text = self._completion(full, search=True, timeout=420)
+        self._attempt_seq = 0
+        self.last_events = None
+        text = self._completion(
+            full, search=True, timeout=420,
+            trace_parse=lambda t: (parse_json_array(t), "array"),
+        )
         return parse_json_array(text)
 
     # --- one chatgpt.com round trip -----------------------------------------
 
-    def _completion(self, prompt, search, timeout=240):
+    def _completion(self, prompt, search, timeout=240, trace_parse=None, schema=None):
         """One message round trip; text of the reply. A dropped Chrome
         connection gets one reconnect-and-retry (the tab survives, the
         websocket dies); everything else -- JS exceptions, HTTP errors from
         chatgpt.com, an empty reply -- is a ProviderError the pipeline treats
         like any other scoring failure."""
         try:
-            return self._attempt(prompt, search, timeout)
+            return self._attempt(prompt, search, timeout, trace_parse, schema)
         except (ConnectionError, OSError):
             self._reset()
             try:
-                return self._attempt(prompt, search, timeout)
+                return self._attempt(prompt, search, timeout, trace_parse, schema)
             except (ConnectionError, OSError) as e2:
                 self._reset()
                 raise ProviderError(f"chatgpt.com connection failed twice: {e2}") from e2
 
-    def _attempt(self, prompt, search, timeout):
+    def _attempt(self, prompt, search, timeout, trace_parse=None, schema=None):
+        started = _now_iso()
+        self._attempt_seq += 1
+        attempt_no = self._attempt_seq
+
+        def emit(raw_text=None, error=None, parsed=None, validation=None, events=None):
+            self._emit_call(
+                None, attempt_no, None, prompt, schema, None,
+                raw_text, parsed, validation, error, started, _now_iso(), events=events,
+            )
+
         conn = self._conn()
         try:
             raw = conn.evaluate(_js_completion(prompt, self.model, search), timeout=timeout)
         except RuntimeError as e:
             # JS exception inside the tab (chatgpt.com HTTP error, expired
             # session, turnstile demand). CDP connection itself is fine.
-            raise ProviderError(f"chatgpt.com call failed: {e}") from e
+            error = f"chatgpt.com call failed: {e}"
+            emit(error=error)
+            raise ProviderError(error) from e
 
         self.record_usage()  # calls only; this transport reports no token counts
         if raw is None:
-            raise ProviderError(
+            error = (
                 "chatgpt.com returned no text -- the Chrome tab was likely "
                 "navigated/reloaded mid-request; leave the chatgpt.com tab alone"
             )
+            emit(error=error)
+            raise ProviderError(error)
         result = raw if isinstance(raw, dict) else json.loads(raw)
         if not isinstance(result, dict):
-            raise ProviderError(f"unexpected completion payload from chatgpt.com: {result!r}")
+            error = f"unexpected completion payload from chatgpt.com: {result!r}"
+            emit(error=error)
+            raise ProviderError(error)
 
         conv_id = result.get("conversation_id")
         text = result.get("text") or ""
+        events = list(result.get("events") or [])
         # Thinking models (the latest-high default) stream on a handed-off
         # channel, so the send returns a stream_handoff and no inline text --
         # read the answer back by polling the conversation until it's finished.
         # Non-thinking models stream inline and already have their text here.
         if not text.strip() and conv_id:
-            text = self._poll(conn, conv_id, timeout)
+            text, poll_events = self._poll(conn, conv_id, timeout)
+            events += poll_events
+        self.last_events = events or []
 
         if conv_id:  # best-effort: hide the scratch conversation, never fatal
             try:
@@ -206,7 +244,17 @@ class ChatGPTBrowserProvider(LLMProvider):
                 pass
 
         if not text.strip():
-            raise ProviderError("empty completion from chatgpt.com")
+            error = "empty completion from chatgpt.com"
+            emit(error=error, events=events or None)
+            raise ProviderError(error)
+
+        parsed, validation = None, None
+        if trace_parse is not None:
+            try:
+                parsed, validation = trace_parse(text)
+            except Exception:  # noqa: BLE001 -- tracing must never break a real call
+                validation = "trace_parse_error"
+        emit(raw_text=text, parsed=parsed, validation=validation, events=events or None)
         return text
 
     def _poll(self, conn, conv_id, timeout):
@@ -215,9 +263,12 @@ class ChatGPTBrowserProvider(LLMProvider):
         message reports finished, or `timeout` elapses. A read failure (socket
         drop mid-poll, HTTP error) is not retried with a fresh send -- that
         would double-post; we return whatever text arrived (empty -> the caller
-        raises a normal, skippable ProviderError)."""
+        raises a normal, skippable ProviderError). Second return value is
+        whatever tool/search events the poll payload carried (see _js_poll) --
+        best effort, [] when the provider exposes none."""
         deadline = time.monotonic() + timeout
         text = ""
+        events = []
         while time.monotonic() < deadline:
             time.sleep(POLL_INTERVAL_SECONDS)
             try:
@@ -231,9 +282,10 @@ class ChatGPTBrowserProvider(LLMProvider):
                 continue
             if data.get("text"):
                 text = data["text"]
+            events += data.get("events") or []
             if data.get("done"):
                 break
-        return text
+        return text, events
 
     # --- session --------------------------------------------------------------
 
@@ -430,6 +482,11 @@ def _js_completion(prompt, model, search):
   const reader = res.body.getReader();
   const decoder = new TextDecoder();
   let buf = '', text = '', convId = null, lastPath = null, handoff = false;
+  // Best-effort retention of observable tool activity (browsing/search
+  // messages have author.role === 'tool' and their own recipient) -- never
+  // fabricated: an empty list becomes one "not exposed by provider" node on
+  // the Python side.
+  const events = [];
   // Assistant snapshots are cumulative; a trailing empty one (or an early
   // status placeholder) must not wipe the answer, so only overwrite with a
   // non-empty join -- verified against live chatgpt.com frames.
@@ -437,6 +494,14 @@ def _js_completion(prompt, model, search):
     if (!Array.isArray(parts)) return;
     const joined = parts.filter(p => typeof p === 'string').join('');
     if (joined) text = joined;
+  }};
+  const recordToolMessage = (m) => {{
+    if (m && m.author && (m.author.role === 'tool' || (m.recipient && m.recipient !== 'all'))) {{
+      events.push({{
+        type: 'tool_message', name: m.author && m.author.name || m.recipient || null,
+        content_type: m.content && m.content.content_type || null,
+      }});
+    }}
   }};
   const PARTS = '/message/content/parts/0';
   while (true) {{
@@ -459,11 +524,13 @@ def _js_completion(prompt, model, search):
           e.message.content && e.message.content.content_type === 'text') {{
         setParts(e.message.content.parts); continue;
       }}
+      if (e.message) recordToolMessage(e.message);
       // delta v1 initial add: v carries the whole message tree
       if (e.o === 'add' && e.v && e.v.message) {{
         if (e.v.conversation_id) convId = e.v.conversation_id;
         const m = e.v.message;
         if (m.author && m.author.role === 'assistant' && m.content && m.content.content_type === 'text') setParts(m.content.parts);
+        recordToolMessage(m);
         lastPath = PARTS; continue;
       }}
       // delta append to the text part, either explicitly pathed or continuing the last path
@@ -477,7 +544,7 @@ def _js_completion(prompt, model, search):
       }}
     }}
   }}
-  return JSON.stringify({{ text, conversation_id: convId, handoff, model, effort }});
+  return JSON.stringify({{ text, conversation_id: convId, handoff, model, effort, events }});
 }})()
 """
 
@@ -501,15 +568,21 @@ def _js_poll(conv_id):
   if (!c.ok) throw new Error('conversation GET HTTP ' + c.status);
   const cj = await c.json();
   let text = '', done = false;
+  const events = [];
   for (const n of Object.values(cj.mapping || {{}})) {{
     const m = n && n.message; if (!m) continue;
     if (m.author && m.author.role === 'assistant' && m.recipient === 'all' &&
         m.content && m.content.content_type === 'text') {{
       const parts = Array.isArray(m.content.parts) ? m.content.parts.filter(p => typeof p === 'string').join('') : '';
       if (parts) {{ text = parts; done = (m.status === 'finished_successfully'); }}
+    }} else if (m.author && (m.author.role === 'tool' || (m.recipient && m.recipient !== 'all'))) {{
+      events.push({{
+        type: 'tool_message', name: m.author.name || m.recipient || null,
+        content_type: m.content && m.content.content_type || null,
+      }});
     }}
   }}
-  return JSON.stringify({{ text, done }});
+  return JSON.stringify({{ text, done, events }});
 }})()
 """
 
