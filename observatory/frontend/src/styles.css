@@ -85,17 +85,33 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .node-card {
   border: 1px solid var(--border); border-left-width: 3px; border-radius: 6px;
   background: #fff; box-shadow: 0 1px 2px rgba(28,37,48,.08);
-  padding: 6px 8px; font-size: 11px; width: 220px; height: 72px; overflow: hidden;
+  padding: 6px 8px; font-size: 11px; width: 100%; height: 100%; overflow: hidden;
 }
 .node-card.emphasized { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(47,111,235,.3); }
 .node-card.status-active { border-left-color: var(--active); }
 .node-card.status-error { border-left-color: var(--error); background: #fff6f5; }
 .node-card.status-ok { border-left-color: var(--ok); }
 .node-card.node-group { background: #f6f4ff; cursor: pointer; border-style: dashed; }
+.node-card.node-group-expanded { overflow: visible; }
+.node-group .node-type { font-weight: 700; color: #6b5bd2; }
+.node-group .node-label { color: #4a3fa8; }
 .node-type { font-size: 9px; text-transform: uppercase; letter-spacing: .04em; color: #98a2b0; }
 .node-label { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .node-summary { color: #556; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .node-meta { display: flex; gap: 6px; font-size: 10px; color: #778; white-space: nowrap; overflow: hidden; }
+
+/* A group's expanded children -- see assemble.ts's containerId,
+   elkLayout.ts's chipGrid -- render as this compact grid INSIDE the
+   group's own (now-grown) card, sorted best-score-first with the top chip
+   highlighted, instead of exploding into free-floating peer cards. */
+.node-chip {
+  width: 100%; height: 100%; display: flex; align-items: center;
+  border: 1px solid var(--border); border-radius: 5px; background: #fff;
+  padding: 2px 8px; font-size: 10px; box-shadow: 0 1px 1px rgba(28,37,48,.06);
+}
+.node-chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.node-chip-top { border-color: var(--accent); background: #eef4ff; font-weight: 600; }
+.node-chip.emphasized { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(47,111,235,.3); }
 /* Scope to the path: the class lands on the edge's whole <g>, and a bare
    stroke there also paints the label's background rect blue. */
 .edge-emphasized .react-flow__edge-path { stroke: var(--accent) !important; stroke-width: 2 !important; }

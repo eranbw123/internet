@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { applyFocus, formatEdgeLabel, mergeExpansion } from "./assemble";
+import { applyFocus, formatEdgeLabel, labelScore, mergeExpansion } from "./assemble";
 import type { GraphResponse, NodeSummary } from "../types";
 
 function node(overrides: Partial<NodeSummary>): NodeSummary {
@@ -48,25 +48,30 @@ describe("mergeExpansion", () => {
     expect(merged.edges).toHaveLength(3);
   });
 
-  it("adds fetched children alongside the group placeholder (kept as the collapse target) and wires parent edges", () => {
+  it("adds fetched children as chips inside the group's own card, sorted best-score-first, with no new edges", () => {
     const g = fixture();
     const children: NodeSummary[] = [
-      node({ id: 101, node_type: "raw-result", swimlane: "mission", label: "result 1" }),
-      node({ id: 102, node_type: "raw-result", swimlane: "mission", label: "result 2" }),
+      node({ id: 101, node_type: "raw-result", swimlane: "mission", label: "low: 0.12" }),
+      node({ id: 102, node_type: "raw-result", swimlane: "mission", label: "high: 0.91" }),
+      node({ id: 103, node_type: "raw-result", swimlane: "mission", label: "no score here" }),
     ];
     const merged = mergeExpansion(g, { "10:returned:raw-result": children });
     const ids = merged.nodes.map((n) => n.id);
-    // the group card itself is still on screen -- it's the only double-click
-    // target GraphCanvas has to collapse back via collapseGroup()
+    // the group card itself is still on screen -- it's the only click target
+    // GraphCanvas has to collapse back via collapseGroup()
     expect(ids).toContain("10:returned:raw-result");
-    expect(ids).toEqual(expect.arrayContaining([1, 2, 101, 102, 20]));
-    // parent (mission id 2) -> each child, using the group's own relationship
-    const newEdges = merged.edges.filter((e) => e.from === 2 && (e.to === 101 || e.to === 102));
-    expect(newEdges).toHaveLength(2);
-    expect(newEdges.every((e) => e.relationship === "returned")).toBe(true);
-    // nothing from the original graph was dropped, only added to
-    expect(merged.edges).toHaveLength(g.edges.length + 2);
-    expect(merged.nodes).toHaveLength(g.nodes.length + 2);
+    expect(ids).toEqual(expect.arrayContaining([1, 2, 101, 102, 103, 20]));
+    // every child carries the group's own key as containerId, not a fresh edge --
+    // a candidate's matches interleaving with an unrelated candidate's collapsed
+    // group in the same lane column (verified live) is exactly what per-child
+    // edges + free-floating peer nodes produced; a shared containerId is what
+    // elkLayout.ts's chip grid keys off instead.
+    const chipped = merged.nodes.filter((n) => n.containerId === "10:returned:raw-result");
+    expect(chipped.map((n) => n.id)).toEqual([102, 101, 103]); // 0.91, 0.12, then no-score last
+    // no edges added at all -- the group's own single inbound edge is the
+    // only connector, regardless of how many children it has
+    expect(merged.edges).toHaveLength(g.edges.length);
+    expect(merged.nodes).toHaveLength(g.nodes.length + 3);
   });
 
   it("collapsing back (omitting the group from `expanded`) reproduces the original graph", () => {
@@ -76,6 +81,22 @@ describe("mergeExpansion", () => {
     const collapsedAgain = mergeExpansion(g, {});
     expect(collapsedAgain).not.toEqual({ nodes: expandedMerge.nodes, edges: expandedMerge.edges });
     expect(collapsedAgain.nodes.map((n) => n.id)).toEqual(g.nodes.map((n) => n.id));
+  });
+});
+
+describe("labelScore", () => {
+  it("extracts a trailing ': N.NN' score", () => {
+    expect(labelScore("speculative-fiction-ideas: 0.24")).toBe(0.24);
+  });
+  it("extracts a trailing integer score", () => {
+    expect(labelScore("some-key: 1")).toBe(1);
+  });
+  it("returns null when there is no trailing score", () => {
+    expect(labelScore("Concept Embedding Models: Beyond the Trade-Off")).toBeNull();
+  });
+  it("returns null for null/empty labels", () => {
+    expect(labelScore(null)).toBeNull();
+    expect(labelScore("")).toBeNull();
   });
 });
 

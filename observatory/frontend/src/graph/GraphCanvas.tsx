@@ -19,6 +19,22 @@ function statusClass(status: string | null): string {
   return "";
 }
 
+// db.py's graph() stamps a group's child type into its label as "N
+// <child_node_type>" (e.g. "12 match", "18 tool-event") -- there's no
+// separate field for it. Turned into plain language instead of showing the
+// backend's internal type name + a redundant "N items" meta chip next to it.
+const GROUP_NOUNS: Record<string, string> = {
+  match: "interest match", "tool-event": "tool call", advisor: "council advisor",
+  "peer-review": "peer review", "rejected-angle": "rejected angle", mission: "mission",
+  "raw-result": "raw result", "raw-result-dropped": "dropped result",
+};
+function groupCaption(label: string | null, childCount: number | undefined): string {
+  const count = childCount ?? 0;
+  const type = /^\d+\s+(.+)$/.exec(label || "")?.[1] ?? "";
+  const noun = GROUP_NOUNS[type] || type || "node";
+  return `${count} ${count === 1 ? noun : `${noun}s`}`;
+}
+
 function NodeCard({ data }: NodeProps) {
   const n = data as unknown as PositionedNode & { emphasized: boolean; expanded?: boolean; onExpandToggle?: () => void };
   const isGroup = n.node_type === "group";
@@ -27,7 +43,7 @@ function NodeCard({ data }: NodeProps) {
     : null;
   return (
     <div
-      className={`node-card ${statusClass(n.status)} ${n.emphasized ? "emphasized" : ""} ${isGroup ? "node-group" : ""}`}
+      className={`node-card ${statusClass(n.status)} ${n.emphasized ? "emphasized" : ""} ${isGroup ? "node-group" : ""} ${isGroup && n.expanded ? "node-group-expanded" : ""}`}
       title={isGroup ? `Click to ${n.expanded ? "collapse" : "expand"}` : undefined}
       data-node-id={n.id}
       data-node-type={n.node_type}
@@ -37,19 +53,34 @@ function NodeCard({ data }: NodeProps) {
           anchor (and therefore never draws) any edge into a custom node. */}
       <Handle type="target" position={Position.Left} isConnectable={false} />
       <Handle type="source" position={Position.Right} isConnectable={false} />
-      {/* Group pseudo-nodes carry no `child_node_type` field of their own --
-          db.py's graph() stamps that info into the node's `label` instead
-          ("N <child_node_type>", see db.py's group-node construction), which
-          is already rendered below, so the type row just says "group" here. */}
-      <div className="node-type">{isGroup ? `group ${n.expanded ? "▾" : "▸"}` : n.node_type}</div>
-      <div className="node-label">{n.label || "(untitled)"}</div>
+      <div className="node-type">{isGroup ? (n.expanded ? "▾ collapse" : "▸ expand") : n.node_type}</div>
+      <div className="node-label">{isGroup ? groupCaption(n.label, n.child_count) : (n.label || "(untitled)")}</div>
       {n.summary && <div className="node-summary">{n.summary}</div>}
       <div className="node-meta">
         {n.status && <span className="node-status">{n.status}</span>}
         {duration && <span className="node-duration">{duration}</span>}
-        {isGroup && <span className="node-child-count">{n.child_count} items</span>}
         {n.started_at && <span className="node-time">{n.started_at}</span>}
       </div>
+    </div>
+  );
+}
+
+// A group's expanded children render as chips INSIDE its own (now-grown)
+// card rather than as free-floating peer nodes -- see assemble.ts's
+// mergeExpansion and elkLayout.ts's chipGrid for why. No Handles: nothing
+// ever draws an edge into a chip (the group's own single inbound edge, from
+// before it was ever expanded, is still the only connector), so anchors
+// would be dead weight.
+function ChipNode({ data }: NodeProps) {
+  const n = data as unknown as PositionedNode & { emphasized: boolean };
+  return (
+    <div
+      className={`node-chip ${n.isTopChip ? "node-chip-top" : ""} ${n.emphasized ? "emphasized" : ""}`}
+      title={n.label || undefined}
+      data-node-id={n.id}
+      data-node-type={n.node_type}
+    >
+      <span className="node-chip-label">{n.label || "(untitled)"}</span>
     </div>
   );
 }
@@ -68,7 +99,7 @@ function LaneBandNode({ data }: NodeProps) {
   );
 }
 
-const nodeTypes = { card: NodeCard, laneBand: LaneBandNode };
+const nodeTypes = { card: NodeCard, chip: ChipNode, laneBand: LaneBandNode };
 
 interface Props {
   seed: GraphSeed | null;
@@ -154,8 +185,14 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
       const isGroup = n.node_type === "group";
       return {
         id: String(n.id),
-        type: "card",
+        type: n.isChip ? "chip" : "card",
         position: { x: n.x, y: n.y },
+        // Containers grow with their chip count and chips are smaller than a
+        // full card -- both need their real size on the flow node itself
+        // (React Flow applies `style` to the node wrapper), not the old
+        // fixed 220x72 every card used to share.
+        style: { width: n.width, height: n.height },
+        zIndex: n.isChip ? 10 : undefined,
         data: {
           ...n,
           emphasized: emphasizedSet.has(String(n.id)),

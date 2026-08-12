@@ -10,35 +10,68 @@ import type { GraphEdge, GraphResponse, ID, NodeSummary } from "../types";
 // graph(), which mints group ids this same way), never by a real node id.
 export type ExpandedGroups = Record<string, NodeSummary[]>;
 
+// `containerId` marks a node as a chip living inside an expanded group's own
+// card (elkLayout.ts's chipGrid) rather than a free-floating peer -- see
+// mergeExpansion below for why this replaced per-child edges entirely.
+export interface DisplayNode extends NodeSummary {
+  containerId?: string;
+}
+
 export interface DisplayGraph {
-  nodes: NodeSummary[];
+  nodes: DisplayNode[];
   edges: GraphEdge[];
+}
+
+/** A node's label often ends in " <score>" (match nodes: "key: 0.84";
+ * candidates carry no score in their label). Extracted once here so both
+ * the sort order below and elkLayout's/GraphCanvas's chip highlighting
+ * agree on the same number instead of three independent regexes drifting
+ * apart. Returns null (sorts last, never highlighted) when there's nothing
+ * that looks like a trailing score. */
+export function labelScore(label: string | null | undefined): number | null {
+  const m = /:\s*(\d+(?:\.\d+)?)\s*$/.exec(label || "");
+  return m ? parseFloat(m[1]) : null;
 }
 
 /** Merge lazily-fetched group children into the base graph. A group node
  * that has been expanded keeps its own card on screen (still `node_type
- * === 'group'`, so it stays the double-click target GraphCanvas uses to
- * collapse back -- there would otherwise be no on-screen affordance left to
- * re-collapse it once its children replaced it) alongside its real children
- * (their own further descendants stay collapsed/hidden until independently
- * expanded -- /api/children only ever returns one level, matching the API).
- * Groups the caller hasn't expanded are left exactly as the API returned
- * them -- this function never drops or invents data, only adds what's been
- * fetched. */
+ * === 'group'`, so it stays the click target GraphCanvas uses to collapse
+ * back -- there would otherwise be no on-screen affordance left to
+ * re-collapse it once its children replaced it) -- but its children no
+ * longer become free-floating peer nodes wired by their own edge. Verified
+ * live: a fanned-out candidate (6-17 matches, common with today's ~40
+ * active interests) dropped its expanded children into the SAME lane
+ * column as every other candidate's still-collapsed group card, with a
+ * forest of parallel "matched" edges crossing between them -- nothing
+ * visually bound a match to the candidate it belonged to. Children now
+ * carry `containerId` (the group's own key) instead of gaining a
+ * `parent -> child` edge; elkLayout.ts lays them out as a compact chip grid
+ * INSIDE the group's own (now-growing) card, so the graph keeps exactly the
+ * one edge it already had (into the group) no matter how many children it
+ * has. Sorted `labelScore` descending (nulls last) so the match that
+ * actually mattered floats to the top instead of sitting at whatever
+ * position the API's id order put it in. Their own further descendants
+ * stay collapsed/hidden until independently expanded (/api/children only
+ * ever returns one level, matching the API). Groups the caller hasn't
+ * expanded are left exactly as the API returned them -- this function
+ * never drops or invents data, only adds what's been fetched. */
 export function mergeExpansion(base: GraphResponse, expanded: ExpandedGroups): DisplayGraph {
-  const groupsById = new Map(base.groups.map((g) => [g.group, g]));
-  const nodes: NodeSummary[] = [];
+  const nodes: DisplayNode[] = [];
   const edges: GraphEdge[] = [...base.edges];
   for (const n of base.nodes) {
     const key = String(n.id);
     nodes.push(n);
     if (n.node_type === "group" && expanded[key]) {
-      const group = groupsById.get(key);
-      for (const child of expanded[key]) {
-        nodes.push(child);
-        if (group) {
-          edges.push({ from: group.parent_node_id, to: child.id, relationship: group.relationship, ordinal: null });
-        }
+      const children = [...expanded[key]].sort((a, b) => {
+        const sa = labelScore(a.label);
+        const sb = labelScore(b.label);
+        if (sa === null && sb === null) return 0;
+        if (sa === null) return 1;
+        if (sb === null) return -1;
+        return sb - sa;
+      });
+      for (const child of children) {
+        nodes.push({ ...child, containerId: key });
       }
     }
   }
