@@ -54,14 +54,21 @@ function NodeCard({ data }: NodeProps) {
   );
 }
 
-// Swimlane captions ride inside the flow as non-interactive nodes so they
+// Swimlane bands ride inside the flow as non-interactive nodes so they
 // pan/zoom with the graph -- a screen-space overlay drifts out of alignment
-// on the first pan.
-function LaneLabelNode({ data }: NodeProps) {
-  return <div className="lane-label">{(data as { text: string }).text}</div>;
+// on the first pan. Each band is a full vertical column (see elkLayout.ts's
+// partitioned layout); size comes from the node's own `style` (React Flow
+// applies that to the wrapper), this component just fills it.
+function LaneBandNode({ data }: NodeProps) {
+  const d = data as { lane: string; i: number };
+  return (
+    <div className={`lane-band ${d.i % 2 === 1 ? "lane-band-odd" : ""}`}>
+      <div className="lane-band-title">{laneLabel(d.lane)}</div>
+    </div>
+  );
 }
 
-const nodeTypes = { card: NodeCard, lane: LaneLabelNode };
+const nodeTypes = { card: NodeCard, laneBand: LaneBandNode };
 
 interface Props {
   seed: GraphSeed | null;
@@ -71,10 +78,13 @@ interface Props {
 
 function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
   const graphData = useGraphData(seed);
-  const { display, base, expandGroup, collapseGroup, expandAll, focusMode, setFocusMode, expandedKeys, reload } =
-    useAugmentedGraphData(graphData);
+  const {
+    display, base, loading, error, expandGroup, collapseGroup, expandAll, focusMode, setFocusMode,
+    expandedKeys, reload,
+  } = useAugmentedGraphData(graphData);
   const [layout, setLayout] = useState<LayoutResult | null>(null);
   const { fitView } = useReactFlow();
+  const seedKey = seed ? JSON.stringify(seed) : null;
 
   useEffect(() => {
     let cancelled = false;
@@ -88,9 +98,27 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
     };
   }, [display]);
 
+  // Deterministic refit, keyed on the seed + node count rather than a bare
+  // node-count-only key: switching between two graphs of the SAME size
+  // (reproduced live: 37 nodes -> 65 nodes -> back to a different 37-node
+  // graph) must still refit even though `layout.nodes.length` alone
+  // wouldn't change. The double-rAF -- not a bare timer -- is what actually
+  // fixes the flake: it was reproduced live as a race between React Flow's
+  // own internal node re-measurement and a bare `setTimeout`, which
+  // sometimes fires fitView() before React Flow has measured the new
+  // nodes' real DOM size, leaving the viewport transform byte-identical to
+  // the previous graph's. Two rAFs guarantee at least one full paint has
+  // happened first.
+  const refitKey = `${seedKey}:${layout?.nodes.length ?? 0}`;
   useEffect(() => {
-    if (layout) setTimeout(() => fitView({ duration: 200 }), 50);
-  }, [layout?.nodes.length]); // eslint-disable-line react-hooks/exhaustive-deps
+    if (!layout) return;
+    const t = setTimeout(() => {
+      requestAnimationFrame(() => {
+        requestAnimationFrame(() => fitView({ duration: 200, padding: 0.05, maxZoom: 1 }));
+      });
+    }, 30);
+    return () => clearTimeout(t);
+  }, [refitKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Re-fit when the viewport itself changes size (phone rotation, window
   // resize, drawer open/close) so the graph never sits off-screen.
@@ -111,16 +139,18 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
 
   const flowNodes: Node[] = useMemo(() => {
     if (!layout) return [];
-    const laneNodes: Node[] = layout.lanes.map(({ lane, top }) => ({
-      id: `lane:${lane}`,
-      type: "lane",
-      position: { x: -190, y: top },
-      data: { text: laneLabel(lane) },
+    const bandNodes: Node[] = layout.lanes.map((band, i) => ({
+      id: `band:${band.lane}`,
+      type: "laneBand",
+      position: { x: band.left, y: band.top },
+      style: { width: band.width, height: band.height },
+      zIndex: -10,
+      data: { lane: band.lane, i },
       draggable: false,
       selectable: false,
       focusable: false,
     }));
-    return laneNodes.concat(layout.nodes.map((n) => {
+    return bandNodes.concat(layout.nodes.map((n) => {
       const isGroup = n.node_type === "group";
       return {
         id: String(n.id),
@@ -154,7 +184,7 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
   // cards now expand/collapse on the same single click every other node
   // selects with.
   function handleNodeClick(_evt: unknown, node: Node) {
-    if (node.type === "lane") return;
+    if (node.type === "laneBand") return;
     const d = node.data as { node_type?: string; onExpandToggle?: () => void };
     if (d.node_type === "group") {
       d.onExpandToggle?.();
@@ -213,7 +243,11 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
           maskColor="rgba(28, 37, 48, 0.08)"
         />
       </ReactFlow>
-      {!base && <div className="graph-empty">Select a discovery from the list to load its trace.</div>}
+      {loading && <div className="graph-status">Loading trace…</div>}
+      {error && <div className="graph-status graph-status-error">Couldn't load this trace: {error}</div>}
+      {!base && !loading && !error && (
+        <div className="graph-empty">Select a discovery from the list to load its trace.</div>
+      )}
     </div>
   );
 }

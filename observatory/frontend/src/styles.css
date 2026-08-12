@@ -58,13 +58,29 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
   background: rgba(255,255,255,.92); cursor: pointer;
 }
 .graph-toolbar button:hover { border-color: var(--accent); }
-.lane-label {
-  position: absolute; font-size: 10px; font-weight: 600; text-transform: uppercase;
-  letter-spacing: .05em; color: #7c8794; padding: 2px 8px; margin-left: 4px;
-  background: rgba(255,255,255,.85); border: 1px solid var(--border); border-radius: 10px;
-  white-space: nowrap;
+/* Swimlanes as vertical columns (elkLayout.ts's partitioned layout) --
+   rendered as real, low-z React Flow nodes sized per-band via `style`, so
+   they pan/zoom exactly with the content instead of drifting on the first
+   pan the way a screen-space overlay would. */
+.lane-band {
+  width: 100%; height: 100%;
+  background: rgba(28,37,48,.025);
+  border-left: 1px dashed #dfe5ec;
+  pointer-events: none;
+}
+.lane-band-odd { background: rgba(47,111,235,.03); }
+.lane-band-title {
+  font-size: 22px; font-weight: 600; text-transform: uppercase; letter-spacing: .1em;
+  color: #a8b3c2; padding: 10px 16px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
 }
 .graph-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #889; }
+.graph-status {
+  position: absolute; top: 44px; left: 50%; transform: translateX(-50%);
+  background: rgba(255,255,255,.95); border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 12px; font-size: 12px; color: #556; z-index: 6;
+}
+.graph-status-error { color: var(--error); border-color: #f2b8b5; background: #fdecea; }
 
 .node-card {
   border: 1px solid var(--border); border-left-width: 3px; border-radius: 6px;
