@@ -48,6 +48,8 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .explorer-row:hover { background: #f5f8ff; }
 .row-top, .row-bottom { display: flex; gap: 8px; font-size: 11px; color: #667; }
 .row-title { font-weight: 600; }
+.row-sent-sent { color: var(--ok); font-weight: 600; }
+.row-sent-failed { color: var(--error); font-weight: 600; }
 .explorer-pager { display: flex; align-items: center; gap: 8px; padding: 6px; }
 
 /* --- graph canvas --- */
@@ -215,6 +217,11 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
   cursor: pointer; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .connection-link:hover { text-decoration: underline; }
+.connection-showall {
+  border: none; background: none; padding: 2px 0 0; font-size: 10.5px; color: var(--accent);
+  cursor: pointer; text-align: left;
+}
+.connection-showall:hover { text-decoration: underline; }
 .overview-preview .monospace-viewer:not(.fullscreen) .viewer-content { max-height: 45vh; }
 .overview-nothing { color: #98a2b0; font-style: italic; margin: 10px 0; }
 .overview-links { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; }

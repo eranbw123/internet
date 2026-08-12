@@ -102,6 +102,7 @@ function RowSummary({ tab, row }: { tab: Tab; row: Record<string, unknown> }) {
   const at = (row.scored_at || row.created_at || row.at || row.first_seen_at || "") as string;
   const interest = (row.interest_key || row.generation_interest_key || "") as string;
   if (tab === "discoveries") {
+    const sentState = row.notification_ok ? "sent" : row.notification_id ? "failed" : "not-sent";
     return (
       <>
         <div className="row-top">
@@ -111,7 +112,7 @@ function RowSummary({ tab, row }: { tab: Tab; row: Record<string, unknown> }) {
         <div className="row-title">{String(row.title ?? row.url ?? "(untitled)")}</div>
         <div className="row-bottom">
           <span className="row-score">{row.final_score != null ? Number(row.final_score).toFixed(2) : "unscored"}</span>
-          <span className="row-sent">{row.notification_ok ? "sent" : row.notification_id ? "failed" : "not sent"}</span>
+          <span className={`row-sent row-sent-${sentState}`}>{sentState === "not-sent" ? "not sent" : sentState}</span>
           <span className="row-feedback">{String(row.feedback_verdict ?? "")}</span>
         </div>
       </>

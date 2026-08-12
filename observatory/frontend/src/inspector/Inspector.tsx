@@ -1,5 +1,6 @@
 import { useEffect, useState } from "react";
 import { fetchNode } from "../api";
+import { labelScore } from "../graph/assemble";
 import type { ID, ModelCallDetail, NodeDetail } from "../types";
 import { MonospaceViewer } from "./MonospaceViewer";
 
@@ -118,7 +119,7 @@ function Overview({ detail, onSelectNode }: { detail: NodeDetail; onSelectNode?:
         {o.started_at && (
           <>
             <dt>Started</dt>
-            <dd>{o.started_at}</dd>
+            <dd>{formatTimestamp(o.started_at)}</dd>
           </>
         )}
         {duration(o.started_at, o.finished_at) && (
@@ -196,17 +197,46 @@ function CallFacts({ call, many }: { call: ModelCallDetail; many: boolean }) {
   );
 }
 
+// Pipeline-relevant relationships first, "matched" last -- on a candidate
+// with many interest matches (common with ~40 active interests) the one
+// link that actually explains what happened to this node (scored,
+// cleared_threshold, rendered, sent...) was previously buried at the
+// bottom of a pile of a dozen "matched" links, sorted by nothing but
+// whatever order the API happened to return them in.
+const RELATIONSHIP_PRIORITY = [
+  "scored", "cleared_threshold", "rejected", "rendered", "sent", "normalized_to",
+  "returned", "generated", "executed", "selected", "matched",
+];
+function relationshipRank(rel: string): number {
+  const i = RELATIONSHIP_PRIORITY.indexOf(rel);
+  return i === -1 ? RELATIONSHIP_PRIORITY.length : i;
+}
+const MATCH_PREVIEW_COUNT = 3;
+const MATCH_COLLAPSE_THRESHOLD = 5;
+
 function Connections({ title, edges, onSelectNode }: {
   title: string;
   edges: { id: ID; relationship: string; label: string; node_type: string }[];
   onSelectNode?: (id: ID) => void;
 }) {
+  const [showAllMatches, setShowAllMatches] = useState(false);
   if (edges.length === 0) return null;
+
+  const nonMatched = edges
+    .filter((e) => e.relationship !== "matched")
+    .sort((a, b) => relationshipRank(a.relationship) - relationshipRank(b.relationship));
+  const matched = edges
+    .filter((e) => e.relationship === "matched")
+    .sort((a, b) => (labelScore(b.label) ?? -Infinity) - (labelScore(a.label) ?? -Infinity));
+  const collapse = matched.length > MATCH_COLLAPSE_THRESHOLD && !showAllMatches;
+  const visibleMatched = collapse ? matched.slice(0, MATCH_PREVIEW_COUNT) : matched;
+  const visible = [...nonMatched, ...visibleMatched];
+
   return (
     <div className="overview-connections">
       <div className="overview-section-title">{title}</div>
       <ul>
-        {edges.map((e, i) => (
+        {visible.map((e, i) => (
           <li key={i}>
             <span className="connection-rel">{e.relationship.replace(/_/g, " ")}</span>
             {onSelectNode ? (
@@ -219,8 +249,22 @@ function Connections({ title, edges, onSelectNode }: {
           </li>
         ))}
       </ul>
+      {collapse && (
+        <button className="connection-showall" onClick={() => setShowAllMatches(true)}>
+          show all {matched.length} matches
+        </button>
+      )}
     </div>
   );
+}
+
+// pipeline.py/trace.py timestamps are ISO with an explicit +00:00 offset
+// (always UTC -- see PROJECT_STATE.md's "All timestamps UTC" note); rendered
+// as "2026-08-12 07:56:58 UTC" instead of the raw ISO string.
+function formatTimestamp(iso: string | null): string | null {
+  if (!iso) return iso;
+  const m = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.\d+)?\+00:00$/.exec(iso);
+  return m ? `${m[1]} ${m[2]} UTC` : iso;
 }
 
 function chipKind(status: string): string {
