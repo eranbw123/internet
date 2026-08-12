@@ -327,6 +327,11 @@ class ObservatoryE2EDesktopTests(_E2EFixture, unittest.TestCase):
         # that was never resolvable via /api/node/<id>, so GraphCanvas.tsx no
         # longer treats a single click on a group as "select this node" --
         # it expands/collapses it directly, same as the old double-click did.
+        #
+        # Expanded children render as .node-chip inside the group's own
+        # (growing) .node-card, not as additional free-floating .node-card
+        # peers (the "matches" redesign -- see PROJECT_STATE.md) -- so the
+        # signal an expand actually happened is chip count, not card count.
         self.set_viewport(DESKTOP_VIEWPORT)
         self.navigate("/observatory/")
         self.wait_for("document.querySelectorAll('.explorer-row').length > 0")
@@ -335,17 +340,17 @@ class ObservatoryE2EDesktopTests(_E2EFixture, unittest.TestCase):
         group = self.js("!!document.querySelector('.node-group')")
         if not group:
             self.skipTest("this discovery's own trace has no sibling set past COLLAPSE_THRESHOLD to expand")
-        before = self.js("document.querySelectorAll('.node-card').length")
+        before = self.js("document.querySelectorAll('.node-chip').length")
         self.click(".node-group")
-        self.wait_for(f"document.querySelectorAll('.node-card').length > {before}", message="expand added nodes")
+        self.wait_for(f"document.querySelectorAll('.node-chip').length > {before}", message="expand added chips")
         # A single click on a group must never trigger the Inspector to fetch
         # a fake node id -- the pre-fix bug this test now also guards against.
         self.assertFalse(self.js("!!document.querySelector('.inspector-error')"))
-        after_expand = self.js("document.querySelectorAll('.node-card').length")
-        self.click(".node-group")  # collapses whichever child card is now first in DOM order -- re-query
-        # A collapsed-again graph must NOT still show more cards than the
-        # pre-expand baseline (the group returns, its children hide again).
-        self.wait_for(f"document.querySelectorAll('.node-card').length <= {after_expand}")
+        after_expand = self.js("document.querySelectorAll('.node-chip').length")
+        self.click(".node-group")  # collapses whichever child chip is now first in DOM order -- re-query
+        # A collapsed-again graph must NOT still show chips left over from
+        # the expansion (the group returns, its children hide again).
+        self.wait_for(f"document.querySelectorAll('.node-chip').length < {after_expand}")
 
     def test_03_pan_zoom(self):
         self.set_viewport(DESKTOP_VIEWPORT)
