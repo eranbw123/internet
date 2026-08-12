@@ -117,6 +117,38 @@ function ChipNode({ data }: NodeProps) {
   );
 }
 
+// One tint per swimlane, reused by the MiniMap so the columns still read
+// (faintly) at minimap scale instead of every node blurring into one grey.
+const LANE_TINT: Record<string, string> = {
+  "interest-state": "#e8c9c9", council: "#d9c9e8", mission: "#c9d4e8",
+  "candidate-pipeline": "#c9e0e8", scoring: "#cfe0c9", "delivery-feedback": "#e8ddc9",
+};
+
+const LEGEND_ITEMS: { swatch: string; text: string }[] = [
+  { swatch: "columns", text: "Columns are pipeline stages, left → right: Interest → Council → Mission → Candidates → Scoring → Delivery." },
+  { swatch: "path", text: "Blue path — the route this discovery took, from search hit to Telegram." },
+  { swatch: "status", text: "Card left edge: green = ok · amber = running · red = failed." },
+  { swatch: "verdict", text: "✓ / ✕ — cleared or missed the score threshold." },
+  { swatch: "group", text: "Dashed purple card — a bundle of similar items; click to open it in place." },
+  { swatch: "dim", text: "Faded cards — dropped results and duplicates (dead ends)." },
+];
+
+function GraphLegend() {
+  return (
+    <div className="graph-legend" role="note">
+      <div className="graph-legend-title">Reading this graph</div>
+      <ul>
+        {LEGEND_ITEMS.map((item) => (
+          <li key={item.swatch}>
+            <span className={`legend-swatch legend-swatch-${item.swatch}`} aria-hidden="true" />
+            {item.text}
+          </li>
+        ))}
+      </ul>
+    </div>
+  );
+}
+
 // Swimlane bands ride inside the flow as non-interactive nodes so they
 // pan/zoom with the graph -- a screen-space overlay drifts out of alignment
 // on the first pan. Each band is a full vertical column (see elkLayout.ts's
@@ -146,6 +178,7 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
     expandedKeys, reload,
   } = useAugmentedGraphData(graphData);
   const [layout, setLayout] = useState<LayoutResult | null>(null);
+  const [showLegend, setShowLegend] = useState(false);
   const { fitView } = useReactFlow();
   const seedKey = seed ? JSON.stringify(seed) : null;
 
@@ -282,11 +315,18 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
       <div className="graph-toolbar">
         <button onClick={expandAll}>Expand all</button>
         <button onClick={() => setFocusMode((v: boolean) => !v)} aria-pressed={focusMode}>
-          {focusMode ? "Focused (showing selected path only)" : "Focus selected path"}
+          {focusMode ? "Show full run" : "Focus: this discovery's path"}
         </button>
+        {focusMode && display.hiddenCount > 0 && (
+          <span className="graph-toolbar-note">· {display.hiddenCount} nodes hidden</span>
+        )}
         <button onClick={() => fitView({ duration: 200 })}>Fit to view</button>
         <button onClick={reload}>Reset layout</button>
+        <button className="graph-toolbar-spacer-left" onClick={() => setShowLegend((v) => !v)} aria-pressed={showLegend}>
+          Legend
+        </button>
       </div>
+      <div className="graph-canvas-body">
       <ReactFlow
         nodes={flowNodes}
         edges={flowEdges}
@@ -310,7 +350,14 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
           pannable
           zoomable
           className="graph-minimap"
-          nodeColor="#b9c6d8"
+          nodeColor={(node) => {
+            // Bands themselves stay transparent in the minimap -- painting
+            // their own tint would just wash out the real node colors sitting
+            // on top of them at that scale.
+            if (node.type === "laneBand") return "transparent";
+            const swimlane = (node.data as { swimlane?: string })?.swimlane;
+            return (swimlane && LANE_TINT[swimlane]) || "#b9c6d8";
+          }}
           nodeStrokeColor="#8b98a9"
           maskColor="rgba(28, 37, 48, 0.08)"
         />
@@ -320,6 +367,8 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
       {!base && !loading && !error && (
         <div className="graph-empty">Select a discovery from the list to load its trace.</div>
       )}
+      {showLegend && <GraphLegend />}
+      </div>
     </div>
   );
 }

@@ -51,13 +51,25 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .explorer-pager { display: flex; align-items: center; gap: 8px; padding: 6px; }
 
 /* --- graph canvas --- */
-.graph-canvas { position: relative; height: 100%; }
-.graph-toolbar { position: absolute; z-index: 5; top: 8px; left: 8px; right: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+/* A real docked bar, not a floating overlay -- it used to sit absolutely
+   positioned on top of the canvas and obscure whatever content happened to
+   render underneath it (verified live: fitted graphs routinely landed
+   partly behind the toolbar). Flex column: toolbar takes its own row,
+   `.graph-canvas-body` (ReactFlow + its own absolute overlays) gets the rest. */
+.graph-canvas { height: 100%; display: flex; flex-direction: column; }
+.graph-canvas-body { position: relative; flex: 1; min-height: 0; }
+.graph-toolbar {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  padding: 6px 8px; border-bottom: 1px solid var(--border); background: #fff;
+}
 .graph-toolbar button {
   font-size: 11px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 4px;
   background: rgba(255,255,255,.92); cursor: pointer;
 }
 .graph-toolbar button:hover { border-color: var(--accent); }
+.graph-toolbar button[aria-pressed="true"] { background: var(--accent); color: #fff; border-color: var(--accent); }
+.graph-toolbar-note { font-size: 11px; color: #778; }
+.graph-toolbar-spacer-left { margin-left: auto; }
 /* Swimlanes as vertical columns (elkLayout.ts's partitioned layout) --
    rendered as real, low-z React Flow nodes sized per-band via `style`, so
    they pan/zoom exactly with the content instead of drifting on the first
@@ -75,6 +87,24 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
   overflow: hidden; text-overflow: ellipsis;
 }
 .graph-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #889; }
+
+/* Dismissible key for the color coding -- there was previously no legend
+   anywhere in the UI at all. */
+.graph-legend {
+  position: absolute; top: 8px; right: 8px; z-index: 7; width: 260px;
+  background: #fff; border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; font-size: 11px; box-shadow: 0 2px 10px rgba(28,37,48,.12);
+}
+.graph-legend-title { font-weight: 700; margin-bottom: 6px; }
+.graph-legend ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.graph-legend li { display: flex; gap: 6px; align-items: flex-start; color: #556; line-height: 1.4; }
+.legend-swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; margin-top: 2px; }
+.legend-swatch-columns { background: linear-gradient(90deg, #c9d4e8, #cfe0c9); }
+.legend-swatch-path { background: var(--accent); border-radius: 50%; }
+.legend-swatch-status { background: linear-gradient(90deg, var(--ok), var(--error)); }
+.legend-swatch-verdict { background: var(--ok); border-radius: 50%; }
+.legend-swatch-group { background: #f6f4ff; border: 1px dashed #6b5bd2; }
+.legend-swatch-dim { background: var(--border); opacity: .6; }
 .graph-status {
   position: absolute; top: 44px; left: 50%; transform: translateX(-50%);
   background: rgba(255,255,255,.95); border: 1px solid var(--border); border-radius: 6px;
