@@ -1,6 +1,27 @@
 # PROJECT_STATE.md — `internet`
 
-Updated 2026-08-11. Imported by `CLAUDE.md`. Current state only — not a log.
+Updated 2026-08-12. Imported by `CLAUDE.md`. Current state only — not a log.
+
+## provider fallback
+`discovery/providers/fallback.py`: `FallbackProvider` wraps two real providers;
+every `complete_json`/`search_json` goes to the primary first and a
+`ProviderError` (incl. `UnsupportedCapability`) falls through to the fallback —
+one extra attempt on a different vendor, never a loop; any other exception
+propagates untouched. Built by `get_provider()` when `cfg.provider_fallback`
+(`DISCOVERY_PROVIDER_FALLBACK`, default "" = off; model via
+`DISCOVERY_PROVIDER_FALLBACK_MODEL`, defaulting from `DEFAULT_MODELS`) names a
+provider distinct from the primary; covers the scoring provider AND the
+mission provider (missions.py's `dataclasses.replace` carries the knob).
+`name`/`model`/`last_events` reflect whichever side served the most recent
+call; `trace_sink` assignment mirrors onto both so trace attribution stays
+per-vendor; `preflight()` passes while either side is up. `db.record_usage`
+now drains a wrapper's real providers each under its own name (additive:
+plain providers behave exactly as before). Motivation (2026-08-12): chatgpt.com
+rate-limited (429) the conversation-read endpoint for 30+ min while the
+60s `collect-web` task kept re-hitting it — every tick failed with "empty
+completion"; with `DISCOVERY_PROVIDER_FALLBACK=claude_chat` those ticks would
+have served from the claude.ai tab instead. 10 new `FallbackProviderTests`
+(482 -> 492, all green).
 
 ## trace backbone (step-13 task 1)
 Append-only observability, pure stdlib, off by one env flag. `discovery/schema.sql`

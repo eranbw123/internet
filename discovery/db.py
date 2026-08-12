@@ -675,29 +675,32 @@ def abandoned_notifications(conn, max_attempts):
 
 def record_usage(conn, provider):
     """Persist and reset a provider's in-process token counters (see
-    providers/base.py). Safe to call when nothing was spent."""
-    usage = getattr(provider, "usage", None)
-    if not usage:
-        return
-    conn.execute(
-        """
-        INSERT INTO llm_usage
-            (day, provider, model, calls, input_tokens, output_tokens, web_searches)
-        VALUES (?, ?, ?, ?, ?, ?, ?)
-        ON CONFLICT(day, provider, model) DO UPDATE SET
-            calls         = calls         + excluded.calls,
-            input_tokens  = input_tokens  + excluded.input_tokens,
-            output_tokens = output_tokens + excluded.output_tokens,
-            web_searches  = web_searches  + excluded.web_searches
-        """,
-        (
-            today(), provider.name, provider.model,
-            usage["calls"], usage["input_tokens"],
-            usage["output_tokens"], usage["web_searches"],
-        ),
-    )
-    conn.commit()
-    usage.clear()
+    providers/base.py). Safe to call when nothing was spent. A
+    FallbackProvider exposes its real providers via `providers`; each is
+    drained under its own name/model so spend attribution survives failover."""
+    for p in getattr(provider, "providers", (provider,)):
+        usage = getattr(p, "usage", None)
+        if not usage:
+            continue
+        conn.execute(
+            """
+            INSERT INTO llm_usage
+                (day, provider, model, calls, input_tokens, output_tokens, web_searches)
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(day, provider, model) DO UPDATE SET
+                calls         = calls         + excluded.calls,
+                input_tokens  = input_tokens  + excluded.input_tokens,
+                output_tokens = output_tokens + excluded.output_tokens,
+                web_searches  = web_searches  + excluded.web_searches
+            """,
+            (
+                today(), p.name, p.model,
+                usage["calls"], usage["input_tokens"],
+                usage["output_tokens"], usage["web_searches"],
+            ),
+        )
+        conn.commit()
+        usage.clear()
 
 
 # --- Council-driven search missions (discovery/council.py, discovery/missions.py) --
