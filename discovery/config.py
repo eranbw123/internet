@@ -113,6 +113,12 @@ class Config:
     council_max_consecutive_failures: int = 3    # generation failures before the static fallback kicks in
     mission_provider: str = "chatgpt_browser"    # search-capable provider the tick executes missions with
     mission_model: str = ""                      # resolved from DEFAULT_MODELS at load() time
+    # Second provider tried when the primary raises ProviderError (see
+    # providers/fallback.py). "" (the default) means no fallback; applies to
+    # the scoring provider AND, via missions.py's dataclasses.replace(), the
+    # mission provider.
+    provider_fallback: str = ""
+    provider_fallback_model: str = ""            # resolved from DEFAULT_MODELS at load() time
     # Trace backbone (discovery/trace.py). On by default -- the rollback
     # lever is turning it off, not deleting anything. observatory_base_url
     # is unused by this task (task 1 is storage + instrumentation only) but
@@ -138,6 +144,7 @@ def load():
     load_dotenv(str(REPO_ROOT / ".env"))
     provider = os.environ.get("DISCOVERY_PROVIDER", "claude_chat")
     mission_provider = os.environ.get("DISCOVERY_MISSION_PROVIDER", "chatgpt_browser")
+    provider_fallback = os.environ.get("DISCOVERY_PROVIDER_FALLBACK", "")
     return Config(
         db_path=os.environ.get("DISCOVERY_DB", str(REPO_ROOT / "discovery.db")),
         interests_path=os.environ.get(
@@ -204,6 +211,10 @@ def load():
         mission_provider=mission_provider,
         mission_model=os.environ.get(
             "DISCOVERY_MISSION_MODEL", DEFAULT_MODELS.get(mission_provider, "")
+        ),
+        provider_fallback=provider_fallback,
+        provider_fallback_model=os.environ.get(
+            "DISCOVERY_PROVIDER_FALLBACK_MODEL", DEFAULT_MODELS.get(provider_fallback, "")
         ),
         trace_enabled=os.environ.get("DISCOVERY_TRACE", "1").strip().lower() in ("1", "true"),
         observatory_base_url=os.environ.get("DISCOVERY_OBSERVATORY_BASE_URL", ""),

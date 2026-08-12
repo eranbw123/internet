@@ -47,7 +47,9 @@ from discovery import (
 from discovery.personal_state import PersonalState, PersonalStateError
 from discovery.collectors import COLLECTORS, stocks, web_search, youtube
 from discovery.models import CandidateItem, Interest, ScoreResult
-from discovery.providers import PROVIDERS, chatgpt_browser, claude_chat
+from discovery.providers import (
+    PROVIDERS, FallbackProvider, chatgpt_browser, claude_chat, get_provider,
+)
 from discovery.providers.anthropic_provider import AnthropicProvider
 from discovery.providers.base import LLMProvider, ProviderError, UnsupportedCapability
 from discovery.providers.openai_provider import OpenAIProvider
@@ -7979,6 +7981,146 @@ class TraceRunOnceCollectorItemRootTests(unittest.TestCase):
             "SELECT node_type FROM trace_nodes WHERE id = ?", (edge["to_node_id"],)
         ).fetchone()
         self.assertEqual(candidate_node["node_type"], "candidate")
+
+
+# --- provider fallback (providers/fallback.py) --------------------------------
+
+class _ScriptedProvider(LLMProvider):
+    """Returns canned results, or raises the canned error, and logs calls."""
+
+    def __init__(self, name, error=None):
+        super().__init__(model=f"{name}-model")
+        self.name = name
+        self.error = error
+        self.calls = []
+
+    def complete_json(self, system, prompt, schema, max_tokens=8000):
+        self.calls.append("complete_json")
+        if self.error is not None:
+            raise self.error
+        self.record_usage(input_tokens=3, output_tokens=2)
+        return {"from": self.name}
+
+    def search_json(self, prompt, max_searches=5, max_tokens=16000):
+        self.calls.append("search_json")
+        if self.error is not None:
+            raise self.error
+        self.record_usage(web_searches=1)
+        self.last_events = [{"type": "tool_message", "name": self.name}]
+        return [{"from": self.name}]
+
+    def preflight(self):
+        if self.error is not None:
+            return False, f"{self.name} down"
+        return True, ""
+
+
+class FallbackProviderTests(unittest.TestCase):
+    def _pair(self, primary_error=None, fallback_error=None):
+        primary = _ScriptedProvider("primary", primary_error)
+        backup = _ScriptedProvider("backup", fallback_error)
+        return FallbackProvider(primary, backup), primary, backup
+
+    def test_primary_success_never_touches_the_fallback(self):
+        wrapped, primary, backup = self._pair()
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            out = wrapped.complete_json("s", "p", {})
+        self.assertEqual(out, {"from": "primary"})
+        self.assertEqual(backup.calls, [])
+        self.assertEqual(wrapped.name, "primary")
+        self.assertEqual(wrapped.model, "primary-model")
+
+    def test_provider_error_falls_through_to_the_fallback(self):
+        wrapped, primary, backup = self._pair(primary_error=ProviderError("rate limited"))
+        with mock.patch("sys.stderr", new=io.StringIO()) as err:
+            out = wrapped.complete_json("s", "p", {})
+        self.assertEqual(out, {"from": "backup"})
+        self.assertEqual(primary.calls, ["complete_json"])
+        self.assertIn("falling back to backup", err.getvalue())
+        # name/model/last_events now describe who actually served the call
+        self.assertEqual(wrapped.name, "backup")
+        self.assertEqual(wrapped.model, "backup-model")
+
+    def test_unsupported_capability_borrows_the_fallbacks_search(self):
+        wrapped, _, backup = self._pair(
+            primary_error=UnsupportedCapability("no search here")
+        )
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            out = wrapped.search_json("find things")
+        self.assertEqual(out, [{"from": "backup"}])
+        self.assertEqual(wrapped.last_events, [{"type": "tool_message", "name": "backup"}])
+
+    def test_non_provider_error_propagates_untouched(self):
+        wrapped, _, backup = self._pair(primary_error=ValueError("a bug, not an outage"))
+        with self.assertRaises(ValueError):
+            wrapped.complete_json("s", "p", {})
+        self.assertEqual(backup.calls, [])
+
+    def test_both_failing_surfaces_the_fallbacks_error(self):
+        wrapped, _, _ = self._pair(
+            primary_error=ProviderError("primary down"),
+            fallback_error=ProviderError("backup down too"),
+        )
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            with self.assertRaises(ProviderError) as ctx:
+                wrapped.complete_json("s", "p", {})
+        self.assertIn("backup down too", str(ctx.exception))
+
+    def test_trace_sink_installs_on_both_real_providers(self):
+        wrapped, primary, backup = self._pair()
+        sink = lambda **kw: None  # noqa: E731
+        wrapped.trace_sink = sink
+        self.assertIs(primary.trace_sink, sink)
+        self.assertIs(backup.trace_sink, sink)
+
+    def test_preflight_passes_while_either_side_is_up(self):
+        wrapped, _, _ = self._pair(primary_error=ProviderError("down"))
+        ok, detail = wrapped.preflight()
+        self.assertTrue(ok)
+        self.assertIn("backup ready", detail)
+
+    def test_preflight_fails_only_when_both_sides_are_down(self):
+        wrapped, _, _ = self._pair(
+            primary_error=ProviderError("down"), fallback_error=ProviderError("down")
+        )
+        ok, detail = wrapped.preflight()
+        self.assertFalse(ok)
+        self.assertIn("primary", detail)
+        self.assertIn("backup", detail)
+
+    def test_record_usage_drains_both_providers_under_their_own_names(self):
+        wrapped, primary, backup = self._pair(primary_error=ProviderError("nope"))
+        with mock.patch("sys.stderr", new=io.StringIO()):
+            wrapped.complete_json("s", "p", {})
+        conn = db.connect(":memory:")
+        db.init(conn)
+        self.addCleanup(conn.close)
+        db.record_usage(conn, wrapped)
+        rows = {
+            r["provider"]: dict(r)
+            for r in conn.execute("SELECT * FROM llm_usage").fetchall()
+        }
+        # The failed primary attempt recorded nothing (usage is only bumped on
+        # success in _ScriptedProvider); the serving fallback recorded its call.
+        self.assertEqual(list(rows), ["backup"])
+        self.assertEqual(rows["backup"]["model"], "backup-model")
+        self.assertEqual(rows["backup"]["calls"], 1)
+        self.assertFalse(backup.usage)   # drained
+
+    def test_get_provider_wraps_only_when_a_distinct_fallback_is_configured(self):
+        base = dataclasses.replace(CFG, provider="claude_chat", model="m")
+        self.assertNotIsInstance(get_provider(base), FallbackProvider)
+
+        wrapped = get_provider(dataclasses.replace(
+            base, provider_fallback="chatgpt_browser", provider_fallback_model="latest-high",
+        ))
+        self.assertIsInstance(wrapped, FallbackProvider)
+        self.assertIsInstance(wrapped.primary, claude_chat.ClaudeChatProvider)
+        self.assertIsInstance(wrapped.fallback, chatgpt_browser.ChatGPTBrowserProvider)
+        self.assertEqual(wrapped.fallback.model, "latest-high")
+
+        same = get_provider(dataclasses.replace(base, provider_fallback="claude_chat"))
+        self.assertNotIsInstance(same, FallbackProvider)
 
 
 import importlib.util as _ilu  # noqa: E402
