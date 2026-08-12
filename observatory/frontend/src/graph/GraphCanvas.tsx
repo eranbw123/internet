@@ -20,7 +20,7 @@ function statusClass(status: string | null): string {
 }
 
 function NodeCard({ data }: NodeProps) {
-  const n = data as unknown as PositionedNode & { emphasized: boolean; onExpandToggle?: () => void };
+  const n = data as unknown as PositionedNode & { emphasized: boolean; expanded?: boolean; onExpandToggle?: () => void };
   const isGroup = n.node_type === "group";
   const duration = n.started_at && n.finished_at
     ? `${((new Date(n.finished_at).getTime() - new Date(n.started_at).getTime()) / 1000).toFixed(1)}s`
@@ -28,8 +28,7 @@ function NodeCard({ data }: NodeProps) {
   return (
     <div
       className={`node-card ${statusClass(n.status)} ${n.emphasized ? "emphasized" : ""} ${isGroup ? "node-group" : ""}`}
-      onDoubleClick={n.onExpandToggle}
-      title={isGroup ? "double-click to expand" : undefined}
+      title={isGroup ? `Click to ${n.expanded ? "collapse" : "expand"}` : undefined}
       data-node-id={n.id}
       data-node-type={n.node_type}
     >
@@ -42,7 +41,7 @@ function NodeCard({ data }: NodeProps) {
           db.py's graph() stamps that info into the node's `label` instead
           ("N <child_node_type>", see db.py's group-node construction), which
           is already rendered below, so the type row just says "group" here. */}
-      <div className="node-type">{isGroup ? "group" : n.node_type}</div>
+      <div className="node-type">{isGroup ? `group ${n.expanded ? "▾" : "▸"}` : n.node_type}</div>
       <div className="node-label">{n.label || "(untitled)"}</div>
       {n.summary && <div className="node-summary">{n.summary}</div>}
       <div className="node-meta">
@@ -121,22 +120,48 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
       selectable: false,
       focusable: false,
     }));
-    return laneNodes.concat(layout.nodes.map((n) => ({
-      id: String(n.id),
-      type: "card",
-      position: { x: n.x, y: n.y },
-      data: {
-        ...n,
-        emphasized: emphasizedSet.has(String(n.id)),
-        onExpandToggle: n.node_type === "group"
-          ? () => (expandedKeys.has(String(n.id)) ? collapseGroup(String(n.id)) : expandGroup(String(n.id)))
-          : undefined,
-      },
-      selected: String(n.id) === String(selectedNodeId),
-    })));
+    return laneNodes.concat(layout.nodes.map((n) => {
+      const isGroup = n.node_type === "group";
+      return {
+        id: String(n.id),
+        type: "card",
+        position: { x: n.x, y: n.y },
+        data: {
+          ...n,
+          emphasized: emphasizedSet.has(String(n.id)),
+          expanded: isGroup ? expandedKeys.has(String(n.id)) : undefined,
+          onExpandToggle: isGroup
+            ? () => (expandedKeys.has(String(n.id)) ? collapseGroup(String(n.id)) : expandGroup(String(n.id)))
+            : undefined,
+        },
+        selected: String(n.id) === String(selectedNodeId),
+      };
+    }));
   }, [layout, emphasizedSet, selectedNodeId, expandGroup, collapseGroup, expandedKeys]);
 
   const nodeById = useMemo(() => new Map(display.nodes.map((n) => [String(n.id), n])), [display.nodes]);
+
+  // A group's id is a synthetic pseudo-id (assemble.ts's ExpandedGroups key
+  // shape, "<parent>:<relationship>:<child_node_type>") that never exists in
+  // trace_nodes -- plugin.py's /api/node/<id> route only matches [0-9]+, so
+  // it can't even resolve the URL. Previously only "lane" captions were
+  // excluded from onSelectNode, so a single click on any collapsed group
+  // card (the common case: 5 advisors, 5 peer-reviewers, N match/raw-result
+  // siblings) sent the Inspector to fetch a node id the backend rejects
+  // outright, surfacing as a bare "Not Found" error with no indication the
+  // click even did the right, discoverable thing -- the real action
+  // (expand/collapse) required an undiscoverable double-click instead. Group
+  // cards now expand/collapse on the same single click every other node
+  // selects with.
+  function handleNodeClick(_evt: unknown, node: Node) {
+    if (node.type === "lane") return;
+    const d = node.data as { node_type?: string; onExpandToggle?: () => void };
+    if (d.node_type === "group") {
+      d.onExpandToggle?.();
+    } else {
+      onSelectNode(node.id);
+    }
+  }
 
   const flowEdges: Edge[] = useMemo(
     () => display.edges.map((e, i) => ({
@@ -164,7 +189,7 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
         nodes={flowNodes}
         edges={flowEdges}
         nodeTypes={nodeTypes}
-        onNodeClick={(_evt, node) => node.type !== "lane" && onSelectNode(node.id)}
+        onNodeClick={handleNodeClick}
         fitView
         fitViewOptions={{ padding: 0.05, maxZoom: 1 }}
         panOnScroll
