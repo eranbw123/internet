@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { applyFocus, formatEdgeLabel, labelScore, mergeExpansion } from "./assemble";
-import type { GraphResponse, NodeSummary } from "../types";
+import { applyFocus, extendPath, formatEdgeLabel, labelScore, mergeExpansion } from "./assemble";
+import type { GraphEdge, GraphResponse, NodeSummary } from "../types";
 
 function node(overrides: Partial<NodeSummary>): NodeSummary {
   return {
@@ -100,6 +100,37 @@ describe("labelScore", () => {
   });
 });
 
+describe("extendPath", () => {
+  // Mirrors a real sent discovery's own shape: the backend's own
+  // emphasized_path ends at the score-attempt (id 3); threshold/render/
+  // notification (4, 5, 6) are all downstream of it but weren't on the
+  // backend's path at all.
+  const chain: GraphEdge[] = [
+    { from: 1, to: 2, relationship: "generated", ordinal: null },
+    { from: 2, to: 3, relationship: "scored", ordinal: null },
+    { from: 3, to: 4, relationship: "cleared_threshold", ordinal: null },
+    { from: 4, to: 5, relationship: "rendered", ordinal: null },
+    { from: 5, to: 6, relationship: "sent", ordinal: null },
+  ];
+
+  it("reaches every descendant of the path's last node -- a sent discovery's chain reaches its own notification", () => {
+    expect(extendPath(chain, [1, 2, 3])).toEqual([1, 2, 3, 4, 5, 6]);
+  });
+
+  it("is a no-op when the path's last node is already a leaf", () => {
+    expect(extendPath(chain, [1, 2, 3, 4, 5, 6])).toEqual([1, 2, 3, 4, 5, 6]);
+  });
+
+  it("is a no-op for an empty path", () => {
+    expect(extendPath(chain, [])).toEqual([]);
+  });
+
+  it("never re-adds a node already earlier in the given path (cycle-safe)", () => {
+    const withCycle: GraphEdge[] = [...chain, { from: 6, to: 3, relationship: "retried_as", ordinal: null }];
+    expect(extendPath(withCycle, [1, 2, 3])).toEqual([1, 2, 3, 4, 5, 6]);
+  });
+});
+
 describe("applyFocus", () => {
   it("hides every node off the emphasized path without touching the source graph", () => {
     const g = fixture();
@@ -130,10 +161,18 @@ describe("applyFocus", () => {
 });
 
 describe("formatEdgeLabel", () => {
-  it("renders 'generated <type>' for a generated edge", () => {
-    const label = formatEdgeLabel({ from: 1, to: 2, relationship: "generated", ordinal: 0 }, node({ node_type: "mission" }));
-    expect(label).toBe("generated mission");
-  });
+  // Relationships that merely restate the target card's own type/label --
+  // verified live that painting these on every edge was noise ("matched"
+  // repeated 12x over one expanded group, "generated" on every edge in the
+  // graph) drowning out the labels that actually carry information.
+  // GraphCanvas.tsx turns "" into `label: undefined`.
+  it.each(["generated", "matched", "scored", "normalized_to", "executed", "sent", "rendered", "selected"])(
+    "silences the restating '%s' relationship",
+    (relationship) => {
+      const label = formatEdgeLabel({ from: 1, to: 2, relationship, ordinal: 0 }, node({ node_type: "mission" }));
+      expect(label).toBe("");
+    },
+  );
 
   it("renders 'result #N' (1-indexed) for a returned edge", () => {
     const label = formatEdgeLabel({ from: 1, to: 2, relationship: "returned", ordinal: 3 }, undefined);
@@ -144,7 +183,7 @@ describe("formatEdgeLabel", () => {
     expect(formatEdgeLabel({ from: 1, to: 2, relationship: "duplicate_of", ordinal: null }, undefined)).toBe("duplicate of");
   });
 
-  it("keeps threshold/match/rejection edges to the relationship word (card shows the summary)", () => {
+  it("keeps a cleared_threshold edge to 'cleared threshold' (the card states the actual verdict)", () => {
     const label = formatEdgeLabel(
       { from: 1, to: 20, relationship: "cleared_threshold", ordinal: null },
       node({ summary: "0.84 >= historical threshold 0.75" }),
@@ -152,7 +191,14 @@ describe("formatEdgeLabel", () => {
     expect(label).toBe("cleared threshold");
   });
 
-  it("falls back to a humanized relationship when the target node is missing", () => {
-    expect(formatEdgeLabel({ from: 1, to: 2, relationship: "cleared_threshold", ordinal: null }, undefined)).toBe("cleared threshold");
+  it.each(["rejected", "deferred", "failed"])(
+    "keeps the real branch-outcome relationship '%s' visible, not silenced",
+    (relationship) => {
+      expect(formatEdgeLabel({ from: 1, to: 2, relationship, ordinal: null }, undefined)).toBe(relationship);
+    },
+  );
+
+  it("falls back to a humanized relationship for an unknown one", () => {
+    expect(formatEdgeLabel({ from: 1, to: 2, relationship: "some_future_edge", ordinal: null }, undefined)).toBe("some future edge");
   });
 });

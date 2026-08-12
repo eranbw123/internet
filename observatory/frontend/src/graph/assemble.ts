@@ -98,18 +98,33 @@ export function applyFocus(graph: DisplayGraph, emphasizedPath: ID[], focusMode:
   return { nodes, edges, hiddenCount: graph.nodes.length - nodes.length };
 }
 
-/** Human-readable edge label. The wire format only ever carries a short,
- * fixed relationship word + an optional ordinal (see trace_edges' schema --
- * there is no free-text edge field), so anything more specific ('matched at
- * 0.91', '0.84 >= historical threshold 0.75', 'filtered because ...') comes
- * from the TARGET node's own label/summary, which is where task 1's pipeline
- * wiring puts that text (see PROJECT_STATE.md's pipeline-wiring notes: the
- * threshold/match/prefilter nodes are what actually carry the human
- * sentence, edges only carry the relationship + ordinal that connects them). */
+/** Human-readable edge label -- or "" for relationships that would just
+ * repeat what the target card already says. The wire format only ever
+ * carries a short, fixed relationship word + an optional ordinal (see
+ * trace_edges' schema -- there is no free-text edge field); a first pass at
+ * this function rendered every relationship as a label, and verified live
+ * against a dense real trace that this painted the canvas with clutter --
+ * "matched" repeated 12 times over a single expanded group, "generated"
+ * labeling every edge in the graph, edge labels visually overlapping the
+ * cards they pointed at. Silencing the restating relationships (GraphCanvas
+ * turns "" into `label: undefined` so React Flow doesn't render an empty
+ * pill) let the labels that actually carry information -- which branch
+ * something took, not just that it existed -- read clearly instead of
+ * drowning in repetition. This incidentally also fixes a real artifact: a
+ * "generated" edge into a group pseudo-node rendered literally as
+ * "generated group" (`toNode.node_type` IS `"group"`), never a useful type
+ * name -- now silent like every other `generated` edge. */
 export function formatEdgeLabel(edge: GraphEdge, toNode: NodeSummary | undefined): string {
   switch (edge.relationship) {
     case "generated":
-      return toNode ? `generated ${toNode.node_type}` : "generated";
+    case "matched":
+    case "scored":
+    case "normalized_to":
+    case "executed":
+    case "sent":
+    case "rendered":
+    case "selected":
+      return "";
     case "returned":
       return edge.ordinal !== null && edge.ordinal !== undefined ? `result #${edge.ordinal + 1}` : "returned";
     case "duplicate_of":
@@ -118,24 +133,56 @@ export function formatEdgeLabel(edge: GraphEdge, toNode: NodeSummary | undefined
       return "retried as";
     case "feedback_on":
       return "feedback on";
-    case "normalized_to":
-      return "normalized to";
-    case "matched":
+    case "cleared_threshold":
+      return "cleared threshold";
     case "rejected":
     case "deferred":
-    case "cleared_threshold":
-    case "scored":
-    case "sent":
     case "failed":
-    case "selected":
-    case "executed":
-      // The target card already renders its own label/summary -- repeating it
-      // on the edge painted long unreadable text strips across the canvas, so
-      // the edge carries only the relationship word.
-      return edge.relationship.replace(/_/g, " ");
+      // Real branch outcomes (this candidate/score took a DIFFERENT path
+      // than the happy one), not restatements -- stay visible.
+      return edge.relationship;
     default:
       return edge.relationship.replace(/_/g, " ");
   }
+}
+
+/** The backend's own `emphasized_path` (see observatory/db.py's graph())
+ * stops at whatever entity the seed resolved to -- for a candidate/score
+ * seed that's the score-attempt, one hop short of the part the owner
+ * actually cares about: did it clear the threshold, and did it reach
+ * Telegram? Verified live on a real SENT discovery: the backend path ended
+ * at "score-attempt", leaving the threshold pass, the render, and the
+ * notification all unhighlighted and outside Focus mode -- "the discovery's
+ * route" told an incomplete story for the one case (a delivered item) where
+ * the full story is the whole point. Extending forward from the path's own
+ * last node (BFS over every outbound edge, since the trace graph is a DAG
+ * in practice) is safe and general: for a candidate/score seed it reaches
+ * exactly threshold -> render -> notification (verified); for an
+ * interest/match seed the path already ends at a leaf, so this is a no-op
+ * (verified). Pure and DOM-free so it's unit-testable without a graph
+ * instance. */
+export function extendPath(edges: GraphEdge[], path: ID[]): ID[] {
+  if (path.length === 0) return path;
+  const outByFrom = new Map<string, ID[]>();
+  for (const e of edges) {
+    const key = String(e.from);
+    if (!outByFrom.has(key)) outByFrom.set(key, []);
+    outByFrom.get(key)!.push(e.to);
+  }
+  const visited = new Set(path.map(String));
+  const extended = [...path];
+  const queue = [path[path.length - 1]];
+  while (queue.length) {
+    const current = queue.shift()!;
+    for (const next of outByFrom.get(String(current)) ?? []) {
+      const key = String(next);
+      if (visited.has(key)) continue;
+      visited.add(key);
+      extended.push(next);
+      queue.push(next);
+    }
+  }
+  return extended;
 }
 
 /** node_type -> display order for the six named swimlanes; anything else

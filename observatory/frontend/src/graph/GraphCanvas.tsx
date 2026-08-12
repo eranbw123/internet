@@ -35,15 +35,45 @@ function groupCaption(label: string | null, childCount: number | undefined): str
   return `${count} ${count === 1 ? noun : `${noun}s`}`;
 }
 
+// pipeline.py stamps a threshold node's label as "{score:.3f} vs {bar:.3f}"
+// (see discovery/pipeline.py's threshold_node construction) -- the single
+// most important decision in the pipeline (did this clear the bar?)
+// otherwise lived only in a small, easily-missed edge label
+// (cleared_threshold vs rejected). Parsed straight from the label itself
+// (score >= bar) rather than cross-referencing the inbound edge: simpler,
+// and correct regardless of whether that edge happens to be present in
+// whatever's currently displayed (e.g. mid-focus-mode filtering).
+function thresholdVerdict(label: string | null): { text: string; passed: boolean } | null {
+  const m = /^([\d.]+)\s+vs\s+([\d.]+)$/.exec(label || "");
+  if (!m) return null;
+  const passed = parseFloat(m[1]) >= parseFloat(m[2]);
+  return { text: `${passed ? "✓" : "✕"} ${m[1]} ${passed ? "≥" : "<"} ${m[2]}`, passed };
+}
+
+// Full ISO timestamps ("2026-08-12T07:56:58+00:00") ate roughly half of a
+// card's already-tight meta row for a date the card's own position in the
+// graph already conveys ("today," implicitly) -- the Inspector's Overview
+// tab keeps the full timestamp for whoever actually needs the date.
+function shortTime(iso: string | null): string | null {
+  const m = /T(\d\d:\d\d:\d\d)/.exec(iso || "");
+  return m ? m[1] : iso;
+}
+
 function NodeCard({ data }: NodeProps) {
   const n = data as unknown as PositionedNode & { emphasized: boolean; expanded?: boolean; onExpandToggle?: () => void };
   const isGroup = n.node_type === "group";
+  const verdict = n.node_type === "threshold" ? thresholdVerdict(n.label) : null;
   const duration = n.started_at && n.finished_at
     ? `${((new Date(n.finished_at).getTime() - new Date(n.started_at).getTime()) / 1000).toFixed(1)}s`
     : null;
   return (
     <div
-      className={`node-card ${statusClass(n.status)} ${n.emphasized ? "emphasized" : ""} ${isGroup ? "node-group" : ""} ${isGroup && n.expanded ? "node-group-expanded" : ""}`}
+      className={[
+        "node-card", statusClass(n.status), n.emphasized ? "emphasized" : "",
+        isGroup ? "node-group" : "", isGroup && n.expanded ? "node-group-expanded" : "",
+        verdict ? (verdict.passed ? "threshold-pass" : "threshold-fail") : "",
+        n.node_type === "raw-result-dropped" || n.node_type === "duplicate" ? "node-dimmed" : "",
+      ].filter(Boolean).join(" ")}
       title={isGroup ? `Click to ${n.expanded ? "collapse" : "expand"}` : undefined}
       data-node-id={n.id}
       data-node-type={n.node_type}
@@ -54,12 +84,14 @@ function NodeCard({ data }: NodeProps) {
       <Handle type="target" position={Position.Left} isConnectable={false} />
       <Handle type="source" position={Position.Right} isConnectable={false} />
       <div className="node-type">{isGroup ? (n.expanded ? "▾ collapse" : "▸ expand") : n.node_type}</div>
-      <div className="node-label">{isGroup ? groupCaption(n.label, n.child_count) : (n.label || "(untitled)")}</div>
+      <div className="node-label">
+        {isGroup ? groupCaption(n.label, n.child_count) : (verdict ? verdict.text : (n.label || "(untitled)"))}
+      </div>
       {n.summary && <div className="node-summary">{n.summary}</div>}
       <div className="node-meta">
         {n.status && <span className="node-status">{n.status}</span>}
         {duration && <span className="node-duration">{duration}</span>}
-        {n.started_at && <span className="node-time">{n.started_at}</span>}
+        {n.started_at && <span className="node-time">{shortTime(n.started_at)}</span>}
       </div>
     </div>
   );
@@ -235,7 +267,10 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
       id: `${e.from}-${e.to}-${e.relationship}-${i}`,
       source: String(e.from),
       target: String(e.to),
-      label: formatEdgeLabel(e, nodeById.get(String(e.to))),
+      // "" (a restating relationship, see assemble.ts's formatEdgeLabel)
+      // becomes undefined so React Flow skips rendering an empty label pill
+      // rather than a blank rounded rect floating on the edge.
+      label: formatEdgeLabel(e, nodeById.get(String(e.to))) || undefined,
       animated: false,
       className: emphasizedSet.has(String(e.from)) && emphasizedSet.has(String(e.to)) ? "edge-emphasized" : "",
     })),

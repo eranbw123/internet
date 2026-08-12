@@ -87,7 +87,7 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
   background: #fff; box-shadow: 0 1px 2px rgba(28,37,48,.08);
   padding: 6px 8px; font-size: 11px; width: 100%; height: 100%; overflow: hidden;
 }
-.node-card.emphasized { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(47,111,235,.3); }
+.node-card.emphasized { border-color: var(--accent); border-left-color: var(--accent); box-shadow: 0 0 0 2px rgba(47,111,235,.3); }
 .node-card.status-active { border-left-color: var(--active); }
 .node-card.status-error { border-left-color: var(--error); background: #fff6f5; }
 .node-card.status-ok { border-left-color: var(--ok); }
@@ -95,6 +95,17 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .node-card.node-group-expanded { overflow: visible; }
 .node-group .node-type { font-weight: 700; color: #6b5bd2; }
 .node-group .node-label { color: #4a3fa8; }
+/* The threshold card's own verdict (assemble.ts/GraphCanvas.tsx's
+   thresholdVerdict) -- previously this decision lived only in a small,
+   easy-to-miss edge label. Comes after the generic .status-ok/-error rules
+   above so it wins the cascade on the (usual) case where a threshold node's
+   execution status is "ok" regardless of which way the score fell. */
+.node-card.threshold-pass { border-left-color: var(--ok); }
+.node-card.threshold-fail { border-left-color: var(--error); background: #fff6f5; }
+/* Dead ends -- a duplicate or a dropped search result never went anywhere
+   else in the pipeline -- recede instead of competing visually with the
+   branch that actually led somewhere. */
+.node-card.node-dimmed { opacity: .55; }
 .node-type { font-size: 9px; text-transform: uppercase; letter-spacing: .04em; color: #98a2b0; }
 .node-label { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .node-summary { color: #556; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
@@ -114,7 +125,7 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .node-chip.emphasized { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(47,111,235,.3); }
 /* Scope to the path: the class lands on the edge's whole <g>, and a bare
    stroke there also paints the label's background rect blue. */
-.edge-emphasized .react-flow__edge-path { stroke: var(--accent) !important; stroke-width: 2 !important; }
+.edge-emphasized .react-flow__edge-path { stroke: var(--accent) !important; stroke-width: 2.5 !important; }
 
 /* Edge anchors exist only so React Flow can draw edges -- keep them as
    near-invisible dots, and never show the "connectable" cursor. */

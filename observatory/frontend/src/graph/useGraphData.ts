@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { fetchChildren, fetchGraph } from "../api";
 import type { GraphResponse, ID } from "../types";
-import { applyFocus, mergeExpansion, type ExpandedGroups } from "./assemble";
+import { applyFocus, extendPath, mergeExpansion, type ExpandedGroups } from "./assemble";
 
 export interface GraphSeed {
   entity_type?: string;
@@ -87,16 +87,24 @@ export function useGraphData(seed: GraphSeed | null) {
     () => (base ? mergeExpansion(base, expanded) : { nodes: [], edges: [] }),
     [base, expanded],
   );
+  // Extended forward from the backend's own path to wherever it actually
+  // ends up (see assemble.ts's extendPath) -- for a sent discovery this is
+  // the difference between "the route stops at the score" and "the route
+  // reaches Telegram".
+  const extendedPath = useMemo(
+    () => (base ? extendPath(merged.edges, base.emphasized_path) : ([] as ID[])),
+    [base, merged.edges],
+  );
   const focused = useMemo(
-    () => (base ? applyFocus(merged, base.emphasized_path, focusMode) : { nodes: [], edges: [], hiddenCount: 0 }),
-    [base, merged, focusMode],
+    () => (base ? applyFocus(merged, extendedPath, focusMode) : { nodes: [], edges: [], hiddenCount: 0 }),
+    [base, merged, extendedPath, focusMode],
   );
 
   return {
     base, loading, error, expanded, focusMode, setFocusMode,
     expandGroup, collapseGroup, expandAll, reload,
     display: focused,
-    emphasizedPath: base?.emphasized_path ?? ([] as ID[]),
+    emphasizedPath: extendedPath,
     focusNodeId: base?.focus_node_id ?? null,
   };
 }
