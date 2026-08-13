@@ -125,7 +125,14 @@ def check(conn, cfg, provider=None):
     jobs.append(_job_status(conn, "digest", DIGEST_INTERVAL_SECONDS, cfg.health_stale_factor))
     jobs.append(_job_status(conn, "feedback", None, cfg.health_stale_factor))
 
-    if provider is None:
+    # While paused (see __main__.PAUSE_GATED) the gated jobs deliberately
+    # don't run, so their growing heartbeat age is the intended state, not an
+    # incident -- and nothing spends, so provider reachability doesn't matter
+    # either (skipping it also avoids preflight's CDP touch during a freeze).
+    paused = db.state_get(conn, "paused") == "1"
+    if paused:
+        provider_ok, provider_detail = None, "not checked (paused)"
+    elif provider is None:
         provider_ok, provider_detail = None, "not checked"
     else:
         try:
@@ -146,8 +153,10 @@ def check(conn, cfg, provider=None):
     # indefinitely, and the required one-time recovery message could never
     # fire.
     abandoned = db.abandoned_notifications(conn, cfg.send_max_attempts)
-    degraded = bool(any(job["stale"] for job in jobs) or provider_ok is False)
+    degraded = not paused and bool(any(job["stale"] for job in jobs) or provider_ok is False)
     return {
+        "paused": paused,
+        "paused_why": db.state_get(conn, "paused_why") or "",
         "jobs": jobs,
         "provider_ok": provider_ok,
         "provider_detail": provider_detail,
@@ -161,6 +170,12 @@ def check(conn, cfg, provider=None):
 
 def format_report(result):
     lines = ["HEALTH"]
+    if result.get("paused"):
+        why = result.get("paused_why") or ""
+        lines.append(
+            "  PAUSED" + (f" ({why})" if why else "")
+            + " -- run-once/web-tick/digest skip; `python -m app resume` lifts it"
+        )
     for job in result["jobs"]:
         age = "never" if job["age_seconds"] is None else f"{job['age_seconds'] / 3600:.1f}h ago"
         flag = ""
@@ -172,7 +187,7 @@ def format_report(result):
         lines.append(line)
 
     if result["provider_ok"] is None:
-        provider_line = "not checked"
+        provider_line = result.get("provider_detail") or "not checked"
     elif result["provider_ok"]:
         provider_line = "ok"
     else:
