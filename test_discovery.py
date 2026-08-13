@@ -4677,7 +4677,54 @@ class CLITests(unittest.TestCase):
         self.assertEqual(code, 2)
         self.assertIn("unknown provider 'bogus'", err)
 
-    def test_personal_state_probe_survives_an_off_contract_generated_at(self):
+    def test_pause_gates_the_spending_commands_without_touching_a_provider(self):
+        code, out, _err = self._main("pause", "--why", "token budget")
+        self.assertEqual(code, 0)
+        self.assertIn("paused", out)
+        # The gate must fire before the provider() closure ever constructs
+        # anything -- a paused tick that still builds a provider would defeat
+        # the point of the freeze on machines where construction has side
+        # effects (CDP probes, key checks).
+        with mock.patch(
+            "discovery.providers.get_provider",
+            side_effect=AssertionError("provider built while paused"),
+        ):
+            for command in ("run-once", "web-tick", "digest"):
+                code, out, _err = self._main(command)
+                self.assertEqual(code, 0)
+                self.assertIn("paused (token budget)", out)
+                self.assertIn(f"{command} skipped", out)
+
+    def test_resume_lifts_the_pause_gate(self):
+        self._main("pause")
+        code, out, _err = self._main("resume")
+        self.assertEqual(code, 0)
+        self.assertIn("resumed", out)
+        # digest is the safe probe: no provider needed, empty DB sends nothing.
+        code, out, _err = self._main("digest")
+        self.assertEqual(code, 0)
+        self.assertIn("sent 0 digest item(s)", out)
+
+    def test_health_while_paused_is_not_degraded_and_skips_the_provider(self):
+        self._main("pause", "--why", "token budget")
+        conn = db.connect(self.db_path)
+        db.init(conn)
+        # A month-stale heartbeat would normally flip `degraded` (exit 1).
+        db.state_set(conn, "job:web:last_ok", db.ago(30 * 24 * 3600))
+        conn.close()
+        code, out, _err = self._main("health")
+        self.assertEqual(code, 0)
+        self.assertIn("PAUSED (token budget)", out)
+        self.assertIn("not checked (paused)", out)
+        self.assertIn("overall: OK", out)
+        # And the same stale heartbeat degrades again once resumed (provider
+        # still skipped: patched to None via a fake that never preflights).
+        self._main("resume")
+        conn = db.connect(self.db_path)
+        db.init(conn)
+        result = health.check(conn, config.load(), provider=None)
+        conn.close()
+        self.assertTrue(result["degraded"])
         # valid JSON, valid v1 shape, but generated_at that isn't a proper
         # "Z"-suffixed UTC timestamp must fall back to "age unknown" rather
         # than tracebacking on offset-naive/None subtraction.
@@ -5341,6 +5388,16 @@ class InstallTasksTests(unittest.TestCase):
         self.assertIn("StartWhenAvailable>true<", xml)
         self.assertIn("InteractiveToken", xml)
         self.assertIn("IgnoreNew", xml)
+
+    def test_action_launches_hidden_via_wscript(self):
+        # InteractiveToken console actions flash a cmd window on every
+        # trigger; the action must go through wscript + ops/hidden.vbs
+        # (GUI-subsystem host, hidden child window) instead.
+        for task in install_tasks.build_tasks(CFG):
+            xml = install_tasks.render_xml(task)
+            self.assertIn("wscript.exe</Command>", xml)
+            self.assertIn("hidden.vbs", xml)
+            self.assertIn("cmd.exe /d /c", xml)
 
     def test_dry_run_install_spawns_no_process(self):
         calls = []
