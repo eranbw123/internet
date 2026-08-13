@@ -1,6 +1,6 @@
 {
   "defaults": {
-    "min_score": 0.7,
+    "min_score": 0.78,
     "sources": [
       "web_search"
     ]
@@ -24,7 +24,7 @@
         "supplement marketing",
         "press release with no useful numbers"
       ],
-      "min_score": 0.64,
+      "min_score": 0.72,
       "sources": [
         "web_search",
         "youtube"
@@ -69,7 +69,7 @@
         "generic orexin explainer",
         "sleep supplement orexin booster"
       ],
-      "min_score": 0.62,
+      "min_score": 0.7,
       "source_config": {
         "web_search": {
           "limit": 2,
@@ -93,7 +93,7 @@
         "supplement wakefulness stack",
         "generic stimulant overview"
       ],
-      "min_score": 0.65,
+      "min_score": 0.73,
       "source_config": {
         "web_search": {
           "limit": 2,
@@ -117,7 +117,7 @@
         "generic medication warning",
         "forum anecdote presented as evidence"
       ],
-      "min_score": 0.68,
+      "min_score": 0.76,
       "source_config": {
         "web_search": {
           "limit": 2,
@@ -141,7 +141,7 @@
         "consumer sleep tracker review",
         "diagnostic marketing with no validation"
       ],
-      "min_score": 0.7,
+      "min_score": 0.78,
       "source_config": {
         "web_search": {
           "limit": 2,
@@ -166,7 +166,7 @@
         "personality explanation of attention",
         "unvalidated online ADHD test"
       ],
-      "min_score": 0.66,
+      "min_score": 0.74,
       "sources": [
         "web_search"
       ],
@@ -193,7 +193,7 @@
         "discipline productivity content",
         "dopamine detox"
       ],
-      "min_score": 0.7,
+      "min_score": 0.78,
       "source_config": {
         "web_search": {
           "limit": 2,
@@ -217,7 +217,7 @@
         "brainwave wellness product",
         "generic neuroscience explainer"
       ],
-      "min_score": 0.72,
+      "min_score": 0.8,
       "source_config": {
         "web_search": {
           "limit": 2,
@@ -242,7 +242,7 @@
         "single gesture means",
         "pop psychology self-help"
       ],
-      "min_score": 0.69,
+      "min_score": 0.77,
       "sources": [
         "web_search"
       ],
@@ -270,7 +270,7 @@
         "zodiac attraction",
         "single cue proves attraction"
       ],
-      "min_score": 0.71,
+      "min_score": 0.79,
       "source_config": {
         "web_search": {
           "limit": 2,
@@ -295,7 +295,7 @@
         "mirror body language advice",
         "hypnosis sensationalism"
       ],
-      "min_score": 0.7,
+      "min_score": 0.78,
       "source_config": {
         "web_search": {
           "limit": 2,
@@ -320,7 +320,7 @@
         "manipulation tips",
         "dark psychology hacks"
       ],
-      "min_score": 0.72,
+      "min_score": 0.8,
       "source_config": {
         "web_search": {
           "limit": 2,
@@ -344,7 +344,7 @@
         "office politics listicle",
         "power pose presented uncritically"
       ],
-      "min_score": 0.72,
+      "min_score": 0.8,
       "source_config": {
         "web_search": {
           "limit": 2,
@@ -368,7 +368,7 @@
         "generic statistics explainer",
         "culture-war treatment of psychology"
       ],
-      "min_score": 0.74,
+      "min_score": 0.82,
       "source_config": {
         "web_search": {
           "limit": 2,
@@ -392,7 +392,7 @@
         "therapy testimonial",
         "trauma healing influencer content"
       ],
-      "min_score": 0.7,
+      "min_score": 0.78,
       "sources": [
         "web_search"
       ],
@@ -420,7 +420,7 @@
         "productivity influencer study routine",
         "mnemonic marketing"
       ],
-      "min_score": 0.71,
+      "min_score": 0.79,
       "sources": [
         "web_search"
       ],
@@ -447,7 +447,7 @@
         "IQ hack",
         "generic memory tips"
       ],
-      "min_score": 0.72,
+      "min_score": 0.8,
       "source_config": {
         "web_search": {
           "limit": 2,
@@ -471,7 +471,7 @@
         "aesthetic note-taking",
         "mind map template"
       ],
-      "min_score": 0.7,
+      "min_score": 0.78,
       "source_config": {
         "web_search": {
           "limit": 2,
@@ -495,7 +495,7 @@
         "PKM productivity workflow",
         "second brain influencer content"
       ],
-      "min_score": 0.68,
+      "min_score": 0.76,
       "sources": [
         "web_search"
       ],
@@ -522,7 +522,7 @@
         "generic RAG tutorial",
         "CRM conversation summary"
       ],
-      "min_score": 0.66,
+      "min_score": 0.74,
       "source_config": {
         "web_search": {
           "limit": 2,
@@ -547,7 +547,7 @@
         "collaborative filtering 101",
         "marketing personalization article"
       ],
-      "min_score": 0.65,
+      "min_score": 0.73,
       "sources": [
         "web_search"
       ],
@@ -575,7 +575,7 @@
         "technical analysis",
         "pump newsletter"
       ],
-      "min_score": 0.6,
+      "min_score": 0.68,
       "sources": [
         "web_search",
         "stocks"
@@ -612,7 +612,7 @@
         "datacenter REIT listicle",
         "stock recommendation with no operating model"
       ],
-      "min_score": 0.66,
+      "min_score": 0.74,
       "sources": [
         "web_search",
         "stocks"
@@ -664,7 +664,7 @@
         "memory market overview with no numbers",
         "PC memory product review"
       ],
-      "min_score": 0.68,
+      "min_score": 0.76,
       "sources": [
         "stocks"
       ],
@@ -696,7 +696,7 @@
         "fiber optic consumer product",
         "AI stock basket with no supply-chain detail"
       ],
-      "min_score": 0.68,
+      "min_score": 0.76,
       "sources": [
         "stocks"
       ],
@@ -743,7 +743,7 @@
         "concept render with no hardware",
         "generic humanoid market forecast"
       ],
-      "min_score": 0.68,
+      "min_score": 0.76,
       "sources": [
         "web_search"
       ],
@@ -771,7 +771,7 @@
         "cheap stock screen",
         "technical analysis"
       ],
-      "min_score": 0.72,
+      "min_score": 0.8,
       "source_config": {
         "web_search": {
           "limit": 2,
@@ -797,7 +797,7 @@
         "futurism speculation",
         "popular science explainer of established fact"
       ],
-      "min_score": 0.76,
+      "min_score": 0.84,
       "sources": [
         "web_search"
       ],
@@ -824,7 +824,7 @@
         "systems thinking self-help",
         "metaphor with no model or data"
       ],
-      "min_score": 0.75,
+      "min_score": 0.83,
       "source_config": {
         "web_search": {
           "limit": 2,
@@ -849,7 +849,7 @@
         "streaming release roundup",
         "horror recommendation based only on gore"
       ],
-      "min_score": 0.74,
+      "min_score": 0.82,
       "sources": [
         "web_search"
       ],
@@ -877,7 +877,7 @@
         "franchise news",
         "romance-first genre fiction"
       ],
-      "min_score": 0.76,
+      "min_score": 0.84,
       "source_config": {
         "web_search": {
           "limit": 2,
@@ -901,7 +901,7 @@
         "university marketing",
         "social worker career overview"
       ],
-      "min_score": 0.72,
+      "min_score": 0.8,
       "sources": [
         "web_search"
       ],
@@ -928,7 +928,7 @@
         "degree marketing page",
         "broad career prospects article"
       ],
-      "min_score": 0.74,
+      "min_score": 0.82,
       "sources": [
         "web_search"
       ],
