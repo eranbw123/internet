@@ -480,30 +480,6 @@
       }
     },
     {
-      "key": "ai-tutoring-learning",
-      "title": "AI tutoring and human-AI learning systems",
-      "description": "Evidence on LLM tutoring, adaptive explanation, conversational learning, automated feedback and AI-generated study material. Prefer randomized or well-controlled outcomes showing what actually improves learning, retention or transfer, and architecture ideas for systems that adapt to a person's cognitive constraints rather than merely generating summaries.",
-      "positive_signals": [
-        "LLM tutor randomized learning outcomes",
-        "AI tutoring adaptive learning",
-        "conversational tutor retention transfer",
-        "generative AI education experiment",
-        "personalized tutoring language model"
-      ],
-      "negative_signals": [
-        "AI will transform education opinion",
-        "prompt list for students",
-        "AI cheating discourse with no learning data"
-      ],
-      "min_score": 0.78,
-      "source_config": {
-        "web_search": {
-          "limit": 2,
-          "max_searches": 1
-        }
-      }
-    },
-    {
       "key": "personal-knowledge-graphs",
       "title": "Personal knowledge graphs, semantic archives and external memory",
       "description": "Technical systems for turning a large personal corpus into a compact, navigable external memory: semantic clustering, hierarchical topic graphs, embeddings, graph construction, retrieval, entity linking, temporal summaries and incremental compression. Especially interested in conversation-history archives and designs that preserve nuance while aggressively reducing context size.",
@@ -775,38 +751,6 @@
         "web_search": {
           "limit": 2,
           "max_searches": 2
-        }
-      }
-    },
-    {
-      "key": "precision-sensing-vpg",
-      "title": "VPG / precision sensing / force and measurement",
-      "description": "Vishay Precision Group and the broader precision-sensing layer of Physical AI: load cells, force/torque measurement, strain gauges, weighing, advanced sensors and how robotics, automation or semiconductor demand can change mix, margins and addressable market. Especially interested in customer wins, qualification cycles, capacity, margin structure and evidence that high-value sensing is becoming a bottleneck.",
-      "positive_signals": [
-        "VPG Vishay Precision Group sensors",
-        "force torque sensor robotics",
-        "load cell strain gauge automation",
-        "precision sensing robotics margin",
-        "VPG customer qualification"
-      ],
-      "negative_signals": [
-        "Vishay Intertechnology confused with VPG",
-        "generic sensor market forecast",
-        "price target only"
-      ],
-      "min_score": 0.7,
-      "sources": [
-        "stocks"
-      ],
-      "source_config": {
-        "stocks": {
-          "tickers": [
-            {
-              "ticker": "VPG",
-              "daily_percent_move": 7,
-              "weekly_percent_move": 14
-            }
-          ]
         }
       }
     },
