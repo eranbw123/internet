@@ -352,6 +352,71 @@ class ObservatoryE2EDesktopTests(_E2EFixture, unittest.TestCase):
         # the expansion (the group returns, its children hide again).
         self.wait_for(f"document.querySelectorAll('.node-chip').length < {after_expand}")
 
+    def test_02b_expand_preserves_viewport(self):
+        """Expanding a group must not throw the camera back to fit-all.
+
+        The refit used to be keyed on `layout.nodes.length`, so every expansion
+        counted as "a new graph" and refitted: measured live as zoom 1.366 ->
+        scale(0.1486) the instant a group opened, i.e. the user lost their
+        place every time they asked for more detail. The camera now only
+        refits on a new seed, and the toggled group is anchored so it stays
+        put in screen space while everything else reflows around it.
+        """
+        self.set_viewport(DESKTOP_VIEWPORT)
+        self.navigate("/observatory/")
+        self.wait_for("document.querySelectorAll('.explorer-row').length > 0")
+        self.click(".explorer-row")
+        self.wait_for("document.querySelectorAll('.node-card').length > 0")
+        if not self.js("!!document.querySelector('.node-group')"):
+            self.skipTest("this discovery's own trace has no sibling set past COLLAPSE_THRESHOLD to expand")
+
+        # Zoom away from the fitted default so a refit would be unmistakable.
+        for _ in range(3):
+            self.click(".react-flow__controls-zoomin")
+        before = self.stable_group_frame()
+
+        chips = self.js("document.querySelectorAll('.node-chip').length")
+        self.click(".node-group")
+        self.wait_for(f"document.querySelectorAll('.node-chip').length > {chips}", message="expand added chips")
+        after = self.stable_group_frame()
+
+        # Zoom is the tell for a refit: fit-all on this graph lands near 0.15,
+        # roughly a tenth of where three zoom-ins leave us.
+        self.assertAlmostEqual(
+            before["scale"], after["scale"], places=3,
+            msg=f"expanding a group changed zoom {before['scale']} -> {after['scale']} (refit regression)",
+        )
+        # And the group itself stays under the pointer: we anchor its top-left,
+        # since the card legitimately grows downward/rightward to hold chips.
+        self.assertLess(abs(after["left"] - before["left"]), 8.0, f"group drifted horizontally: {before} -> {after}")
+        self.assertLess(abs(after["top"] - before["top"]), 8.0, f"group drifted vertically: {before} -> {after}")
+
+    def stable_group_frame(self):
+        """Zoom + the group's screen-space top-left, once React Flow's own
+        transition has settled (both the zoom control and our anchoring are
+        animated/rAF-batched, so a single sample races them)."""
+        expr = """
+            (() => {
+              const vp = document.querySelector('.react-flow__viewport');
+              const g = document.querySelector('.node-group');
+              if (!vp || !g) return null;
+              const m = /scale\\(([-0-9.]+)\\)/.exec(vp.style.transform || '');
+              const r = g.getBoundingClientRect();
+              return {scale: m ? parseFloat(m[1]) : null, left: r.left, top: r.top};
+            })()
+        """
+        previous = None
+        deadline = time.time() + 10
+        while time.time() < deadline:
+            current = self.js(expr)
+            if current and previous and all(
+                abs(current[k] - previous[k]) < 0.01 for k in ("scale", "left", "top")
+            ):
+                return current
+            previous = current
+            time.sleep(0.25)
+        raise TimeoutError(f"group frame never settled; last={previous!r}")
+
     def test_03_pan_zoom(self):
         self.set_viewport(DESKTOP_VIEWPORT)
         self.navigate("/observatory/")

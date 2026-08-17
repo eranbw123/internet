@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   Background, Controls, Handle, MarkerType, MiniMap, Position, ReactFlow,
   ReactFlowProvider, useReactFlow,
@@ -165,6 +165,16 @@ function LaneBandNode({ data }: NodeProps) {
 
 const nodeTypes = { card: NodeCard, chip: ChipNode, laneBand: LaneBandNode };
 
+/** Run `fn` once React Flow has measured and painted the nodes we just handed
+ * it. See the layout effect for why two rAFs (and not a bare timer). */
+function afterPaint(fn: () => void): void {
+  setTimeout(() => {
+    requestAnimationFrame(() => {
+      requestAnimationFrame(fn);
+    });
+  }, 30);
+}
+
 interface Props {
   seed: GraphSeed | null;
   selectedNodeId: ID | null;
@@ -179,42 +189,67 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
   } = useAugmentedGraphData(graphData);
   const [layout, setLayout] = useState<LayoutResult | null>(null);
   const [showLegend, setShowLegend] = useState(false);
-  const { fitView } = useReactFlow();
+  const { fitView, getViewport, setViewport } = useReactFlow();
   const seedKey = seed ? JSON.stringify(seed) : null;
+
+  // Which seed we have already framed. Refitting is keyed on this rather than
+  // on the node count: expanding a group changes the count, and keying the
+  // refit on the count meant every expansion threw the camera back to fit-all
+  // (measured: zoomed to scale 1.366, expanded a group 96 -> 101 nodes,
+  // viewport snapped to translate(17.78px, 142.12px) scale(0.1486)). The
+  // original reason for including the count -- that switching between two
+  // DIFFERENT graphs of the SAME size must still refit -- is served by the
+  // seed key alone, which is what actually identifies "a different graph".
+  const fittedSeedRef = useRef<string | null>(null);
+  // Set just before a group toggle so the layout that follows can keep that
+  // group pinned under the cursor instead of letting the graph reflow away.
+  const anchorRef = useRef<{ id: string; x: number; y: number } | null>(null);
+  // Set by deliberate view changes (the focus toggle) that SHOULD refit.
+  const refitNextRef = useRef(false);
 
   useEffect(() => {
     let cancelled = false;
     (async () => {
       const elk = await defaultElk();
       const result = await computeLayout(display, elk);
-      if (!cancelled) setLayout(result);
+      if (cancelled) return;
+      setLayout(result);
+
+      const anchor = anchorRef.current;
+      anchorRef.current = null;
+      const deliberateRefit = refitNextRef.current;
+      refitNextRef.current = false;
+      const isNewSeed = seedKey !== fittedSeedRef.current;
+      // Only claim the seed as framed once it actually has nodes, so an
+      // intermediate empty/loading layout can't swallow the real one's fit.
+      if (isNewSeed && result.nodes.length > 0) fittedSeedRef.current = seedKey;
+
+      // The double-rAF -- not a bare timer -- is what fixes the measurement
+      // flake: it was reproduced live as a race between React Flow's internal
+      // node re-measurement and a bare setTimeout, which sometimes ran before
+      // React Flow had measured the new nodes' real DOM size, leaving the
+      // viewport transform byte-identical to the previous graph's. Two rAFs
+      // guarantee at least one full paint has happened first. Viewport writes
+      // are batched the same way, so anchoring goes through it too.
+      afterPaint(() => {
+        if (cancelled) return;
+        if (isNewSeed || deliberateRefit) {
+          fitView({ duration: 200, padding: 0.05, maxZoom: 1 });
+          return;
+        }
+        if (!anchor) return; // e.g. "Expand all": no single anchor, keep the viewport verbatim
+        const moved = result.nodes.find((n) => String(n.id) === anchor.id);
+        if (!moved) return;
+        // Counter-translate by however far the anchored group drifted, in
+        // screen space, so the card grows in place under the pointer.
+        const { x, y, zoom } = getViewport();
+        setViewport({ x: x - (moved.x - anchor.x) * zoom, y: y - (moved.y - anchor.y) * zoom, zoom });
+      });
     })();
     return () => {
       cancelled = true;
     };
-  }, [display]);
-
-  // Deterministic refit, keyed on the seed + node count rather than a bare
-  // node-count-only key: switching between two graphs of the SAME size
-  // (reproduced live: 37 nodes -> 65 nodes -> back to a different 37-node
-  // graph) must still refit even though `layout.nodes.length` alone
-  // wouldn't change. The double-rAF -- not a bare timer -- is what actually
-  // fixes the flake: it was reproduced live as a race between React Flow's
-  // own internal node re-measurement and a bare `setTimeout`, which
-  // sometimes fires fitView() before React Flow has measured the new
-  // nodes' real DOM size, leaving the viewport transform byte-identical to
-  // the previous graph's. Two rAFs guarantee at least one full paint has
-  // happened first.
-  const refitKey = `${seedKey}:${layout?.nodes.length ?? 0}`;
-  useEffect(() => {
-    if (!layout) return;
-    const t = setTimeout(() => {
-      requestAnimationFrame(() => {
-        requestAnimationFrame(() => fitView({ duration: 200, padding: 0.05, maxZoom: 1 }));
-      });
-    }, 30);
-    return () => clearTimeout(t);
-  }, [refitKey]); // eslint-disable-line react-hooks/exhaustive-deps
+  }, [display]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Re-fit when the viewport itself changes size (phone rotation, window
   // resize, drawer open/close) so the graph never sits off-screen.
@@ -289,10 +324,22 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
     if (node.type === "laneBand") return;
     const d = node.data as { node_type?: string; onExpandToggle?: () => void };
     if (d.node_type === "group") {
+      // Remember where this group sits *before* the relayout, so the effect
+      // above can pin it in place once the new positions come back.
+      const current = layout?.nodes.find((n) => String(n.id) === node.id);
+      if (current) anchorRef.current = { id: node.id, x: current.x, y: current.y };
       d.onExpandToggle?.();
     } else {
       onSelectNode(node.id);
     }
+  }
+
+  // Toggling focus deliberately changes what is on screen, so it is one of the
+  // few things that SHOULD refit -- explicitly, rather than implicitly via a
+  // node count that also moves for reasons the user didn't ask for.
+  function toggleFocus() {
+    refitNextRef.current = true;
+    setFocusMode((v: boolean) => !v);
   }
 
   const flowEdges: Edge[] = useMemo(
@@ -314,7 +361,7 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
     <div className="graph-canvas">
       <div className="graph-toolbar">
         <button onClick={expandAll}>Expand all</button>
-        <button onClick={() => setFocusMode((v: boolean) => !v)} aria-pressed={focusMode}>
+        <button onClick={toggleFocus} aria-pressed={focusMode}>
           {focusMode ? "Show full run" : "Focus: this discovery's path"}
         </button>
         {focusMode && display.hiddenCount > 0 && (
