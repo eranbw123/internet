@@ -120,6 +120,15 @@ export interface NodeDetail {
   truncated: boolean;
 }
 
+/** /api/runs -- enough of a run to pick it out of a list. */
+export interface RunOption {
+  id: number;
+  kind: string;
+  status: string;
+  started_at: string | null;
+  node_count: number | null;
+}
+
 /** /api/interests -- just enough of an interest to populate a picker. */
 export interface InterestOption {
   key: string;
@@ -178,4 +187,8 @@ export interface BootstrapFocus {
 
 export interface Bootstrap {
   focus: BootstrapFocus | null;
+  /** True when the server is running with --public, i.e. every request needs
+   * the bearer token. The raw-database button opens "/" with no token, which
+   * lands on a 403 there, so it is hidden instead. */
+  public?: boolean;
 }

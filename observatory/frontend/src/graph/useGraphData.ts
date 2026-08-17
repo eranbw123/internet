@@ -34,6 +34,16 @@ export function initialFocusMode(isMobile: boolean): boolean {
   return isMobile;
 }
 
+/** Cheap structural equality for a poll response: ids plus the fields that
+ * actually change while a run is in flight. Enough to answer "is this the same
+ * graph I already laid out?" without deep-comparing every payload. */
+function sameGraph(a: GraphResponse, b: GraphResponse): boolean {
+  if (a.nodes.length !== b.nodes.length || a.edges.length !== b.edges.length) return false;
+  const key = (g: GraphResponse) =>
+    g.nodes.map((n) => `${n.id}:${n.status ?? ""}:${n.finished_at ?? ""}:${n.label ?? ""}`).join("|");
+  return key(a) === key(b);
+}
+
 export function useGraphData(seed: GraphSeed | null, isMobile = false) {
   const [base, setBase] = useState<GraphResponse | null>(null);
   const [expanded, setExpanded] = useState<ExpandedGroups>({});
@@ -54,20 +64,26 @@ export function useGraphData(seed: GraphSeed | null, isMobile = false) {
   }, []);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [expandError, setExpandError] = useState<string | null>(null);
   const seedKey = seed ? JSON.stringify(seed) : null;
   const pollRef = useRef<ReturnType<typeof setInterval> | null>(null);
 
-  const reload = useCallback(async () => {
+  // `silent` is what a background poll passes: it must not flash the "Loading
+  // trace..." overlay every 4 seconds, and must not hand back a fresh object
+  // identity when nothing changed -- `display`'s identity is what drives the
+  // ELK layout, so an identical poll response otherwise re-ran the whole
+  // layout (and, before the viewport fix, moved the camera with it).
+  const reload = useCallback(async (silent = false) => {
     if (!seed) return;
-    setLoading(true);
+    if (!silent) setLoading(true);
     setError(null);
     try {
       const g = await fetchGraph(seed);
-      setBase(g);
+      setBase((prev) => (silent && prev && sameGraph(prev, g) ? prev : g));
     } catch (e) {
-      setError(e instanceof Error ? e.message : String(e));
+      if (!silent) setError(e instanceof Error ? e.message : String(e));
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }, [seedKey]); // eslint-disable-line react-hooks/exhaustive-deps
 
@@ -91,7 +107,7 @@ export function useGraphData(seed: GraphSeed | null, isMobile = false) {
     if (!base) return;
     const hasActive = base.nodes.some((n) => n.status && ACTIVE_STATUSES.has(n.status));
     if (!hasActive) return;
-    pollRef.current = setInterval(reload, POLL_INTERVAL_MS);
+    pollRef.current = setInterval(() => reload(true), POLL_INTERVAL_MS);
     return () => {
       if (pollRef.current) clearInterval(pollRef.current);
     };
@@ -99,8 +115,14 @@ export function useGraphData(seed: GraphSeed | null, isMobile = false) {
 
   const expandGroup = useCallback(async (groupId: string) => {
     if (expanded[groupId]) return; // already fetched -- toggle is handled by the caller's own open/closed state
-    const { children } = await fetchChildren({ group: groupId });
-    setExpanded((prev) => ({ ...prev, [groupId]: children }));
+    try {
+      const { children } = await fetchChildren({ group: groupId });
+      setExpanded((prev) => ({ ...prev, [groupId]: children }));
+    } catch (e) {
+      // Previously an unhandled rejection: the card simply never opened, with
+      // nothing anywhere saying why -- a dead click.
+      setExpandError(`Couldn't open that group: ${e instanceof Error ? e.message : String(e)}`);
+    }
   }, [expanded]);
 
   const collapseGroup = useCallback((groupId: string) => {
@@ -113,6 +135,8 @@ export function useGraphData(seed: GraphSeed | null, isMobile = false) {
 
   const expandAll = useCallback(async () => {
     if (!base) return;
+    // expandGroup swallows its own failures into expandError, so one bad group
+    // can't reject the whole batch and silently abandon the good ones.
     await Promise.all(base.groups.map((g) => expandGroup(g.group)));
   }, [base, expandGroup]);
 
@@ -140,6 +164,7 @@ export function useGraphData(seed: GraphSeed | null, isMobile = false) {
 
   return {
     base, loading, error, expanded, focusMode, setFocusMode,
+    expandError, clearExpandError: () => setExpandError(null),
     expandGroup, collapseGroup, expandAll, reload,
     display: focused,
     emphasizedPath: extendedPath,

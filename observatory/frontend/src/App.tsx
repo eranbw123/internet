@@ -4,7 +4,7 @@ import { GraphCanvas } from "./graph/GraphCanvas";
 import { Inspector } from "./inspector/Inspector";
 import { InterestPanel } from "./interest/InterestPanel";
 import { CompareView } from "./compare/CompareView";
-import { readBootstrap } from "./deepLink";
+import { formatHash, parseHash, readBootstrap } from "./deepLink";
 import { useIsMobile } from "./useIsMobile";
 import type { GraphSeed } from "./graph/useGraphData";
 import type { ID, Tab } from "./types";
@@ -14,11 +14,18 @@ const INSPECTOR_WIDTH_KEY = "observatory-inspector-width";
 
 export function App() {
   const bootstrap = useMemo(() => readBootstrap(), []);
+  // A hash wins over the server-rendered bootstrap: it is the more specific
+  // thing the user actually navigated to (a shared link, or their own reload).
+  const initialHash = useMemo(() => parseHash(window.location.hash), []);
   const [seed, setSeed] = useState<GraphSeed | null>(
-    bootstrap.focus?.kind === "score" ? { entity_type: "scores", entity_id: bootstrap.focus.score_id } : null,
+    initialHash.seed
+      ?? (bootstrap.focus?.kind === "score" ? { entity_type: "scores", entity_id: bootstrap.focus.score_id } : null),
   );
-  const [selectedNodeId, setSelectedNodeId] = useState<ID | null>(bootstrap.focus?.node_id ?? null);
+  const [selectedNodeId, setSelectedNodeId] = useState<ID | null>(
+    initialHash.nodeId ?? bootstrap.focus?.node_id ?? null,
+  );
   const [compareOpen, setCompareOpen] = useState(false);
+  const [compareRunId, setCompareRunId] = useState<string | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
   const [selectedRowKey, setSelectedRowKey] = useState<string | null>(null);
@@ -36,6 +43,21 @@ export function App() {
   useEffect(() => {
     localStorage.setItem(INSPECTOR_WIDTH_KEY, String(inspectorWidth));
   }, [inspectorWidth]);
+
+  // Keep the URL describing what is on screen, so a reload restores it and the
+  // view can be linked to. replaceState, not a hash assignment: this reflects
+  // state rather than navigating, and shouldn't stack history entries.
+  useEffect(() => {
+    const hash = formatHash({
+      seed: seed
+        ? { entity_type: seed.entity_type, entity_id: seed.entity_id != null ? String(seed.entity_id) : undefined, run_id: seed.run_id }
+        : null,
+      nodeId: selectedNodeId != null ? String(selectedNodeId) : null,
+    });
+    if (hash !== window.location.hash) {
+      window.history.replaceState(null, "", hash || window.location.pathname);
+    }
+  }, [seed, selectedNodeId]);
 
   function startInspectorResize(e: React.PointerEvent) {
     e.preventDefault();
@@ -141,7 +163,17 @@ export function App() {
         />
       );
     }
-    return <Inspector nodeId={selectedNodeId} onClose={onClose} onSelectNode={selectNode} />;
+    return (
+      <Inspector
+        nodeId={selectedNodeId}
+        onClose={onClose}
+        onSelectNode={selectNode}
+        onCompareRun={(runId) => {
+          setCompareRunId(String(runId));
+          setCompareOpen(true);
+        }}
+      />
+    );
   }
 
   function openRawDb() {
@@ -157,12 +189,23 @@ export function App() {
       </header>
       <div className="app-body">
         <div className={`pane pane-explorer ${isMobile ? "drawer" : ""} ${drawerOpen ? "open" : ""}`}>
-          <Explorer onSelectDiscovery={selectDiscovery} onOpenRawDb={openRawDb} selectedRowKey={selectedRowKey} />
+          <Explorer
+            onSelectDiscovery={selectDiscovery}
+            onOpenRawDb={bootstrap.public ? undefined : openRawDb}
+            selectedRowKey={selectedRowKey}
+          />
         </div>
         {isMobile && drawerOpen && <div className="drawer-scrim" onClick={() => setDrawerOpen(false)} />}
         <div className="pane pane-graph">
           {compareOpen ? (
-            <CompareView onClose={() => setCompareOpen(false)} />
+            <CompareView
+              onClose={() => setCompareOpen(false)}
+              initialA={compareRunId ?? undefined}
+              onSelectNode={(id) => {
+                setCompareOpen(false);
+                selectNode(id);
+              }}
+            />
           ) : (
             <GraphCanvas seed={seed} selectedNodeId={selectedNodeId} onSelectNode={selectNode} isMobile={isMobile} />
           )}

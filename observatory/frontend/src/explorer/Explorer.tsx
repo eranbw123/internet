@@ -12,7 +12,9 @@ const TABS: { key: Tab; label: string }[] = [
 
 interface Props {
   onSelectDiscovery: (row: Record<string, unknown>, tab: Tab) => void;
-  onOpenRawDb: () => void;
+  /** Omitted in public mode: the button opens "/" without the bearer
+   * token, which lands on a 403 behind the tunnel. */
+  onOpenRawDb?: () => void;
   /** rowKey() of the currently open row, so the list can show what is selected. */
   selectedRowKey?: string | null;
 }
@@ -121,7 +123,7 @@ export function Explorer({ onSelectDiscovery, onOpenRawDb, selectedRowKey }: Pro
             {tab === t.key && result ? <span className="tab-count"> {result.total.toLocaleString()}</span> : null}
           </button>
         ))}
-        <button role="tab" onClick={onOpenRawDb}>Raw database</button>
+        {onOpenRawDb && <button role="tab" onClick={onOpenRawDb}>Raw database</button>}
       </div>
       <FilterBar tab={tab} filters={filters} interests={interests} onChange={setFilters} />
       <ActiveFilterChips tab={tab} filters={filters} onChange={setFilters} />

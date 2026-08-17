@@ -1,11 +1,18 @@
 import { useEffect, useState } from "react";
-import { fetchCompare } from "../api";
-import type { CompareResponse } from "../types";
+import { fetchCompare, fetchRuns } from "../api";
+import type { CompareResponse, ID, RunOption } from "../types";
 import { MonospaceViewer } from "../inspector/MonospaceViewer";
 import { GraphCanvas } from "../graph/GraphCanvas";
 
 interface Props {
   onClose: () => void;
+  /** Pre-filled from "Compare this run" in the Inspector, so the view can be
+   * opened with an input already in hand instead of demanding a number the UI
+   * never showed anywhere. */
+  initialA?: string;
+  /** Opens a node from either pane in the main inspector. Without it the
+   * compare panes' cards were wired to a no-op -- a dead click on every card. */
+  onSelectNode?: (id: ID) => void;
 }
 
 /** Pick two traces/generations/model calls -> side-by-side flowcharts (kind
@@ -13,12 +20,27 @@ interface Props {
  * 'model_call'), all sourced from GET /observatory/api/compare -- see
  * observatory/db.py's compare(). `kind=generation` is a documented,
  * intentional gap (PROJECT_STATE.md) -- the API 400s on it today. */
-export function CompareView({ onClose }: Props) {
+export function CompareView({ onClose, initialA, onSelectNode }: Props) {
   const [kind, setKind] = useState<"run" | "model_call">("run");
-  const [a, setA] = useState("");
+  const [a, setA] = useState(initialA ?? "");
   const [b, setB] = useState("");
   const [result, setResult] = useState<CompareResponse | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [runs, setRuns] = useState<RunOption[]>([]);
+
+  useEffect(() => {
+    let cancelled = false;
+    fetchRuns()
+      .then((r) => {
+        if (!cancelled) setRuns(r.runs);
+      })
+      .catch(() => {
+        // The text inputs still work; a missing index just means no picker.
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
 
   useEffect(() => {
     if (!a || !b) {
@@ -49,28 +71,54 @@ export function CompareView({ onClose }: Props) {
           <option value="run">Compare traces (run)</option>
           <option value="model_call">Compare model calls</option>
         </select>
-        <input placeholder="A id" value={a} onChange={(e) => setA(e.target.value)} />
-        <input placeholder="B id" value={b} onChange={(e) => setB(e.target.value)} />
+        {kind === "run" && runs.length > 0 ? (
+          <>
+            <RunPicker label="A" runs={runs} value={a} onChange={setA} />
+            <RunPicker label="B" runs={runs} value={b} onChange={setB} />
+          </>
+        ) : (
+          <>
+            <input placeholder="A id" aria-label="A id" value={a} onChange={(e) => setA(e.target.value)} />
+            <input placeholder="B id" aria-label="B id" value={b} onChange={(e) => setB(e.target.value)} />
+          </>
+        )}
         <button onClick={onClose}>Close compare</button>
       </div>
       {error && <div className="compare-error">{error}</div>}
-      {result?.kind === "run" && <RunCompare result={result} a={a} b={b} />}
+      {result?.kind === "run" && <RunCompare result={result} a={a} b={b} onSelectNode={onSelectNode} />}
       {result?.kind === "model_call" && <ModelCallCompare result={result} />}
     </div>
   );
 }
 
-function RunCompare({ result, a, b }: { result: Extract<CompareResponse, { kind: "run" }>; a: string; b: string }) {
+function RunPicker({ label, runs, value, onChange }: {
+  label: string; runs: RunOption[]; value: string; onChange: (v: string) => void;
+}) {
+  return (
+    <select aria-label={`${label} run`} value={value} onChange={(e) => onChange(e.target.value)}>
+      <option value="">run {label}…</option>
+      {runs.map((r) => (
+        <option key={r.id} value={String(r.id)}>
+          #{r.id} · {r.kind} · {r.status}{r.node_count != null ? ` · ${r.node_count} nodes` : ""}
+        </option>
+      ))}
+    </select>
+  );
+}
+
+function RunCompare({ result, a, b, onSelectNode }: {
+  result: Extract<CompareResponse, { kind: "run" }>; a: string; b: string; onSelectNode?: (id: ID) => void;
+}) {
   return (
     <div className="compare-run">
       <div className="compare-split">
         <div className="compare-pane">
           <h3>Run {a}</h3>
-          <GraphCanvas seed={{ run_id: Number(a) }} selectedNodeId={null} onSelectNode={() => {}} />
+          <GraphCanvas seed={{ run_id: Number(a) }} selectedNodeId={null} onSelectNode={onSelectNode ?? (() => {})} />
         </div>
         <div className="compare-pane">
           <h3>Run {b}</h3>
-          <GraphCanvas seed={{ run_id: Number(b) }} selectedNodeId={null} onSelectNode={() => {}} />
+          <GraphCanvas seed={{ run_id: Number(b) }} selectedNodeId={null} onSelectNode={onSelectNode ?? (() => {})} />
         </div>
       </div>
       <div className="compare-diffs">

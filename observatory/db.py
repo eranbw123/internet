@@ -872,6 +872,26 @@ def _row_url(database, table, pk):
     return f"/{database}/{table}/{pk}"
 
 
+# --- /api/runs -------------------------------------------------------------------
+
+MAX_RUNS = 200
+
+
+def run_index(conn):
+    """Recent runs, enough to pick two of them.
+
+    Compare asks for run ids as raw numbers typed into text boxes, and until
+    now the UI displayed a run id precisely nowhere -- so the one view built
+    for comparing runs had no way to discover its own inputs.
+    """
+    rows = _rows(conn, """
+        SELECT r.id, r.kind, r.status, r.started_at,
+               (SELECT COUNT(*) FROM trace_nodes n WHERE n.run_id = r.id) AS node_count
+        FROM trace_runs r ORDER BY r.id DESC LIMIT ?
+    """, (MAX_RUNS,))
+    return {"runs": [_redact_row(r) for r in rows]}
+
+
 # --- /api/interests --------------------------------------------------------------
 
 def interest_index(conn):

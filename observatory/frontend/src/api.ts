@@ -4,7 +4,7 @@
 // crashing the tree.
 import type {
   CompareResponse, GraphResponse, InterestDetail, InterestOption, ListResponse,
-  NodeDetail, PromptTemplate, Tab,
+  NodeDetail, PromptTemplate, RunOption, Tab,
 } from "./types";
 
 export class ApiError extends Error {
@@ -74,6 +74,12 @@ export function fetchNode(nodeId: string | number): Promise<NodeDetail> {
  * capped at MAX_LIMIT=50 (there are already 46). */
 export function fetchInterests(): Promise<{ interests: InterestOption[] }> {
   return getJson<{ interests: InterestOption[] }>("/observatory/api/interests");
+}
+
+/** Recent runs, so Compare can offer its own inputs instead of demanding run
+ * ids the UI displayed nowhere. */
+export function fetchRuns(): Promise<{ runs: RunOption[] }> {
+  return getJson<{ runs: RunOption[] }>("/observatory/api/runs");
 }
 
 export function fetchInterest(key: string): Promise<InterestDetail> {

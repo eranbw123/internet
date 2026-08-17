@@ -186,7 +186,7 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode, isMobile = false
   const graphData = useGraphData(seed, isMobile);
   const {
     display, base, loading, error, expandGroup, collapseGroup, expandAll, focusMode, setFocusMode,
-    expandedKeys, reload,
+    expandedKeys, reload, expandError, clearExpandError,
   } = useAugmentedGraphData(graphData);
   const [layout, setLayout] = useState<LayoutResult | null>(null);
   const [showLegend, setShowLegend] = useState(false);
@@ -404,7 +404,9 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode, isMobile = false
         )}
         <button onClick={fitFocusFirst}>Fit to view</button>
         <button className="toolbar-overflow-only" onClick={expandAll}>Expand all</button>
-        <button className="toolbar-overflow-only" onClick={reload}>Reset layout</button>
+        {/* Wrapped, not passed directly: reload takes a `silent` flag now, and
+            a bare handler would hand it a MouseEvent as that argument. */}
+        <button className="toolbar-overflow-only" onClick={() => reload()}>Reset layout</button>
         <button
           className="toolbar-overflow-only graph-toolbar-spacer-left"
           onClick={() => setShowLegend((v) => !v)}
@@ -464,6 +466,11 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode, isMobile = false
       </ReactFlow>
       {loading && <div className="graph-status">Loading trace…</div>}
       {error && <div className="graph-status graph-status-error">Couldn't load this trace: {error}</div>}
+      {expandError && (
+        <div className="graph-status graph-status-error" role="alert">
+          {expandError} <button onClick={clearExpandError}>Dismiss</button>
+        </div>
+      )}
       {!base && !loading && !error && (
         <div className="graph-empty">Select a discovery from the list to load its trace.</div>
       )}

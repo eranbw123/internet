@@ -23,6 +23,9 @@ interface Props {
   nodeId: ID | null;
   onClose?: () => void;
   onSelectNode?: (id: ID) => void;
+  /** Opens Compare with this run pre-filled. Compare asks for run ids as raw
+   * numbers, and this is the only place in the UI one is ever shown. */
+  onCompareRun?: (runId: number) => void;
 }
 
 /** The attempt a reader means when they say "what did the model answer?".
@@ -69,7 +72,7 @@ function availableTabs(detail: NodeDetail): InspectorTab[] {
   return ["Overview", ...PAYLOAD_TABS.filter((t) => present[t])];
 }
 
-export function Inspector({ nodeId, onClose, onSelectNode }: Props) {
+export function Inspector({ nodeId, onClose, onSelectNode, onCompareRun }: Props) {
   const [tab, setTab] = useState<InspectorTab>("Overview");
   const [detail, setDetail] = useState<NodeDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
@@ -138,7 +141,7 @@ export function Inspector({ nodeId, onClose, onSelectNode }: Props) {
         {showAttempts && (
           <AttemptPicker calls={calls} selectedId={call?.id ?? null} onSelect={setSelectedCallId} />
         )}
-        {tab === "Overview" && <Overview detail={detail} onSelectNode={onSelectNode} />}
+        {tab === "Overview" && <Overview detail={detail} onSelectNode={onSelectNode} onCompareRun={onCompareRun} />}
         {tab === "Prompt" && <PromptTab call={call} onSelectNode={onSelectNode} />}
         {tab === "Exact text" && <MonospaceViewer text={detail.exact_text} truncated={detail.truncated} filename="exact_text.txt" />}
         {tab === "Exact input" && <MonospaceViewer text={jsonText(detail.input)} json truncated={detail.truncated} filename="input.json" />}
@@ -303,7 +306,9 @@ function AttemptEmpty({ call, what }: { call: ModelCallDetail | undefined; what:
   );
 }
 
-function Overview({ detail, onSelectNode }: { detail: NodeDetail; onSelectNode?: (id: ID) => void }) {
+function Overview({ detail, onSelectNode, onCompareRun }: {
+  detail: NodeDetail; onSelectNode?: (id: ID) => void; onCompareRun?: (runId: number) => void;
+}) {
   const o = detail.overview;
   const entityUrl = o.entity_type ? detail.row_urls[`${o.entity_type}:${o.entity_id}`] : undefined;
   const preview = primaryPayload(detail);
@@ -345,6 +350,9 @@ function Overview({ detail, onSelectNode }: { detail: NodeDetail; onSelectNode?:
             <dd>
               #{detail.run.id} · {detail.run.kind}
               {detail.run.status && <> · <span className={`status-chip status-chip-${chipKind(detail.run.status)}`}>{detail.run.status}</span></>}
+              {onCompareRun && (
+                <> · <button className="connection-link" onClick={() => onCompareRun(detail.run!.id)}>Compare this run</button></>
+              )}
             </dd>
           </>
         )}
