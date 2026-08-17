@@ -74,6 +74,19 @@ export function App() {
     if (tab === "failed") {
       if (row.entity_type != null && row.entity_id != null) {
         setSeed({ entity_type: row.entity_type as string, entity_id: row.entity_id as string | number });
+      } else if (row.run_id != null) {
+        // A few _FAILED_UNION kinds (duplicate, prefilter_rejected -- see
+        // observatory/db.py) carry no entity link at all, only a bare
+        // node_id/run_id -- verified live that clicking one of these rows
+        // previously did nothing whatsoever, since entity_type/entity_id
+        // both being null failed the branch above silently. fetchGraph
+        // already accepts a run_id-only seed (the deep-link path uses the
+        // same shape), so falling back to it here still loads the row's own
+        // graph, with the Inspector opened directly on its node.
+        setSeed({ run_id: row.run_id as number });
+        setSelectedNodeId(row.node_id as ID);
+        if (isMobile) setDrawerOpen(false);
+        return;
       }
     } else if (tab === "discoveries" && row.item_id != null) {
       setSeed({ entity_type: "candidate_items", entity_id: row.item_id as string | number });

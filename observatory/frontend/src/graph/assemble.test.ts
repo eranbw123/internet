@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
-import { applyFocus, formatEdgeLabel, mergeExpansion } from "./assemble";
-import type { GraphResponse, NodeSummary } from "../types";
+import { applyFocus, extendPath, formatEdgeLabel, labelScore, mergeExpansion } from "./assemble";
+import type { GraphEdge, GraphResponse, NodeSummary } from "../types";
 
 function node(overrides: Partial<NodeSummary>): NodeSummary {
   return {
@@ -48,25 +48,30 @@ describe("mergeExpansion", () => {
     expect(merged.edges).toHaveLength(3);
   });
 
-  it("adds fetched children alongside the group placeholder (kept as the collapse target) and wires parent edges", () => {
+  it("adds fetched children as chips inside the group's own card, sorted best-score-first, with no new edges", () => {
     const g = fixture();
     const children: NodeSummary[] = [
-      node({ id: 101, node_type: "raw-result", swimlane: "mission", label: "result 1" }),
-      node({ id: 102, node_type: "raw-result", swimlane: "mission", label: "result 2" }),
+      node({ id: 101, node_type: "raw-result", swimlane: "mission", label: "low: 0.12" }),
+      node({ id: 102, node_type: "raw-result", swimlane: "mission", label: "high: 0.91" }),
+      node({ id: 103, node_type: "raw-result", swimlane: "mission", label: "no score here" }),
     ];
     const merged = mergeExpansion(g, { "10:returned:raw-result": children });
     const ids = merged.nodes.map((n) => n.id);
-    // the group card itself is still on screen -- it's the only double-click
-    // target GraphCanvas has to collapse back via collapseGroup()
+    // the group card itself is still on screen -- it's the only click target
+    // GraphCanvas has to collapse back via collapseGroup()
     expect(ids).toContain("10:returned:raw-result");
-    expect(ids).toEqual(expect.arrayContaining([1, 2, 101, 102, 20]));
-    // parent (mission id 2) -> each child, using the group's own relationship
-    const newEdges = merged.edges.filter((e) => e.from === 2 && (e.to === 101 || e.to === 102));
-    expect(newEdges).toHaveLength(2);
-    expect(newEdges.every((e) => e.relationship === "returned")).toBe(true);
-    // nothing from the original graph was dropped, only added to
-    expect(merged.edges).toHaveLength(g.edges.length + 2);
-    expect(merged.nodes).toHaveLength(g.nodes.length + 2);
+    expect(ids).toEqual(expect.arrayContaining([1, 2, 101, 102, 103, 20]));
+    // every child carries the group's own key as containerId, not a fresh edge --
+    // a candidate's matches interleaving with an unrelated candidate's collapsed
+    // group in the same lane column (verified live) is exactly what per-child
+    // edges + free-floating peer nodes produced; a shared containerId is what
+    // elkLayout.ts's chip grid keys off instead.
+    const chipped = merged.nodes.filter((n) => n.containerId === "10:returned:raw-result");
+    expect(chipped.map((n) => n.id)).toEqual([102, 101, 103]); // 0.91, 0.12, then no-score last
+    // no edges added at all -- the group's own single inbound edge is the
+    // only connector, regardless of how many children it has
+    expect(merged.edges).toHaveLength(g.edges.length);
+    expect(merged.nodes).toHaveLength(g.nodes.length + 3);
   });
 
   it("collapsing back (omitting the group from `expanded`) reproduces the original graph", () => {
@@ -76,6 +81,53 @@ describe("mergeExpansion", () => {
     const collapsedAgain = mergeExpansion(g, {});
     expect(collapsedAgain).not.toEqual({ nodes: expandedMerge.nodes, edges: expandedMerge.edges });
     expect(collapsedAgain.nodes.map((n) => n.id)).toEqual(g.nodes.map((n) => n.id));
+  });
+});
+
+describe("labelScore", () => {
+  it("extracts a trailing ': N.NN' score", () => {
+    expect(labelScore("speculative-fiction-ideas: 0.24")).toBe(0.24);
+  });
+  it("extracts a trailing integer score", () => {
+    expect(labelScore("some-key: 1")).toBe(1);
+  });
+  it("returns null when there is no trailing score", () => {
+    expect(labelScore("Concept Embedding Models: Beyond the Trade-Off")).toBeNull();
+  });
+  it("returns null for null/empty labels", () => {
+    expect(labelScore(null)).toBeNull();
+    expect(labelScore("")).toBeNull();
+  });
+});
+
+describe("extendPath", () => {
+  // Mirrors a real sent discovery's own shape: the backend's own
+  // emphasized_path ends at the score-attempt (id 3); threshold/render/
+  // notification (4, 5, 6) are all downstream of it but weren't on the
+  // backend's path at all.
+  const chain: GraphEdge[] = [
+    { from: 1, to: 2, relationship: "generated", ordinal: null },
+    { from: 2, to: 3, relationship: "scored", ordinal: null },
+    { from: 3, to: 4, relationship: "cleared_threshold", ordinal: null },
+    { from: 4, to: 5, relationship: "rendered", ordinal: null },
+    { from: 5, to: 6, relationship: "sent", ordinal: null },
+  ];
+
+  it("reaches every descendant of the path's last node -- a sent discovery's chain reaches its own notification", () => {
+    expect(extendPath(chain, [1, 2, 3])).toEqual([1, 2, 3, 4, 5, 6]);
+  });
+
+  it("is a no-op when the path's last node is already a leaf", () => {
+    expect(extendPath(chain, [1, 2, 3, 4, 5, 6])).toEqual([1, 2, 3, 4, 5, 6]);
+  });
+
+  it("is a no-op for an empty path", () => {
+    expect(extendPath(chain, [])).toEqual([]);
+  });
+
+  it("never re-adds a node already earlier in the given path (cycle-safe)", () => {
+    const withCycle: GraphEdge[] = [...chain, { from: 6, to: 3, relationship: "retried_as", ordinal: null }];
+    expect(extendPath(withCycle, [1, 2, 3])).toEqual([1, 2, 3, 4, 5, 6]);
   });
 });
 
@@ -109,10 +161,18 @@ describe("applyFocus", () => {
 });
 
 describe("formatEdgeLabel", () => {
-  it("renders 'generated <type>' for a generated edge", () => {
-    const label = formatEdgeLabel({ from: 1, to: 2, relationship: "generated", ordinal: 0 }, node({ node_type: "mission" }));
-    expect(label).toBe("generated mission");
-  });
+  // Relationships that merely restate the target card's own type/label --
+  // verified live that painting these on every edge was noise ("matched"
+  // repeated 12x over one expanded group, "generated" on every edge in the
+  // graph) drowning out the labels that actually carry information.
+  // GraphCanvas.tsx turns "" into `label: undefined`.
+  it.each(["generated", "matched", "scored", "normalized_to", "executed", "sent", "rendered", "selected"])(
+    "silences the restating '%s' relationship",
+    (relationship) => {
+      const label = formatEdgeLabel({ from: 1, to: 2, relationship, ordinal: 0 }, node({ node_type: "mission" }));
+      expect(label).toBe("");
+    },
+  );
 
   it("renders 'result #N' (1-indexed) for a returned edge", () => {
     const label = formatEdgeLabel({ from: 1, to: 2, relationship: "returned", ordinal: 3 }, undefined);
@@ -123,7 +183,7 @@ describe("formatEdgeLabel", () => {
     expect(formatEdgeLabel({ from: 1, to: 2, relationship: "duplicate_of", ordinal: null }, undefined)).toBe("duplicate of");
   });
 
-  it("keeps threshold/match/rejection edges to the relationship word (card shows the summary)", () => {
+  it("keeps a cleared_threshold edge to 'cleared threshold' (the card states the actual verdict)", () => {
     const label = formatEdgeLabel(
       { from: 1, to: 20, relationship: "cleared_threshold", ordinal: null },
       node({ summary: "0.84 >= historical threshold 0.75" }),
@@ -131,7 +191,14 @@ describe("formatEdgeLabel", () => {
     expect(label).toBe("cleared threshold");
   });
 
-  it("falls back to a humanized relationship when the target node is missing", () => {
-    expect(formatEdgeLabel({ from: 1, to: 2, relationship: "cleared_threshold", ordinal: null }, undefined)).toBe("cleared threshold");
+  it.each(["rejected", "deferred", "failed"])(
+    "keeps the real branch-outcome relationship '%s' visible, not silenced",
+    (relationship) => {
+      expect(formatEdgeLabel({ from: 1, to: 2, relationship, ordinal: null }, undefined)).toBe(relationship);
+    },
+  );
+
+  it("falls back to a humanized relationship for an unknown one", () => {
+    expect(formatEdgeLabel({ from: 1, to: 2, relationship: "some_future_edge", ordinal: null }, undefined)).toBe("some future edge");
   });
 });

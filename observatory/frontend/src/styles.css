@@ -48,41 +48,116 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .explorer-row:hover { background: #f5f8ff; }
 .row-top, .row-bottom { display: flex; gap: 8px; font-size: 11px; color: #667; }
 .row-title { font-weight: 600; }
+.row-sent-sent { color: var(--ok); font-weight: 600; }
+.row-sent-failed { color: var(--error); font-weight: 600; }
 .explorer-pager { display: flex; align-items: center; gap: 8px; padding: 6px; }
 
 /* --- graph canvas --- */
-.graph-canvas { position: relative; height: 100%; }
-.graph-toolbar { position: absolute; z-index: 5; top: 8px; left: 8px; right: 8px; display: flex; gap: 6px; flex-wrap: wrap; }
+/* A real docked bar, not a floating overlay -- it used to sit absolutely
+   positioned on top of the canvas and obscure whatever content happened to
+   render underneath it (verified live: fitted graphs routinely landed
+   partly behind the toolbar). Flex column: toolbar takes its own row,
+   `.graph-canvas-body` (ReactFlow + its own absolute overlays) gets the rest. */
+.graph-canvas { height: 100%; display: flex; flex-direction: column; }
+.graph-canvas-body { position: relative; flex: 1; min-height: 0; }
+.graph-toolbar {
+  display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
+  padding: 6px 8px; border-bottom: 1px solid var(--border); background: #fff;
+}
 .graph-toolbar button {
   font-size: 11px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 4px;
   background: rgba(255,255,255,.92); cursor: pointer;
 }
 .graph-toolbar button:hover { border-color: var(--accent); }
-.lane-label {
-  position: absolute; font-size: 10px; font-weight: 600; text-transform: uppercase;
-  letter-spacing: .05em; color: #7c8794; padding: 2px 8px; margin-left: 4px;
-  background: rgba(255,255,255,.85); border: 1px solid var(--border); border-radius: 10px;
-  white-space: nowrap;
+.graph-toolbar button[aria-pressed="true"] { background: var(--accent); color: #fff; border-color: var(--accent); }
+.graph-toolbar-note { font-size: 11px; color: #778; }
+.graph-toolbar-spacer-left { margin-left: auto; }
+/* Swimlanes as vertical columns (elkLayout.ts's partitioned layout) --
+   rendered as real, low-z React Flow nodes sized per-band via `style`, so
+   they pan/zoom exactly with the content instead of drifting on the first
+   pan the way a screen-space overlay would. */
+.lane-band {
+  width: 100%; height: 100%;
+  background: rgba(28,37,48,.025);
+  border-left: 1px dashed #dfe5ec;
+  pointer-events: none;
+}
+.lane-band-odd { background: rgba(47,111,235,.03); }
+.lane-band-title {
+  font-size: 22px; font-weight: 600; text-transform: uppercase; letter-spacing: .1em;
+  color: #a8b3c2; padding: 10px 16px; white-space: nowrap;
+  overflow: hidden; text-overflow: ellipsis;
 }
 .graph-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #889; }
+
+/* Dismissible key for the color coding -- there was previously no legend
+   anywhere in the UI at all. */
+.graph-legend {
+  position: absolute; top: 8px; right: 8px; z-index: 7; width: 260px;
+  background: #fff; border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; font-size: 11px; box-shadow: 0 2px 10px rgba(28,37,48,.12);
+}
+.graph-legend-title { font-weight: 700; margin-bottom: 6px; }
+.graph-legend ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
+.graph-legend li { display: flex; gap: 6px; align-items: flex-start; color: #556; line-height: 1.4; }
+.legend-swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; margin-top: 2px; }
+.legend-swatch-columns { background: linear-gradient(90deg, #c9d4e8, #cfe0c9); }
+.legend-swatch-path { background: var(--accent); border-radius: 50%; }
+.legend-swatch-status { background: linear-gradient(90deg, var(--ok), var(--error)); }
+.legend-swatch-verdict { background: var(--ok); border-radius: 50%; }
+.legend-swatch-group { background: #f6f4ff; border: 1px dashed #6b5bd2; }
+.legend-swatch-dim { background: var(--border); opacity: .6; }
+.graph-status {
+  position: absolute; top: 44px; left: 50%; transform: translateX(-50%);
+  background: rgba(255,255,255,.95); border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 12px; font-size: 12px; color: #556; z-index: 6;
+}
+.graph-status-error { color: var(--error); border-color: #f2b8b5; background: #fdecea; }
 
 .node-card {
   border: 1px solid var(--border); border-left-width: 3px; border-radius: 6px;
   background: #fff; box-shadow: 0 1px 2px rgba(28,37,48,.08);
-  padding: 6px 8px; font-size: 11px; width: 220px; height: 72px; overflow: hidden;
+  padding: 6px 8px; font-size: 11px; width: 100%; height: 100%; overflow: hidden;
 }
-.node-card.emphasized { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(47,111,235,.3); }
+.node-card.emphasized { border-color: var(--accent); border-left-color: var(--accent); box-shadow: 0 0 0 2px rgba(47,111,235,.3); }
 .node-card.status-active { border-left-color: var(--active); }
 .node-card.status-error { border-left-color: var(--error); background: #fff6f5; }
 .node-card.status-ok { border-left-color: var(--ok); }
 .node-card.node-group { background: #f6f4ff; cursor: pointer; border-style: dashed; }
+.node-card.node-group-expanded { overflow: visible; }
+.node-group .node-type { font-weight: 700; color: #6b5bd2; }
+.node-group .node-label { color: #4a3fa8; }
+/* The threshold card's own verdict (assemble.ts/GraphCanvas.tsx's
+   thresholdVerdict) -- previously this decision lived only in a small,
+   easy-to-miss edge label. Comes after the generic .status-ok/-error rules
+   above so it wins the cascade on the (usual) case where a threshold node's
+   execution status is "ok" regardless of which way the score fell. */
+.node-card.threshold-pass { border-left-color: var(--ok); }
+.node-card.threshold-fail { border-left-color: var(--error); background: #fff6f5; }
+/* Dead ends -- a duplicate or a dropped search result never went anywhere
+   else in the pipeline -- recede instead of competing visually with the
+   branch that actually led somewhere. */
+.node-card.node-dimmed { opacity: .55; }
 .node-type { font-size: 9px; text-transform: uppercase; letter-spacing: .04em; color: #98a2b0; }
 .node-label { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .node-summary { color: #556; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .node-meta { display: flex; gap: 6px; font-size: 10px; color: #778; white-space: nowrap; overflow: hidden; }
+
+/* A group's expanded children -- see assemble.ts's containerId,
+   elkLayout.ts's chipGrid -- render as this compact grid INSIDE the
+   group's own (now-grown) card, sorted best-score-first with the top chip
+   highlighted, instead of exploding into free-floating peer cards. */
+.node-chip {
+  width: 100%; height: 100%; display: flex; align-items: center;
+  border: 1px solid var(--border); border-radius: 5px; background: #fff;
+  padding: 2px 8px; font-size: 10px; box-shadow: 0 1px 1px rgba(28,37,48,.06);
+}
+.node-chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.node-chip-top { border-color: var(--accent); background: #eef4ff; font-weight: 600; }
+.node-chip.emphasized { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(47,111,235,.3); }
 /* Scope to the path: the class lands on the edge's whole <g>, and a bare
    stroke there also paints the label's background rect blue. */
-.edge-emphasized .react-flow__edge-path { stroke: var(--accent) !important; stroke-width: 2 !important; }
+.edge-emphasized .react-flow__edge-path { stroke: var(--accent) !important; stroke-width: 2.5 !important; }
 
 /* Edge anchors exist only so React Flow can draw edges -- keep them as
    near-invisible dots, and never show the "connectable" cursor. */
@@ -142,6 +217,11 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
   cursor: pointer; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
 }
 .connection-link:hover { text-decoration: underline; }
+.connection-showall {
+  border: none; background: none; padding: 2px 0 0; font-size: 10.5px; color: var(--accent);
+  cursor: pointer; text-align: left;
+}
+.connection-showall:hover { text-decoration: underline; }
 .overview-preview .monospace-viewer:not(.fullscreen) .viewer-content { max-height: 45vh; }
 .overview-nothing { color: #98a2b0; font-style: italic; margin: 10px 0; }
 .overview-links { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; }
