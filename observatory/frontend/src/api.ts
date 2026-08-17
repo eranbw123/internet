@@ -3,8 +3,8 @@
 // ApiError on a non-2xx response so callers can render a message instead of
 // crashing the tree.
 import type {
-  CompareResponse, GraphResponse, InterestDetail, ListResponse, NodeDetail,
-  PromptTemplate, Tab,
+  CompareResponse, GraphResponse, InterestDetail, InterestOption, ListResponse,
+  NodeDetail, PromptTemplate, Tab,
 } from "./types";
 
 export class ApiError extends Error {
@@ -40,6 +40,9 @@ export interface ListFilters {
   interest?: string; layer?: string; source?: string; provider?: string; model?: string;
   mission?: string; sent?: string; feedback?: string; date_from?: string; date_to?: string;
   failure_stage?: string; trace_complete?: string;
+  /** Interests tab only: "yes" | "no". 13 of 46 live interests are
+   * deactivated and were previously indistinguishable and unfilterable. */
+  active?: string;
 }
 
 export function listRows(
@@ -64,6 +67,13 @@ export function fetchChildren(
 
 export function fetchNode(nodeId: string | number): Promise<NodeDetail> {
   return getJson<NodeDetail>(`/observatory/api/node/${nodeId}`);
+}
+
+/** The whole interest list, cheaply -- enough to populate a picker. Separate
+ * from listRows('interests'), which runs four COUNT subqueries per row and is
+ * capped at MAX_LIMIT=50 (there are already 46). */
+export function fetchInterests(): Promise<{ interests: InterestOption[] }> {
+  return getJson<{ interests: InterestOption[] }>("/observatory/api/interests");
 }
 
 export function fetchInterest(key: string): Promise<InterestDetail> {

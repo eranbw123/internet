@@ -156,6 +156,7 @@ async def list_view(request, datasette):
         for key in (
             "interest", "layer", "source", "provider", "model", "mission", "sent",
             "feedback", "date_from", "date_to", "failure_stage", "trace_complete",
+            "active",
         )
         if request.args.get(key)
     }
@@ -263,6 +264,17 @@ async def compare_view(request, datasette):
     return Response.json(result)
 
 
+async def interest_index_view(request, datasette):
+    denied = _guard(datasette, request) or _require_get(request)
+    if denied:
+        return denied
+    conn = _connect(datasette)
+    try:
+        return Response.json(odb.interest_index(conn))
+    finally:
+        conn.close()
+
+
 async def prompt_template_view(request, datasette):
     denied = _guard(datasette, request) or _require_get(request)
     if denied:
@@ -310,6 +322,9 @@ def register_routes():
         (r"^/observatory/api/graph$", graph_view),
         (r"^/observatory/api/children$", children_view),
         (r"^/observatory/api/node/(?P<node_id>[0-9]+)$", node_view),
+        # Registered before the /interest/<key> route: "interests" would
+        # otherwise be swallowed as a key by the pattern below.
+        (r"^/observatory/api/interests$", interest_index_view),
         (r"^/observatory/api/interest/(?P<key>[^/]+)$", interest_view),
         (r"^/observatory/api/compare$", compare_view),
         (r"^/observatory/api/prompt-template$", prompt_template_view),
