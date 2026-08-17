@@ -76,7 +76,8 @@ describe("Explorer", () => {
     listRows.mockClear();
     fireEvent.click(screen.getByRole("tab", { name: /Missions/ }));
     await waitFor(() => {
-      const call = listRows.mock.calls.at(-1);
+      const calls = listRows.mock.calls;
+      const call = calls[calls.length - 1];
       expect(call?.[0]).toBe("missions");
       expect(call?.[1].filters.interest).toBeUndefined();
       // The discoveries-only trace_complete default must not ride along either.
@@ -92,7 +93,8 @@ describe("Explorer", () => {
     listRows.mockClear();
     fireEvent.click(chip);
     await waitFor(() => {
-      expect(listRows.mock.calls.at(-1)?.[1].filters.trace_complete).toBeUndefined();
+      const calls = listRows.mock.calls;
+      expect(calls[calls.length - 1][1].filters.trace_complete).toBeUndefined();
     });
   });
 
