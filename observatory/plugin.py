@@ -263,6 +263,27 @@ async def compare_view(request, datasette):
     return Response.json(result)
 
 
+async def prompt_template_view(request, datasette):
+    denied = _guard(datasette, request) or _require_get(request)
+    if denied:
+        return denied
+    call_id = request.args.get("call")
+    if not call_id:
+        return _bad_request("call required")
+    try:
+        call_id = int(call_id)
+    except (TypeError, ValueError):
+        return _bad_request("call must be an integer")
+    conn = _connect(datasette)
+    try:
+        result = odb.prompt_template(conn, call_id)
+    except LookupError as e:
+        return Response.json({"error": str(e)}, status=404)
+    finally:
+        conn.close()
+    return Response.json(result)
+
+
 async def trace_score_view(request, datasette):
     denied = _guard(datasette, request)
     if denied:
@@ -291,5 +312,6 @@ def register_routes():
         (r"^/observatory/api/node/(?P<node_id>[0-9]+)$", node_view),
         (r"^/observatory/api/interest/(?P<key>[^/]+)$", interest_view),
         (r"^/observatory/api/compare$", compare_view),
+        (r"^/observatory/api/prompt-template$", prompt_template_view),
         (r"^/observatory/trace/score/(?P<score_id>[0-9]+)$", trace_score_view),
     ]

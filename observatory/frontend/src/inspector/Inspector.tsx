@@ -1,22 +1,23 @@
-import { useEffect, useState } from "react";
-import { fetchNode } from "../api";
+import { useEffect, useMemo, useState } from "react";
+import { fetchNode, fetchPromptTemplate } from "../api";
 import { labelScore } from "../graph/assemble";
-import type { ID, ModelCallDetail, NodeDetail } from "../types";
+import type { ID, ModelCallDetail, NodeDetail, PromptTemplate } from "../types";
 import { MonospaceViewer } from "./MonospaceViewer";
+import { splitPromptSections } from "./promptSections";
 
 // Tab identity is its label; only tabs whose content is actually non-empty
 // for the selected node are offered (most nodes carry one or two payloads,
 // so a fixed 9-tab strip was mostly dead buttons). Timing and database-row
 // links live on the Overview now instead of dedicated tabs.
 const PAYLOAD_TABS = [
-  "Exact text", "Exact input", "Exact output", "Raw response", "Parsed JSON",
+  "Prompt", "Exact text", "Exact input", "Exact output", "Raw response", "Parsed JSON",
   "Reasoning record", "Configuration",
 ] as const;
 type InspectorTab = "Overview" | (typeof PAYLOAD_TABS)[number];
 
 /** Tabs whose content is scoped to ONE model call, so they follow the attempt
  * picker rather than the node as a whole. */
-const CALL_SCOPED_TABS: InspectorTab[] = ["Raw response", "Parsed JSON"];
+const CALL_SCOPED_TABS: InspectorTab[] = ["Prompt", "Raw response", "Parsed JSON"];
 
 interface Props {
   nodeId: ID | null;
@@ -47,9 +48,16 @@ export function bestCall(calls: ModelCallDetail[]): ModelCallDetail | undefined 
 // A call-scoped tab is offered when ANY attempt carries that payload, not just
 // the selected one -- so switching attempts moves content in and out of a
 // stable tab strip instead of making tabs appear and vanish underfoot.
+/** Calls the payload tabs can read: the node's own, or -- when it has none --
+ * the ones borrowed from the adjacent node that explains it. */
+export function promptCalls(detail: NodeDetail): ModelCallDetail[] {
+  return detail.model_calls.length > 0 ? detail.model_calls : (detail.related_model_calls ?? []);
+}
+
 function availableTabs(detail: NodeDetail): InspectorTab[] {
-  const calls = detail.model_calls;
+  const calls = promptCalls(detail);
   const present: Record<(typeof PAYLOAD_TABS)[number], boolean> = {
+    "Prompt": calls.some((c) => !!c.exact_user_prompt),
     "Exact text": (detail.exact_text ?? "") !== "",
     "Exact input": jsonText(detail.input) !== "",
     "Exact output": jsonText(detail.output) !== "",
@@ -83,7 +91,7 @@ export function Inspector({ nodeId, onClose, onSelectNode }: Props) {
         if (!cancelled) {
           setDetail(d);
           setError(null);
-          setSelectedCallId(bestCall(d.model_calls)?.id ?? null);
+          setSelectedCallId(bestCall(promptCalls(d))?.id ?? null);
           // Keep the current tab across node switches when it still applies
           // (comparing siblings), otherwise fall back to Overview.
           setTab((t) => (availableTabs(d).includes(t) ? t : "Overview"));
@@ -103,9 +111,10 @@ export function Inspector({ nodeId, onClose, onSelectNode }: Props) {
   if (error) return <div className="inspector inspector-error">{error}</div>;
   if (!detail) return <div className="inspector inspector-loading">Loading...</div>;
 
-  const call = detail.model_calls.find((c) => c.id === selectedCallId) ?? bestCall(detail.model_calls);
+  const calls = promptCalls(detail);
+  const call = calls.find((c) => c.id === selectedCallId) ?? bestCall(calls);
   const tabs = availableTabs(detail);
-  const showAttempts = detail.model_calls.length > 1 && CALL_SCOPED_TABS.includes(tab);
+  const showAttempts = calls.length > 1 && CALL_SCOPED_TABS.includes(tab);
 
   return (
     <div className="inspector" data-testid="inspector">
@@ -127,9 +136,10 @@ export function Inspector({ nodeId, onClose, onSelectNode }: Props) {
       )}
       <div className="inspector-body">
         {showAttempts && (
-          <AttemptPicker calls={detail.model_calls} selectedId={call?.id ?? null} onSelect={setSelectedCallId} />
+          <AttemptPicker calls={calls} selectedId={call?.id ?? null} onSelect={setSelectedCallId} />
         )}
         {tab === "Overview" && <Overview detail={detail} onSelectNode={onSelectNode} />}
+        {tab === "Prompt" && <PromptTab call={call} onSelectNode={onSelectNode} />}
         {tab === "Exact text" && <MonospaceViewer text={detail.exact_text} truncated={detail.truncated} filename="exact_text.txt" />}
         {tab === "Exact input" && <MonospaceViewer text={jsonText(detail.input)} json truncated={detail.truncated} filename="input.json" />}
         {tab === "Exact output" && <MonospaceViewer text={jsonText(detail.output)} json truncated={detail.truncated} filename="output.json" />}
@@ -146,6 +156,105 @@ export function Inspector({ nodeId, onClose, onSelectNode }: Props) {
         {tab === "Reasoning record" && <ReasoningRecord detail={detail} />}
         {tab === "Configuration" && <MonospaceViewer text={jsonText(detail.config)} json filename="config.json" />}
       </div>
+    </div>
+  );
+}
+
+/** The prompt, front and centre.
+ *
+ * This is the thing the Observatory most needed to show and least did: it was
+ * reachable only on score-attempt nodes, only under "Reasoning record", and
+ * only inside a collapsed <details> -- on a node type nobody clicks, since the
+ * cards that tell the story (candidate, threshold, score-debug) carry no model
+ * calls of their own. The backend now lends those nodes their neighbour's
+ * calls, and this tab renders the result in one click from anywhere on the
+ * scoring path.
+ */
+function PromptTab({ call, onSelectNode }: { call: ModelCallDetail | undefined; onSelectNode?: (id: ID) => void }) {
+  const [template, setTemplate] = useState<PromptTemplate | null>(null);
+  const [templateError, setTemplateError] = useState<string | null>(null);
+  const [showDiff, setShowDiff] = useState(false);
+
+  useEffect(() => {
+    setTemplate(null);
+    setTemplateError(null);
+    setShowDiff(false);
+  }, [call?.id]);
+
+  if (!call) return <div className="reasoning-empty">No model call attached to this node.</div>;
+  const text = [call.exact_system_prompt, call.exact_user_prompt].filter(Boolean).join("\n\n---\n\n");
+  if (!text) return <AttemptEmpty call={call} what="recorded no prompt" />;
+
+  async function loadTemplate() {
+    if (!call) return;
+    try {
+      const t = await fetchPromptTemplate(call.id);
+      setTemplate(t);
+      setShowDiff(true);
+    } catch (e) {
+      setTemplateError(e instanceof Error ? e.message : String(e));
+    }
+  }
+
+  return (
+    <div className="prompt-tab">
+      {call.via_node_id != null && (
+        <div className="prompt-provenance">
+          This prompt belongs to the {call.via_node_type} node that produced this one
+          {onSelectNode ? (
+            <> — <button className="connection-link" onClick={() => onSelectNode(call.via_node_id!)}>open #{call.via_node_id}</button></>
+          ) : (
+            <> (#{call.via_node_id})</>
+          )}
+        </div>
+      )}
+      <div className="prompt-actions">
+        <button onClick={showDiff ? () => setShowDiff(false) : loadTemplate}>
+          {showDiff ? "Hide template diff" : "Diff vs current template"}
+        </button>
+        {templateError && <span className="error"> {templateError}</span>}
+      </div>
+      {showDiff && template && (
+        template.available && template.matches_current ? (
+          <div className="prompt-diff">
+            <div className="overview-section-title">Differences from the current template</div>
+            <MonospaceViewer
+              text={template.diff.length > 0 ? template.diff.join("\n") : "(identical to the template apart from substitutions)"}
+              filename="prompt-vs-template.diff"
+            />
+          </div>
+        ) : (
+          <div className="prompt-diff-unavailable">{template.reason}</div>
+        )
+      )}
+      <FoldedPrompt text={text} attempt={call.attempt} />
+    </div>
+  );
+}
+
+/** A 27kB prompt is mostly the ~40 interest definitions, identical for every
+ * item scored in a run. Folding along the prompt's own XML-ish blocks beats
+ * both endless scrolling and pulling in a virtualization dependency (27kB in
+ * one <pre> renders fine; it is the scrolling that was the problem). */
+function FoldedPrompt({ text, attempt }: { text: string; attempt: number }) {
+  const sections = useMemo(() => splitPromptSections(text), [text]);
+  if (sections.length <= 1) {
+    return <MonospaceViewer text={text} large filename={`prompt-attempt-${attempt}.txt`} />;
+  }
+  return (
+    <div className="prompt-sections">
+      {sections.map((section, i) =>
+        section.tag ? (
+          <details key={i} open={section.defaultOpen}>
+            <summary>
+              &lt;{section.tag}&gt; <span className="prompt-section-size">{section.text.length.toLocaleString()} chars</span>
+            </summary>
+            <MonospaceViewer text={section.text} large filename={`prompt-${section.tag}.txt`} />
+          </details>
+        ) : (
+          <MonospaceViewer key={i} text={section.text} large filename={`prompt-attempt-${attempt}-part${i}.txt`} />
+        ),
+      )}
     </div>
   );
 }

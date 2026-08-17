@@ -3,7 +3,8 @@
 // ApiError on a non-2xx response so callers can render a message instead of
 // crashing the tree.
 import type {
-  CompareResponse, GraphResponse, InterestDetail, ListResponse, NodeDetail, Tab,
+  CompareResponse, GraphResponse, InterestDetail, ListResponse, NodeDetail,
+  PromptTemplate, Tab,
 } from "./types";
 
 export class ApiError extends Error {
@@ -71,4 +72,8 @@ export function fetchInterest(key: string): Promise<InterestDetail> {
 
 export function fetchCompare(kind: "run" | "model_call", a: string | number, b: string | number): Promise<CompareResponse> {
   return getJson<CompareResponse>("/observatory/api/compare", { kind, a, b });
+}
+
+export function fetchPromptTemplate(callId: string | number): Promise<PromptTemplate> {
+  return getJson<PromptTemplate>("/observatory/api/prompt-template", { call: callId });
 }

@@ -129,7 +129,7 @@ class _E2EFixture:
     three per test would make an already-slow browser suite far slower for
     no isolation benefit, since every method only reads.
 
-    Split across two TestCase classes (see below), each with its own
+    Split across several small TestCase classes (see below), each with its own
     fixture, rather than one shared instance for every test method: this
     sandbox's single-worker `python -m app ui` dev server (Datasette +
     uvicorn on Windows) was found, live, to wedge permanently -- stops
@@ -138,10 +138,14 @@ class _E2EFixture:
     server process, regardless of event-loop policy or Datasette's
     `num_sql_threads` pool size (both tried and ruled out); the trigger is
     pure cumulative request count on this exact environment, not anything
-    about a specific route, payload, or viewport. All 7 tests against one
-    shared server cross that line (each hard `navigate()` alone re-fetches
-    the HTML shell + 3 static bundles + the interest list); two independent
-    fixtures of ~3-4 tests each stay comfortably under it. This is a
+    about a specific route, payload, or viewport. Every test against one
+    shared server crosses that line (each hard `navigate()` alone re-fetches
+    the HTML shell + 3 static bundles + the interest list); independent
+    fixtures of ~3-5 tests each stay comfortably under it. Keep new tests
+    within that budget: a sixth test added to a five-test class was observed
+    to wedge the server mid-class, and the symptom is a later test timing out
+    waiting for content that never arrives, not an obvious server error. This
+    is a
     resource ceiling of this sandboxed worker, not a defect reachable from
     `observatory/` app code -- worth re-verifying on an unrestricted machine."""
 
@@ -453,6 +457,64 @@ class ObservatoryE2EDesktopTests(_E2EFixture, unittest.TestCase):
             message="prompt text rendered",
         )
         self.assertIn(expected_prompt, shown, "displayed prompt is not byte-equal to the fixture's stored prompt")
+
+
+@unittest.skipUnless(CHROME_PATH, "no Chrome/Chromium binary found on this machine -- set DISCOVERY_UI_E2E_CHROME")
+class ObservatoryE2EPromptTests(_E2EFixture, unittest.TestCase):
+    """The Prompt tab, in its own fixture.
+
+    A third fixture rather than a sixth method on the desktop class, for the
+    request-ceiling reason in _E2EFixture's docstring: this sandbox's
+    single-worker dev server wedges after roughly 40-42 requests, and a sixth
+    desktop navigation crossed that line -- observed as the graph fetch never
+    returning, with the canvas stuck on "Loading trace..." and zero nodes,
+    while the same test passed in isolation."""
+
+    def test_08_prompt_tab_reaches_the_prompt_from_a_threshold_node(self):
+        """One click to the prompt, from a node that has no model call.
+
+        The prompt used to be reachable only on score-attempt nodes, under
+        "Reasoning record", inside a collapsed <details> -- and the cards a
+        reader actually clicks (candidate, threshold, score-debug) carry no
+        calls at all, so from those it was not reachable by any number of
+        clicks. node_detail() now lends them their neighbour's calls.
+        """
+        self.set_viewport(DESKTOP_VIEWPORT)
+        with self.db() as conn:
+            row = conn.execute(
+                "SELECT t.id AS threshold_id, m.exact_user_prompt AS prompt "
+                "FROM trace_nodes t "
+                "JOIN trace_edges e ON e.to_node_id = t.id "
+                "JOIN model_calls m ON m.trace_node_id = e.from_node_id "
+                "WHERE t.node_type = 'threshold' AND m.exact_user_prompt IS NOT NULL "
+                "ORDER BY t.id ASC LIMIT 1"
+            ).fetchone()
+        self.assertIsNotNone(row, "fixture has no threshold node behind a scoring call")
+        threshold_id, expected_prompt = row
+
+        self.navigate("/observatory/")
+        self.wait_for("document.querySelectorAll('.explorer-row').length > 0")
+        self.click(".explorer-row")
+        self.wait_for("document.querySelectorAll('.node-card').length > 0")
+        self.click(f'[data-node-id="{threshold_id}"]')
+        self.wait_for("!!document.querySelector('[data-testid=\"inspector\"]')")
+
+        # A single click on the tab -- no <details> to open, no other node to
+        # find first.
+        self.click_text("button", "Prompt")
+        shown = self.wait_for(
+            "(() => [...document.querySelectorAll('[data-testid=\"monospace-content\"]')]"
+            ".map(e => e.textContent).join('\\n'))()",
+            message="prompt text rendered on the threshold node",
+        )
+        # Folding splits the prompt into sections, so compare on a distinctive
+        # slice rather than the whole blob.
+        needle = expected_prompt.strip().splitlines()[0][:60]
+        self.assertIn(needle, shown, "threshold node did not show its score-attempt's prompt")
+        self.assertTrue(
+            self.js("!!document.querySelector('.prompt-provenance')"),
+            "borrowed prompt was shown without attributing it to the neighbour",
+        )
 
 
 @unittest.skipUnless(CHROME_PATH, "no Chrome/Chromium binary found on this machine -- set DISCOVERY_UI_E2E_CHROME")
