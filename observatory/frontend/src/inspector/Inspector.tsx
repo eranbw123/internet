@@ -9,10 +9,14 @@ import { MonospaceViewer } from "./MonospaceViewer";
 // so a fixed 9-tab strip was mostly dead buttons). Timing and database-row
 // links live on the Overview now instead of dedicated tabs.
 const PAYLOAD_TABS = [
-  "Exact input", "Exact output", "Raw response", "Parsed JSON",
+  "Exact text", "Exact input", "Exact output", "Raw response", "Parsed JSON",
   "Reasoning record", "Configuration",
 ] as const;
 type InspectorTab = "Overview" | (typeof PAYLOAD_TABS)[number];
+
+/** Tabs whose content is scoped to ONE model call, so they follow the attempt
+ * picker rather than the node as a whole. */
+const CALL_SCOPED_TABS: InspectorTab[] = ["Raw response", "Parsed JSON"];
 
 interface Props {
   nodeId: ID | null;
@@ -20,14 +24,38 @@ interface Props {
   onSelectNode?: (id: ID) => void;
 }
 
+/** The attempt a reader means when they say "what did the model answer?".
+ *
+ * db.py returns model_calls in chronological order, and retried calls are the
+ * norm rather than the exception (measured: 89.5% of call-bearing nodes have
+ * more than one attempt, and attempt #1 is typically the errored one with
+ * raw_response_text NULL). Reading calls[0] therefore showed the *failure* --
+ * or, since the payload tabs were gated on that same call, showed nothing at
+ * all and left the real answer unreachable in the UI.
+ *
+ * Preference order: the last attempt that validated cleanly, else the last
+ * attempt that produced any response text at all, else the last attempt (so a
+ * node whose every attempt errored still reports its final error).
+ */
+export function bestCall(calls: ModelCallDetail[]): ModelCallDetail | undefined {
+  if (calls.length === 0) return undefined;
+  const withResponse = calls.filter((c) => c.raw_response_text != null);
+  const valid = withResponse.filter((c) => c.validation_result === "valid" && !c.error);
+  return valid[valid.length - 1] ?? withResponse[withResponse.length - 1] ?? calls[calls.length - 1];
+}
+
+// A call-scoped tab is offered when ANY attempt carries that payload, not just
+// the selected one -- so switching attempts moves content in and out of a
+// stable tab strip instead of making tabs appear and vanish underfoot.
 function availableTabs(detail: NodeDetail): InspectorTab[] {
-  const call = detail.model_calls[0];
+  const calls = detail.model_calls;
   const present: Record<(typeof PAYLOAD_TABS)[number], boolean> = {
+    "Exact text": (detail.exact_text ?? "") !== "",
     "Exact input": jsonText(detail.input) !== "",
     "Exact output": jsonText(detail.output) !== "",
-    "Raw response": !!call?.raw_response_text,
-    "Parsed JSON": jsonText(call?.parsed_response_json) !== "",
-    "Reasoning record": detail.model_calls.length > 0,
+    "Raw response": calls.some((c) => !!c.raw_response_text),
+    "Parsed JSON": calls.some((c) => jsonText(c.parsed_response_json) !== ""),
+    "Reasoning record": calls.length > 0,
     "Configuration": jsonText(detail.config) !== "",
   };
   return ["Overview", ...PAYLOAD_TABS.filter((t) => present[t])];
@@ -37,17 +65,25 @@ export function Inspector({ nodeId, onClose, onSelectNode }: Props) {
   const [tab, setTab] = useState<InspectorTab>("Overview");
   const [detail, setDetail] = useState<NodeDetail | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [selectedCallId, setSelectedCallId] = useState<number | null>(null);
 
   useEffect(() => {
     if (nodeId == null) {
       setDetail(null);
+      setError(null);
       return;
     }
     let cancelled = false;
+    // Clearing the error here (and on success) is what keeps one failed fetch
+    // from bricking the panel: without it the `if (error)` branch below won
+    // forever, over every subsequently selected node, for the whole session.
+    setError(null);
     fetchNode(nodeId)
       .then((d) => {
         if (!cancelled) {
           setDetail(d);
+          setError(null);
+          setSelectedCallId(bestCall(d.model_calls)?.id ?? null);
           // Keep the current tab across node switches when it still applies
           // (comparing siblings), otherwise fall back to Overview.
           setTab((t) => (availableTabs(d).includes(t) ? t : "Overview"));
@@ -67,8 +103,9 @@ export function Inspector({ nodeId, onClose, onSelectNode }: Props) {
   if (error) return <div className="inspector inspector-error">{error}</div>;
   if (!detail) return <div className="inspector inspector-loading">Loading...</div>;
 
-  const call = detail.model_calls[0]; // most nodes have at most one; multi-attempt nodes show every attempt in Reasoning record
+  const call = detail.model_calls.find((c) => c.id === selectedCallId) ?? bestCall(detail.model_calls);
   const tabs = availableTabs(detail);
+  const showAttempts = detail.model_calls.length > 1 && CALL_SCOPED_TABS.includes(tab);
 
   return (
     <div className="inspector" data-testid="inspector">
@@ -89,14 +126,70 @@ export function Inspector({ nodeId, onClose, onSelectNode }: Props) {
         </div>
       )}
       <div className="inspector-body">
+        {showAttempts && (
+          <AttemptPicker calls={detail.model_calls} selectedId={call?.id ?? null} onSelect={setSelectedCallId} />
+        )}
         {tab === "Overview" && <Overview detail={detail} onSelectNode={onSelectNode} />}
+        {tab === "Exact text" && <MonospaceViewer text={detail.exact_text} truncated={detail.truncated} filename="exact_text.txt" />}
         {tab === "Exact input" && <MonospaceViewer text={jsonText(detail.input)} json truncated={detail.truncated} filename="input.json" />}
         {tab === "Exact output" && <MonospaceViewer text={jsonText(detail.output)} json truncated={detail.truncated} filename="output.json" />}
-        {tab === "Raw response" && <MonospaceViewer text={call?.raw_response_text} truncated={detail.truncated} filename="raw_response.txt" />}
-        {tab === "Parsed JSON" && <MonospaceViewer text={jsonText(call?.parsed_response_json)} json truncated={detail.truncated} filename="parsed.json" />}
+        {tab === "Raw response" && (
+          call?.raw_response_text
+            ? <MonospaceViewer text={call.raw_response_text} truncated={detail.truncated} filename="raw_response.txt" />
+            : <AttemptEmpty call={call} what="returned no response text" />
+        )}
+        {tab === "Parsed JSON" && (
+          jsonText(call?.parsed_response_json) !== ""
+            ? <MonospaceViewer text={jsonText(call?.parsed_response_json)} json truncated={detail.truncated} filename="parsed.json" />
+            : <AttemptEmpty call={call} what="produced no parsed JSON" />
+        )}
         {tab === "Reasoning record" && <ReasoningRecord detail={detail} />}
         {tab === "Configuration" && <MonospaceViewer text={jsonText(detail.config)} json filename="config.json" />}
       </div>
+    </div>
+  );
+}
+
+/** Chips across the top of a call-scoped tab: which attempt am I reading?
+ * Multi-attempt nodes are the common case, so the retry history has to be
+ * navigable, not just summarised in prose further down the panel. */
+function AttemptPicker({ calls, selectedId, onSelect }: {
+  calls: ModelCallDetail[];
+  selectedId: number | null;
+  onSelect: (id: number) => void;
+}) {
+  return (
+    <div className="attempt-picker" role="tablist" aria-label="Model call attempts">
+      {calls.map((c) => (
+        <button
+          key={c.id}
+          role="tab"
+          aria-selected={c.id === selectedId}
+          className={`attempt-chip attempt-chip-${attemptKind(c)}${c.id === selectedId ? " active" : ""}`}
+          title={c.error || c.validation_result || undefined}
+          onClick={() => onSelect(c.id)}
+        >
+          attempt {c.attempt} {attemptKind(c) === "ok" ? "✓" : attemptKind(c) === "error" ? "✕" : "·"}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function attemptKind(call: ModelCallDetail): "ok" | "error" | "neutral" {
+  if (call.error) return "error";
+  if (call.validation_result === "valid") return "ok";
+  if (call.raw_response_text == null) return "error";
+  return "neutral";
+}
+
+function AttemptEmpty({ call, what }: { call: ModelCallDetail | undefined; what: string }) {
+  if (!call) return <div className="reasoning-empty">No model call attached to this node.</div>;
+  return (
+    <div className="reasoning-empty">
+      Attempt {call.attempt} {what}.
+      {call.error && <span className="error"> {call.error}</span>}
+      {" "}Pick another attempt above to see one that did.
     </div>
   );
 }
@@ -122,10 +215,28 @@ function Overview({ detail, onSelectNode }: { detail: NodeDetail; onSelectNode?:
             <dd>{formatTimestamp(o.started_at)}</dd>
           </>
         )}
+        {o.finished_at && (
+          <>
+            <dt>Finished</dt>
+            <dd>{formatTimestamp(o.finished_at)}</dd>
+          </>
+        )}
         {duration(o.started_at, o.finished_at) && (
           <>
             <dt>Duration</dt>
             <dd>{duration(o.started_at, o.finished_at)}</dd>
+          </>
+        )}
+        {/* The run id is returned on every node and was rendered nowhere,
+            which left the Compare view (which asks for run ids by number)
+            with no way to discover its own inputs. */}
+        {detail.run && (
+          <>
+            <dt>Run</dt>
+            <dd>
+              #{detail.run.id} · {detail.run.kind}
+              {detail.run.status && <> · <span className={`status-chip status-chip-${chipKind(detail.run.status)}`}>{detail.run.status}</span></>}
+            </dd>
           </>
         )}
         {isSourceResult(detail) && <SourceResultFacts detail={detail} />}
@@ -169,7 +280,7 @@ function Overview({ detail, onSelectNode }: { detail: NodeDetail; onSelectNode?:
 /** One most-informative payload, previewed inline so a click on a node shows
  * its substance immediately instead of an empty pane and a hunt through tabs. */
 function primaryPayload(detail: NodeDetail): { title: string; text: string; json: boolean; filename: string } | null {
-  const call = detail.model_calls[0];
+  const call = bestCall(detail.model_calls);
   if (detail.exact_text) return { title: "Exact text", text: detail.exact_text, json: false, filename: "exact_text.txt" };
   const output = jsonText(detail.output);
   if (output) return { title: "Output", text: output, json: true, filename: "output.json" };
