@@ -4,24 +4,12 @@ import { GraphCanvas } from "./graph/GraphCanvas";
 import { Inspector } from "./inspector/Inspector";
 import { CompareView } from "./compare/CompareView";
 import { readBootstrap } from "./deepLink";
+import { useIsMobile } from "./useIsMobile";
 import type { GraphSeed } from "./graph/useGraphData";
 import type { ID, Tab } from "./types";
 
-const MOBILE_BREAKPOINT = 480; // iPhone-width class of device
 const MIN_INSPECTOR_WIDTH = 280;
 const INSPECTOR_WIDTH_KEY = "observatory-inspector-width";
-
-function useIsMobile() {
-  const [isMobile, setIsMobile] = useState(() => window.innerWidth <= MOBILE_BREAKPOINT);
-  useEffect(() => {
-    function onResize() {
-      setIsMobile(window.innerWidth <= MOBILE_BREAKPOINT);
-    }
-    window.addEventListener("resize", onResize);
-    return () => window.removeEventListener("resize", onResize);
-  }, []);
-  return isMobile;
-}
 
 export function App() {
   const bootstrap = useMemo(() => readBootstrap(), []);
@@ -85,7 +73,14 @@ export function App() {
         // graph, with the Inspector opened directly on its node.
         setSeed({ run_id: row.run_id as number });
         setSelectedNodeId(row.node_id as ID);
-        if (isMobile) setDrawerOpen(false);
+        if (isMobile) {
+          setDrawerOpen(false);
+          // This branch sets selection state directly instead of going through
+          // selectNode(), so it also has to open the sheet -- otherwise the
+          // Inspector content existed but stayed invisible and the tap read as
+          // "nothing happened".
+          setSheetOpen(true);
+        }
         return;
       }
     } else if (tab === "discoveries" && row.item_id != null) {
@@ -126,7 +121,7 @@ export function App() {
           {compareOpen ? (
             <CompareView onClose={() => setCompareOpen(false)} />
           ) : (
-            <GraphCanvas seed={seed} selectedNodeId={selectedNodeId} onSelectNode={selectNode} />
+            <GraphCanvas seed={seed} selectedNodeId={selectedNodeId} onSelectNode={selectNode} isMobile={isMobile} />
           )}
         </div>
         {!isMobile && (
