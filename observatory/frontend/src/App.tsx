@@ -2,6 +2,7 @@ import { useEffect, useMemo, useState } from "react";
 import { Explorer, rowKey } from "./explorer/Explorer";
 import { GraphCanvas } from "./graph/GraphCanvas";
 import { Inspector } from "./inspector/Inspector";
+import { InterestPanel } from "./interest/InterestPanel";
 import { CompareView } from "./compare/CompareView";
 import { readBootstrap } from "./deepLink";
 import { useIsMobile } from "./useIsMobile";
@@ -21,6 +22,10 @@ export function App() {
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
   const [selectedRowKey, setSelectedRowKey] = useState<string | null>(null);
+  // Both halves, because they address different things: the panel is fetched
+  // by key (/api/interest/<key>), while trace_nodes carry the numeric id as
+  // their entity_id.
+  const [selectedInterest, setSelectedInterest] = useState<{ key: string; id: ID } | null>(null);
   const isMobile = useIsMobile();
   const [inspectorWidth, setInspectorWidth] = useState(() => {
     const saved = Number(localStorage.getItem(INSPECTOR_WIDTH_KEY));
@@ -53,6 +58,7 @@ export function App() {
 
   function selectDiscovery(row: Record<string, unknown>, tab: Tab) {
     setSelectedRowKey(rowKey(tab, row, -1));
+    if (tab !== "interests") setSelectedInterest(null);
     // Each explorer tab's row.id is a primary key from a DIFFERENT table
     // (interests.id, search_generations.id, search_missions.id, ...) --
     // entity_id is only unique WITHIN one entity_type (see db.py's
@@ -87,8 +93,19 @@ export function App() {
       }
     } else if (tab === "discoveries" && row.item_id != null) {
       setSeed({ entity_type: "candidate_items", entity_id: row.item_id as string | number });
-    } else if (tab === "interests" && row.id != null) {
-      setSeed({ entity_type: "interests", entity_id: row.id as string | number });
+    } else if (tab === "interests" && row.key != null && row.id != null) {
+      // Opens the interest itself rather than seeding the graph. Seeding
+      // resolved to the newest trace node carrying this entity, which is a
+      // `match` node 13,763 times out of 13,857 -- i.e. whichever candidate
+      // most recently keyword-matched, an arbitrary trace. The panel keeps a
+      // "Show latest trace" button for when that IS what you wanted.
+      setSelectedInterest({ key: row.key as string, id: row.id as ID });
+      setSelectedNodeId(null);
+      if (isMobile) {
+        setDrawerOpen(false);
+        setSheetOpen(true);
+      }
+      return;
     } else if (tab === "generations" && row.id != null) {
       setSeed({ entity_type: "search_generations", entity_id: row.id as string | number });
     } else if (tab === "missions" && row.id != null) {
@@ -100,7 +117,31 @@ export function App() {
 
   function selectNode(id: ID) {
     setSelectedNodeId(id);
+    setSelectedInterest(null);
     if (isMobile) setSheetOpen(true);
+  }
+
+  /** The right-hand pane shows an interest when one is open, otherwise the
+   * node inspector -- one pane, two subjects, never both at once. */
+  function rightPane(onClose?: () => void) {
+    if (selectedInterest) {
+      return (
+        <InterestPanel
+          interestKey={selectedInterest.key}
+          onClose={onClose}
+          onSelectDiscovery={(itemId) => {
+            setSelectedInterest(null);
+            setSeed({ entity_type: "candidate_items", entity_id: itemId });
+            setSelectedNodeId(null);
+          }}
+          onShowLatestTrace={() => {
+            setSeed({ entity_type: "interests", entity_id: selectedInterest.id });
+            setSelectedInterest(null);
+          }}
+        />
+      );
+    }
+    return <Inspector nodeId={selectedNodeId} onClose={onClose} onSelectNode={selectNode} />;
   }
 
   function openRawDb() {
@@ -130,7 +171,7 @@ export function App() {
           <>
             <div className="pane-resizer" title="Drag to resize" onPointerDown={startInspectorResize} />
             <div className="pane pane-inspector" style={{ width: inspectorWidth }}>
-              <Inspector nodeId={selectedNodeId} onSelectNode={selectNode} />
+              {rightPane()}
             </div>
           </>
         )}
@@ -138,7 +179,7 @@ export function App() {
       {isMobile && (
         <div className={`bottom-sheet ${sheetOpen ? "open" : ""}`} data-testid="bottom-sheet">
           <div className="bottom-sheet-handle" onClick={() => setSheetOpen(false)} />
-          <Inspector nodeId={selectedNodeId} onClose={() => setSheetOpen(false)} onSelectNode={selectNode} />
+          {rightPane(() => setSheetOpen(false))}
         </div>
       )}
     </div>
