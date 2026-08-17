@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react";
+import { Fragment, useEffect, useMemo, useState } from "react";
 import { fetchNode, fetchPromptTemplate } from "../api";
 import { labelScore } from "../graph/assemble";
 import type { ID, ModelCallDetail, NodeDetail, PromptTemplate } from "../types";
@@ -363,6 +363,7 @@ function Overview({ detail, onSelectNode }: { detail: NodeDetail; onSelectNode?:
         edges={detail.outbound_edges.map((e) => ({ id: e.to, relationship: e.relationship, label: e.to_label, node_type: e.to_node_type }))}
         onSelectNode={onSelectNode}
       />
+      <EntityFacts detail={detail} />
       {preview ? (
         <div className="overview-preview">
           <div className="overview-section-title">{preview.title}</div>
@@ -384,6 +385,160 @@ function Overview({ detail, onSelectNode }: { detail: NodeDetail; onSelectNode?:
       )}
     </div>
   );
+}
+
+/** The operational row behind the node, rendered per entity type.
+ *
+ * All of this existed one JOIN away and was reachable only by leaving the app
+ * for raw Datasette: the six sub-scores behind the single number on a
+ * threshold card, the item body the scorer actually read, what a duplicate
+ * duplicated, how many times a delivery was attempted, why a mission exists.
+ */
+function EntityFacts({ detail }: { detail: NodeDetail }) {
+  const row = detail.entity_row;
+  const entityType = detail.overview.entity_type;
+  if (!row || !entityType) return null;
+
+  if (entityType === "scores") return <ScoreFacts row={row} weights={detail.score_weights} />;
+  if (entityType === "candidate_items") return <ItemFacts row={row} truncated={detail.truncated} />;
+  if (entityType === "notifications") {
+    return (
+      <FactList title="Delivery" pairs={[
+        ["Channel", str(row.channel)],
+        ["Attempts", str(row.attempts)],
+        ["Sent", formatTimestamp(str(row.sent_at)) ?? ""],
+        ["Result", row.ok ? "delivered" : "failed"],
+      ]} />
+    );
+  }
+  if (entityType === "search_missions") {
+    return (
+      <>
+        <FactList title="Mission" pairs={[
+          ["Interest", str(row.interest_key)],
+          ["Status", str(row.status)],
+          ["Attempts", str(row.attempts)],
+          ["Items returned", str(row.items_returned)],
+          ["Last error", str(row.last_error)],
+        ]} />
+        {str(row.rationale) && (
+          <div className="overview-preview">
+            <div className="overview-section-title">Why this mission exists</div>
+            <p className="overview-summary">{str(row.rationale)}</p>
+          </div>
+        )}
+        {str(row.prompt) && (
+          <details className="entity-fold">
+            <summary>Mission prompt</summary>
+            <MonospaceViewer text={str(row.prompt)} large filename="mission-prompt.txt" />
+          </details>
+        )}
+      </>
+    );
+  }
+  if (entityType === "search_generations") {
+    return (
+      <FactList title="Generation" pairs={[
+        ["Interest", str(row.interest_key)],
+        ["Model", [str(row.provider), str(row.model)].filter(Boolean).join("/")],
+        ["Missions", `${str(row.missions_returned)} of ${str(row.missions_requested)} requested`],
+        ["Status", str(row.status)],
+        ["Error", str(row.error)],
+      ]} />
+    );
+  }
+  return null;
+}
+
+/** The six dimensions behind the one number on a threshold card, each with the
+ * weight that actually produced final_score (specificity is scored but
+ * deliberately unweighted -- see discovery/models.py). */
+function ScoreFacts({ row, weights }: { row: Record<string, unknown>; weights: Record<string, number> | null }) {
+  const dimensions = ["personal_relevance", "novelty", "depth", "specificity", "importance", "surprise"];
+  return (
+    <div className="entity-facts">
+      <div className="overview-section-title">Score breakdown</div>
+      <ul className="score-bars">
+        {dimensions.map((name) => {
+          const value = Number(row[name]);
+          if (!isFinite(value)) return null;
+          const weight = weights?.[name];
+          return (
+            <li key={name}>
+              <span className="score-bar-name">{name.replace(/_/g, " ")}</span>
+              <span className="score-bar-track"><span className="score-bar-fill" style={{ width: `${Math.round(value * 100)}%` }} /></span>
+              <span className="score-bar-value">
+                {value.toFixed(2)}
+                <span className="score-bar-weight">{weight != null ? ` ×${weight}` : " unweighted"}</span>
+              </span>
+            </li>
+          );
+        })}
+      </ul>
+      <FactList pairs={[
+        ["Final score", str(row.final_score)],
+        ["Confidence", str(row.confidence)],
+        ["Prompt version", str(row.prompt_hash)],
+      ]} />
+      {str(row.reason) && <p className="overview-summary">{str(row.reason)}</p>}
+      {str(row.why_better_than_generic) && (
+        <p className="overview-summary"><em>Better than generic:</em> {str(row.why_better_than_generic)}</p>
+      )}
+    </div>
+  );
+}
+
+/** The item body the scorer actually read -- previously the card showed only
+ * its title, and the text (avg 760 chars, max 10,220) was invisible. */
+function ItemFacts({ row, truncated }: { row: Record<string, unknown>; truncated: boolean }) {
+  const duplicate = row.duplicate_of_item as { id: number; title: string; url: string } | undefined;
+  return (
+    <div className="entity-facts">
+      <FactList title="Item" pairs={[
+        ["Source", [str(row.source), str(row.type)].filter(Boolean).join(" · ")],
+        ["Author", str(row.author)],
+        ["Published", str(row.published_at)],
+        ["From interest", str(row.origin_interest)],
+        ["Prefilter", row.prefilter_ok === 0 ? `rejected -- ${str(row.prefilter_reason)}` : ""],
+      ]} />
+      {duplicate && (
+        <div className="entity-duplicate">
+          Duplicate of <a href={str(duplicate.url)} target="_blank" rel="noreferrer">{str(duplicate.title)}</a>
+          {str(row.dup_reason) && <> ({str(row.dup_reason)})</>}
+        </div>
+      )}
+      {str(row.text) && (
+        <details className="entity-fold">
+          <summary>Item text ({str(row.text).length.toLocaleString()} chars)</summary>
+          <MonospaceViewer text={str(row.text)} large truncated={truncated} filename="item-text.txt" />
+        </details>
+      )}
+    </div>
+  );
+}
+
+function FactList({ title, pairs }: { title?: string; pairs: [string, string][] }) {
+  const shown = pairs.filter(([, value]) => value !== "" && value !== "null" && value !== "undefined");
+  if (shown.length === 0) return null;
+  return (
+    <>
+      {title && <div className="overview-section-title">{title}</div>}
+      <dl className="overview-facts">
+        {shown.map(([label, value]) => (
+          <Fragment key={label}>
+            <dt>{label}</dt>
+            <dd>{value}</dd>
+          </Fragment>
+        ))}
+      </dl>
+    </>
+  );
+}
+
+/** Row values arrive as raw SQLite cells; null/undefined render as "". */
+function str(value: unknown): string {
+  if (value == null) return "";
+  return String(value);
 }
 
 /** One most-informative payload, previewed inline so a click on a node shows

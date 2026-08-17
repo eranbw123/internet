@@ -218,6 +218,22 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .search-hit { background: #fff2a8; }
 .search-hit-active { background: #ffc400; }
 
+/* The operational row behind a node: sub-scores, item text, delivery, mission. */
+.entity-facts { margin: 8px 0; }
+.entity-fold { margin: 6px 0; border: 1px solid var(--border); border-radius: 4px; }
+.entity-fold > summary { cursor: pointer; padding: 4px 8px; font-size: 12px; background: #f6f8fb; }
+.entity-duplicate {
+  font-size: 12px; background: #f4f7fb; border-left: 3px solid var(--accent);
+  padding: 4px 8px; margin: 6px 0;
+}
+.score-bars { list-style: none; margin: 0 0 8px; padding: 0; font-size: 11px; }
+.score-bars li { display: grid; grid-template-columns: 8.5em 1fr 6.5em; gap: 6px; align-items: center; margin-bottom: 2px; }
+.score-bar-name { color: #667; }
+.score-bar-track { background: #eef1f5; border-radius: 3px; height: 8px; overflow: hidden; }
+.score-bar-fill { display: block; height: 100%; background: var(--accent); }
+.score-bar-value { text-align: right; font-variant-numeric: tabular-nums; }
+.score-bar-weight { color: #98a2b0; }
+
 .overview-error {
   background: #fdecea; color: var(--error); border: 1px solid #f2b8b5;
   border-radius: 4px; padding: 6px 8px; margin-bottom: 8px; word-break: break-word;
