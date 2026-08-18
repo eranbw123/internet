@@ -1255,7 +1255,17 @@ def _extract_interests_cmd(conn, cfg, args):
     # map had pending work and finished with just as much still pending, it
     # spent browser time and digested nothing, and the next import will
     # re-import a byte-identical artifact. Say so, and fail.
-    if (not args.skip_map and pending_before and pending_after is not None
+    # `> 0`, not truthiness. The extractor reports pending_conversations as
+    # conversations_in_db minus conversations_digested, and those two count
+    # different things -- digests are keyed by content hash, so a re-digested
+    # conversation is counted again and the difference goes NEGATIVE once the
+    # corpus has been re-mapped (measured: 355 in db, 503 digested, pending
+    # -148). A negative number is truthy, and -148 >= -148, so the bare
+    # truthiness test failed a run in which map correctly had nothing to do
+    # and reduce had just published a fresh artifact. Guarding against
+    # false success is the point of this check; reporting a false failure
+    # would discredit it just as fast.
+    if (not args.skip_map and (pending_before or 0) > 0 and pending_after is not None
             and pending_after >= pending_before):
         _say(
             f"extract-interests: map made no progress -- {pending_before} conversations "

@@ -9715,6 +9715,30 @@ class ExtractInterestsCLITests(unittest.TestCase):
         self.assertIn("does not accept --max-themes", out)
         self.assertIn("UNBOUNDED", out)
 
+    def test_a_negative_pending_count_is_not_a_failure(self):
+        """The extractor computes pending_conversations as conversations_in_db
+        minus conversations_digested, and those count different things --
+        digests are keyed by content hash, so a re-digested conversation is
+        counted twice and the difference goes NEGATIVE once the corpus has
+        been re-mapped. Measured on the live corpus: 355 in db, 503 digested,
+        pending -148. A negative is truthy and -148 >= -148, so a bare
+        truthiness guard failed a run where map correctly had nothing to do
+        and reduce had just published a fresh artifact. A false failure
+        discredits the honesty check as fast as a false success does."""
+        self._set_pending(-148)
+        self._write_extractor(
+            "if cmd == 'map':\n"
+            "    print('nothing to do')\n"
+            "    raise SystemExit(0)\n"
+            "if cmd == 'reduce':\n"
+            "    out = sys.argv[sys.argv.index('--out') + 1]\n"
+            "    open(out, 'w').write('{}')\n"
+            "    raise SystemExit(0)\n"
+        )
+        code, out, _err = self._main()
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("made no progress", out)
+
     def test_skip_map_reduces_over_the_existing_digests(self):
         self._write_extractor(self.GOOD)
         code, out, _err = self._main("--skip-map")
