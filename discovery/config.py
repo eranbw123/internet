@@ -94,6 +94,24 @@ class Config:
     # checkpointed per batch and resumable, so hitting this costs at most one
     # batch and the next night resumes -- and stopping map on a deadline is
     # what guarantees `reduce` still gets to run and publish an artifact.
+    # How many themes the extractor's `reduce` stage may send to claude.ai in
+    # one request. Measured against the live corpus on 2026-08-18: 60 themes
+    # reduced fine in 6 minutes and produced 27 candidates, while 400 and 838
+    # both came back as "empty completion from claude.ai" within ten seconds.
+    #
+    # A bound is needed at all because the extractor's own durability gate
+    # filters nothing in practice -- map writes deliberately specific labels,
+    # so 837 of 838 themes hold exactly ONE conversation and all of them are
+    # "transient", which makes run_reduce fall back to the entire theme list.
+    # That list grows with the corpus, so an unbounded nightly reduce fails
+    # every night once the corpus is big enough. It did, on the first
+    # scheduled run.
+    #
+    # 60 is the value actually proven to work, not a guess one notch below a
+    # failure. It is also the cheaper one: a bounded reduce is a shorter
+    # completion, and this job shares a claude.ai quota with the web
+    # collector. Raise it once the durability gate does real filtering.
+    interest_extract_max_themes: int = 60
     interest_extract_map_seconds: int = 60 * 60
     # 30 minutes, from a measurement rather than a guess: the first end-to-end
     # run took 13.0m for reduce, of which 12.9m was a single claude.ai
@@ -242,6 +260,9 @@ def load():
         ),
         offers_sweep_interval_seconds=int(
             os.environ.get("DISCOVERY_OFFERS_SWEEP_INTERVAL", str(6 * 3600))
+        ),
+        interest_extract_max_themes=int(
+            os.environ.get("DISCOVERY_INTEREST_EXTRACT_MAX_THEMES", "60")
         ),
         interest_extract_map_seconds=int(
             os.environ.get("DISCOVERY_INTEREST_EXTRACT_MAP_SECONDS", str(60 * 60))

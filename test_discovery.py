@@ -9670,6 +9670,51 @@ class ExtractInterestsCLITests(unittest.TestCase):
         self.assertIn("[map] batch 1 -- 3 digested", out)
         self.assertIn("[map] batch 2 -- 3 digested", out)
 
+    def test_reduce_is_given_a_bounded_theme_list(self):
+        """Unbounded, `reduce` forwards the extractor's entire theme list --
+        its durability gate filters nothing on the real corpus -- and the
+        request grows until claude.ai answers with nothing at all. The first
+        scheduled run of this job mapped 240 conversations successfully and
+        then failed reduce outright, twice, in under ten seconds each."""
+        self._write_extractor(
+            "if cmd == 'map':\n"
+            "    import os\n"
+            "    open(os.path.join(os.path.dirname(__file__), 'pending.txt'), 'w').write('0')\n"
+            "    raise SystemExit(0)\n"
+            "if cmd == 'reduce':\n"
+            "    out = sys.argv[sys.argv.index('--out') + 1]\n"
+            "    open(out, 'w').write(' '.join(sys.argv))\n"
+            "    raise SystemExit(0)\n"
+        )
+        code, _out, _err = self._main(env={"DISCOVERY_INTEREST_EXTRACT_MAX_THEMES": "42"})
+        self.assertEqual(code, 0)
+        with open(self.artifact) as fh:
+            self.assertIn("--max-themes 42", fh.read())
+
+    def test_an_ai_checkout_without_the_flag_still_reduces(self):
+        """argparse exits 2 on an unknown flag. An `ai` checkout older than
+        eranbw123/ai#21 has never heard of --max-themes, and refusing to
+        reduce at all over a flag it does not know would be a worse failure
+        than the one the flag exists to prevent -- so it retries without it,
+        and says loudly in the log that the request went out unbounded."""
+        self._write_extractor(
+            "if cmd == 'map':\n"
+            "    import os\n"
+            "    open(os.path.join(os.path.dirname(__file__), 'pending.txt'), 'w').write('0')\n"
+            "    raise SystemExit(0)\n"
+            "if cmd == 'reduce':\n"
+            "    if '--max-themes' in sys.argv:\n"
+            "        sys.stderr.write('unrecognized arguments: --max-themes\\n')\n"
+            "        raise SystemExit(2)\n"
+            "    out = sys.argv[sys.argv.index('--out') + 1]\n"
+            "    open(out, 'w').write('{}')\n"
+            "    raise SystemExit(0)\n"
+        )
+        code, out, _err = self._main()
+        self.assertEqual(code, 0, out)
+        self.assertIn("does not accept --max-themes", out)
+        self.assertIn("UNBOUNDED", out)
+
     def test_skip_map_reduces_over_the_existing_digests(self):
         self._write_extractor(self.GOOD)
         code, out, _err = self._main("--skip-map")

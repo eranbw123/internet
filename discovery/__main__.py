@@ -1203,10 +1203,36 @@ def _extract_interests_cmd(conn, cfg, args):
     # reduce runs even after a map timeout: a partial digest set still yields a
     # valid, if slightly staler, candidate list, and publishing something beats
     # publishing nothing.
+    # --max-themes bounds what reduce sends claude.ai in one request. Without
+    # it the extractor forwards its ENTIRE theme list -- its durability gate
+    # filters nothing on the real corpus -- and the request grows with the
+    # corpus until claude.ai answers with nothing at all. That is not a
+    # hypothetical: the first scheduled run of this job mapped 240
+    # conversations successfully and then failed reduce outright, twice, in
+    # under ten seconds each time. See cfg.interest_extract_max_themes.
+    reduce_args = ["reduce", "--out", str(artifact)]
+    if cfg.interest_extract_max_themes:
+        reduce_args += ["--max-themes", str(cfg.interest_extract_max_themes)]
     code, reduce_timed_out = _run_extractor_stage(
-        python, script, repo_root, ["reduce", "--out", str(artifact)],
+        python, script, repo_root, reduce_args,
         cfg.interest_extract_reduce_seconds,
     )
+    if code == 2 and cfg.interest_extract_max_themes:
+        # argparse exits 2 on an unknown flag. An `ai` checkout older than
+        # eranbw123/ai#21 has no --max-themes, and refusing to reduce at all
+        # because of a flag it has never heard of would be a worse failure
+        # than the one the flag exists to prevent. Say so, then reduce
+        # without it -- loudly, so the log records that the request went out
+        # unbounded and may well come back empty.
+        _say(
+            "extract-interests: this ai checkout does not accept --max-themes "
+            "(pre-#21); retrying reduce UNBOUNDED, which is the configuration "
+            "that fails once the corpus is large"
+        )
+        code, reduce_timed_out = _run_extractor_stage(
+            python, script, repo_root, ["reduce", "--out", str(artifact)],
+            cfg.interest_extract_reduce_seconds,
+        )
     if reduce_timed_out or code != 0:
         _say(
             f"extract-interests: reduce FAILED (exit {code}, timed_out={reduce_timed_out})"
