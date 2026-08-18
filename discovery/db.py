@@ -125,11 +125,15 @@ def init(conn):
 
 # --- interests ---------------------------------------------------------------
 
-def upsert_interest(conn, interest):
+def upsert_interest(conn, interest, active=1):
     """Insert or update by `key`. interests.json is the source of truth, so a
-    re-load overwrites the stored copy rather than merging. Always writes
-    layer='owner'; the ON CONFLICT branch only fires `WHERE layer = 'owner'`,
-    so this can never overwrite a derived row (structurally impossible
+    re-load overwrites the stored copy rather than merging. `active` defaults
+    to 1 (every pre-sync-v2 call site is byte-identical); sync v2 passes 0 for
+    an entry the file marks `"active": false`, so retiring an interest in the
+    file and re-writing its definition are one atomic row write rather than an
+    insert that briefly reactivates it. Always writes layer='owner'; the ON
+    CONFLICT branch only fires `WHERE layer = 'owner'`, so this can never
+    overwrite a derived row (structurally impossible
     anyway -- interests.load_file() rejects an owner key carrying
     DERIVED_KEY_PREFIX -- but guarded here too, defense in depth)."""
     conn.execute(
@@ -137,7 +141,7 @@ def upsert_interest(conn, interest):
         INSERT INTO interests
             (key, title, description, positive_signals, negative_signals,
              min_score, sources, source_config, active, layer)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'owner')
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'owner')
         ON CONFLICT(key) DO UPDATE SET
             title = excluded.title,
             description = excluded.description,
@@ -146,7 +150,7 @@ def upsert_interest(conn, interest):
             min_score = excluded.min_score,
             sources = excluded.sources,
             source_config = excluded.source_config,
-            active = 1,
+            active = excluded.active,
             layer = 'owner'
         WHERE interests.layer = 'owner'
         """,
@@ -159,6 +163,7 @@ def upsert_interest(conn, interest):
             interest.min_score,
             json.dumps(interest.sources),
             json.dumps(interest.source_config),
+            active,
         ),
     )
     conn.commit()

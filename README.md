@@ -46,7 +46,8 @@ a long-lived session.
 
 | Command | What it does |
 | --- | --- |
-| `init` | Create/upgrade `discovery.db` and load `interests.json` |
+| `init` | Create/upgrade `discovery.db` and reconcile `interests.json` into it |
+| `sync [--dry-run] [--force]` | Reconcile `interests.json` into a running database: upsert edits, deactivate entries the file dropped or marked `"active": false`, and cancel those interests' pending missions. Takes effect on the next cycle — no re-`init`, no manual DB write. `--dry-run` prints the plan; `--force` overrides the truncated-file guard — see [interests.json](#interestsjson) |
 | `run-once [--source X]` | One collect → score → notify cycle (stocks/youtube; web discovery is scheduled via `web-tick` instead, see below). Gated by a provider preflight — exits 3 without touching a collector/LLM if Chrome/CDP is down |
 | `web-tick` | One continuous Council-driven web discovery tick — replenish, lease and execute a fair slice of pending research missions through the real pipeline. Gated by the mission provider's own preflight, same exit-3 convention — see [Continuous web discovery](#continuous-web-discovery-council-missions) |
 | `listen` | Long-polls Telegram for feedback buttons, blocking — interactive use |
@@ -154,6 +155,46 @@ place rather than duplicating it. Every interest loaded from this file is
 layer `owner` — the layer that's immutable to automation; see
 [Layered interest state](#layered-interest-state) for how the system can add
 its own interests alongside these.
+
+**This file is the source of truth in both directions.** Edit it, then run
+`python -m app sync` — the change is live on the next cycle:
+
+```bash
+python -m app sync --dry-run    # what would change, writes nothing
+python -m app sync              # apply it
+```
+
+| In the file | In the database |
+| --- | --- |
+| present, new | created and live |
+| present, saying nothing about `active` | definition updated; **liveness left alone**, so an interest the decay sweep auto-paused stays paused |
+| present with `"active": false` | **retired** — the definition is kept, so reviving it is one flag rather than re-authoring the entry |
+| present with `"active": true` | forced live, overruling the sweep |
+| present again after being retired | revived — re-adding an entry *is* the revival |
+| removed entirely | **retired**, and its pending research missions are cancelled |
+
+Retirement and revival are not written here directly: they go through the
+interest lifecycle state machine in `discovery/offers.py`
+(`active`/`decaying`/`paused`/`retired`), so there is one deactivation
+mechanism in the engine and the `lifecycle` and `active` columns can never
+disagree. Every actual change appends an `owner_sync` row to `interest_events`
+(`python -m app interests --why <key>` prints the chain); an unchanged file
+writes nothing at all, so `sync` is safe to run on a schedule. Retiring an
+interest never deletes its row — its items, scores and provenance stay
+queryable.
+
+Because the file is the source of truth, a retirement made only in the
+database (`offers.retire_interest()`) while the entry still sits in the file
+saying nothing is undone by the next sync. `interest_sync.set_entry_active()`
+is the call that writes the decision back to the file, and
+`interest_sync.entry_writer()` is the callable `offers.accept(sync=...)`
+takes — accepting an offer writes its entry into `interests.json`, syncs it
+into the database, and activates the offer in one call.
+
+Because a truncated or half-written file must not be able to retire the whole
+engine, `sync` refuses any run that would deactivate more than half the active
+interests (above 3 of them) and tells you to re-run with `--force` if you
+meant it.
 
 `min_score` is a **0–1** threshold on the final score. (It used to be 0–100;
 anything above 1 is treated as the old scale and divided by 100, so a stale

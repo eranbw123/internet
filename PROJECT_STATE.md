@@ -1168,9 +1168,58 @@ collectors already fetch — no new collector call); promotion past
 at/above today's owner bars). CLI: `python -m app interests [--layer L]
 [--why KEY] [--refresh]` — list (owner first), provenance chain, or run
 `apply_transitions` (prints the off-message and changes nothing if the flag
-is off). `interests.sync` now appends one 'owner_sync' event per interest.
+is off). `interests.sync` now appends one 'owner_sync' event per interest (superseded
+by sync v2 below: one event per actual change).
 Scheduling the refresh on a cadence is deferred to a later step — not
 wired into `ops/install_tasks.py` here.
+
+## interest sync v2 (deactivation-aware, callable)
+`discovery/interest_sync.py` — `interests.json` is now the source of truth in
+BOTH directions. v1 only ever inserted/updated, so an interest deleted from
+the file kept collecting and spending until somebody hand-ran an UPDATE on the
+live DB (that is what the 13 `active=0` owner rows in production are, and why
+the standing procedure was "JSON PR **and** a live-DB op" — obsolete now).
+`plan(conn, path)` computes the reconciliation without writing;
+`apply(conn, plan, force)` writes it; `sync()` is both. New entry → created
+live; entry saying nothing about `active` → definition updated, **liveness
+untouched** (an auto-paused interest stays paused — sync must not fight the
+decay sweep); `"active": false` (new optional field, read three-way by
+`interests.load_stated_active`, mirroring `load_blocked`) → retired,
+definition intact; `"active": true` → forced live, overruling the sweep;
+present again after being retired → revived; absent → retired. Retiring
+cancels the interest's PENDING `search_missions` (RUNNING is left alone — its
+lease owns that row).
+
+**Liveness is never written here.** Retirement/revival go through
+`offers.set_lifecycle()`, so there is one deactivation mechanism and
+`lifecycle`/`active` can never disagree; this module owns the reconciliation
+(what the file says), `offers.py` owns the state machine (what happens to an
+interest once it exists). The seam runs both ways: `entry_writer(conn, path)`
+is the callable `offers.accept(sync=...)` takes — entry into interests.json,
+sync into the DB, `offers.activate()` finds its row — and `write_entry()` /
+`set_entry_active()` are the atomic interests.json writers (same shape as
+`offers.append_blocked_terms`). A retirement made only in the DB while the
+file still carries the entry is reverted by the next sync **by design**: the
+file is the source of truth, so the write API (PR J) must call
+`set_entry_active()` alongside every retire/undo.
+
+One `owner_sync` `interest_events` row per *actual* change (`create`/`update`
+from here, `reactivate`/`deactivate` from `set_lifecycle`, carrying the
+changed fields or the reason plus missions cancelled); an unchanged file
+writes nothing, so repeat runs are free. Only `layer='owner'` rows are
+visible; derived rows stay `interest_state.py`'s. Guard: a run that would
+retire >50% of the non-retired set (above 3) raises `SyncRefused` unless
+forced — a truncated/half-written file must not retire the engine. Migration
+owned by this module (`MIGRATION`/`migrate()`, additive ALTER applied on
+demand by every `plan()`, deliberately NOT in `db.init()`'s pass, so it stays
+clear of the offers store's columns): `interests.synced_at`.
+`db.upsert_interest` gained `active=1` (every prior call site unchanged).
+CLI `python -m app sync [--dry-run] [--force]`; `init` routes through the same
+call and reports what it reconciled. Rehearsed on a copy of the production DB:
+the first run retires the 13 owner rows that were hand-deactivated by live-DB
+ops (PR H's backfill had set them all `lifecycle='active'` while `active=0`),
+writes 13 provenance events, and touches none of the 153 pending missions;
+the second run is a no-op. 32 new tests (green).
 
 ## engine lab (`experiments/lab/`, branch `engine-lab`)
 Reusable prompt-optimization loop for the whole engine, generalized from the
