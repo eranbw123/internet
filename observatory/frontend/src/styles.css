@@ -107,7 +107,14 @@ button[aria-selected="true"], button.active, button[aria-pressed="true"] {
 .explorer-search input { width: 100%; padding: 6px; }
 .explorer-tabs { display: flex; flex-wrap: wrap; gap: 2px; padding: 4px 0; }
 .explorer-tabs button[aria-selected="true"] { font-weight: 700; border-bottom: 2px solid var(--accent); }
-.explorer-filters { display: flex; gap: 4px; flex-wrap: wrap; padding: 4px 0; }
+/* The interest <select> sizes itself to its longest option -- measured 461px
+   inside a 319px pane -- which made the explorer scroll sideways. That was
+   fixed for the phone and only the phone; the same select overflows the same
+   pane on a desktop, where the pane is resizable and can be narrower still.
+   Nothing inside the pane may exceed it, at any width. */
+.explorer select, .explorer input { max-width: 100%; }
+.explorer-filters { display: flex; gap: 4px; flex-wrap: wrap; padding: 4px 0; min-width: 0; }
+.explorer-filters select { min-width: 0; }
 .explorer-rows { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; overflow-anchor: none; }
 .explorer-row { padding: 6px 4px; border-bottom: 1px solid var(--border-subtle); cursor: pointer; }
 .explorer-row:hover { background: var(--hover); }
