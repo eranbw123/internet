@@ -39,6 +39,12 @@
                   Datasette UI + JSON API over the trace tables, bound to
                   localhost by default; --public additionally requires
                   DISCOVERY_UI_TOKEN and DISCOVERY_NGROK_CMD (see README)
+    offers        AI-generated interest offers (discovery/offers.py): the
+                  inbox (--status), one offer's provenance (--why KEY),
+                  --import [PATH] a contract-v2 candidates artifact,
+                  --sweep the expiry/decay/auto-pause timers, and the
+                  decisions --accept/--reject/--snooze KEY, plus --undo KEY
+                  for the one-click undo of an auto-pause
 
 There is no `run`/scheduler loop -- an OS scheduler (see
 ops/install_tasks.py) calls the commands above on their own cadence instead;
@@ -52,7 +58,7 @@ from collections import Counter
 
 from datetime import datetime, timezone
 
-from . import config, db, feedback_listener, health, interests, missions, personal_state, providers, stats, teach, trace
+from . import config, db, feedback_listener, health, interests, missions, offers, personal_state, providers, stats, teach, trace
 from .collectors import COLLECTORS
 from .models import CandidateItem
 from .notify import FEEDBACK_VERDICTS, print_safe
@@ -160,6 +166,21 @@ def main(argv=None):
         "--public", action="store_true",
         help="expose via ngrok, token-gated -- requires DISCOVERY_UI_TOKEN and DISCOVERY_NGROK_CMD",
     )
+    of = sub.add_parser(
+        "offers", help="interest offers: inbox, import, decisions, and the lifecycle sweeps"
+    )
+    of.add_argument("--status", help="filter the listing (default: the 'offered' inbox)")
+    of.add_argument("--why", metavar="KEY", help="print one offer's evidence, scores and event chain")
+    of.add_argument(
+        "--import", dest="import_path", nargs="?", const="", metavar="PATH",
+        help="import a contract-v2 candidates artifact (default: cfg.interest_candidates_path)",
+    )
+    of.add_argument("--sweep", action="store_true", help="run the expiry/decay/auto-pause timers")
+    of.add_argument("--accept", metavar="KEY", help="accept an offer (prints the interests.json entry)")
+    of.add_argument("--reject", metavar="KEY", help="reject an offer and block its terms")
+    of.add_argument("--snooze", metavar="KEY", help="snooze an offer back into the inbox later")
+    of.add_argument("--undo", metavar="KEY", help="undo an interest's auto-pause")
+    of.add_argument("--note", default="", help="note recorded with a decision")
 
     args = parser.parse_args(argv)
     if args.command == "trace-fixture" and not args.db:
@@ -264,6 +285,8 @@ def _dispatch(conn, cfg, args, provider):
         print(trace_fixture.build(conn, cfg))
     elif args.command == "ui":
         return _ui_cmd(cfg, args)
+    elif args.command == "offers":
+        return _offers_cmd(conn, cfg, args)
     return 0
 
 
@@ -633,6 +656,102 @@ def _launch_ngrok(cfg, port):
         print(f"ui --public: failed to launch ngrok ({cmd_str!r}): {e}", file=sys.stderr)
         return False
     return True
+
+
+def _offers_cmd(conn, cfg, args):
+    """One subcommand over discovery/offers.py. Every branch is offline:
+    importing reads a local artifact, the sweeps read the funnel, and the
+    decisions write only the offer/interest tables -- no provider is ever
+    built, no model is ever called."""
+    if args.why:
+        return _offer_why(conn, args.why)
+    if args.import_path is not None:
+        path = args.import_path or cfg.interest_candidates_path
+        summary = offers.import_artifact(conn, path, interests_path=cfg.interests_path)
+        print_safe(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+    if args.sweep:
+        summary = offers.sweep(conn)
+        for announcement in summary["announcements"]:
+            print_safe(announcement["text"])
+        print_safe(json.dumps(
+            {k: v for k, v in summary.items() if k != "announcements"}, ensure_ascii=False
+        ))
+        return 0
+    for key, action in (
+        (args.accept, "accept"), (args.reject, "reject"),
+        (args.snooze, "snooze"), (args.undo, "undo"),
+    ):
+        if key:
+            return _offer_decide(conn, cfg, key, action, args.note)
+    return _offers_list(conn, args.status)
+
+
+def _offers_list(conn, status):
+    rows = offers.list_offers(conn, status=status or offers.OFFERED)
+    if not rows:
+        print_safe(f"no offers with status '{status or offers.OFFERED}'")
+        return 0
+    for row in rows:
+        score = "  -  " if row["score"] is None else f"{row['score']:.2f}"
+        print_safe(
+            f"{row['key']}  {row['kind']}  score={score}  status={row['status']}  "
+            f"evidence={len(row['evidence'])} quote(s) from "
+            f"{len(row['source_conversations'])} conversation(s)"
+        )
+    return 0
+
+
+def _offer_why(conn, key):
+    """The provenance answer for one offer: which conversations, which
+    verbatim quotes, every score term, and the whole event chain."""
+    detail = offers.offer_detail(conn, key)
+    if detail is None:
+        print(f"no offer with key {key!r}", file=sys.stderr)
+        return 2
+    print_safe(f"{detail['key']}  ({detail['kind']}, {detail['status']})")
+    print_safe(f"  title: {detail['title']}")
+    if detail["score"] is not None:
+        print_safe(f"  score: {detail['score']:.3f}")
+        print_safe(f"  terms: {json.dumps(detail['score_terms'], ensure_ascii=False)}")
+    print_safe(f"  durability: {json.dumps(detail['durability'], ensure_ascii=False)}")
+    print_safe(f"  similarity: {json.dumps(detail['similarity'], ensure_ascii=False)}")
+    print_safe(f"  conversations: {', '.join(detail['source_conversations']) or '-'}")
+    for quote in detail["evidence"]:
+        print_safe(
+            f"  [{quote['date']}] ({quote['lang']}, depth {quote['depth']:.2f}, "
+            f"conv {quote['conversation_id'] or '-'}) {quote['quote']}"
+        )
+    for event in detail["events"]:
+        print_safe(
+            f"  {event['at']}  {event['actor']}  {event['action']}  "
+            f"{event['from_status'] or '-'} -> {event['to_status'] or '-'}"
+        )
+    return 0
+
+
+def _offer_decide(conn, cfg, key, action, note):
+    try:
+        if action == "accept":
+            result = offers.accept(conn, key, note=note)
+            print_safe(json.dumps(result["entry"], ensure_ascii=False, indent=2))
+            print_safe(
+                "accepted -- the interests sync writes it into interests.json and the DB "
+                "(offers.activate() then starts its lifecycle)"
+            )
+        elif action == "reject":
+            result = offers.reject(conn, key, note=note, interests_path=cfg.interests_path)
+            print_safe(f"rejected {key} -- blocked terms: {', '.join(result['blocked_terms'])}")
+        elif action == "snooze":
+            result = offers.snooze(conn, key, note=note)
+            print_safe(f"snoozed {key} until {result['snoozed_until']}")
+        else:
+            offers.undo_auto_pause(conn, key, note=note)
+            print_safe(f"{key} is active again -- the silence clock restarts from now")
+    except offers.OfferError as e:
+        print(f"{action} failed: {e}", file=sys.stderr)
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

@@ -1459,3 +1459,58 @@ gates which derived scores can notify at all; this step only needed distinct
 in `test_discovery.py`'s `ExplorationLaneTests` is a synthetic in-memory
 fixture. Live readout once dynamic interests are running for real:
 `python -m app stats --days 7`, EXPLORATION section.
+
+
+## interest offers store + lifecycle (PR H)
+`discovery/offers.py` (new, stdlib-only, **no provider, no LLM/network call
+ever**) is the store for AI-generated interest offers. Schema (additive, via
+`schema.sql` + `db.init`'s ALTER pass): `interest_offers` (key UNIQUE, kind
+new|bridge|merge|split|revive|retire, evidence JSON `[{date, quote, lang,
+depth, conversation_id}]`, `source_conversations`, `score_terms`,
+`durability`, `similarity`, status, `artifact_sha256`), append-only
+`offer_events` (actor generator|importer|owner_ui|timer|pipeline),
+`interest_edges` (empty until PR M), and two columns on `interests`:
+`parent_key` and `lifecycle` (active|decaying|paused|retired, default
+'active' -- deliberately orthogonal to `layer`, whose owner-immutability
+triggers stay untouched). Verified additive against a read-only snapshot of
+the live 93 MB DB: 3 tables + 2 columns added, all 46 interests / 2,114
+scores preserved, every row backfilled to lifecycle='active'.
+
+`personal_state.py` now reads contract v2 (`SUPPORTED_VERSIONS = {1, 2}`):
+v2 adds `candidates[]` beside v1's `topics[]`, and either half may be absent
+(nightly map publishes topics, weekly reduce publishes candidates). Path:
+`DISCOVERY_INTEREST_CANDIDATES` / `cfg.interest_candidates_path`.
+
+State machines, both enforced as data (`TRANSITIONS`,
+`LIFECYCLE_TRANSITIONS`) with one append-only event per move: offers go
+proposed -> offered -> accepted|rejected|snoozed|expired (snoozed wakes back
+to offered; a decided offer can never be re-decided), and an accepted offer's
+interest goes active -> decaying (30 idle days, raises a `retire:<key>`
+offer) -> paused (45 idle days, reversible + announced) / retired (owner
+click, or 3 negative reactions while decaying). `undo_auto_pause()` restores
+the interest, closes the retirement offer, and resets the silence clock (the
+undo event is the new baseline). Two guards: the sweep refuses to judge
+silence when the pipeline scored nothing in the last 7 days, and never pauses
+an interest with fewer than 5 attributed items. Derived (non-owner) rows are
+left entirely to `interest_state.py`.
+
+Ranking is code, rating is the model's (weights .30/.15/.15/.20/.20, floor
+.45, durability gate 3 convs x 2 months or a deep pair, 5 offers/run with one
+serendipity slot). Dedup is semantic in three layers: slug normalization,
+>=.5 signal-token overlap (attaches the quotes to the existing interest as an
+`offer_evidence` interest_event instead of offering), and the producer's
+similarity >= .70. Rejections block the key + its tokens for 180 days from
+the offer row itself, and append to `interests.json`'s
+`blocked_derived_terms` when a path is given (atomic rewrite).
+
+Import is idempotent on the artifact sha256 (`service_state` key
+`offers:artifact:<sha>`) and fail-soft (missing/malformed/v1 -> a summary
+with a reason, never an exception). CLI: `python -m app offers
+[--status S] [--why KEY] [--import [PATH]] [--sweep] [--accept/--reject/
+--snooze/--undo KEY] [--note TEXT]`. Not wired into any scheduled task or
+the tick yet (PR N); `accept()` deliberately does not write
+`interests.json`/`interests` -- it returns the entry, takes an optional
+`sync` callable, and `activate()` starts the lifecycle once the row exists
+(sync v2 = PR I, write API = PR J). Tests: 63 offline cases across
+`OfferRankingTests`/`OfferStoreTests`/`OfferLifecycleTests`/
+`OfferSweepTests`/`OffersCLITests`, Hebrew fixtures included.
