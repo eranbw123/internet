@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   Background, Controls, Handle, MarkerType, MiniMap, Position, ReactFlow,
   ReactFlowProvider, useReactFlow,
@@ -179,16 +179,18 @@ interface Props {
   seed: GraphSeed | null;
   selectedNodeId: ID | null;
   onSelectNode: (id: ID) => void;
+  isMobile?: boolean;
 }
 
-function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
-  const graphData = useGraphData(seed);
+function GraphCanvasInner({ seed, selectedNodeId, onSelectNode, isMobile = false }: Props) {
+  const graphData = useGraphData(seed, isMobile);
   const {
     display, base, loading, error, expandGroup, collapseGroup, expandAll, focusMode, setFocusMode,
     expandedKeys, reload,
   } = useAugmentedGraphData(graphData);
   const [layout, setLayout] = useState<LayoutResult | null>(null);
   const [showLegend, setShowLegend] = useState(false);
+  const [overflowOpen, setOverflowOpen] = useState(false);
   const { fitView, getViewport, setViewport } = useReactFlow();
   const seedKey = seed ? JSON.stringify(seed) : null;
 
@@ -201,6 +203,35 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
   // DIFFERENT graphs of the SAME size must still refit -- is served by the
   // seed key alone, which is what actually identifies "a different graph".
   const fittedSeedRef = useRef<string | null>(null);
+  // Frame the story, not the whole world.
+  //
+  // Fitting the entire graph was measured at scale 0.1486 on a 1400px desktop
+  // and 0.100 on a 390px phone -- the latter clamped at minZoom, i.e. it did
+  // not even fit, and rendered 220px cards 22px wide. The backend already
+  // hands us the antidote: emphasized_path (extended client-side through
+  // threshold -> render -> notification) is ~7 nodes describing the route this
+  // discovery actually took, and it lays out left-to-right, so framing it
+  // lands the reader on the readable chain -- search hit, candidate, score,
+  // threshold, Telegram -- with the rest of the run in the periphery.
+  //
+  // Zoom floors keep the fallback honest: a readable partial view beats an
+  // unreadable total one. The global minZoom stays 0.1 so manual zoom-out is
+  // unaffected.
+  const fitFocusFirst = useCallback(() => {
+    const path = graphData.emphasizedPath;
+    const options = {
+      duration: 200,
+      padding: isMobile ? 0.15 : 0.1,
+      minZoom: isMobile ? 0.55 : 0.35,
+      maxZoom: 1,
+    };
+    if (path.length > 0) {
+      fitView({ ...options, nodes: path.map((id) => ({ id: String(id) })) });
+    } else {
+      // Run-id seeds (the Failed tab) resolve no emphasized path.
+      fitView(options);
+    }
+  }, [fitView, graphData.emphasizedPath, isMobile]);
   // Set just before a group toggle so the layout that follows can keep that
   // group pinned under the cursor instead of letting the graph reflow away.
   const anchorRef = useRef<{ id: string; x: number; y: number } | null>(null);
@@ -234,7 +265,7 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
       afterPaint(() => {
         if (cancelled) return;
         if (isNewSeed || deliberateRefit) {
-          fitView({ duration: 200, padding: 0.05, maxZoom: 1 });
+          fitFocusFirst();
           return;
         }
         if (!anchor) return; // e.g. "Expand all": no single anchor, keep the viewport verbatim
@@ -252,19 +283,21 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
   }, [display]); // eslint-disable-line react-hooks/exhaustive-deps
 
   // Re-fit when the viewport itself changes size (phone rotation, window
-  // resize, drawer open/close) so the graph never sits off-screen.
+  // resize, drawer open/close) so the graph never sits off-screen. Uses the
+  // same focus-first framing as the initial fit, so a rotation doesn't quietly
+  // demote the reader to the unreadable fit-all view.
   useEffect(() => {
     let t: ReturnType<typeof setTimeout>;
     const onResize = () => {
       clearTimeout(t);
-      t = setTimeout(() => fitView({ duration: 150 }), 150);
+      t = setTimeout(fitFocusFirst, 150);
     };
     window.addEventListener("resize", onResize);
     return () => {
       clearTimeout(t);
       window.removeEventListener("resize", onResize);
     };
-  }, [fitView]);
+  }, [fitFocusFirst]);
 
   const emphasizedSet = useMemo(() => new Set(graphData.emphasizedPath.map(String)), [graphData.emphasizedPath]);
 
@@ -359,19 +392,38 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
 
   return (
     <div className="graph-canvas">
+      {/* Primary actions stay on the bar; the rest collapse into an overflow
+          menu on a phone, where six buttons wrapped to two rows and ate the
+          height the graph itself needed. */}
       <div className="graph-toolbar">
-        <button onClick={expandAll}>Expand all</button>
         <button onClick={toggleFocus} aria-pressed={focusMode}>
           {focusMode ? "Show full run" : "Focus: this discovery's path"}
         </button>
         {focusMode && display.hiddenCount > 0 && (
           <span className="graph-toolbar-note">· {display.hiddenCount} nodes hidden</span>
         )}
-        <button onClick={() => fitView({ duration: 200 })}>Fit to view</button>
-        <button onClick={reload}>Reset layout</button>
-        <button className="graph-toolbar-spacer-left" onClick={() => setShowLegend((v) => !v)} aria-pressed={showLegend}>
+        <button onClick={fitFocusFirst}>Fit to view</button>
+        <button className="toolbar-overflow-only" onClick={expandAll}>Expand all</button>
+        <button className="toolbar-overflow-only" onClick={reload}>Reset layout</button>
+        <button
+          className="toolbar-overflow-only graph-toolbar-spacer-left"
+          onClick={() => setShowLegend((v) => !v)}
+          aria-pressed={showLegend}
+        >
           Legend
         </button>
+        {isMobile && (
+          <div className="toolbar-overflow">
+            <button onClick={() => setOverflowOpen((v) => !v)} aria-expanded={overflowOpen} aria-label="More graph actions">⋯</button>
+            {overflowOpen && (
+              <div className="toolbar-overflow-menu" role="menu">
+                <button role="menuitem" onClick={() => { setOverflowOpen(false); expandAll(); }}>Expand all</button>
+                <button role="menuitem" onClick={() => { setOverflowOpen(false); reload(); }}>Reset layout</button>
+                <button role="menuitem" onClick={() => { setOverflowOpen(false); setShowLegend((v) => !v); }}>Legend</button>
+              </div>
+            )}
+          </div>
+        )}
       </div>
       <div className="graph-canvas-body">
       <ReactFlow
@@ -379,8 +431,9 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode }: Props) {
         edges={flowEdges}
         nodeTypes={nodeTypes}
         onNodeClick={handleNodeClick}
-        fitView
-        fitViewOptions={{ padding: 0.05, maxZoom: 1 }}
+        // No `fitView`/`fitViewOptions` props: React Flow's own mount-time fit
+        // would race the layout effect's focus-first fit and frame the whole
+        // world for a beat before we reframe it.
         panOnScroll
         zoomOnPinch
         minZoom={0.1}

@@ -11,11 +11,47 @@ export interface GraphSeed {
 
 const POLL_INTERVAL_MS = 4000;
 const ACTIVE_STATUSES = new Set(["running", "pending", "started", "in_progress"]);
+const FOCUS_MODE_KEY = "observatory-focus-mode";
 
-export function useGraphData(seed: GraphSeed | null) {
+/** Focus mode starts ON for phones and OFF for desktop, but an explicit choice
+ * wins and persists.
+ *
+ * A full run is ~90-106 nodes over ~13 ELK layers (≳3,700px wide); fitting all
+ * of it on a 390px phone hits the 0.1 minZoom floor and renders 220px cards at
+ * 22px -- an illegible smudge. The emphasized path is 7 nodes and fits at a
+ * readable zoom, so it is the right thing to land on. A hard default would
+ * fight anyone who wants the whole run on mobile, though, so the toggle is
+ * remembered instead of re-guessed on every load.
+ */
+export function initialFocusMode(isMobile: boolean): boolean {
+  try {
+    const saved = localStorage.getItem(FOCUS_MODE_KEY);
+    if (saved === "true") return true;
+    if (saved === "false") return false;
+  } catch {
+    // localStorage can throw in private-mode/sandboxed contexts; fall through.
+  }
+  return isMobile;
+}
+
+export function useGraphData(seed: GraphSeed | null, isMobile = false) {
   const [base, setBase] = useState<GraphResponse | null>(null);
   const [expanded, setExpanded] = useState<ExpandedGroups>({});
-  const [focusMode, setFocusMode] = useState(false);
+  const [focusMode, setFocusModeState] = useState(() => initialFocusMode(isMobile));
+
+  // Persist every explicit toggle so the choice survives a reload and the
+  // per-seed reset below restores the user's preference rather than `false`.
+  const setFocusMode = useCallback((next: boolean | ((prev: boolean) => boolean)) => {
+    setFocusModeState((prev) => {
+      const value = typeof next === "function" ? next(prev) : next;
+      try {
+        localStorage.setItem(FOCUS_MODE_KEY, String(value));
+      } catch {
+        // ignore -- persistence is a convenience, not a correctness requirement
+      }
+      return value;
+    });
+  }, []);
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const seedKey = seed ? JSON.stringify(seed) : null;
@@ -37,7 +73,9 @@ export function useGraphData(seed: GraphSeed | null) {
 
   useEffect(() => {
     setExpanded({});
-    setFocusMode(false);
+    // Reset to the *preference*, not to false -- resetting to false here is
+    // what would otherwise undo the mobile default on every discovery opened.
+    setFocusModeState(initialFocusMode(isMobile));
     reload();
   }, [seedKey]); // eslint-disable-line react-hooks/exhaustive-deps
 

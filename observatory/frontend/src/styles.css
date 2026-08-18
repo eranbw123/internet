@@ -259,12 +259,15 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .diff-section { border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
 .diff-section h4 { margin: 4px 8px; }
 
-/* --- mobile --- */
+/* --- mobile ---
+   768px, matching MOBILE_MEDIA_QUERY in useIsMobile.ts -- the two MUST agree,
+   which is why the JS side reads this same query through matchMedia rather
+   than keeping its own pixel constant. At the previous 480px, every device
+   between 481 and 768 (large phones, landscape phones, small tablets) got the
+   three-pane desktop layout with a fixed 380px inspector. */
 @media (max-width: 768px) {
   /* The minimap is screen real estate the flowchart needs on a phone. */
   .graph-minimap { display: none; }
-}
-@media (max-width: 480px) {
   .drawer-toggle { display: inline-block; }
   .app-body { position: relative; }
   .pane-explorer.drawer {
@@ -281,4 +284,18 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
   .bottom-sheet.open { height: 85vh; overflow: auto; }
   .bottom-sheet-handle { height: 24px; display: flex; align-items: center; justify-content: center; }
   .bottom-sheet-handle::before { content: ""; width: 40px; height: 4px; background: #ccc; border-radius: 2px; }
+
+  /* The toolbar wrapped to two rows on a phone, eating the graph's height.
+     Primary actions stay visible; the rest move into the overflow menu. */
+  .graph-toolbar { flex-wrap: nowrap; }
+  .graph-toolbar .toolbar-overflow-only { display: none; }
 }
+
+.toolbar-overflow { position: relative; margin-left: auto; }
+.toolbar-overflow-menu {
+  position: absolute; right: 0; top: 100%; z-index: 30; background: #fff;
+  border: 1px solid var(--border); border-radius: 4px; padding: 4px;
+  display: flex; flex-direction: column; gap: 2px; min-width: 160px;
+  box-shadow: 0 4px 12px rgba(0,0,0,.12);
+}
+.toolbar-overflow-menu button { text-align: left; white-space: nowrap; }

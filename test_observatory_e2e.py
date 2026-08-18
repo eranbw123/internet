@@ -504,6 +504,43 @@ class ObservatoryE2EMobileTests(_E2EFixture, unittest.TestCase):
         self.click(".node-card")
         self.wait_for("document.querySelector('[data-testid=\"bottom-sheet\"]')?.classList.contains('open')")
 
+    def test_06b_mobile_lands_zoomed_in_enough_to_read(self):
+        """A phone must not open on the unreadable fit-all view.
+
+        Measured before this change: fitting the whole graph landed at
+        scale(0.100) on a 390px viewport -- clamped at minZoom, so it did not
+        even fit -- which rendered 220px cards 22px wide. The initial fit now
+        frames the emphasized path (~7 nodes) with a zoom floor, and focus mode
+        defaults on for phones.
+        """
+        self.set_viewport(IPHONE_VIEWPORT)
+        self.navigate("/observatory/")
+        self.wait_for("!!document.querySelector('[data-testid=\"app\"]')")
+        self.click(".drawer-toggle")
+        self.wait_for("document.querySelectorAll('.explorer-row').length > 0")
+        self.click(".explorer-row")
+        self.wait_for("document.querySelectorAll('.node-card').length > 0")
+
+        scale = self.wait_for(
+            "(() => {"
+            "  const vp = document.querySelector('.react-flow__viewport');"
+            "  const m = /scale\\(([-0-9.]+)\\)/.exec(vp?.style.transform || '');"
+            "  return m && parseFloat(m[1]) > 0.3 ? parseFloat(m[1]) : false;"
+            "})()",
+            message="mobile initial zoom rose above the old fit-all floor",
+        )
+        self.assertGreaterEqual(scale, 0.3, f"mobile opened at scale {scale}, still effectively unreadable")
+
+        # Focus mode defaults ON for phones, so the toggle offers the way out.
+        self.wait_for(
+            "!![...document.querySelectorAll('.graph-toolbar button')]"
+            ".find(b => b.textContent.includes('Show full run'))",
+            message="focus mode defaulted on for mobile",
+        )
+        # And a real card is now wide enough to read rather than a smudge.
+        width = self.js("document.querySelector('.node-card')?.getBoundingClientRect().width")
+        self.assertGreater(width, 60, f"cards render {width}px wide on a phone")
+
     def test_07_deep_link_highlights_sent_path(self):
         self.set_viewport(DESKTOP_VIEWPORT)
         with self.db() as conn:
