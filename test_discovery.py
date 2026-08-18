@@ -30,6 +30,7 @@ from discovery import (
     feedback_listener,
     health,
     interest_state,
+    interest_sync,
     interests,
     matching,
     missions,
@@ -9141,6 +9142,513 @@ class OffersCLITests(unittest.TestCase):
         code, out, _err = self._main("offers", "--import", os.path.join(self.tmp.name, "no.json"))
         self.assertEqual(code, 0)
         self.assertIn("unreadable", out)
+
+
+class InterestSyncV2Tests(unittest.TestCase):
+    """Sync v2 (discovery/interest_sync.py): interests.json is the source of
+    truth in BOTH directions. The bug these pin down: v1 only ever inserted,
+    so an interest deleted from the file kept collecting and spending until
+    somebody hand-ran an UPDATE against the live database."""
+
+    HEBREW = {
+        "key": "memory-retrieval-he",
+        "title": "זיכרון ושליפה",
+        "description": "עבודה על זיכרון",
+        "positive_signals": ["זיכרון", "retrieval practice"],
+    }
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "interests.json")
+
+    def _write(self, entries, defaults=None):
+        # ensure_ascii=False: the real file carries Hebrew titles and signals.
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"defaults": defaults or {"min_score": 0.7, "sources": ["web_search"]},
+                       "interests": entries}, fh, ensure_ascii=False)
+        return self.path
+
+    def _entry(self, key, **kw):
+        return {"key": key, "title": key.upper(), **kw}
+
+    def _row(self, key):
+        return self.conn.execute("SELECT * FROM interests WHERE key = ?", (key,)).fetchone()
+
+    def _actions(self, key):
+        return [e["action"] for e in db.interest_events(self.conn, key)]
+
+    def _pending(self, key, label="m1", status="PENDING"):
+        self.conn.execute(
+            "INSERT INTO search_missions (interest_key, label, prompt, prompt_sha256,"
+            " status, created_at) VALUES (?, ?, 'p', 'h', ?, ?)",
+            (key, label, status, db.now()),
+        )
+        self.conn.commit()
+
+    # --- the regression this PR exists for ---------------------------------
+
+    def test_an_entry_removed_from_the_file_is_deactivated(self):
+        """v1's never-deactivates bug: `sync` used to leave a dropped interest
+        active forever, so it kept being collected for and scored."""
+        self._write([self._entry("keeper"), self._entry("dropped")])
+        interest_sync.sync(self.conn, self.path)
+        self.assertEqual(self._row("dropped")["active"], 1)
+
+        self._write([self._entry("keeper")])
+        result = interest_sync.sync(self.conn, self.path)
+
+        self.assertEqual(result.deactivated, ["dropped"])
+        self.assertEqual(self._row("dropped")["active"], 0)
+        self.assertEqual(self._row("keeper")["active"], 1)
+        self.assertEqual([i.key for i in db.active_interests(self.conn)], ["keeper"])
+
+    def test_deactivating_cancels_pending_missions_but_never_a_running_one(self):
+        self._write([self._entry("dropped")])
+        interest_sync.sync(self.conn, self.path)
+        self._pending("dropped", "queued")
+        self._pending("dropped", "queued-2")
+        self._pending("dropped", "in-flight", status="RUNNING")
+
+        self._write([])
+        result = interest_sync.sync(self.conn, self.path, force=True)
+
+        self.assertEqual(result.missions_cancelled, 2)
+        rows = dict(self.conn.execute(
+            "SELECT label, status FROM search_missions WHERE interest_key = 'dropped'"
+        ).fetchall())
+        # A RUNNING mission is leased and mid-execution -- its own finish/fail
+        # path owns that row; cancelling it would lose a result already paid for.
+        self.assertEqual(rows, {"queued": "CANCELLED", "queued-2": "CANCELLED",
+                                "in-flight": "RUNNING"})
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT last_error FROM search_missions WHERE label = 'queued'"
+            ).fetchone()["last_error"],
+            interest_sync.CANCEL_REASON,
+        )
+
+    def test_deactivation_is_recorded_as_an_owner_sync_event_with_its_reason(self):
+        self._write([self._entry("dropped")])
+        interest_sync.sync(self.conn, self.path)
+        self._pending("dropped")
+        self._write([])
+        interest_sync.sync(self.conn, self.path, force=True)
+
+        events = db.interest_events(self.conn, "dropped")
+        self.assertEqual([e["action"] for e in events], ["create", "deactivate"])
+        self.assertEqual([e["actor"] for e in events], ["owner_sync", "owner_sync"])
+        # Written by offers.set_lifecycle -- the reason and the mission count
+        # ride along on the same event as the lifecycle move that caused them.
+        self.assertEqual(events[-1]["evidence"], {
+            "from_lifecycle": offers.ACTIVE, "to_lifecycle": offers.RETIRED,
+            "reason": "absent from the file", "missions_cancelled": 1,
+        })
+
+    # --- idempotence -------------------------------------------------------
+
+    def test_re_running_an_unchanged_file_writes_nothing_and_logs_nothing(self):
+        """Safe to run repeatedly against the live DB -- v1 appended one row
+        per interest per run (155 rows saying only 'sync' in production)."""
+        self._write([self._entry("a"), self._entry("b"), self.HEBREW])
+        first = interest_sync.sync(self.conn, self.path)
+        self.assertEqual(len(first.created), 3)
+        events_after_first = self.conn.execute(
+            "SELECT COUNT(*) c FROM interest_events").fetchone()["c"]
+
+        second = interest_sync.sync(self.conn, self.path)
+
+        self.assertEqual(second.changes, 0)
+        self.assertEqual(sorted(second.unchanged), ["a", "b", self.HEBREW["key"]])
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) c FROM interest_events").fetchone()["c"],
+            events_after_first,
+        )
+
+    def test_a_hebrew_entry_does_not_look_changed_on_every_run(self):
+        """Signals are stored as JSON with ensure_ascii=True, so comparing the
+        raw column text would see the escapes and log an update forever."""
+        self._write([self.HEBREW])
+        interest_sync.sync(self.conn, self.path)
+        plan = interest_sync.plan(self.conn, self.path)
+        self.assertEqual(plan.updated, [])
+        self.assertEqual(plan.unchanged, [self.HEBREW["key"]])
+        self.assertEqual(
+            json.loads(self._row(self.HEBREW["key"])["positive_signals"]),
+            self.HEBREW["positive_signals"],
+        )
+
+    def test_an_unchanged_bar_written_on_the_legacy_scale_is_not_a_change(self):
+        self._write([self._entry("a", min_score=0.7)])
+        interest_sync.sync(self.conn, self.path)
+        self._write([self._entry("a", min_score=70)])   # legacy 0-100 scale
+        self.assertEqual(interest_sync.plan(self.conn, self.path).changes, 0)
+
+    # --- retire in place, and revival --------------------------------------
+
+    def test_active_false_retires_the_entry_without_losing_its_definition(self):
+        self._write([self._entry("paused", positive_signals=["keep me"])])
+        interest_sync.sync(self.conn, self.path)
+        self._pending("paused")
+
+        self._write([self._entry("paused", positive_signals=["keep me"], active=False)])
+        result = interest_sync.sync(self.conn, self.path)
+
+        self.assertEqual(result.deactivated, ["paused"])
+        self.assertEqual(result.missions_cancelled, 1)
+        row = self._row("paused")
+        self.assertEqual(row["active"], 0)
+        self.assertEqual(json.loads(row["positive_signals"]), ["keep me"])
+        self.assertEqual(db.interest_events(self.conn, "paused")[-1]["evidence"]["reason"],
+                         "marked inactive in the file")
+
+    def test_removing_the_active_flag_revives_a_retired_interest(self):
+        self._write([self._entry("retired-then-back", active=False)])
+        interest_sync.sync(self.conn, self.path)
+        self.assertEqual(self._row("retired-then-back")["active"], 0)
+        self.assertEqual(self._actions("retired-then-back"), ["create", "deactivate"])
+
+        self._write([self._entry("retired-then-back")])
+        result = interest_sync.sync(self.conn, self.path)
+
+        self.assertEqual(result.reactivated, ["retired-then-back"])
+        row = self._row("retired-then-back")
+        self.assertEqual((row["active"], row["lifecycle"]), (1, offers.ACTIVE))
+        self.assertEqual(self._actions("retired-then-back"),
+                         ["create", "deactivate", "reactivate"])
+
+    def test_an_edit_takes_effect_without_re_initialising(self):
+        """The end-to-end promise: edit the file, call sync, and the next
+        cycle's active_interests() already sees it -- no `init`, no DB op."""
+        self._write([self._entry("bar-tuning", min_score=0.62)])
+        interest_sync.sync(self.conn, self.path)
+        self._write([self._entry("bar-tuning", min_score=0.78,
+                                 positive_signals=["new signal"])])
+
+        interest_sync.sync(self.conn, self.path)
+
+        (live,) = db.active_interests(self.conn)
+        self.assertEqual(live.min_score, 0.78)
+        self.assertEqual(live.positive_signals, ["new signal"])
+        self.assertEqual(db.interest_events(self.conn, "bar-tuning")[-1]["evidence"],
+                         {"changed": ["positive_signals", "min_score"]})
+
+    # --- blast radius ------------------------------------------------------
+
+    def test_a_truncated_file_is_refused_rather_than_retiring_everything(self):
+        self._write([self._entry(f"i{n}") for n in range(8)])
+        interest_sync.sync(self.conn, self.path)
+        self._write([self._entry("i0")])       # 7 of 8 gone: a half-written file
+
+        with self.assertRaises(interest_sync.SyncRefused):
+            interest_sync.sync(self.conn, self.path)
+
+        self.assertEqual(len(db.active_interests(self.conn)), 8)   # nothing written
+
+    def test_the_guard_is_overridable_when_the_purge_is_intended(self):
+        self._write([self._entry(f"i{n}") for n in range(8)])
+        interest_sync.sync(self.conn, self.path)
+        self._write([self._entry("i0")])
+        result = interest_sync.sync(self.conn, self.path, force=True)
+        self.assertEqual(len(result.deactivated), 7)
+        self.assertEqual([i.key for i in db.active_interests(self.conn)], ["i0"])
+
+    def test_ordinary_gardening_is_never_blocked_by_the_guard(self):
+        self._write([self._entry(f"i{n}") for n in range(33)])
+        interest_sync.sync(self.conn, self.path)
+        self._write([self._entry(f"i{n}") for n in range(33) if n > 4])   # retire 5 of 33
+        result = interest_sync.sync(self.conn, self.path)
+        self.assertEqual(len(result.deactivated), 5)
+
+    def test_a_malformed_file_aborts_before_anything_is_deactivated(self):
+        self._write([self._entry("a"), self._entry("b")])
+        interest_sync.sync(self.conn, self.path)
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("{ not json")
+        with self.assertRaises(json.JSONDecodeError):
+            interest_sync.sync(self.conn, self.path)
+        self.assertEqual(len(db.active_interests(self.conn)), 2)
+
+    def test_a_file_disagreeing_with_itself_about_a_key_is_rejected(self):
+        self._write([self._entry("a", min_score=0.6), self._entry("a", min_score=0.9)])
+        with self.assertRaises(ValueError) as ctx:
+            interest_sync.sync(self.conn, self.path)
+        self.assertIn("duplicate interest key", str(ctx.exception))
+
+    # --- boundaries with the layered ladder --------------------------------
+
+    def test_derived_rows_are_invisible_to_sync(self):
+        """interests.json has no authority over derived:* rows -- they belong
+        to interest_state.py's ladder, whatever the file does or does not say."""
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="inferred"), {})
+        self._write([self._entry("owned")])
+        result = interest_sync.sync(self.conn, self.path)
+        self.assertEqual(result.deactivated, [])
+        self.assertEqual(self._row("derived:gizmo")["active"], 1)
+
+    def test_plan_writes_nothing(self):
+        self._write([self._entry("a")])
+        interest_sync.sync(self.conn, self.path)
+        self._write([self._entry("b")])
+        before = self.conn.execute("SELECT COUNT(*) c FROM interest_events").fetchone()["c"]
+
+        plan = interest_sync.plan(self.conn, self.path)
+
+        self.assertEqual(plan.created, ["b"])
+        self.assertEqual(plan.deactivated, [("a", "absent from the file")])
+        self.assertIsNone(self._row("b"))
+        self.assertEqual(self._row("a")["active"], 1)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) c FROM interest_events").fetchone()["c"], before)
+
+    def test_migrate_is_idempotent_and_stamps_synced_at(self):
+        interest_sync.migrate(self.conn)
+        interest_sync.migrate(self.conn)   # would raise if it were not additive-safe
+        self._write([self._entry("a")])
+        interest_sync.sync(self.conn, self.path)
+        self.assertTrue(self._row("a")["synced_at"])
+
+    def test_sync_migrates_a_database_that_predates_the_column(self):
+        """db.init() does not know about synced_at (the column is owned here,
+        not by db.py's ALTER pass), so this is the already-deployed
+        discovery.db case: sync applies its own migration on the way in."""
+        columns = [c[1] for c in self.conn.execute("PRAGMA table_info(interests)")]
+        self.assertNotIn("synced_at", columns)
+
+        self._write([self._entry("a")])
+        interest_sync.sync(self.conn, self.path)
+
+        self.assertTrue(self._row("a")["synced_at"])
+
+    # --- the offers store owns liveness; this module owns the file ---------
+
+    def test_retiring_moves_the_lifecycle_rather_than_only_the_active_flag(self):
+        """One deactivation mechanism, not two: `active` and `lifecycle` must
+        never be able to disagree, so sync drives offers.set_lifecycle()."""
+        self._write([self._entry("dropped")])
+        interest_sync.sync(self.conn, self.path)
+        self.assertEqual(self._row("dropped")["lifecycle"], offers.ACTIVE)
+
+        self._write([])
+        interest_sync.sync(self.conn, self.path)
+
+        row = self._row("dropped")
+        self.assertEqual((row["active"], row["lifecycle"]), (0, offers.RETIRED))
+        self.assertEqual(offers.interest_lifecycle(self.conn, "dropped"),
+                         {"lifecycle": offers.RETIRED, "active": False})
+
+    def test_an_auto_paused_interest_stays_paused_across_a_sync(self):
+        """The decay sweep paused it; the file says nothing about liveness, so
+        a sync that only carries a definition edit must not silently un-pause
+        it -- that would be sync v2 fighting the sweep every cycle."""
+        self._write([self._entry("quiet")])
+        interest_sync.sync(self.conn, self.path)
+        offers.set_lifecycle(self.conn, "quiet", offers.PAUSED,
+                             actor="timer", action="auto_pause")
+
+        self._write([self._entry("quiet", min_score=0.9)])   # an ordinary edit
+        result = interest_sync.sync(self.conn, self.path)
+
+        self.assertEqual(result.reactivated, [])
+        self.assertEqual(result.updated, [("quiet", ["min_score"])])
+        row = self._row("quiet")
+        self.assertEqual((row["active"], row["lifecycle"]), (0, offers.PAUSED))
+        self.assertEqual(row["min_score"], 0.9)   # the edit still landed
+
+    def test_active_true_is_the_owner_overruling_the_sweep(self):
+        self._write([self._entry("quiet")])
+        interest_sync.sync(self.conn, self.path)
+        offers.set_lifecycle(self.conn, "quiet", offers.PAUSED,
+                             actor="timer", action="auto_pause")
+
+        self._write([self._entry("quiet", active=True)])
+        result = interest_sync.sync(self.conn, self.path)
+
+        self.assertEqual(result.reactivated, ["quiet"])
+        row = self._row("quiet")
+        self.assertEqual((row["active"], row["lifecycle"]), (1, offers.ACTIVE))
+
+    def test_entry_writer_is_the_callable_offers_accept_expects(self):
+        """PR H's accept() deliberately writes neither interests.json nor the
+        interests table and takes a `sync` callable instead; this is it. One
+        call: entry in the file, interest in the DB, offer activated."""
+        self._write([self._entry("existing")])
+        interest_sync.sync(self.conn, self.path)
+        offers.insert_offer(self.conn, {
+            "key": "handheld-gaming", "title": "Handheld and roguelike gaming",
+            "description": "Steam Deck and roguelike progression",
+            "positive_signals": ["steam deck"], "suggested_min_score": 0.8,
+            "artifact_sha256": "abc", "generated_at": "2026-08-17T00:00:00+00:00",
+        })
+        offers.offer(self.conn, "handheld-gaming")
+
+        result = offers.accept(self.conn, "handheld-gaming",
+                               sync=interest_sync.entry_writer(self.conn, self.path))
+
+        self.assertTrue(result["ok"])
+        # the interest row exists, live, with the offer's suggested bar
+        row = self._row("handheld-gaming")
+        self.assertEqual((row["active"], row["lifecycle"]), (1, offers.ACTIVE))
+        self.assertEqual(row["min_score"], 0.8)
+        # ... and the file carries it, provenance included, without losing the
+        # entry that was already there
+        entries = json.load(open(self.path, encoding="utf-8-sig"))["interests"]
+        keys = [e["key"] for e in entries]
+        self.assertEqual(keys, ["existing", "handheld-gaming"])
+        self.assertEqual(entries[1]["offered_by"]["artifact_sha256"], "abc")
+        # activate() ran, which it can only do once the interest row exists
+        self.assertEqual(offers.get_offer(self.conn, "handheld-gaming")["status"],
+                         offers.ACCEPTED)
+        self.assertIn("offer_accepted", self._actions("handheld-gaming"))
+
+    def test_set_entry_active_is_what_makes_a_retirement_durable(self):
+        """A retirement recorded only in the DB, while the file still carries
+        the entry saying nothing, is undone by the next sync -- the file is the
+        source of truth. This is the call that keeps the two agreeing."""
+        self._write([self._entry("to-retire")])
+        interest_sync.sync(self.conn, self.path)
+        offers.retire_interest(self.conn, "to-retire")
+
+        interest_sync.set_entry_active(self.path, "to-retire", False)
+        result = interest_sync.sync(self.conn, self.path)
+
+        self.assertEqual(result.reactivated, [])
+        self.assertEqual(self._row("to-retire")["lifecycle"], offers.RETIRED)
+
+    def test_a_db_only_retirement_is_reverted_by_the_file(self):
+        """The other half of the rule above, pinned deliberately: without the
+        file being told, the entry's continued presence revives it."""
+        self._write([self._entry("to-retire")])
+        interest_sync.sync(self.conn, self.path)
+        offers.retire_interest(self.conn, "to-retire")
+
+        result = interest_sync.sync(self.conn, self.path)
+
+        self.assertEqual(result.reactivated, ["to-retire"])
+        self.assertEqual(self._row("to-retire")["lifecycle"], offers.ACTIVE)
+
+    def test_write_entry_replaces_by_key_and_keeps_the_rest_of_the_file(self):
+        self._write([self._entry("a"), self.HEBREW])
+        data = json.load(open(self.path, encoding="utf-8-sig"))
+        data["blocked_derived_terms"] = ["nope"]
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+
+        self.assertEqual(interest_sync.write_entry(
+            self.path, {"key": "a", "title": "A", "min_score": 0.9}), "updated")
+        self.assertEqual(interest_sync.write_entry(
+            self.path, {"key": "new", "title": "New"}), "created")
+
+        after = json.load(open(self.path, encoding="utf-8-sig"))
+        self.assertEqual([e["key"] for e in after["interests"]],
+                         ["a", self.HEBREW["key"], "new"])
+        self.assertEqual(after["interests"][0]["min_score"], 0.9)
+        self.assertEqual(after["blocked_derived_terms"], ["nope"])
+        self.assertEqual(after["defaults"]["min_score"], 0.7)
+        # Hebrew survives the round trip unescaped, as offers.py writes it too.
+        self.assertEqual(after["interests"][1]["title"], self.HEBREW["title"])
+
+    def test_load_stated_active_answers_three_ways(self):
+        """Silent is not active: an entry saying nothing must not appear here,
+        or the sweep's auto-pause would be undone on every sync."""
+        self._write([self._entry("silent"), self._entry("off", active=False),
+                     self._entry("on", active=True)])
+        self.assertEqual(interests.load_stated_active(self.path),
+                         {"off": False, "on": True})
+
+    def test_the_real_interests_file_is_readable_by_the_new_helper(self):
+        # interests.json is real user config; this asserts the flag is
+        # readable on it, not what it says.
+        self.assertIsInstance(interests.load_stated_active("interests.json"), dict)
+
+
+class SyncCLITests(unittest.TestCase):
+    """`python -m app sync` -- the runtime half: an edit takes effect without
+    a redeploy, an `init`, or a hand-written UPDATE."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = os.path.join(self.tmp.name, "d.db")
+        self.path = os.path.join(self.tmp.name, "interests.json")
+
+    def _write(self, keys, **extra):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"interests": [{"key": k, "title": k, **extra} for k in keys]}, fh)
+
+    def _main(self, *argv):
+        import contextlib
+
+        from discovery.__main__ import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"DISCOVERY_INTERESTS": self.path}), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(["--db", self.db_path, *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def _conn(self):
+        conn = db.connect(self.db_path)
+        self.addCleanup(conn.close)
+        return conn
+
+    def test_sync_deactivates_a_dropped_interest_with_no_manual_db_op(self):
+        self._write(["keeper", "dropped"])
+        self.assertEqual(self._main("init")[0], 0)
+
+        self._write(["keeper"])
+        code, out, _err = self._main("sync")
+
+        self.assertEqual(code, 0)
+        self.assertIn("1 deactivated", out)
+        self.assertEqual([i.key for i in db.active_interests(self._conn())], ["keeper"])
+
+    def test_dry_run_prints_the_plan_and_writes_nothing(self):
+        self._write(["keeper", "dropped"])
+        self._main("init")
+        self._write(["keeper"])
+        code, out, _err = self._main("sync", "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("nothing written", out)
+        self.assertIn("dropped", out)
+        self.assertEqual(len(db.active_interests(self._conn())), 2)
+
+    def test_the_guard_exits_2_and_force_gets_through(self):
+        self._write([f"i{n}" for n in range(8)])
+        self._main("init")
+        self._write(["i0"])
+
+        code, _out, err = self._main("sync")
+        self.assertEqual(code, 2)
+        self.assertIn("sync refused", err)
+        self.assertEqual(len(db.active_interests(self._conn())), 8)
+
+        code, out, _err = self._main("sync", "--force")
+        self.assertEqual(code, 0)
+        self.assertIn("7 deactivated", out)
+
+    def test_sync_on_a_malformed_file_exits_cleanly(self):
+        self._write(["a"])
+        self._main("init")
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("{ not json")
+        code, _out, err = self._main("sync")
+        self.assertEqual(code, 2)
+        self.assertIn("malformed interests file", err)
+        self.assertEqual(len(db.active_interests(self._conn())), 1)
+
+    def test_init_reports_what_it_reconciled(self):
+        self._write(["a", "b"])
+        code, out, _err = self._main("init")
+        self.assertEqual(code, 0)
+        self.assertIn("schema ready", out)
+        self.assertIn("2 interests loaded", out)
+        self.assertIn("2 created", out)
+
 
 
 if __name__ == "__main__":
