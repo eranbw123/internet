@@ -41,6 +41,13 @@ class Config:
     # the producer publishes them on different cadences -- nightly map vs
     # weekly reduce. Gitignored, inbound, never committed.
     interest_candidates_path: str = ""
+    # Extra read-only SQLite files mounted alongside discovery.db in the
+    # Observatory's Datasette, so another project's data is browsable in the
+    # SAME UI instead of needing a second server on another port. Semicolon
+    # separated -- Windows paths contain ':', so ';' is the only safe
+    # splitter. A missing file is skipped, never fatal: a sibling repo being
+    # absent must not stop the Observatory from starting.
+    ui_extra_dbs: tuple = ()
     # Per-job cadence. No in-process scheduler reads these anymore (see
     # health.py/__main__.py's "run" removal) -- the OS scheduler's triggers
     # are derived from these same fields instead.
@@ -169,6 +176,11 @@ def load():
         ),
         interest_candidates_path=os.environ.get(
             "DISCOVERY_INTEREST_CANDIDATES", str(REPO_ROOT / "interest_candidates.json")
+        ),
+        ui_extra_dbs=tuple(
+            part.strip()
+            for part in os.environ.get("DISCOVERY_UI_EXTRA_DBS", "").split(";")
+            if part.strip()
         ),
         interval_stocks_seconds=int(os.environ.get("DISCOVERY_INTERVAL_STOCKS", "3600")),
         interval_web_seconds=int(os.environ.get("DISCOVERY_INTERVAL_WEB", "60")),

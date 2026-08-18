@@ -12,6 +12,7 @@ the UI is open. observatory/db.py's own queries additionally open their own
 independent `mode=ro` connection per request, so the read-only guarantee
 does not depend on Datasette's internal connection handling alone.
 """
+import os
 from datasette.app import Datasette
 from datasette.plugins import pm
 
@@ -31,7 +32,15 @@ def build_datasette(cfg, public=False):
     if public and not cfg.ui_token:
         raise ValueError("public mode requires cfg.ui_token")
     _ensure_plugin_registered()
-    ds = Datasette(files=[cfg.db_path], settings={"default_allow_sql": True})
+    # discovery.db first so it stays the default database in the UI and in
+    # every existing row/table URL; extras are appended, never inserted.
+    # A configured path that isn't there is skipped -- a sibling project
+    # being absent or mid-clone must not stop the Observatory booting.
+    files = [cfg.db_path]
+    for extra in getattr(cfg, "ui_extra_dbs", ()) or ():
+        if extra and os.path.exists(extra) and extra not in files:
+            files.append(extra)
+    ds = Datasette(files=files, settings={"default_allow_sql": True})
     ds._observatory_db_path = cfg.db_path
     # The write API needs more than the db path (interests.json, the
     # candidates artifact), so the whole cfg rides along.
