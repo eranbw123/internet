@@ -287,7 +287,29 @@ export function App() {
                 </div>
               )}
               {explorePane === "details" && (
-                <div className="pane-mobile-body pane-mobile-details">{rightPane()}</div>
+                <div className="pane-mobile-body pane-mobile-details">
+                  {/* On a desktop "Select a node to inspect it." is fine: the
+                      graph is on screen beside the inspector, so the
+                      instruction names something you can see. On a phone the
+                      panes are exclusive, so tapping Details with no node
+                      chosen was a dead end -- an instruction to do something
+                      that is not reachable from where you are standing. Say
+                      where the nodes are, and offer the way back. */}
+                  {selectedNodeId == null && !selectedInterest ? (
+                    <div className="pane-empty" data-testid="details-empty">
+                      <p>{seed ? "Tap a node in the trace to inspect it." : "Pick a discovery in Results, then tap a node in its trace."}</p>
+                      <button
+                        type="button"
+                        className="btn"
+                        onClick={() => setExplorePane(seed ? "graph" : "results")}
+                      >
+                        {seed ? "Back to the trace" : "Back to results"}
+                      </button>
+                    </div>
+                  ) : (
+                    rightPane()
+                  )}
+                </div>
               )}
             </div>
           )}
