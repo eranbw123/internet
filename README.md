@@ -643,14 +643,50 @@ data — including a real feedback row — into the production `discovery.db`.
 
 There is no in-process scheduler (see [How a cycle works](#how-a-cycle-works))
 -- an OS scheduler has to call the commands above on their own cadence.
-`ops/install_tasks.py` registers six one-purpose Windows Scheduled Tasks
-(`internet-discovery-collect-stocks/-web/-youtube`, `-digest`, `-feedback`,
-`-health`), one XML task per job, trigger intervals read straight from
-`config.load()` so a `.env` change and a re-`--install` is all it takes to
-reschedule. `collect-web` runs `web-tick` (see [Continuous web
+`ops/install_tasks.py` registers one-purpose Windows Scheduled Tasks, one XML
+task per job, trigger intervals read straight from `config.load()` so a `.env`
+change and a re-`--install` is all it takes to reschedule:
+
+| task | cadence | `.env` |
+| --- | --- | --- |
+| `-collect-stocks` | 1h | `DISCOVERY_INTERVAL_STOCKS` |
+| `-collect-web` | 60s | `DISCOVERY_INTERVAL_WEB` |
+| `-collect-youtube` | 4h | `DISCOVERY_INTERVAL_YOUTUBE` |
+| `-digest` | daily 08:00, re-firing every 30m until 23:00 | `DISCOVERY_DIGEST_TIME` / `_INTERVAL` / `_WINDOW_END` |
+| `-feedback` | 5m | fixed |
+| `-health` | 3h | fixed |
+| `-update` | 30m | fixed |
+| `-offers-sweep` | 6h | `DISCOVERY_OFFERS_SWEEP_INTERVAL` |
+| `-offers-import` | 1h | `DISCOVERY_OFFERS_IMPORT_INTERVAL` |
+| `-interest-extract` | daily 03:30 | `DISCOVERY_INTEREST_EXTRACT_TIME` |
+
+`collect-web` runs `web-tick` (see [Continuous web
 discovery](#continuous-web-discovery-council-missions)) on
 `DISCOVERY_INTERVAL_WEB`'s cadence, default every 60 seconds -- not a
 periodic batch collect.
+
+The last three are the [interest-suggestion
+pipeline](#interest-offers-contract-v2), and they are why the
+inbox fills by itself. `-interest-extract` is the only one that costs
+anything: it shells out to the sibling `ai` repo's `interest_extractor.py`
+(`map`, then `reduce`) over a real claude.ai tab, found via
+`DISCOVERY_INTEREST_CANDIDATES` -- the artifact path the two repos already
+share -- so the extractor keeps living in `ai` while this repo owns *when* it
+runs. It fires at 03:30, outside the digest window and at an hour nobody is
+driving Chrome by hand.
+
+`-offers-sweep` is the quiet one, and the reason it exists at all: without a
+sweep timer the entire offer/interest lifecycle is inert -- offers never
+expire, snoozed offers never wake, and interests never decay (30d) or
+auto-pause (45d). Every one of those rules is evaluated by that task and
+nothing else.
+
+All three report failure the way the rest of the appliance does: a non-zero
+exit stamps `job:<name>:last_fail`, which `health` reads and `health
+--notify` turns into a Telegram alert. None of them exits 0 on a run that
+achieved nothing -- an unreadable candidates artifact fails the import, and a
+`map` that leaves as many conversations pending as it started with fails the
+extraction rather than stamping a heartbeat that says all is well.
 
 **One manual prerequisite:** Chrome has to be running, in the same
 interactive Windows session the tasks run in, launched with
@@ -662,9 +698,9 @@ can relaunch it once automatically, see [Configuration](#configuration).
 
 ```bash
 python ops/install_tasks.py --dry-run              # print every task's XML + schtasks command, register nothing
-python ops/install_tasks.py --install              # create/update all six tasks
+python ops/install_tasks.py --install              # create/update every task in the table above
 python ops/install_tasks.py --status               # state, last run, last result, next run
-python ops/install_tasks.py --uninstall            # delete only the six tasks this script created
+python ops/install_tasks.py --uninstall            # delete only the tasks this script created
 python ops/install_tasks.py --uninstall --dry-run  # preview the deletion instead of running it
 python ops/install_tasks.py --soak                 # register the one-shot 24h soak checkpoint, see ops/SOAK.md
 ```

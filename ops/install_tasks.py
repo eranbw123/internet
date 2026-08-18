@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
-"""Register/remove/inspect the six Windows Task Scheduler tasks that run the
+"""Register/remove/inspect the Windows Task Scheduler tasks that run the
 discovery engine as an appliance -- no in-process scheduler, no session-child
 tick loop. Every task shells out to ops/run.cmd, which calls `python -m app`,
 via wscript + ops/hidden.vbs so no console window ever appears on a trigger.
 
     python ops/install_tasks.py --dry-run       # print XML + commands, register nothing
-    python ops/install_tasks.py --install       # create/update all six tasks
+    python ops/install_tasks.py --install       # create/update every task in _TASK_SPECS
     python ops/install_tasks.py --uninstall     # delete only tasks this script created
     python ops/install_tasks.py --status        # state/last-run/last-result/next-run
     python ops/install_tasks.py --soak [--soak-hours 24] [--dry-run]
         # register the one-shot 24h soak-checkpoint task (see ops/SOAK.md);
         # composable with --dry-run to preview without registering
 
-Cadence for the collect-* tasks and the digest come from `config.load()`
-(interval_stocks_seconds / interval_web_seconds / interval_youtube_seconds /
-digest_time / digest_interval_seconds / digest_window_end -- the digest
-re-fires every digest_interval_seconds from digest_time until
-digest_window_end, same day) -- they are never hardcoded here, so changing a
-`.env` interval and re-running --install is enough to reschedule.
+Cadence comes from `config.load()`, never from a literal here, so changing a
+`.env` interval and re-running --install is enough to reschedule:
+interval_stocks_seconds / interval_web_seconds / interval_youtube_seconds for
+the collectors, digest_time (+ digest_interval_seconds / digest_window_end,
+which re-fire the digest through the day) for delivery, and
+interest_extract_time / offers_import_interval_seconds /
+offers_sweep_interval_seconds for the interest-suggestion pipeline. The
+5-minute feedback drain, the 3-hour health check and the 30-minute self-update
+are the deliberate literal exceptions.
 
 Registration goes through generated Task Scheduler XML + `schtasks /create
 /XML`, not `schtasks /create /sc minute`, which can't express the settings
@@ -41,10 +44,14 @@ from discovery import config  # noqa: E402
 PREFIX = "internet-discovery-"
 
 # (name suffix, `python -m app` args, trigger kind, cfg field name or a literal
-# seconds/HH:MM value, ExecutionTimeLimit[, script]). Collect jobs get a longer
-# time limit than the rest -- they're the ones that can spend an LLM budget.
+# seconds/HH:MM value, ExecutionTimeLimit[, script[, repeat]]). Collect jobs get
+# a longer time limit than the rest -- they're the ones that can spend an LLM
+# budget.
 # The optional 6th element overrides the run.cmd action for tasks that aren't a
 # `python -m app` subcommand (the updater shells to ops/update.cmd instead).
+# The optional 7th is a "daily"-only (repeat_seconds_field, window_end_field)
+# pair that makes a daily task re-fire through the day; without it a "daily"
+# task fires once, which is what a daily task should mean.
 _TASK_SPECS = [
     ("collect-stocks", ["run-once", "--source", "stocks"], "interval", "interval_stocks_seconds", "PT30M"),
     # Continuous Council-driven web discovery (discovery/missions.py) --
@@ -52,20 +59,83 @@ _TASK_SPECS = [
     # periodic full-interest batch collect.
     ("collect-web", ["web-tick"], "interval", "interval_web_seconds", "PT30M"),
     ("collect-youtube", ["run-once", "--source", "youtube"], "interval", "interval_youtube_seconds", "PT30M"),
-    ("digest", ["digest"], "daily", "digest_time", "PT10M"),
+    # The 7th element is the daily re-firing window: (repeat_seconds_field,
+    # window_end_field). ONLY the digest has one. It used to be applied to
+    # every "daily" task by build_tasks(), which was harmless while the digest
+    # was the only daily task and actively wrong the moment a second one
+    # existed -- the nightly interest extractor would have inherited the
+    # digest's Repetition and re-fired every 30 minutes until 23:00, running
+    # an hour of browser work up to 30 times a day.
+    ("digest", ["digest"], "daily", "digest_time", "PT10M", "run.cmd",
+     ("digest_interval_seconds", "digest_window_end")),
     ("feedback", ["listen", "--drain"], "interval", 5 * 60, "PT10M"),
     ("health", ["health", "--notify"], "interval", 3 * 3600, "PT10M"),
     # Self-update: fast-forward the checkout to origin and redeploy, so a merged
     # fix reaches production without a hand deploy. Literal 30-min cadence (like
     # feedback/health); shells to ops/update.cmd, not `python -m app`.
     ("update", [], "interval", 30 * 60, "PT10M", "update.cmd"),
+    # --- the interest-suggestion pipeline (2026-08-18) ---------------------
+    # Until this block existed, NOTHING scheduled any of these three: the
+    # extractor only ever ran when the owner typed it, so no new suggestion
+    # was ever produced; the importer only ever ran by hand, so an artifact
+    # could sit on disk unread; and -- the quiet one -- with no sweep timer
+    # every lifecycle rule in the design was inert. Offers never expired,
+    # snoozed offers never woke, interests never decayed at 30 days and never
+    # auto-paused at 45. The owner had a Stop button that could not fire.
+    #
+    # offers-sweep: local, offline, a handful of SQLite reads. The brief is
+    # "at least daily" for the 30/45-day clocks to mean anything; the cadence
+    # is cfg.offers_sweep_interval_seconds (6h), which is four chances a day,
+    # so a machine asleep or off through one slot still sweeps that day.
+    ("offers-sweep", ["offers", "--sweep"], "interval", "offers_sweep_interval_seconds", "PT10M"),
+    # offers-import: local, offline, and idempotent on the artifact's sha256
+    # (a re-run of an already-imported artifact is one hash plus one state
+    # lookup), so it can run often and harmlessly. Hourly rather than daily
+    # so an artifact produced by hand -- which is exactly how the first five
+    # offers arrived -- reaches the inbox within the hour.
+    ("offers-import", ["offers", "--import"], "interval", "offers_import_interval_seconds", "PT10M"),
+    # interest-extract: the expensive one, and the only task in this family
+    # that drives a browser it does not own. A plain DAILY fire at
+    # cfg.interest_extract_time (03:30) -- see the `repeat` field below for
+    # why "daily" alone no longer implies the digest's re-firing window.
+    #
+    # Why daily and not weekly: `map` is incremental, so a nightly run
+    # digests one day of new conversations in minutes, where a weekly one
+    # digests seven days at once and is far likelier to hit its budget. Small
+    # frequent runs also mean a failure costs one day of freshness, not a
+    # week. Why not sub-daily: `reduce` re-proposes from the same digest pool,
+    # so a second run the same day spends real browser time to produce a
+    # near-identical candidate list.
+    #
+    # Why 03:30 specifically -- browser contention. This is the only job here
+    # that holds a claude.ai tab for minutes at a time, and it shares ONE
+    # Chrome with the live appliance. 03:30 is outside the digest window
+    # (digest_time 08:00 .. digest_window_end 23:00), so it never overlaps the
+    # delivery burst, and it is an hour the owner is not driving that Chrome
+    # by hand. It cannot be scheduled "away from" collect-web, which fires
+    # every 60s and therefore has no quiet hour -- but it does not need to be:
+    # collect-web's mission provider is chatgpt_browser (a chatgpt.com tab),
+    # while the extractor drives claude.ai, and both claude.ai clients in this
+    # system (providers/claude_chat.py and the ai repo's claude_browser.py)
+    # work by fetch()ing claude.ai's API from inside the tab into a FRESH
+    # scratch conversation per call -- neither navigates or reloads it. So
+    # concurrent use is separate conversations, not a shared one. 03:30 keeps
+    # them apart in practice anyway; the tab design is what keeps it correct.
+    #
+    # ExecutionTimeLimit PT2H is the outer backstop only: the command budgets
+    # map and reduce itself (cfg.interest_extract_map_seconds /
+    # _reduce_seconds, 60m + 20m) so that reduce always gets to run and
+    # publish, instead of the whole task being killed mid-map with nothing to
+    # show. `map` is checkpointed per batch, so either kind of stop costs at
+    # most one batch and the next night resumes.
+    ("interest-extract", ["extract-interests"], "daily", "interest_extract_time", "PT2H"),
 ]
 
 TASK_NAMES = [f"{PREFIX}{suffix}" for suffix, *_ in _TASK_SPECS]
 
 # The one-shot 24h soak checkpoint (objective C). Deliberately NOT a
 # _TASK_SPECS entry: build_tasks()/install() must keep creating exactly the
-# six recurring tasks, so a normal --install never touches this one, and
+# recurring tasks in _TASK_SPECS, so a normal --install never touches this one, and
 # a re-run of --install never reschedules or recreates it.
 SOAK_TASK = f"{PREFIX}soak-check"
 
@@ -89,16 +159,23 @@ class TaskDef:
 def build_tasks(cfg):
     """Every trigger value is read from `cfg`, not hardcoded -- the 5-minute
     feedback poll and the 3-hour health check are the two literal exceptions
-    the plan calls for; nothing per-source or per-day is a literal here."""
+    the plan calls for; nothing per-source or per-day is a literal here.
+
+    The daily re-firing window comes from the spec's optional 7th element, not
+    from `kind == "daily"`. That distinction is load-bearing: reading it off
+    the trigger kind silently gave the digest's every-30-minutes-until-23:00
+    Repetition to any daily task that came later."""
     tasks = []
     for spec in _TASK_SPECS:
         suffix, app_args, kind, field, limit = spec[:5]
         script = spec[5] if len(spec) > 5 else "run.cmd"
+        repeat = spec[6] if len(spec) > 6 else None
         value = getattr(cfg, field) if isinstance(field, str) else field
         task = TaskDef(f"{PREFIX}{suffix}", app_args, kind, value, limit, script=script)
-        if kind == "daily":
-            task.repeat_seconds = cfg.digest_interval_seconds
-            task.window_end = cfg.digest_window_end
+        if repeat:
+            repeat_field, window_field = repeat
+            task.repeat_seconds = getattr(cfg, repeat_field)
+            task.window_end = getattr(cfg, window_field)
         tasks.append(task)
     return tasks
 
@@ -288,7 +365,7 @@ def _start_boundary(xml):
 def _register_task(task, runner, dry_run, xml=None):
     """Render, write and register ONE task via `schtasks /create /XML`, then
     verify with a `/query` follow-up. The single registration path for both
-    the six recurring tasks (`install`) and the one-shot soak checkpoint
+    the recurring tasks (`install`) and the one-shot soak checkpoint
     (`install_soak`) -- there is no second, parallel way this script talks
     to `schtasks /create`. Returns True on success. `xml` lets a caller
     (install_soak) pass in the XML it already rendered, so the StartBoundary
@@ -363,7 +440,7 @@ def install_soak(cfg, runner=None, dry_run=False, hours=24):
 
 
 def uninstall(runner=None, dry_run=False):
-    """Only ever touches the six names this script creates plus the one-shot
+    """Only ever touches the names this script creates plus the one-shot
     soak checkpoint -- TASK_NAMES + [SOAK_TASK] is a fixed, prefix-scoped
     whitelist, so this can never reach a task (e.g. an `ec-*` canary task) it
     did not itself create. Deleting a soak task that was never registered is
@@ -437,7 +514,7 @@ def main(argv=None):
     # since argparse's own group can't express "exclusive among these, but
     # not with that other flag".
     group = parser.add_mutually_exclusive_group(required=False)
-    group.add_argument("--install", action="store_true", help="create/update all six tasks")
+    group.add_argument("--install", action="store_true", help="create/update every task in _TASK_SPECS")
     group.add_argument("--uninstall", action="store_true", help="delete only the tasks this script created")
     group.add_argument("--status", action="store_true", help="state/last-run/last-result/next-run per task")
     group.add_argument("--soak", action="store_true", help="register the one-shot 24h soak-checkpoint task")
