@@ -1459,3 +1459,48 @@ gates which derived scores can notify at all; this step only needed distinct
 in `test_discovery.py`'s `ExplorationLaneTests` is a synthetic in-memory
 fixture. Live readout once dynamic interests are running for real:
 `python -m app stats --days 7`, EXPLORATION section.
+
+
+## observatory dark mode (PR K) -- FOUNDATIONS LANDED, MIGRATION DEFERRED
+
+`observatory/frontend/src/tokens.css` is now the only place a colour is
+allowed to be written. ~60 semantic tokens (surfaces, lines, ink, accent,
+status/severity, group, JSON syntax, search highlight, the six swimlane chart
+tints, graph chrome, effects), defined three times: bare `:root` (complete
+light set), `@media (prefers-color-scheme: dark) { :root:not([data-theme=
+"light"]) }`, and `:root[data-theme="dark"]` last. No colour has its only
+definition inside a theme block -- the theme blocks redefine, never introduce
+-- and `color-scheme` is set in all three so native controls follow.
+
+Theme state is `src/theme.ts` (`observatory-theme` in localStorage, same
+namespace as `observatory-inspector-width`): three states, `system` default,
+`applyTheme()` REMOVES `data-theme` for system rather than writing
+`data-theme="system"` (which would leave the media query's `:not()` matching).
+`src/ThemeToggle.tsx` cycles system -> light -> dark from the app header. A
+four-line inline script in `index.html`, before the module bundle, applies the
+stored choice pre-mount -- that is what stops the reload flash. `App.tsx`
+changed by exactly two lines.
+
+**Scope was deliberate.** Only ONE surface was migrated off literals as proof
+(MonospaceViewer: `.monospace-viewer`, `.viewer-*`, `.json-*`, `.search-hit*`
+-- self-contained, densest literal cluster, its full-screen mode is a whole
+viewport painted only from tokens). 88 literal occurrences remain (78 in
+`styles.css`, 10 in `graph/GraphCanvas.tsx`); the complete literal->token
+mapping table, in migration order, is `observatory/frontend/THEME_MIGRATION.md`.
+Do that as its own PR, after the frontend redesign lands -- it touches nearly
+every line both workstreams touch. Until then two spots look wrong in dark:
+`.graph-toolbar` (white bar, white labels) and the React Flow minimap.
+
+**Three live light-theme AA failures were fixed on the way**, all real defects
+independent of dark mode: `--ok` `#2f9e44` 3.45:1 -> `#1F7A38` 5.39:1,
+the `--active` amber `#f0a500` 2.08:1 -> `--active-text` `#956700` 4.98:1
+(with `--active` `#B87D00` kept as the 3:1 border-stripe variant, since no one
+amber does both jobs on white), and muted text `#98a2b0` 2.58:1 ->
+`--fg-faint` `#697381` 4.81:1 (ten call sites). Every shipped pair is
+re-measured from `tokens.css` itself by
+`test_observatory.py::ObservatoryThemeTokenTests` (15 tests, not gated on
+datasette) -- 104 pair assertions, all >= AA in both themes -- so the palette
+cannot drift. `test_observatory_e2e.py::ObservatoryE2EThemeTests` (4 tests)
+drives the cascade on a real engine via `Emulation.setEmulatedMedia`,
+including explicit-light-on-a-dark-OS and explicit-dark-on-a-light-OS, and
+checks Hebrew/RTL still renders inside the migrated surface.

@@ -1,0 +1,243 @@
+/* Semantic design tokens for the Observatory -- the whole colour system, in
+   one file, defined three times: once for light, once for "the OS says dark
+   and the user has not overridden it", once for "the user picked dark".
+
+   Rules this file exists to enforce:
+
+   1. EVERY colour has its value on bare `:root`. A colour whose only
+      definition lives inside a media query or a `[data-theme]` block is the
+      classic wrong-theme-text bug: the selector stops matching and the
+      property falls back to inherit/initial rather than to the other theme.
+      So the two dark blocks REDEFINE tokens; they never introduce one.
+   2. The media block is guarded with `:not([data-theme="light"])` so an
+      explicit light choice still wins on a dark-preferring OS, and the
+      attribute block comes last so an explicit dark choice still wins on a
+      light-preferring OS. Three states, both directions.
+   3. The two dark blocks are byte-identical. CSS has no way to share them,
+      so tokens.test.ts asserts it instead -- keep them in sync or the suite
+      fails.
+   4. No component rule ever lives in here, and no theme block ever contains
+      anything but token declarations.
+
+   Contrast: every pair that renders text-on-surface or a meaningful
+   graphical object is verified against WCAG 2.1 AA by a checker that parses
+   THIS file, so the measured ratios cannot drift from what ships. The light
+   palette also fixes three AA failures that were already live: --ok was
+   #2f9e44 (3.45:1), the amber used for "active" was #f0a500 (2.08:1), and
+   muted text was #98a2b0 (2.58:1). */
+
+:root {
+  color-scheme: light;
+
+  /* -- surfaces ------------------------------------------------------- */
+  --bg: #FFFFFF;
+  --surface: #F7F9FA;
+  --surface-raised: #FFFFFF;
+  --hover: #F1F5FB;
+  --track: #EEF1F5;
+
+  /* -- lines ---------------------------------------------------------- */
+  --border: #D8DEE6;
+  --border-subtle: #EDF0F4;
+  --border-strong: #8596AB;
+
+  /* -- ink ------------------------------------------------------------ */
+  --fg: #1C2530;
+  --fg-muted: #5B6675;
+  --fg-faint: #697381;
+  --fg-on-accent: #FFFFFF;
+
+  /* -- accent --------------------------------------------------------- */
+  --accent: #2467EA;
+  --accent-soft: #EEF4FF;
+  --accent-ring: rgba(36, 103, 234, .30);
+
+  /* -- status / severity ---------------------------------------------- */
+  /* --active is the border stripe (a graphical object, 3:1 floor);
+     --active-text is the same state rendered as text (4.5:1 floor). They
+     differ because no single amber can do both jobs on white. */
+  --ok: #1F7A38;
+  --ok-bg: #E3F4E8;
+  --error: #C0392B;
+  --error-bg: #FDECEA;
+  --active: #B87D00;
+  --active-text: #956700;
+  --active-bg: #FDF3DC;
+  --warn-text: #7A5B00;
+  --warn-bg: #FFF3CD;
+  --neutral-bg: #EEF1F5;
+
+  /* -- grouped / derived nodes ---------------------------------------- */
+  --group-fg: #4A3FA8;
+  --group-label: #5B4FC0;
+  --group-bg: #F6F4FF;
+  --group-border: #6B5BD2;
+
+  /* -- JSON syntax ----------------------------------------------------- */
+  --syn-key: #8250DF;
+  --syn-string: #0A7D3C;
+  --syn-number: #B35900;
+  --syn-bool: #CF222E;
+
+  /* -- in-text search highlight ---------------------------------------- */
+  --hit-bg: #FFF2A8;
+  --hit-fg: #1C2530;
+  --hit-active-bg: #FFC400;
+  --hit-active-fg: #1C2530;
+
+  /* -- chart layer: swimlane tints, minimap, heat ----------------------- */
+  /* Categorical fills, deliberately low-contrast against the page: they
+     group nodes, they never encode a value. Status colour is never reused
+     here, so green always means ok and never means "lane 5". */
+  --lane-1: #E8C9C9;
+  --lane-2: #D9C9E8;
+  --lane-3: #C9D4E8;
+  --lane-4: #C9E0E8;
+  --lane-5: #CFE0C9;
+  --lane-6: #E8DDC9;
+  --lane-fg: #1C2530;
+  --lane-line: #DFE5EC;
+  --lane-title: #697381;
+  --lane-band: rgba(28, 37, 48, .025);
+  --lane-band-odd: rgba(36, 103, 234, .03);
+
+  /* -- graph chrome ----------------------------------------------------- */
+  --edge: #8996A8;
+  --edge-text: #5B6675;
+  --edge-label-bg: rgba(255, 255, 255, .85);
+  --handle: #C3CCD8;
+  --minimap-mask: rgba(28, 37, 48, .08);
+  --minimap-node: #7E96B7;
+
+  /* -- effects ---------------------------------------------------------- */
+  --shadow: rgba(28, 37, 48, .12);
+  --shadow-strong: rgba(28, 37, 48, .18);
+  --scrim: rgba(0, 0, 0, .35);
+}
+
+/* System default: follow the OS, unless the user explicitly chose light. */
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --bg: #141920;
+    --surface: #1B222B;
+    --surface-raised: #222A35;
+    --hover: #263140;
+    --track: #2A3340;
+    --border: #313B48;
+    --border-subtle: #242D38;
+    --border-strong: #5E6D81;
+    --fg: #D9E1EA;
+    --fg-muted: #9AA6B5;
+    --fg-faint: #93A0AF;
+    --fg-on-accent: #10151C;
+    --accent: #82AAF7;
+    --accent-soft: #1D2A40;
+    --accent-ring: rgba(130, 170, 247, .35);
+    --ok: #6DC17E;
+    --ok-bg: #1E3326;
+    --error: #EE8B80;
+    --error-bg: #3A2622;
+    --active: #E0A83B;
+    --active-text: #E0A83B;
+    --active-bg: #372E1A;
+    --warn-text: #E6C067;
+    --warn-bg: #372E1A;
+    --neutral-bg: #263140;
+    --group-fg: #C0A8F5;
+    --group-label: #C0A8F5;
+    --group-bg: #241F33;
+    --group-border: #8E7BE8;
+    --syn-key: #C0A8F5;
+    --syn-string: #86CE96;
+    --syn-number: #E4A96B;
+    --syn-bool: #F09A91;
+    --hit-bg: #6B5300;
+    --hit-fg: #FFEFC2;
+    --hit-active-bg: #E0A83B;
+    --hit-active-fg: #17130A;
+    --lane-1: #3A2E31;
+    --lane-2: #332E3D;
+    --lane-3: #2A3140;
+    --lane-4: #28353C;
+    --lane-5: #2C382E;
+    --lane-6: #3A342A;
+    --lane-fg: #D9E1EA;
+    --lane-line: #2E3742;
+    --lane-title: #93A0AF;
+    --lane-band: rgba(217, 225, 234, .035);
+    --lane-band-odd: rgba(130, 170, 247, .06);
+    --edge: #6E7C8E;
+    --edge-text: #9AA6B5;
+    --edge-label-bg: rgba(20, 25, 32, .85);
+    --handle: #4A5666;
+    --minimap-mask: rgba(8, 11, 15, .55);
+    --minimap-node: #566682;
+    --shadow: rgba(0, 0, 0, .55);
+    --shadow-strong: rgba(0, 0, 0, .65);
+    --scrim: rgba(0, 0, 0, .62);
+  }
+}
+
+/* Explicit dark: last, so it also wins on a light-preferring OS. Must stay
+   byte-identical to the media block above (tokens.test.ts checks). */
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --bg: #141920;
+  --surface: #1B222B;
+  --surface-raised: #222A35;
+  --hover: #263140;
+  --track: #2A3340;
+  --border: #313B48;
+  --border-subtle: #242D38;
+  --border-strong: #5E6D81;
+  --fg: #D9E1EA;
+  --fg-muted: #9AA6B5;
+  --fg-faint: #93A0AF;
+  --fg-on-accent: #10151C;
+  --accent: #82AAF7;
+  --accent-soft: #1D2A40;
+  --accent-ring: rgba(130, 170, 247, .35);
+  --ok: #6DC17E;
+  --ok-bg: #1E3326;
+  --error: #EE8B80;
+  --error-bg: #3A2622;
+  --active: #E0A83B;
+  --active-text: #E0A83B;
+  --active-bg: #372E1A;
+  --warn-text: #E6C067;
+  --warn-bg: #372E1A;
+  --neutral-bg: #263140;
+  --group-fg: #C0A8F5;
+  --group-label: #C0A8F5;
+  --group-bg: #241F33;
+  --group-border: #8E7BE8;
+  --syn-key: #C0A8F5;
+  --syn-string: #86CE96;
+  --syn-number: #E4A96B;
+  --syn-bool: #F09A91;
+  --hit-bg: #6B5300;
+  --hit-fg: #FFEFC2;
+  --hit-active-bg: #E0A83B;
+  --hit-active-fg: #17130A;
+  --lane-1: #3A2E31;
+  --lane-2: #332E3D;
+  --lane-3: #2A3140;
+  --lane-4: #28353C;
+  --lane-5: #2C382E;
+  --lane-6: #3A342A;
+  --lane-fg: #D9E1EA;
+  --lane-line: #2E3742;
+  --lane-title: #93A0AF;
+  --lane-band: rgba(217, 225, 234, .035);
+  --lane-band-odd: rgba(130, 170, 247, .06);
+  --edge: #6E7C8E;
+  --edge-text: #9AA6B5;
+  --edge-label-bg: rgba(20, 25, 32, .85);
+  --handle: #4A5666;
+  --minimap-mask: rgba(8, 11, 15, .55);
+  --minimap-node: #566682;
+  --shadow: rgba(0, 0, 0, .55);
+  --shadow-strong: rgba(0, 0, 0, .65);
+  --scrim: rgba(0, 0, 0, .62);
+}

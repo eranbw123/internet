@@ -4,6 +4,17 @@
 <meta charset="utf-8">
 <title>Observatory</title>
 <meta name="viewport" content="width=device-width, initial-scale=1">
+<script>
+/* Applied before the bundle loads, so the first paint is already the right
+   theme -- a React-side-only toggle flashes white on every reload. Kept in
+   sync with applyTheme() in src/theme.ts (theme.test.ts asserts the pair). */
+(function () {
+  try {
+    var t = localStorage.getItem("observatory-theme");
+    if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+  } catch (e) {}
+})();
+</script>
   <script type="module" crossorigin src="/observatory/static/assets/index.js"></script>
   <link rel="stylesheet" crossorigin href="/observatory/static/assets/index.css">
 </head>
