@@ -915,7 +915,18 @@ def _import_and_top_up(conn, cfg, path, trigger):
             f"offers[{trigger}] top-up: inbox is {topped['live_after']}/{topped['target']} "
             f"and the artifact is exhausted -- the next extractor run is what fills it"
         )
-    did_work = bool(summary.get("offered") or topped.get("offered"))
+    # What counts as "the event path should already have done this": anything
+    # that CHANGED the funnel. Offers added is the obvious one; attaching an
+    # artifact's evidence to an interest the owner already has is the other,
+    # and it is import_artifact's once-per-artifact job, so a reconcile finding
+    # it undone means an event was missed just as surely.
+    #
+    # Recording a new artifact sha while adding nothing is deliberately NOT
+    # work: when the inbox is already at target, whether the event path
+    # imported is invisible to the owner, and a warning nobody can act on is
+    # how a useful alert becomes noise.
+    did_work = bool(summary.get("offered") or summary.get("attached")
+                    or topped.get("offered"))
     if _import_is_failure(summary):
         # Non-zero, so _run_job stamps job:offers-import:last_fail and
         # `health` starts counting this job as failing.
