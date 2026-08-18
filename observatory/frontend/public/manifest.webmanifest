@@ -1,0 +1,13 @@
+{
+  "name": "Observatory",
+  "short_name": "Observatory",
+  "description": "Discovery traces, interests and offers",
+  "start_url": "../",
+  "scope": "../",
+  "display": "standalone",
+  "background_color": "#12161a",
+  "theme_color": "#12161a",
+  "icons": [
+    { "src": "apple-touch-icon.png", "sizes": "180x180", "type": "image/png" }
+  ]
+}

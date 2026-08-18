@@ -3,7 +3,21 @@
 <head>
 <meta charset="utf-8">
 <title>Observatory</title>
-<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+
+<!-- Added to the Home Screen, these make iOS drop Safari's own chrome (the
+     bottom toolbar and the address bar) and run the Observatory as a
+     standalone app. apple-mobile-web-app-capable is the tag iOS actually
+     honours; the manifest's display:standalone covers Android/Chrome. -->
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="black-translucent">
+<meta name="apple-mobile-web-app-title" content="Observatory">
+<link rel="manifest" href="manifest.webmanifest">
+<link rel="apple-touch-icon" href="apple-touch-icon.png">
+<!-- Matches the token palettes so the status bar and task switcher blend in. -->
+<meta name="theme-color" media="(prefers-color-scheme: light)" content="#ffffff">
+<meta name="theme-color" media="(prefers-color-scheme: dark)" content="#12161a">
 <script>
 /* Applied before the bundle loads, so the first paint is already the right
    theme -- a React-side-only toggle flashes white on every reload. Kept in

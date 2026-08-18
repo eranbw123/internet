@@ -35,6 +35,11 @@ from . import manage
 
 STATIC_DIR = pathlib.Path(__file__).parent / "static"
 
+# Python's table has no entry for .webmanifest, so static_view's
+# mimetypes.guess_type() would serve the PWA manifest as
+# application/octet-stream and some browsers ignore it.
+mimetypes.add_type("application/manifest+json", ".webmanifest")
+
 
 def _public(datasette):
     return bool(getattr(datasette, "_observatory_public", False))
