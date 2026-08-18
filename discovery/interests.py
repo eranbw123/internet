@@ -1,7 +1,7 @@
 """Load interests.json into the interests table."""
 import json
 
-from .db import DERIVED_KEY_PREFIX, add_interest_event, upsert_interest
+from .db import DERIVED_KEY_PREFIX
 from .models import Interest
 
 
@@ -21,6 +21,30 @@ def load_blocked(path):
     every existing call site stays untouched."""
     data = json.loads(open(path, encoding="utf-8-sig").read())
     return list(data.get("blocked_derived_terms", []))
+
+
+def load_stated_active(path):
+    """What the file explicitly says about liveness: `{key: True|False}` for
+    the entries carrying an optional `"active"` flag, and nothing at all for
+    the ones that stay silent about it.
+
+    The three-way answer is the point. "Silent" is not "active": it means the
+    file is not expressing an opinion, which is what lets an interest the
+    decay sweep auto-paused stay paused across a sync instead of being
+    revived every cycle. `"active": false` retires an interest without losing
+    its definition, so reviving it is one flag rather than re-authoring the
+    entry.
+
+    Same separate-helper shape as load_blocked() above: models.Interest
+    deliberately has no `active` field (DB-only bookkeeping the pipeline reads
+    straight from SQL), so load_file()'s return shape stays untouched and only
+    sync v2 (discovery/interest_sync.py) has to care."""
+    data = json.loads(open(path, encoding="utf-8-sig").read())
+    return {
+        entry["key"]: bool(entry["active"])
+        for entry in data["interests"]
+        if "active" in entry
+    }
 
 
 def _to_interest(entry, defaults, state=None):
@@ -64,12 +88,13 @@ def _threshold(value):
 
 
 def sync(conn, path, state=None):
-    """Write the file's interests into the DB, and append an 'owner_sync'
-    provenance event per interest so owner rows are queryable the same way
-    derived ones are (`python -m app interests --why <key>`). Returns how
-    many were written."""
-    interests = load_file(path, state)
-    for interest in interests:
-        upsert_interest(conn, interest)
-        add_interest_event(conn, interest.key, "owner_sync", "sync", None, "owner")
-    return len(interests)
+    """Reconcile the file into the DB and return how many entries it held.
+
+    Kept as the stable entry point with its v1 signature and int return; the
+    reconciliation itself is sync v2 (discovery/interest_sync.py), which also
+    deactivates what the file dropped, cancels those interests' pending
+    missions, and writes an 'owner_sync' interest_events row per actual
+    change instead of one per interest per run. Callers wanting the detail
+    (what changed, what was retired) call interest_sync.sync() directly."""
+    from .interest_sync import sync as sync_v2   # deferred: interest_sync imports this module
+    return sync_v2(conn, path, state).written

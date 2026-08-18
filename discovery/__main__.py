@@ -3,6 +3,11 @@
 `python -m app <command>` is the same CLI under a shorter name.
 
     init          create/upgrade discovery.db and load interests.json
+    sync          reconcile interests.json into the DB at runtime: upsert
+                  edits, deactivate entries the file dropped or marked
+                  "active": false, and cancel those interests' pending
+                  missions. --dry-run prints the plan; --force overrides
+                  the truncated-file guard. No re-init, no manual DB op
     run-once      one collect -> score -> notify cycle (--source to limit
                   collection to one collector; Alerts still send immediately,
                   Discovery items still just queue for `digest`). Gated by a
@@ -32,6 +37,12 @@
                   promotion/decay (a no-op unless DISCOVERY_DYNAMIC_INTERESTS)
     health        job staleness, provider reachability, pending sends;
                   --notify alerts on degraded/recovery (rate-limited)
+    pause         freeze the LLM-spending scheduled commands: run-once,
+                  web-tick and digest exit immediately (0 tokens, no
+                  provider construction) until `resume`; `listen --drain`
+                  and `health` keep running so feedback buttons and the
+                  remote resume path stay alive. --why records a note.
+    resume        lift `pause`
     personal-state  print the ai repo's personal-state contract artifact
     teach         rank scored-but-unlabeled items by expected information
                   value and record labels; --list/--explain/--send
@@ -65,6 +76,7 @@ from .notify import FEEDBACK_VERDICTS, print_safe
 from .personal_state import PersonalStateError
 from .pipeline import Budget, deliver, ingest, outcome_metric, run_once, send_digest
 from . import interest_state
+from . import interest_sync
 
 
 def main(argv=None):
@@ -78,6 +90,20 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="create the DB and load interests.json")
+    sy = sub.add_parser(
+        "sync",
+        help="reconcile interests.json into the DB now -- upsert, and deactivate what the file dropped",
+    )
+    sy.add_argument(
+        "--force", action="store_true",
+        help="apply even when the mass-deactivation guard trips (truncated-file protection)",
+    )
+    sy.add_argument(
+        # default=SUPPRESS so the flag can also be given before the subcommand
+        # (`--dry-run sync`), same reason trace-fixture's --db does it.
+        "--dry-run", action="store_true", default=argparse.SUPPRESS,
+        help="print the plan and write nothing",
+    )
     ro = sub.add_parser("run-once", help="one cycle")
     ro.add_argument(
         "--source", choices=sorted(COLLECTORS), help="collect only this collector's items"
@@ -121,6 +147,11 @@ def main(argv=None):
         "--notify", action="store_true",
         help="alert on degraded/recovery over Telegram, rate-limited",
     )
+    pa = sub.add_parser(
+        "pause", help="freeze run-once/web-tick/digest until `resume` (0 LLM spend)"
+    )
+    pa.add_argument("--why", default="", help="optional note echoed by health and the skip message")
+    sub.add_parser("resume", help="lift `pause`")
     it = sub.add_parser(
         "interests", help="layered interest state: list, --why <key>, --refresh"
     )
@@ -228,17 +259,28 @@ def main(argv=None):
         conn.close()   # Windows keeps the .db file locked otherwise
 
 
+# Commands that spend LLM/API calls when the OS scheduler fires them. `pause`
+# freezes exactly these; `listen --drain` (one free Telegram getUpdates -- it
+# keeps feedback buttons responsive while paused) and `health` (free local
+# checks, pause-aware in health.check) deliberately keep running.
+PAUSE_GATED = ("run-once", "web-tick", "digest")
+
+
 def _dispatch(conn, cfg, args, provider):
+    # Checked before any provider construction or _run_job heartbeat: a gated
+    # invocation is a deliberate no-op, not a run -- run_ok/last_ok would lie.
+    if args.command in PAUSE_GATED and db.state_get(conn, "paused") == "1":
+        why = db.state_get(conn, "paused_why") or ""
+        note = f" ({why})" if why else ""
+        print(f"paused{note} -- {args.command} skipped; `python -m app resume` lifts it")
+        return 0
     if args.command == "init":
-        try:
-            count = interests.sync(conn, cfg.interests_path)
-        except FileNotFoundError:
-            print(f"interests file not found: {cfg.interests_path}", file=sys.stderr)
+        result = _sync_interests(conn, cfg)
+        if result is None:
             return 2
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
-            print(f"malformed interests file {cfg.interests_path}: {e}", file=sys.stderr)
-            return 2
-        print(f"{cfg.db_path}: schema ready, {count} interests loaded")
+        print(f"{cfg.db_path}: schema ready, {result.describe()}")
+    elif args.command == "sync":
+        return _sync_cmd(conn, cfg, args)
     elif args.command == "run-once":
         sources = [args.source] if args.source else None
         job_name = health.job_name_for_source(args.source)
@@ -273,6 +315,17 @@ def _dispatch(conn, cfg, args, provider):
         print_safe(stats.report(conn, args.days, cfg))
     elif args.command == "health":
         return _health_cmd(conn, cfg, provider(), args)
+    elif args.command == "pause":
+        db.state_set(conn, "paused", "1")
+        db.state_set(conn, "paused_why", args.why)
+        print(
+            "paused -- run-once/web-tick/digest exit immediately until `resume`"
+            " (feedback drain and health keep running)"
+        )
+    elif args.command == "resume":
+        db.state_set(conn, "paused", "0")
+        db.state_set(conn, "paused_why", "")
+        print("resumed")
     elif args.command == "interests":
         return _interests_cmd(conn, cfg, args)
     elif args.command == "personal-state":
@@ -482,6 +535,45 @@ def _list_items(conn, limit, min_score):
         print_safe(f"[{row['final_score'] * 100:>3.0f}] #{row['id']} {row['interest']}: {row['title']}")
         print_safe(f"      {row['reason']}")
         print_safe(f"      {row['url']}")
+
+
+def _sync_interests(conn, cfg, force=False):
+    """Shared by `init` and `sync`: run sync v2, or print why it could not and
+    return None so the caller exits 2. A malformed/absent file must never fall
+    through to a deactivation pass."""
+    try:
+        return interest_sync.sync(conn, cfg.interests_path, force=force)
+    except FileNotFoundError:
+        print(f"interests file not found: {cfg.interests_path}", file=sys.stderr)
+    except interest_sync.SyncRefused as e:
+        print(f"sync refused: {e}", file=sys.stderr)
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        print(f"malformed interests file {cfg.interests_path}: {e}", file=sys.stderr)
+    return None
+
+
+def _sync_cmd(conn, cfg, args):
+    """`python -m app sync` -- the runtime half of sync v2. Editing
+    interests.json and running this takes effect on the next pipeline cycle
+    (db.active_interests() reads the DB live); no re-init, no hand-written
+    UPDATE, no redeploy."""
+    if args.dry_run:
+        try:
+            planned = interest_sync.plan(conn, cfg.interests_path)
+        except FileNotFoundError:
+            print(f"interests file not found: {cfg.interests_path}", file=sys.stderr)
+            return 2
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            print(f"malformed interests file {cfg.interests_path}: {e}", file=sys.stderr)
+            return 2
+        print(f"dry run -- {planned.changes} changes, nothing written")
+        print(planned.describe())
+        return 0
+    result = _sync_interests(conn, cfg, force=args.force)
+    if result is None:
+        return 2
+    print(result.describe())
+    return 0
 
 
 def _interests_cmd(conn, cfg, args):

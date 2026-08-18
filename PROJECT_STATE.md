@@ -1,6 +1,33 @@
 # PROJECT_STATE.md — `internet`
 
-Updated 2026-08-12. Imported by `CLAUDE.md`. Current state only — not a log.
+Updated 2026-08-13. Imported by `CLAUDE.md`. Current state only — not a log.
+
+## pause switch (owner token freeze)
+`python -m app pause [--why]` / `resume` set `service_state` keys
+`paused`/`paused_why`. `__main__.PAUSE_GATED` = run-once/web-tick/digest:
+while paused each exits 0 at the very top of `_dispatch` — before provider
+construction and before `_run_job`, so no `run_ok`/`last_ok` is stamped for
+a skipped run. `listen --drain` and `health` deliberately keep running
+(free — feedback buttons and the remote resume path stay alive).
+`health.check` is pause-aware: staleness/provider never set `degraded`
+while paused, the provider preflight is skipped ("not checked (paused)"),
+and `format_report` leads with a PAUSED line. The flag is the guarantee —
+it works even when `schtasks /change` is ACCESS DENIED (tasks registered
+from an elevated shell deny an unelevated process; observed live
+2026-08-13 until a task re-registration made them changeable again).
+Telegram control lives in engine-control: global `/pause` · `/resume`
+(all-stop: worker dispatch + this flag + best-effort `schtasks
+/disable|/enable` over the six tasks, via `newsops.pause/resume`) and
+`/news pause`/`/news resume` for the appliance alone. While fully paused
+the feedback drain task is disabled too — product-bot button presses
+queue on Telegram (~24h retention) and are drained after resume.
+Live-verified 2026-08-13 through the real scheduled task ("web-tick
+skipped" in the task log). `internet-discovery-update` (the 30-min
+self-updater; its `self_update.py` re-registers ALL tasks via
+`install_tasks.py --install` on every run, resetting manual task state)
+is deliberately NOT in the pause/resume task set and was disabled outright
+2026-08-13 (owner all-stop); re-enable: `schtasks /change /tn
+internet-discovery-update /enable`. 3 new CLITests (492 → 495).
 
 ## provider fallback
 `discovery/providers/fallback.py`: `FallbackProvider` wraps two real providers;
@@ -1053,6 +1080,23 @@ drain instead of lost. Send-retry policy moved onto `Config`
 3/15min module-constant defaults, which stay as `db.pending_notifications`'s
 own fallback); `pipeline._send_one` bumps `send_failed` on a failed send.
 
+## hidden task launch (2026-08-13): no console windows from scheduled tasks
+`ops/hidden.vbs` (new) + `install_tasks._action_command()`: every task action
+is now `wscript.exe //B //Nologo ops\hidden.vbs cmd.exe /d /c ops\<script> ...`
+— wscript is a GUI-subsystem host, so no console ever flashes in the
+interactive session (`collect-web` fires every 60s; the owner was seeing a
+cmd window blink each time). hidden.vbs waits on the child and propagates
+its exit code, so IgnoreNew/RestartOnFailure/Last Result are unchanged.
+Machine-wide convention, not just this repo: `C:\projects\engine-control`
+(control.py tick/listener installers + claude_runner.py's ec-* task lane,
+which now writes a `launch.cmd` into the run's artifact dir to stay under
+schtasks' ~240-char /tr cap) and `C:\Users\eranb\ssh_watch` each carry their
+own copy of hidden.vbs. Any future Scheduled Task (engine-lab one-shots
+included) must launch through it. Elevation trap: tasks registered from an
+elevated shell can't be overwritten unelevated (`--install` fails Access
+denied); fix is a one-time elevated delete, then unelevated re-create.
+1 new test (`test_action_launches_hidden_via_wscript`).
+
 ## personal-state contract (consumer side)
 `discovery/personal_state.py` is the ONLY reader of the `ai` repo's derived
 personal-state artifact (schema owned by `ai`'s `PERSONAL_STATE_CONTRACT.md`);
@@ -1124,9 +1168,58 @@ collectors already fetch — no new collector call); promotion past
 at/above today's owner bars). CLI: `python -m app interests [--layer L]
 [--why KEY] [--refresh]` — list (owner first), provenance chain, or run
 `apply_transitions` (prints the off-message and changes nothing if the flag
-is off). `interests.sync` now appends one 'owner_sync' event per interest.
+is off). `interests.sync` now appends one 'owner_sync' event per interest (superseded
+by sync v2 below: one event per actual change).
 Scheduling the refresh on a cadence is deferred to a later step — not
 wired into `ops/install_tasks.py` here.
+
+## interest sync v2 (deactivation-aware, callable)
+`discovery/interest_sync.py` — `interests.json` is now the source of truth in
+BOTH directions. v1 only ever inserted/updated, so an interest deleted from
+the file kept collecting and spending until somebody hand-ran an UPDATE on the
+live DB (that is what the 13 `active=0` owner rows in production are, and why
+the standing procedure was "JSON PR **and** a live-DB op" — obsolete now).
+`plan(conn, path)` computes the reconciliation without writing;
+`apply(conn, plan, force)` writes it; `sync()` is both. New entry → created
+live; entry saying nothing about `active` → definition updated, **liveness
+untouched** (an auto-paused interest stays paused — sync must not fight the
+decay sweep); `"active": false` (new optional field, read three-way by
+`interests.load_stated_active`, mirroring `load_blocked`) → retired,
+definition intact; `"active": true` → forced live, overruling the sweep;
+present again after being retired → revived; absent → retired. Retiring
+cancels the interest's PENDING `search_missions` (RUNNING is left alone — its
+lease owns that row).
+
+**Liveness is never written here.** Retirement/revival go through
+`offers.set_lifecycle()`, so there is one deactivation mechanism and
+`lifecycle`/`active` can never disagree; this module owns the reconciliation
+(what the file says), `offers.py` owns the state machine (what happens to an
+interest once it exists). The seam runs both ways: `entry_writer(conn, path)`
+is the callable `offers.accept(sync=...)` takes — entry into interests.json,
+sync into the DB, `offers.activate()` finds its row — and `write_entry()` /
+`set_entry_active()` are the atomic interests.json writers (same shape as
+`offers.append_blocked_terms`). A retirement made only in the DB while the
+file still carries the entry is reverted by the next sync **by design**: the
+file is the source of truth, so the write API (PR J) must call
+`set_entry_active()` alongside every retire/undo.
+
+One `owner_sync` `interest_events` row per *actual* change (`create`/`update`
+from here, `reactivate`/`deactivate` from `set_lifecycle`, carrying the
+changed fields or the reason plus missions cancelled); an unchanged file
+writes nothing, so repeat runs are free. Only `layer='owner'` rows are
+visible; derived rows stay `interest_state.py`'s. Guard: a run that would
+retire >50% of the non-retired set (above 3) raises `SyncRefused` unless
+forced — a truncated/half-written file must not retire the engine. Migration
+owned by this module (`MIGRATION`/`migrate()`, additive ALTER applied on
+demand by every `plan()`, deliberately NOT in `db.init()`'s pass, so it stays
+clear of the offers store's columns): `interests.synced_at`.
+`db.upsert_interest` gained `active=1` (every prior call site unchanged).
+CLI `python -m app sync [--dry-run] [--force]`; `init` routes through the same
+call and reports what it reconciled. Rehearsed on a copy of the production DB:
+the first run retires the 13 owner rows that were hand-deactivated by live-DB
+ops (PR H's backfill had set them all `lifecycle='active'` while `active=0`),
+writes 13 provenance events, and touches none of the 153 pending missions;
+the second run is a no-op. 32 new tests (green).
 
 ## engine lab (`experiments/lab/`, branch `engine-lab`)
 Reusable prompt-optimization loop for the whole engine, generalized from the
