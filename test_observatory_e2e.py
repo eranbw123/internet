@@ -609,11 +609,13 @@ class ObservatoryE2EMobileTests(_E2EFixture, unittest.TestCase):
         scrolled sideways; and 87 controls on the interests screen alone were
         under the 44x44 tap floor, the smallest being 68x16 filter chips.
 
-        The floor asserted here is 36px rather than 44px, and it skips inline
-        text links: a <button> inside running prose cannot be made 44px tall
+        The floor asserted here is Apple's 44px, and it skips inline text
+        links: a <button> inside running prose cannot be made 44px tall
         without wrecking the paragraph, so those get an overlaid hit area
         instead (see .link-button::after in interests.css), which a bounding
-        box cannot see.
+        box cannot see. Those overlays were checked separately with
+        elementFromPoint at +/-18px and +/-20px from the centre; every probe
+        hit the button.
         """
         self.set_viewport(IPHONE_VIEWPORT)
         self.navigate("/observatory/?interests=mock")
@@ -630,7 +632,7 @@ class ObservatoryE2EMobileTests(_E2EFixture, unittest.TestCase):
             "      if (el.closest('.react-flow')) return false;"
             "      const r = el.getBoundingClientRect();"
             "      if (!r.width && !r.height) return false;"
-            "      return r.height < 36 || r.width < 36;"
+            "      return r.height < 44 || r.width < 44;"
             "    })"
             "    .map(el => el.tagName + '.' + (el.className || '') + ' '"
             "               + Math.round(el.getBoundingClientRect().width) + 'x'"
@@ -659,6 +661,68 @@ class ObservatoryE2EMobileTests(_E2EFixture, unittest.TestCase):
                 report["small"], [],
                 f"controls under the tap floor on the {surface} surface: {report['small']}",
             )
+
+    def test_06e_no_field_on_a_phone_is_small_enough_to_zoom_ios(self):
+        """iOS zooms the whole page in when a focused field's text is under
+        16px, and then leaves it zoomed -- which is where most of the "it goes
+        sideways when I type" feeling came from.
+
+        There is a `input, select, textarea { font-size: 16px }` floor in
+        styles.css, but it is a bare type selector at (0,0,1) and it was losing
+        to `.field input, .field textarea, .field select { font: inherit }` at
+        (0,1,1), and to `.list-search`'s own font-size. Measured before the
+        fix: every field in the interest editor computed to 13px and the
+        interests filter to 12px -- so the one screen in the app that is mostly
+        form was the one screen that still zoomed on focus.
+
+        A CSS-text assertion would not have caught that, because the rule that
+        loses is still present in the file. This measures the computed value,
+        which is the only thing iOS reads.
+        """
+        self.set_viewport(IPHONE_VIEWPORT)
+        self.navigate("/observatory/?interests=mock")
+        self.wait_for("!!document.querySelector('[data-testid=\"app\"]')")
+
+        probe = (
+            "(() => {"
+            "  const small = [...document.querySelectorAll('input, select, textarea')]"
+            "    .filter(el => {"
+            "      const r = el.getBoundingClientRect();"
+            "      if (!r.width && !r.height) return false;"
+            "      if (['range', 'checkbox', 'radio', 'button', 'submit'].includes(el.type)) return false;"
+            "      return parseFloat(getComputedStyle(el).fontSize) < 16;"
+            "    })"
+            "    .map(el => el.tagName + '[' + (el.type || '') + '].'"
+            "               + ((el.className || '').toString().split(' ')[0] || '-') + ' '"
+            "               + getComputedStyle(el).fontSize);"
+            "  return JSON.stringify([...new Set(small)]);"
+            "})()"
+        )
+
+        for surface in ("explore", "interests", "offers", "connections", "compare"):
+            self.click(f'[data-surface="{surface}"]')
+            self.wait_for(
+                f"document.querySelector('[data-surface=\"{surface}\"]').getAttribute('aria-current') === 'page'"
+            )
+            time.sleep(0.8)
+            self.assertEqual(
+                json.loads(self.js(probe)), [],
+                f"fields under the 16px iOS-zoom floor on the {surface} surface: "
+                + self.js(probe),
+            )
+
+        # The editor is the form-heaviest surface and the one that regressed,
+        # so it is checked with the sheet actually open rather than trusted to
+        # the list behind it.
+        self.click('[data-surface="interests"]')
+        self.wait_for("!!document.querySelector('[data-testid^=\"interest-row-\"]')")
+        self.click('[data-testid^="interest-row-"]')
+        self.wait_for("!!document.querySelector('.editor')")
+        time.sleep(0.8)
+        self.assertEqual(
+            json.loads(self.js(probe)), [],
+            "fields under the 16px iOS-zoom floor in the interest editor: " + self.js(probe),
+        )
 
     def test_06b_mobile_lands_zoomed_in_enough_to_read(self):
         """A phone must not open on the unreadable fit-all view.

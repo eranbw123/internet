@@ -990,6 +990,23 @@ input[type="range"]::-moz-range-thumb {
   .funnel-n { font-size: 15px; }
   .funnel-l { font-size: 9.5px; }
 
+  /* The 16px iOS-zoom floor, enforced where it actually loses.
+     `input, select, textarea { font-size: 16px }` in styles.css is (0,0,1),
+     and it was being beaten by `.field input, .field textarea, .field select
+     { font: inherit }` at (0,1,1) and by `.list-search`'s own font-size --
+     measured, every field in the editor computed to 13px and the interests
+     filter to 12px. Which means the one screen in the app that is mostly form
+     was the one screen that still zoomed the page the moment you tapped a
+     field, and iOS leaves it zoomed: exactly the "it goes sideways when I
+     type" symptom the floor exists to prevent. Verified after this change:
+     every input/select/textarea in every surface computes >= 16px. */
+  .field input, .field textarea, .field select,
+  .field input.bar-number,
+  .chip-input input,
+  .list-search {
+    font-size: 16px;
+  }
+
   .list-controls { gap: 8px; align-items: stretch; }
   .filter-tabs { flex-basis: 100%; }
   .filter-tabs button { flex: 1; min-width: 0; min-height: 44px; padding: 0 4px; font-size: 12px; }
