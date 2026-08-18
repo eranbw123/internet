@@ -46,7 +46,9 @@ CLAUDE.md + PROJECT_STATE.md are the authoritative starting context and are alre
 - **Experiment iterations and refinement always run detached**: any lab run
   that spends provider calls or outlives a few minutes goes in a one-shot
   Windows Scheduled Task (`schtasks /sc once`), never as a session child —
-  SSH-session children get reaped on disconnect. Chain the follow-up steps
+  SSH-session children get reaped on disconnect. Task actions must launch
+  through `wscript //B ops\hidden.vbs ...` so no console window flashes in
+  the owner's session. Chain the follow-up steps
   (validate, ntfy via `design_council.py notify`) into the task's `.cmd`, and
   persist every result to `experiments/lab/artifacts/` as it is produced, so
   any later session resumes from state without rework.

@@ -36,6 +36,11 @@ class Config:
     youtube_api_key: str = ""   # YouTube Data API v3 key; only the youtube collector needs it
     max_scores_per_cycle: int = 25   # hard ceiling on LLM scoring calls per run_once()
     personal_state_path: str = ""    # ai repo's derived contract artifact; see discovery/personal_state.py
+    # The contract-v2 artifact carrying interest candidates (same reader,
+    # same fail-soft posture). Separate path from personal_state.json because
+    # the producer publishes them on different cadences -- nightly map vs
+    # weekly reduce. Gitignored, inbound, never committed.
+    interest_candidates_path: str = ""
     # Per-job cadence. No in-process scheduler reads these anymore (see
     # health.py/__main__.py's "run" removal) -- the OS scheduler's triggers
     # are derived from these same fields instead.
@@ -161,6 +166,9 @@ def load():
         max_scores_per_cycle=int(os.environ.get("DISCOVERY_MAX_SCORES", "25")),
         personal_state_path=os.environ.get(
             "DISCOVERY_PERSONAL_STATE", str(REPO_ROOT / "personal_state.json")
+        ),
+        interest_candidates_path=os.environ.get(
+            "DISCOVERY_INTEREST_CANDIDATES", str(REPO_ROOT / "interest_candidates.json")
         ),
         interval_stocks_seconds=int(os.environ.get("DISCOVERY_INTERVAL_STOCKS", "3600")),
         interval_web_seconds=int(os.environ.get("DISCOVERY_INTERVAL_WEB", "60")),
