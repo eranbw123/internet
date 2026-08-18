@@ -120,6 +120,14 @@ export interface NodeDetail {
   truncated: boolean;
 }
 
+/** /api/interests -- just enough of an interest to populate a picker. */
+export interface InterestOption {
+  key: string;
+  title: string | null;
+  active: number;
+  layer: string | null;
+}
+
 export interface InterestDetail {
   definition: Record<string, unknown>;
   provenance: unknown;

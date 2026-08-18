@@ -1369,6 +1369,61 @@ class ObservatoryPromptVisibilityTests(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(HAVE_DATASETTE, "datasette not installed")
+class ObservatoryInterestFilteringTests(unittest.IsolatedAsyncioTestCase):
+    """The interest filter was a free-text box that had to contain an exact,
+    case-sensitive key, with no list of valid keys anywhere in the UI -- and on
+    the Interests tab the backend ignored it entirely."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.db_path, cls.cfg = _build_fixture_db()
+
+    def setUp(self):
+        self.ds = build_datasette(self.cfg, public=False)
+
+    async def test_interest_index_lists_every_interest_cheaply(self):
+        body = (await self.ds.client.get("/observatory/api/interests")).json()
+        rows = body["interests"]
+        self.assertTrue(rows)
+        # Deliberately not the list_rows shape: no COUNT subqueries, no
+        # MAX_LIMIT cap (46 live interests against a cap of 50).
+        self.assertEqual(set(rows[0]), {"key", "title", "active", "layer"})
+
+    async def test_interest_index_puts_active_interests_first(self):
+        raw = sqlite3.connect(self.db_path)
+        raw.execute("UPDATE interests SET active = 0 WHERE id = (SELECT MIN(id) FROM interests)")
+        raw.commit()
+        raw.close()
+        rows = (await self.ds.client.get("/observatory/api/interests")).json()["interests"]
+        actives = [bool(r["active"]) for r in rows]
+        self.assertEqual(actives, sorted(actives, reverse=True), "inactive interests sorted above active ones")
+
+    async def test_interests_tab_can_filter_by_active_state(self):
+        raw = sqlite3.connect(self.db_path)
+        raw.execute("UPDATE interests SET active = 0 WHERE id = (SELECT MIN(id) FROM interests)")
+        raw.commit()
+        total = raw.execute("SELECT COUNT(*) FROM interests").fetchone()[0]
+        raw.close()
+
+        active = (await self.ds.client.get("/observatory/api/list?tab=interests&active=yes")).json()
+        inactive = (await self.ds.client.get("/observatory/api/list?tab=interests&active=no")).json()
+        self.assertEqual(inactive["total"], 1)
+        self.assertEqual(active["total"] + inactive["total"], total)
+        self.assertTrue(all(r["active"] == 0 for r in inactive["rows"]))
+
+    async def test_unknown_active_value_is_ignored_rather_than_erroring(self):
+        total = (await self.ds.client.get("/observatory/api/list?tab=interests")).json()["total"]
+        body = (await self.ds.client.get("/observatory/api/list?tab=interests&active=maybe")).json()
+        self.assertEqual(body["total"], total)
+
+    async def test_interests_endpoint_is_not_swallowed_by_the_interest_key_route(self):
+        """/api/interests must not resolve as /api/interest/<key='s'>."""
+        r = await self.ds.client.get("/observatory/api/interests")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("interests", r.json())
+
+
+@unittest.skipUnless(HAVE_DATASETTE, "datasette not installed")
 class ObservatoryEntityRowTests(unittest.IsolatedAsyncioTestCase):
     """The operational row behind a node used to be reachable only by leaving
     the app for raw Datasette -- node_detail() knew entity_type/entity_id and

@@ -1,5 +1,5 @@
 import { useEffect, useMemo, useState } from "react";
-import { Explorer } from "./explorer/Explorer";
+import { Explorer, rowKey } from "./explorer/Explorer";
 import { GraphCanvas } from "./graph/GraphCanvas";
 import { Inspector } from "./inspector/Inspector";
 import { CompareView } from "./compare/CompareView";
@@ -20,6 +20,7 @@ export function App() {
   const [compareOpen, setCompareOpen] = useState(false);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
+  const [selectedRowKey, setSelectedRowKey] = useState<string | null>(null);
   const isMobile = useIsMobile();
   const [inspectorWidth, setInspectorWidth] = useState(() => {
     const saved = Number(localStorage.getItem(INSPECTOR_WIDTH_KEY));
@@ -51,6 +52,7 @@ export function App() {
   }
 
   function selectDiscovery(row: Record<string, unknown>, tab: Tab) {
+    setSelectedRowKey(rowKey(tab, row, -1));
     // Each explorer tab's row.id is a primary key from a DIFFERENT table
     // (interests.id, search_generations.id, search_missions.id, ...) --
     // entity_id is only unique WITHIN one entity_type (see db.py's
@@ -114,7 +116,7 @@ export function App() {
       </header>
       <div className="app-body">
         <div className={`pane pane-explorer ${isMobile ? "drawer" : ""} ${drawerOpen ? "open" : ""}`}>
-          <Explorer onSelectDiscovery={selectDiscovery} onOpenRawDb={openRawDb} />
+          <Explorer onSelectDiscovery={selectDiscovery} onOpenRawDb={openRawDb} selectedRowKey={selectedRowKey} />
         </div>
         {isMobile && drawerOpen && <div className="drawer-scrim" onClick={() => setDrawerOpen(false)} />}
         <div className="pane pane-graph">

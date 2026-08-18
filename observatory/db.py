@@ -267,12 +267,19 @@ def _interests_query(filters, search):
     clauses, params = [], []
     if filters.get("layer"):
         clauses.append("it.layer = ?"); params.append(filters["layer"])
+    # 13 of 46 live interests are deactivated and nothing distinguished them:
+    # the row template read a `status` column interests does not have, so the
+    # line was always blank, and there was no way to filter either way.
+    if filters.get("active") in ("yes", "no"):
+        clauses.append("it.active = ?"); params.append(1 if filters["active"] == "yes" else 0)
     if search:
         q = _like(search)
         clauses.append("(it.key LIKE ? ESCAPE '\\' OR it.title LIKE ? ESCAPE '\\' OR it.description LIKE ? ESCAPE '\\')")
         params.extend([q, q, q])
     where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
-    return base, where_sql, params, "ORDER BY it.id ASC"
+    # Active first, then by key: a deactivated interest is still worth listing
+    # but should not sit above the ones actually running.
+    return base, where_sql, params, "ORDER BY it.active DESC, it.key ASC"
 
 
 def _generations_query(filters, search):
@@ -863,6 +870,23 @@ def _maybe_json(text):
 
 def _row_url(database, table, pk):
     return f"/{database}/{table}/{pk}"
+
+
+# --- /api/interests --------------------------------------------------------------
+
+def interest_index(conn):
+    """Every interest, as just enough to populate a picker.
+
+    Deliberately not `list_rows(tab='interests')`: that runs four correlated
+    COUNT subqueries per row and is capped at MAX_LIMIT=50, which 46 live
+    interests are one growth step away from breaking. This is the whole set,
+    cheaply, and it is also what the interest panel indexes off.
+    """
+    rows = _rows(
+        conn,
+        "SELECT key, title, active, layer FROM interests ORDER BY active DESC, key ASC",
+    )
+    return {"interests": [_redact_row(r) for r in rows]}
 
 
 # --- /api/interest/<key> ---------------------------------------------------------
