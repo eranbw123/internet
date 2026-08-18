@@ -10457,6 +10457,419 @@ class OfferDecisionSyncTests(unittest.TestCase):
         self.assertEqual(learned.n_owner_decisions, 1)
 
 
+class InboxTopUpTests(unittest.TestCase):
+    """The owner asked for one thing: "I want interests to like aim to always
+    have 10 suggestions ... it should fill automatically to 10 suggested
+    interests. And when I accept or reject, it should run again."
+
+    These are the tests for the arithmetic that means, for the gates that must
+    survive it (a short inbox beats a padded one), and for the two runners --
+    the hourly tick and the click -- racing each other.
+    """
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _write_artifact(self, candidates, name="interest_candidates.json"):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(_artifact(candidates), fh, ensure_ascii=False)
+        return path
+
+    def _fill(self, n):
+        """Put `n` live offers in the inbox, from `n` distinct candidates."""
+        path = self._write_artifact(_distinct_candidates(n))
+        offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(offers.live_offer_count(self.conn), n)
+        return path
+
+    # --- what the target counts ------------------------------------------
+
+    def test_only_offered_counts_toward_the_target(self):
+        """Decided offers are out by definition; snoozed is out by intent --
+        the owner said "not now" and the inbox hides it, so counting it would
+        leave what he can SEE short by the number of things he set aside."""
+        path = self._write_artifact(_distinct_candidates(4))
+        offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(offers.live_offer_count(self.conn), 4)
+        offers.snooze(self.conn, "orexin-wakefulness", now=OFFER_NOW)
+        offers.reject(self.conn, "perovskite-tandem", now=OFFER_NOW)
+        offers.accept(self.conn, "mitochondrial-uncoupling", now=OFFER_NOW)
+        offers.expire(self.conn, "harbour-dredging", now=OFFER_NOW)
+        self.assertEqual(offers.live_offer_count(self.conn), 0)
+
+    def test_a_snoozed_offer_is_replaced_and_still_wakes_later(self):
+        # The whole point of excluding snoozed: setting one aside must refill
+        # the visible inbox, and must not cost the owner the offer itself.
+        path = self._write_artifact(_distinct_candidates(12))
+        offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        target = offers.DEFAULT_RULES.target_inbox_size
+        self.assertEqual(offers.live_offer_count(self.conn), target)
+        offers.snooze(self.conn, "orexin-wakefulness", now=OFFER_NOW)
+        self.assertEqual(offers.live_offer_count(self.conn), target - 1)
+        summary = offers.top_up(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(summary["offered"], 1)
+        self.assertEqual(offers.live_offer_count(self.conn), target)
+        # ...and the snoozed one is still there, asleep, not lost.
+        self.assertEqual(offers.get_offer(self.conn, "orexin-wakefulness")["status"],
+                         offers.SNOOZED)
+
+    # --- the top-up itself ------------------------------------------------
+
+    def test_top_up_refills_after_a_decision_from_candidates_already_on_disk(self):
+        """The measured production case: the artifact holds far more qualified
+        candidates than the inbox, and refilling needs no extractor run at
+        all -- it is local arithmetic over a file that is already there."""
+        path = self._write_artifact(_distinct_candidates(14))
+        offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        target = offers.DEFAULT_RULES.target_inbox_size
+        offers.accept(self.conn, "orexin-wakefulness", now=OFFER_NOW)
+        offers.reject(self.conn, "perovskite-tandem", now=OFFER_NOW)
+        self.assertEqual(offers.live_offer_count(self.conn), target - 2)
+
+        summary = offers.top_up(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(summary["offered"], 2)
+        self.assertEqual(summary["live_before"], target - 2)
+        self.assertEqual(summary["live_after"], target)
+        self.assertEqual(offers.live_offer_count(self.conn), target)
+        self.assertFalse(summary["exhausted"])
+        self.assertIn("topped up 2 offer(s)", summary["reason"])
+
+    def test_top_up_ignores_the_artifact_sha_the_importer_records(self):
+        """import_artifact() is idempotent on the sha -- correct, and exactly
+        why the inbox could only ever shrink. top_up() must NOT consult it."""
+        path = self._write_artifact(_distinct_candidates(14))
+        offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(
+            offers.import_artifact(self.conn, path, now=OFFER_NOW)["error"], "already imported"
+        )
+        offers.accept(self.conn, "orexin-wakefulness", now=OFFER_NOW)
+        summary = offers.top_up(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(summary["offered"], 1)
+        self.assertEqual(summary["error"], "")
+
+    def test_top_up_is_a_no_op_when_the_target_is_already_met_and_says_so(self):
+        path = self._fill(offers.DEFAULT_RULES.target_inbox_size)
+        summary = offers.top_up(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(summary["offered"], 0)
+        self.assertEqual(summary["deficit"], 0)
+        self.assertIn("target already met", summary["reason"])
+
+    def test_top_up_never_overshoots_the_target(self):
+        path = self._write_artifact(_distinct_candidates(16))
+        offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        target = offers.DEFAULT_RULES.target_inbox_size
+        for _ in range(4):
+            offers.top_up(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(offers.live_offer_count(self.conn), target)
+
+    # --- the gates survive the target ------------------------------------
+
+    def test_the_floors_still_apply_and_a_short_inbox_is_the_correct_outcome(self):
+        """Never pad. A candidate that fails the durability gate stays out
+        even when the inbox is nine short and it is the only thing left."""
+        weak = _distinct_candidates(1)
+        weak[0]["durability"] = {"n_convs": 1, "active_months": 0, "recency_days": 2}
+        weak[0]["evidence"] = [dict(weak[0]["evidence"][0], depth=0.1)]
+        path = self._write_artifact(weak)
+        summary = offers.top_up(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(summary["offered"], 0)
+        self.assertEqual(summary["skipped_floor"], 1)
+        self.assertEqual(offers.live_offer_count(self.conn), 0)
+        self.assertTrue(summary["exhausted"])
+        self.assertIn("durability gate", summary["reasons"][0]["why"])
+
+    def test_a_rejected_theme_is_not_re_offered_by_the_top_up(self):
+        path = self._write_artifact(_distinct_candidates(3))
+        offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        offers.reject(self.conn, "orexin-wakefulness", now=OFFER_NOW)
+        summary = offers.top_up(self.conn, path, now=OFFER_NOW)
+        self.assertNotIn("orexin-wakefulness", summary["offers"])
+        self.assertEqual(offers.get_offer(self.conn, "orexin-wakefulness")["status"],
+                         offers.REJECTED)
+
+    def test_the_top_up_never_re_decides_a_decided_offer(self):
+        path = self._write_artifact(_distinct_candidates(6))
+        offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        for key, decide in (("orexin-wakefulness", offers.accept),
+                            ("perovskite-tandem", offers.reject),
+                            ("mitochondrial-uncoupling", offers.expire)):
+            decide(self.conn, key, now=OFFER_NOW)
+        before = {r["key"]: r["status"] for r in offers.list_offers(self.conn)}
+        for _ in range(3):
+            offers.top_up(self.conn, path, now=OFFER_NOW)
+        after = {r["key"]: r["status"] for r in offers.list_offers(self.conn)}
+        for key in ("orexin-wakefulness", "perovskite-tandem", "mitochondrial-uncoupling"):
+            self.assertEqual(after[key], before[key])
+
+    def test_the_top_up_does_not_attach_evidence_the_import_already_attached(self):
+        """Dedup layer 2 writes the candidate's quotes onto the interest that
+        covers it. That belongs to the once-per-artifact import; a refill that
+        may run several times an hour must not re-write it every time."""
+        db.upsert_interest(self.conn, Interest(
+            key="sleep-neuropeptides", title="Sleep neuropeptides", description="",
+            positive_signals=["orexin", "hypocretin"], min_score=0.7, sources=["web_search"],
+        ))
+        path = self._write_artifact(_distinct_candidates(3))
+        imported = offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(imported["attached"], 1)
+        events_after_import = self.conn.execute(
+            "SELECT COUNT(*) FROM interest_events"
+        ).fetchone()[0]
+        summary = offers.top_up(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(summary["attached"], 0)
+        self.assertEqual(summary["skipped_dedup"], 1)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM interest_events").fetchone()[0],
+            events_after_import,
+        )
+
+    # --- near-duplicate suppression, the measured production bug ----------
+
+    def test_a_near_duplicate_of_a_live_offer_is_suppressed_not_offered_beside_it(self):
+        """The production bug, reproduced: dedup was semantic against
+        interests but exact-key-only against offers, so two paraphrases of one
+        idea could sit in the inbox at once. Measured 2026-08-18 on the live
+        inbox: 'concentrated-portfolio-construction' vs
+        'portfolio-construction-conviction-risk' at 65% token overlap, and
+        'handheld-pc-gaming-steamos' vs 'handheld-pc-gaming-linux' at 50%."""
+        first = _candidate(
+            key="portfolio-construction-conviction-risk",
+            title="Portfolio construction, conviction and risk",
+            positive_signals=["portfolio construction", "position sizing", "drawdown",
+                              "conviction thesis"],
+            durability={"n_convs": 12, "active_months": 4, "recency_days": 3},
+        )
+        offers.import_artifact(self.conn, self._write_artifact([first]), now=OFFER_NOW)
+        self.assertEqual(offers.live_offer_count(self.conn), 1)
+
+        near_dupe = _candidate(
+            key="concentrated-portfolio-construction",
+            title="Concentrated portfolio construction",
+            positive_signals=["portfolio construction", "position sizing", "drawdown"],
+            durability={"n_convs": 12, "active_months": 4, "recency_days": 1},
+        )
+        summary = offers.top_up(
+            self.conn, self._write_artifact([first, near_dupe], name="second.json"),
+            now=OFFER_NOW,
+        )
+        self.assertEqual(summary["offered"], 0)
+        self.assertEqual(summary["skipped_dedup"], 1)
+        self.assertEqual(offers.live_offer_count(self.conn), 1)
+        why = [r["why"] for r in summary["reasons"]
+               if r["key"] == "concentrated-portfolio-construction"][0]
+        self.assertIn("signal overlap with offer", why)
+        self.assertIn("portfolio-construction-conviction-risk", why)
+
+    def test_one_run_cannot_place_two_near_duplicates_of_each_other(self):
+        """Distinctness beats the number: the peer set grows as the run
+        promotes, so the second paraphrase loses to the first."""
+        pair = [
+            _candidate(key="handheld-pc-gaming-steamos", title="Handheld PC gaming on SteamOS",
+                       positive_signals=["handheld gaming", "steamos", "proton", "thermal"],
+                       durability={"n_convs": 9, "active_months": 4, "recency_days": 1}),
+            _candidate(key="handheld-pc-gaming-linux", title="Handheld PC gaming on Linux",
+                       positive_signals=["handheld gaming", "steamos", "proton"],
+                       durability={"n_convs": 9, "active_months": 4, "recency_days": 2}),
+        ]
+        summary = offers.import_artifact(self.conn, self._write_artifact(pair), now=OFFER_NOW)
+        self.assertEqual(summary["offered"], 1)
+        self.assertEqual(summary["skipped_dedup"], 1)
+        self.assertEqual(offers.live_offer_count(self.conn), 1)
+
+    def test_distinctness_wins_even_when_it_leaves_the_inbox_short(self):
+        """Ten suggestions with two duplicate pairs is a worse inbox than
+        three distinct ones -- so the run stops short rather than padding."""
+        pool = _distinct_candidates(3) + [
+            _candidate(key=f"orexin-wakefulness-variant-{i}", title="Orexin wakefulness",
+                       positive_signals=["orexin", "hypocretin"],
+                       durability={"n_convs": 9, "active_months": 4, "recency_days": 5 + i})
+            for i in range(6)
+        ]
+        summary = offers.import_artifact(self.conn, self._write_artifact(pool), now=OFFER_NOW)
+        self.assertEqual(summary["offered"], 3)
+        self.assertEqual(offers.live_offer_count(self.conn), 3)
+        self.assertLess(offers.live_offer_count(self.conn),
+                        offers.DEFAULT_RULES.target_inbox_size)
+
+    def test_a_near_duplicate_of_a_rejected_offer_stays_out_for_the_block_window(self):
+        """blocked_offer_keys() catches an exact token hit; a rephrasing needs
+        the peer rule, or the owner is asked the same question again."""
+        original = _candidate(
+            key="lattice-cryptography-schemes", title="Lattice cryptography schemes",
+            positive_signals=["lattice cryptography", "kyber", "dilithium"],
+            durability={"n_convs": 9, "active_months": 4, "recency_days": 1},
+        )
+        offers.import_artifact(self.conn, self._write_artifact([original]), now=OFFER_NOW)
+        offers.reject(self.conn, "lattice-cryptography-schemes", now=OFFER_NOW)
+
+        rephrased = _candidate(
+            key="post-quantum-lattice-primitives", title="Post-quantum lattice primitives",
+            positive_signals=["lattice cryptography", "kyber", "dilithium"],
+            durability={"n_convs": 9, "active_months": 4, "recency_days": 1},
+        )
+        path = self._write_artifact([rephrased], name="rephrased.json")
+        summary = offers.top_up(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(summary["offered"], 0)
+        self.assertEqual(offers.live_offer_count(self.conn), 0)
+
+        # ...and it is free again once the 180-day window has passed.
+        later = OFFER_NOW + timedelta(days=offers.DEFAULT_RULES.reject_block_days + 1)
+        self.assertEqual(offers.top_up(self.conn, path, now=later)["offered"], 1)
+
+    # --- the artifact runs dry -------------------------------------------
+
+    def test_an_exhausted_artifact_is_reported_not_faked(self):
+        path = self._write_artifact(_distinct_candidates(4))
+        summary = offers.top_up(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(summary["offered"], 4)
+        self.assertTrue(summary["exhausted"])
+        self.assertIn("still 6 short", summary["reason"])
+        self.assertIn("New extraction is what this needs", summary["reason"])
+        self.assertEqual(offers.live_offer_count(self.conn), 4)
+
+    def test_a_top_up_that_adds_nothing_always_says_why(self):
+        """Silent failure is banned: two multi-day outages in this system were
+        jobs that did nothing and reported success."""
+        cases = {
+            "target already met": lambda: self._fill(
+                offers.DEFAULT_RULES.target_inbox_size),
+            "could not be read": lambda: os.path.join(self.tmp.name, "nope.json"),
+            "missing, malformed": lambda: self._write_bad(),
+            "no candidates at all": lambda: self._write_artifact([]),
+        }
+        for expected, make in cases.items():
+            with self.subTest(expected):
+                # A fresh inbox per case -- the first one deliberately fills it.
+                self.conn = db.connect(":memory:")
+                db.init(self.conn)
+                path = make()
+                summary = offers.top_up(self.conn, path, now=OFFER_NOW)
+                self.assertEqual(summary["offered"], 0)
+                self.assertTrue(summary["reason"], "a silent run is the banned outcome")
+                self.assertIn(expected, summary["reason"])
+
+    def _write_bad(self):
+        path = os.path.join(self.tmp.name, "bad.json")
+        with open(path, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        return path
+
+    def test_every_run_leaves_a_heartbeat_naming_what_it_decided(self):
+        path = self._write_artifact(_distinct_candidates(12))
+        offers.top_up(self.conn, path, now=OFFER_NOW)
+        beat = json.loads(db.state_get(self.conn, offers.TOPUP_STATE_KEY))
+        self.assertEqual(beat["offered"], offers.DEFAULT_RULES.target_inbox_size)
+        self.assertEqual(beat["live_after"], offers.DEFAULT_RULES.target_inbox_size)
+        self.assertTrue(beat["reason"])
+        # ...including the runs that add nothing.
+        offers.top_up(self.conn, path, now=OFFER_NOW)
+        beat = json.loads(db.state_get(self.conn, offers.TOPUP_STATE_KEY))
+        self.assertEqual(beat["offered"], 0)
+        self.assertIn("target already met", beat["reason"])
+
+    # --- races between the hourly tick and the click ----------------------
+
+    def test_a_refill_racing_the_hourly_tick_neither_duplicates_nor_overshoots(self):
+        """The real interleave: the hourly tick is midway through promoting
+        when the owner's click fires its own refill on the same DB. The second
+        runner is re-entered from inside the first one's insert, which is the
+        worst-case ordering -- the first run's row exists but has not yet been
+        transitioned into the inbox."""
+        path = self._write_artifact(_distinct_candidates(14))
+        offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        target = offers.DEFAULT_RULES.target_inbox_size
+        for key in ("orexin-wakefulness", "perovskite-tandem", "mitochondrial-uncoupling"):
+            offers.accept(self.conn, key, now=OFFER_NOW)
+        self.assertEqual(offers.live_offer_count(self.conn), target - 3)
+
+        real_insert = offers.insert_offer
+        inner = []
+
+        def racing_insert(conn, candidate, **kw):
+            row = real_insert(conn, candidate, **kw)
+            if not inner:
+                inner.append(None)      # re-enter exactly once
+                with mock.patch.object(offers, "insert_offer", real_insert):
+                    inner[0] = offers.top_up(conn, path, now=OFFER_NOW)
+            return row
+
+        with mock.patch.object(offers, "insert_offer", racing_insert):
+            outer = offers.top_up(self.conn, path, now=OFFER_NOW)
+
+        # Together they filled the three empty slots and not one more.
+        self.assertEqual(offers.live_offer_count(self.conn), target)
+        self.assertEqual(outer["offered"] + inner[0]["offered"], 3)
+        keys = [r["key"] for r in offers.inbox(self.conn)]
+        self.assertEqual(len(keys), len(set(keys)), "no key was offered twice")
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT COUNT(*) FROM interest_offers WHERE status = ?", (offers.PROPOSED,)
+            ).fetchone()[0],
+            0, "no row was left parked at 'proposed', silently eating a slot",
+        )
+
+    def test_a_key_offered_by_another_run_mid_flight_is_not_duplicated(self):
+        """The narrow window insert_offer() guards: between its SELECT and its
+        INSERT, the other run offered this very key. Losing that race returns
+        None rather than raising -- the row exists, which is what both runs
+        wanted."""
+        candidate = dict(_distinct_candidates(1)[0], score=0.9, score_terms={})
+        self.assertIsNotNone(offers.insert_offer(self.conn, candidate, now=OFFER_NOW))
+        self.assertIsNone(offers.insert_offer(self.conn, candidate, now=OFFER_NOW))
+
+        # ...and the same when the SELECT misses and the UNIQUE index is what
+        # catches it, which is the actual concurrent case.
+        with mock.patch.object(offers, "get_offer", return_value=None):
+            self.assertIsNone(offers.insert_offer(self.conn, candidate, now=OFFER_NOW))
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) FROM interest_offers").fetchone()[0], 1
+        )
+
+    # --- the click path ---------------------------------------------------
+
+    def test_a_failing_refill_can_never_cost_the_owner_his_decision(self):
+        """The decision is the important write and is already committed by the
+        time the refill runs; the refill is best-effort garnish on the same
+        request."""
+        path = self._write_artifact(_distinct_candidates(12))
+        offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        offers.accept(self.conn, "orexin-wakefulness", now=OFFER_NOW)
+
+        class Exploding:
+            """A connection that fails the way a contended SQLite does."""
+
+            def execute(self, *a, **k):
+                raise sqlite3.OperationalError("database is locked")
+
+        result = offers.top_up_after_decision(Exploding(), path)
+        self.assertEqual(result["offered"], 0)
+        self.assertIn("database is locked", result["error"])
+        self.assertIn("the decision itself is unaffected", result["reason"])
+        # The accepted offer is untouched by the failure.
+        self.assertEqual(offers.get_offer(self.conn, "orexin-wakefulness")["status"],
+                         offers.ACCEPTED)
+
+    def test_the_click_path_makes_no_network_or_model_call(self):
+        """The refill runs inside the owner's Accept request, so it has to be
+        arithmetic over a local file and nothing else."""
+        path = self._write_artifact(_distinct_candidates(12))
+        offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        offers.accept(self.conn, "orexin-wakefulness", now=OFFER_NOW)
+
+        def explode(*a, **k):
+            raise AssertionError("the refill opened a socket")
+
+        with mock.patch("socket.socket", explode), \
+                mock.patch("urllib.request.urlopen", explode):
+            summary = offers.top_up_after_decision(self.conn, path)
+        self.assertEqual(summary["offered"], 1)
+        self.assertEqual(summary["trigger"], "decision")
+
+
 class OfferLearningColdStartTests(unittest.TestCase):
     """With no history, ranking is the §5.2 evidence terms and nothing else."""
 
