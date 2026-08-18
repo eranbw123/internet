@@ -104,6 +104,14 @@ def init(conn):
         ("interests", "last_observed_at", "TEXT"),
         ("candidate_items", "duplicate_of", "INTEGER REFERENCES candidate_items(id)"),
         ("candidate_items", "dup_reason", "TEXT"),
+        # Offers (discovery/offers.py). `parent_key` carries an accepted
+        # offer's single-level hierarchy; `lifecycle` is the post-acceptance
+        # half of the offer state machine (active|decaying|paused|retired),
+        # deliberately orthogonal to `layer` -- an owner row's layer is
+        # immutable by trigger, but its lifecycle is exactly what the
+        # decay/auto-pause sweep moves.
+        ("interests", "parent_key", "TEXT"),
+        ("interests", "lifecycle", "TEXT NOT NULL DEFAULT 'active'"),
     ):
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")

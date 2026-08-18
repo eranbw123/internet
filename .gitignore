@@ -32,3 +32,7 @@ experiments/lab/artifacts/
 # ops/install_tasks.py, ops/run.cmd). Inbound-only, never committed.
 logs/
 backups/
+
+# Inbound contract-v2 artifact carrying interest candidates (see
+# discovery/offers.py). Never produced or committed here.
+interest_candidates.json

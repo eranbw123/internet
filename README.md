@@ -947,3 +947,60 @@ This worktree has no `discovery.db`, so every number above comes from
 synthetic in-memory fixtures in `test_discovery.py`'s `ExplorationLaneTests`
 -- not a real-corpus reading. Live readout once dynamic interests are
 running for real: `python -m app stats --days 7`, EXPLORATION section.
+
+
+## Interest offers (contract v2)
+
+The `ai` repo can also publish an evidence-bearing **contract v2** artifact:
+the same schema as the personal-state one plus a `candidates[]` array, each
+candidate a proposed interest with the quotes -- and the conversation ids --
+that produced it. `discovery/personal_state.py` reads both versions
+(`SUPPORTED_VERSIONS = {1, 2}`); `discovery/offers.py` is what turns
+candidates into offers you decide on.
+
+```bash
+python -m app offers --import                 # import the artifact (idempotent per sha256)
+python -m app offers                          # the inbox: what you're being asked to decide
+python -m app offers --why KEY                # quotes, conversations, every score term, event chain
+python -m app offers --accept KEY             # prints the interests.json entry it becomes
+python -m app offers --reject KEY             # and blocks its terms for 180 days
+python -m app offers --snooze KEY             # ask me again in 30 days
+python -m app offers --sweep                  # the timers: expiry, decay, auto-pause
+python -m app offers --undo KEY               # one-click undo of an auto-pause
+```
+
+The artifact path comes from `DISCOVERY_INTEREST_CANDIDATES` (default
+`interest_candidates.json` at the repo root -- gitignored, inbound only). An
+import is a no-op after the first time it sees a given file's sha256, so a
+re-run, a double copy, or a re-copied half-written file cannot duplicate an
+offer.
+
+**Ranking is arithmetic, never a model call.** `offers.py` holds no provider
+and makes no network call: the model rates (`expected_yield`, and the
+similarity of a candidate to each existing interest), and code ranks --
+evidence strength .30, recurrence .15, recency .15, novelty .20, expected
+yield .20, floored at .45 with a durability gate (3 conversations across 2
+months, or a deep 2-conversation dive). At most five offers reach the inbox
+per run, one slot reserved for the deliberately exploratory pick.
+
+Dedup against what you already follow is **semantic, not exact-hash**: a key
+that normalizes onto an existing interest is dropped, a candidate whose
+signals overlap an active interest by half or more is attached to it as
+evidence instead of being offered, and a candidate the producer scored >= .70
+similar to something you already follow never becomes an offer -- in either
+language.
+
+**Decay, and the reversible auto-pause.** `--sweep` also runs the interest
+half of the lifecycle. An interest with no item above its bar for 30 days
+becomes `decaying` and raises a retirement offer; at 45 days it **auto-pauses
+itself, announces that it did, and can be undone with one click**
+(`--undo KEY`, which also restarts its silence clock and closes the
+retirement offer). Two refusals to judge are built in: nothing is paused when
+the pipeline itself has scored nothing recently (it can be paused for days --
+that is the pipeline being quiet, not the interest), and nothing is paused
+before at least five items have ever been attributed to it.
+
+Accepting an offer does not itself write `interests.json` or the `interests`
+table -- that is the sync/write-API path; `accept()` returns the entry and
+takes an optional `sync` callable, and `offers.activate()` starts the
+interest's lifecycle once its row exists.
