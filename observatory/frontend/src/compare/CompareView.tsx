@@ -5,7 +5,9 @@ import { MonospaceViewer } from "../inspector/MonospaceViewer";
 import { GraphCanvas } from "../graph/GraphCanvas";
 
 interface Props {
-  onClose: () => void;
+  /** Optional: on a phone the bottom tab bar is the way out of this surface,
+   * so there is no in-view Close button to render. */
+  onClose?: () => void;
   /** Pre-filled from "Compare this run" in the Inspector, so the view can be
    * opened with an input already in hand instead of demanding a number the UI
    * never showed anywhere. */
@@ -82,9 +84,25 @@ export function CompareView({ onClose, initialA, onSelectNode }: Props) {
             <input placeholder="B id" aria-label="B id" value={b} onChange={(e) => setB(e.target.value)} />
           </>
         )}
-        <button onClick={onClose}>Close compare</button>
+        {onClose && <button onClick={onClose}>Close compare</button>}
       </div>
       {error && <div className="compare-error">{error}</div>}
+      {/* Until both sides are picked this rendered nothing at all -- on a
+          phone that is a full screen of blank white under two dropdowns, which
+          reads as a broken page rather than as a screen waiting for input. */}
+      {!error && !result && (
+        <div className="ws-empty" data-testid="compare-empty">
+          <p><strong>Pick two {kind === "run" ? "runs" : "model calls"} to compare.</strong></p>
+          <p>
+            {kind === "run"
+              ? "Choose a run in A and another in B. You get the two traces side by side, plus"
+                + " what changed between them: which nodes only one run has, and which shared"
+                + " nodes differ."
+              : "Enter two model-call ids. You get the two calls' prompts and responses diffed"
+                + " against each other."}
+          </p>
+        </div>
+      )}
       {result?.kind === "run" && <RunCompare result={result} a={a} b={b} onSelectNode={onSelectNode} />}
       {result?.kind === "model_call" && <ModelCallCompare result={result} />}
     </div>

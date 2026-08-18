@@ -175,9 +175,9 @@ function GraphLegend() {
 // partitioned layout); size comes from the node's own `style` (React Flow
 // applies that to the wrapper), this component just fills it.
 function LaneBandNode({ data }: NodeProps) {
-  const d = data as { lane: string; i: number };
+  const d = data as { lane: string; i: number; vertical?: boolean };
   return (
-    <div className={`lane-band ${d.i % 2 === 1 ? "lane-band-odd" : ""}`}>
+    <div className={`lane-band ${d.i % 2 === 1 ? "lane-band-odd" : ""} ${d.vertical ? "lane-band-row" : ""}`}>
       <div className="lane-band-title">{laneLabel(d.lane)}</div>
     </div>
   );
@@ -244,8 +244,12 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode, isMobile = false
     const path = graphData.emphasizedPath;
     const options = {
       duration: 200,
-      padding: isMobile ? 0.15 : 0.1,
-      minZoom: isMobile ? 0.55 : 0.35,
+      padding: isMobile ? 0.12 : 0.1,
+      // Laid out downwards a trace is about one card wide, so a phone can
+      // frame it at full size instead of clamping against an unreachable fit
+      // -- the 0.55 floor existed only because the horizontal layout could
+      // never fit a 2800px chain into 393px.
+      minZoom: isMobile ? 0.5 : 0.35,
       maxZoom: 1,
     };
     if (path.length > 0) {
@@ -265,7 +269,9 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode, isMobile = false
     let cancelled = false;
     (async () => {
       const elk = await defaultElk();
-      const result = await computeLayout(display, elk);
+      // A phone lays the pipeline out downwards -- see the elk.direction
+      // comment in elkLayout.ts.
+      const result = await computeLayout(display, elk, isMobile);
       if (cancelled) return;
       setLayout(result);
 
@@ -339,7 +345,7 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode, isMobile = false
       height: band.height,
       style: { width: band.width, height: band.height },
       zIndex: -10,
-      data: { lane: band.lane, i },
+      data: { lane: band.lane, i, vertical: isMobile },
       draggable: false,
       selectable: false,
       focusable: false,
@@ -432,7 +438,9 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode, isMobile = false
           {focusMode ? "Show full run" : "Focus: this discovery's path"}
         </button>
         {focusMode && display.hiddenCount > 0 && (
-          <span className="graph-toolbar-note">· {display.hiddenCount} nodes hidden</span>
+          <span className="graph-toolbar-note">
+            {display.hiddenCount} {display.hiddenCount === 1 ? "node" : "nodes"} hidden
+          </span>
         )}
         <button onClick={fitFocusFirst}>Fit to view</button>
         <button className="toolbar-overflow-only" onClick={expandAll}>Expand all</button>

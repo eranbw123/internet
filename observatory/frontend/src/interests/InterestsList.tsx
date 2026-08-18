@@ -26,6 +26,7 @@ import { useMemo, useState } from "react";
 import type { InterestStat, Lifecycle, StatsResponse } from "./types";
 import { isCollecting } from "./types";
 import { BidiText, guessLang } from "./Bidi";
+import { useIsMobile } from "../useIsMobile";
 
 type SortKey = "title" | "collected" | "matched" | "above_bar" | "delivered" | "conversion" | "min_score";
 type Filter = "collecting" | "dead" | "stopped" | "all";
@@ -41,6 +42,11 @@ interface Props {
   /** Key most recently stopped, so its row can offer an immediate undo
    * instead of making the reversibility something you have to already know. */
   justRetiredKey?: string | null;
+  /** Phone only. The workspace header that used to carry "New interest" is
+   * dropped on a phone (the app header and the tab bar already say where you
+   * are), so the verb moves into the control row, where it costs no extra
+   * vertical space instead of its own 76px band above the fold. */
+  onCreate?: () => void;
 }
 
 function conversion(row: InterestStat): number {
@@ -86,12 +92,19 @@ function Sparkline({ values, dead }: { values: number[]; dead: boolean }) {
 }
 
 export function InterestsList({
-  stats, loading, onEdit, onRevive, onRetire, busyKey, justRetiredKey,
+  stats, loading, onEdit, onRevive, onRetire, busyKey, justRetiredKey, onCreate,
 }: Props) {
   const [sort, setSort] = useState<SortKey>("collected");
   const [asc, setAsc] = useState(false);
   const [filter, setFilter] = useState<Filter>("collecting");
   const [query, setQuery] = useState("");
+  // Which row is currently asking "stop this one?". Stopping is reversible,
+  // so this is a light inline step rather than a modal -- but it is a step:
+  // the whole row is now a tap target for the editor, which makes a bare
+  // single-tap Stop sitting inside it far too easy to hit by accident on a
+  // phone.
+  const [confirmStopKey, setConfirmStopKey] = useState<string | null>(null);
+  const isMobile = useIsMobile();
 
   const rows = useMemo(() => {
     const all = stats?.interests ?? [];
@@ -162,11 +175,21 @@ export function InterestsList({
               </>
             )}
           </p>
-          <p className="summary-note prov-muted">
-            Delivered exceeds above-bar because those notifications went out under the bars in
-            force at the time; every bar rose by 0.08 on 2026-08-13, and above-bar is recounted
-            at today's bars.
-          </p>
+          {isMobile ? (
+            <details className="summary-caveat">
+              <summary>Why delivered exceeds above bar</summary>
+              <p className="summary-note prov-muted">
+                Those notifications went out under the bars in force at the time; every bar
+                rose by 0.08 on 2026-08-13, and above-bar is recounted at today's bars.
+              </p>
+            </details>
+          ) : (
+            <p className="summary-note prov-muted">
+              Delivered exceeds above-bar because those notifications went out under the bars in
+              force at the time; every bar rose by 0.08 on 2026-08-13, and above-bar is recounted
+              at today's bars.
+            </p>
+          )}
         </div>
       </div>
 
@@ -198,6 +221,11 @@ export function InterestsList({
           onChange={(e) => setQuery(e.target.value)}
           aria-label="Filter by key or title"
         />
+        {onCreate && (
+          <button type="button" className="btn list-new" onClick={onCreate}>
+            New interest
+          </button>
+        )}
       </div>
 
       <div className="table-scroll">
@@ -220,15 +248,32 @@ export function InterestsList({
             {rows.map((row) => (
               <tr
                 key={row.key}
-                className={`${row.dead_weight ? "row-dead" : ""} ${busyKey === row.key ? "is-busy" : ""}`}
+                className={`row-clickable ${row.dead_weight ? "row-dead" : ""} ${busyKey === row.key ? "is-busy" : ""}`}
                 data-testid={`interest-row-${row.key}`}
+                /* The whole row opens the editor. A 38x25 "Edit" button in the
+                   last column was the only way in, which on a phone is both a
+                   miss-prone target and the cell furthest from the thumb.
+                   Deliberately NOT role="button": that would override the
+                   row's implicit `row` role and take the table's structure
+                   away from a screen reader, which is a real loss for a
+                   convenience shortcut. The row is focusable and answers
+                   Enter/Space; the Edit button inside it stays as the named,
+                   announced affordance. */
+                tabIndex={0}
+                onClick={() => onEdit(row)}
+                onKeyDown={(e) => {
+                  if (e.key === "Enter" || e.key === " ") {
+                    e.preventDefault();
+                    onEdit(row);
+                  }
+                }}
               >
                 <th scope="row" className="cell-interest">
                   <BidiText className="row-title" block lang={guessLang(row.title)}>{row.title}</BidiText>
                   <code className="key-chip">{row.key}</code>
                   {row.parent_key && <span className="prov-muted"> under {row.parent_key}</span>}
                 </th>
-                <td>
+                <td className="cell-state">
                   <span className={`chip ${LIFECYCLE_CHIP[row.lifecycle]}`}>{row.lifecycle}</span>
                   {row.lifecycle === "decaying" && row.silence_days !== null && (
                     <span className="cell-sub" title="auto-pause at 45 silent days">
@@ -237,16 +282,43 @@ export function InterestsList({
                   )}
                   {row.dead_weight && <span className="chip chip-error">dead weight</span>}
                 </td>
-                <td className="num">{row.min_score.toFixed(2)}</td>
-                <td className="num">{row.collected.toLocaleString()}</td>
-                <td className="num num-muted">{row.matched.toLocaleString()}</td>
-                <td className={`num ${row.above_bar === 0 && row.collected > 0 ? "num-zero" : ""}`}>
+                <td className="num cell-metric" data-label="Bar">{row.min_score.toFixed(2)}</td>
+                <td className="num cell-metric" data-label="Collected">{row.collected.toLocaleString()}</td>
+                <td className="num num-muted cell-metric" data-label="Matched">{row.matched.toLocaleString()}</td>
+                <td className={`num cell-metric ${row.above_bar === 0 && row.collected > 0 ? "num-zero" : ""}`} data-label="Above bar">
                   {row.above_bar}
                 </td>
-                <td className="num">{row.delivered}</td>
-                <td className="num">{row.collected ? pct(conversion(row)) : "-"}</td>
-                <td><Sparkline values={row.daily_above_bar} dead={row.dead_weight} /></td>
-                <td className="cell-actions">
+                <td className="num cell-metric" data-label="Delivered">{row.delivered}</td>
+                <td className="num cell-metric" data-label="Conv.">{row.collected ? pct(conversion(row)) : "-"}</td>
+                <td className="cell-spark" data-label="Daily above bar"><Sparkline values={row.daily_above_bar} dead={row.dead_weight} /></td>
+                {/* Every control here sits inside a row that is itself a
+                    button, so each one stops the event rather than opening the
+                    editor behind the action the user actually pressed. */}
+                <td className="cell-actions" onClick={(e) => e.stopPropagation()}>
+                  {confirmStopKey === row.key ? (
+                    <div className="stop-confirm" role="group" aria-label={`Stop ${row.title || row.key}?`}>
+                      <span className="stop-confirm-text">
+                        Stop collecting <strong>{row.title || row.key}</strong>? It keeps its
+                        history and can be started again.
+                      </span>
+                      <button
+                        type="button"
+                        className="btn btn-small btn-danger"
+                        disabled={busyKey === row.key}
+                        onClick={() => { setConfirmStopKey(null); onRetire(row); }}
+                      >
+                        Stop it
+                      </button>
+                      <button
+                        type="button"
+                        className="btn btn-small"
+                        onClick={() => setConfirmStopKey(null)}
+                      >
+                        Cancel
+                      </button>
+                    </div>
+                  ) : (
+                  <>
                   <button type="button" className="btn btn-small" onClick={() => onEdit(row)}>
                     Edit
                   </button>
@@ -263,7 +335,7 @@ export function InterestsList({
                       className="btn btn-small btn-danger"
                       disabled={busyKey === row.key}
                       title="stop collecting for this interest -- it keeps its history and can be started again"
-                      onClick={() => onRetire(row)}
+                      onClick={() => setConfirmStopKey(row.key)}
                     >
                       Stop
                     </button>
@@ -289,6 +361,8 @@ export function InterestsList({
                     >
                       Revive
                     </button>
+                  )}
+                  </>
                   )}
                 </td>
               </tr>

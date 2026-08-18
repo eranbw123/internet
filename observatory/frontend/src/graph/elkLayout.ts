@@ -83,10 +83,17 @@ export interface ElkLike {
 
 function buildElkGraph(
   graph: DisplayGraph, partitioned: boolean, sizeOf: (n: DisplayNode) => { width: number; height: number },
+  vertical = false,
 ): ElkLikeGraph {
   const layoutOptions: Record<string, string> = {
     "elk.algorithm": "layered",
-    "elk.direction": "RIGHT",
+    // A phone is 393 wide and 852 tall, so the pipeline runs DOWN there: the
+    // same partitioned layered layout, rotated a quarter turn. Laid out
+    // RIGHT, a seven-node trace is ~2800px wide, which at a readable zoom
+    // shows three cards and needs a horizontal drag for the rest -- measured
+    // on the live app. Laid out DOWN it is ~220px wide, so it fits the screen
+    // at zoom 1 and you scroll through it the way you scroll everything else.
+    "elk.direction": vertical ? "DOWN" : "RIGHT",
     "elk.spacing.nodeNode": "14",
     "elk.layered.spacing.nodeNodeBetweenLayers": "64",
     "elk.layered.crossingMinimization.strategy": "LAYER_SWEEP",
@@ -111,7 +118,9 @@ function buildElkGraph(
   } as ElkLikeGraph & { layoutOptions: Record<string, string> };
 }
 
-export async function computeLayout(graph: DisplayGraph, elk: ElkLike): Promise<LayoutResult> {
+export async function computeLayout(
+  graph: DisplayGraph, elk: ElkLike, vertical = false,
+): Promise<LayoutResult> {
   // Chips never enter ELK's own graph as independent nodes -- they render
   // inside their container's card instead, so ELK only needs to reserve
   // space for the container's own (possibly grown) footprint. Bucketing
@@ -136,7 +145,7 @@ export async function computeLayout(graph: DisplayGraph, elk: ElkLike): Promise<
   const topGraph: DisplayGraph = { nodes: topLevel, edges: graph.edges };
   let laidOut: ElkLikeGraph;
   try {
-    laidOut = await elk.layout(buildElkGraph(topGraph, true, sizeOf));
+    laidOut = await elk.layout(buildElkGraph(topGraph, true, sizeOf, vertical));
   } catch {
     // Partitioning requires every edge to point from a lower partition to a
     // higher (or equal) one -- true of every relationship/type pair in the
@@ -144,7 +153,7 @@ export async function computeLayout(graph: DisplayGraph, elk: ElkLike): Promise<
     // forever (e.g. a future feedback_on edge). Retry once unpartitioned so
     // the graph still renders -- row-order layout, not columns -- rather
     // than throwing and showing nothing.
-    laidOut = await elk.layout(buildElkGraph(topGraph, false, sizeOf));
+    laidOut = await elk.layout(buildElkGraph(topGraph, false, sizeOf, vertical));
   }
   const elkById = new Map((laidOut.children || []).map((c) => [c.id, c]));
 
@@ -185,30 +194,44 @@ export async function computeLayout(graph: DisplayGraph, elk: ElkLike): Promise<
   // order and never interleave with another lane's -- verified against the
   // live app across every discovery shape tried (simple, deep-chain, wide
   // fan-out, council generation).
+  // Bands run across the axis the pipeline does NOT advance along: columns
+  // when it flows RIGHT, rows when it flows DOWN. Everything below is the one
+  // calculation with `along` = the pipeline axis and `across` = the other, so
+  // the two orientations cannot drift apart.
+  const along = vertical
+    ? { min: (n: PositionedNode) => n.y, max: (n: PositionedNode) => n.y + n.height, pad: BAND_PAD_V }
+    : { min: (n: PositionedNode) => n.x, max: (n: PositionedNode) => n.x + n.width, pad: BAND_PAD_X };
+  const across = vertical
+    ? { min: (n: PositionedNode) => n.x, max: (n: PositionedNode) => n.x + n.width, pad: BAND_PAD_X }
+    : { min: (n: PositionedNode) => n.y, max: (n: PositionedNode) => n.y + n.height, pad: BAND_PAD_V };
+
   const extents = laneOrder.map((lane) => {
     const list = byLane.get(lane)!;
     return {
       lane,
-      minX: Math.min(...list.map((n) => n.x)),
-      maxX: Math.max(...list.map((n) => n.x + n.width)),
+      minA: Math.min(...list.map(along.min)),
+      maxA: Math.max(...list.map(along.max)),
     };
   });
 
-  const minNodeY = topPositioned.length ? Math.min(...topPositioned.map((n) => n.y)) : 0;
-  const maxNodeY = topPositioned.length ? Math.max(...topPositioned.map((n) => n.y + n.height)) : 0;
-  const top = Math.min(0, minNodeY) - BAND_PAD_V;
-  const height = maxNodeY - top + BAND_PAD_V;
+  const minAcross = topPositioned.length ? Math.min(...topPositioned.map(across.min)) : 0;
+  const maxAcross = topPositioned.length ? Math.max(...topPositioned.map(across.max)) : 0;
+  const acrossStart = Math.min(0, minAcross) - across.pad;
+  const acrossSize = maxAcross - acrossStart + across.pad;
 
   // Band boundaries sit at the MIDPOINT between adjacent lanes' extents, so
   // bands tile edge-to-edge with no gap or overlap; outermost bands get flat
   // padding since there's no neighbor to split with.
   const lanes: LaneBand[] = extents.map((e, i) => {
-    const left = i === 0 ? e.minX - BAND_PAD_X : (extents[i - 1].maxX + e.minX) / 2;
-    const right = i === extents.length - 1 ? e.maxX + BAND_PAD_X : (e.maxX + extents[i + 1].minX) / 2;
-    return { lane: e.lane, left, width: right - left, top, height };
+    const start = i === 0 ? e.minA - along.pad : (extents[i - 1].maxA + e.minA) / 2;
+    const end = i === extents.length - 1 ? e.maxA + along.pad : (e.maxA + extents[i + 1].minA) / 2;
+    return vertical
+      ? { lane: e.lane, left: acrossStart, width: acrossSize, top: start, height: end - start }
+      : { lane: e.lane, left: start, width: end - start, top: acrossStart, height: acrossSize };
   });
 
   const width = Math.max(0, ...topPositioned.map((n) => n.x + n.width)) + BAND_PAD_X;
+  const height = Math.max(0, ...topPositioned.map((n) => n.y + n.height)) + BAND_PAD_V;
   return { nodes, width, height, lanes };
 }
 

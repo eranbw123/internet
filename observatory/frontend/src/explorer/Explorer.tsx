@@ -1,11 +1,16 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchInterests, listRows, type ListFilters } from "../api";
 import type { InterestOption, ListResponse, Tab } from "../types";
 import { exactTitle, formatInstant } from "../time";
+import { useIsMobile } from "../useIsMobile";
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "discoveries", label: "Discoveries" },
-  { key: "interests", label: "Interests" },
+  // The explorer's "Interests" tab listed the same interests the workspace now
+  // owns outright, one row deep and with no verb on it -- a second, worse copy
+  // of a whole surface. The slot goes to the thing that had nowhere to live:
+  // when the interest extractor last ran and what it produced.
+  { key: "extractor", label: "Extractor runs" },
   { key: "generations", label: "Council generations" },
   { key: "missions", label: "Missions" },
   { key: "failed", label: "Failed runs" },
@@ -29,7 +34,7 @@ const DEFAULT_FILTERS: Record<Tab, ListFilters> = {
   // Most rows in a live discovery.db predate the trace backbone and have no
   // graph behind them; showing them by default buries the inspectable ones.
   discoveries: { trace_complete: "yes" },
-  interests: {},
+  extractor: {},
   generations: {},
   missions: {},
   failed: {},
@@ -101,6 +106,21 @@ export function Explorer({ onSelectDiscovery, onOpenRawDb, selectedRowKey }: Pro
     };
   }, [tab, debouncedSearch, filters, offset, limit]);
 
+  const isMobile = useIsMobile();
+
+  /* The source strip is one sideways-scrolling row on a phone (six sources
+     wrapped to three rows and ate 145px otherwise), so the selected source can
+     sit off-screen -- "Raw databases" is past the right edge at 393px. Bring
+     it into view whenever it changes, so the strip always shows where you are.
+     `block: "nearest"` keeps it from scrolling the page vertically as well. */
+  const tabsRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const strip = tabsRef.current;
+    if (!strip || strip.scrollWidth <= strip.clientWidth) return;
+    const selected = strip.querySelector('[aria-selected="true"]');
+    selected?.scrollIntoView({ inline: "nearest", block: "nearest" });
+  }, [tab]);
+
   return (
     <div className="explorer" data-testid="explorer">
       <div className="explorer-search">
@@ -111,7 +131,7 @@ export function Explorer({ onSelectDiscovery, onOpenRawDb, selectedRowKey }: Pro
           onChange={(e) => setSearch(e.target.value)}
         />
       </div>
-      <div className="explorer-tabs" role="tablist">
+      <div className="explorer-tabs" role="tablist" ref={tabsRef}>
         {TABS.map((t) => (
           <button
             key={t.key}
@@ -134,7 +154,14 @@ export function Explorer({ onSelectDiscovery, onOpenRawDb, selectedRowKey }: Pro
           </button>
         )}
       </div>
-      <FilterBar tab={tab} filters={filters} interests={interests} onChange={setFilters} />
+      {isMobile ? (
+        <details className="explorer-filters-fold">
+          <summary>Filters</summary>
+          <FilterBar tab={tab} filters={filters} interests={interests} onChange={setFilters} />
+        </details>
+      ) : (
+        <FilterBar tab={tab} filters={filters} interests={interests} onChange={setFilters} />
+      )}
       <ActiveFilterChips tab={tab} filters={filters} onChange={setFilters} />
       {loading && <div className="explorer-status">Loading...</div>}
       {error && <div className="explorer-status error">{error}</div>}
@@ -224,20 +251,32 @@ function RowSummary({ tab, row }: { tab: Tab; row: Record<string, unknown> }) {
   // templates rather than a shared one that fell back through
   // `label ?? key ?? title ?? id` and rendered a bare integer id for
   // generations, plus a `status` column interests does not even have.
-  if (tab === "interests") {
+  if (tab === "extractor") {
+    const offers = Number(row.offers ?? 0);
+    const waiting = Number(row.waiting ?? 0);
+    const decided = offers - waiting;
+    const sha = String(row.artifact_sha256 ?? "");
     return (
       <>
         <div className="row-top">
-          <span className="row-interest">{String(row.key ?? "")}</span>
-          <span className={`row-active row-active-${row.active ? "yes" : "no"}`}>
-            {row.active ? "active" : "inactive"}
+          <span className="row-time" title={exactTitle(String(row.generated_at ?? ""))}>
+            {formatInstant(String(row.generated_at ?? ""))}
           </span>
+          <span className="row-interest">extracted</span>
         </div>
-        <div className="row-title">{String(row.title ?? row.key ?? "")}</div>
+        <div className="row-title">
+          {offers} {offers === 1 ? "candidate" : "candidates"}
+          {waiting > 0 && <span className="row-waiting">{" · "}{waiting} still waiting</span>}
+        </div>
         <div className="row-bottom">
-          <span>{String(row.layer ?? "")}</span>
-          <span>{String(row.discoveries_count ?? 0)} discoveries</span>
-          <span>{String(row.missions_count ?? 0)} missions</span>
+          <span title="imported into the database">
+            imported {formatInstant(String(row.imported_at ?? ""))}
+          </span>
+          {decided > 0 && <span>{decided} decided</span>}
+          {row.top_score != null && <span>top {Number(row.top_score).toFixed(2)}</span>}
+        </div>
+        <div className="row-bottom">
+          <code className="row-artifact" title={sha}>{sha.slice(0, 12)}</code>
         </div>
       </>
     );
@@ -280,7 +319,10 @@ function RowSummary({ tab, row }: { tab: Tab; row: Record<string, unknown> }) {
  * selected row can be highlighted. Each tab's rows come from a different
  * table, so there is no single id column to rely on. */
 export function rowKey(tab: Tab, row: Record<string, unknown>, index: number): string {
-  const id = row.item_id ?? row.id ?? row.node_id ?? row.key;
+  // An extractor run has no primary key of its own -- it is a GROUP BY over
+  // the offers that share an artifact (db.py's _extractor_runs_query), so the
+  // artifact digest is its identity.
+  const id = row.item_id ?? row.id ?? row.node_id ?? row.key ?? row.artifact_sha256;
   return id != null ? `${tab}:${String(id)}` : `${tab}:idx${index}`;
 }
 
@@ -339,19 +381,12 @@ function FilterBar({ tab, filters, interests, onChange }: {
           key match server-side (it.key = ?), and nothing in the UI ever listed
           the valid keys -- so any human-typed value silently returned "No rows
           match", which is indistinguishable from broken. */}
-      {tab !== "interests" && (
+      {tab !== "extractor" && (
         <select value={filters.interest || ""} onChange={(e) => set("interest", e.target.value)} aria-label="Interest">
           <option value="">all interests</option>
           {interests.map((i) => (
             <option key={i.key} value={i.key}>{i.title || i.key}{i.active ? "" : " (inactive)"}</option>
           ))}
-        </select>
-      )}
-      {tab === "interests" && (
-        <select value={filters.active || ""} onChange={(e) => set("active", e.target.value)} aria-label="Active state">
-          <option value="">all interests</option>
-          <option value="yes">active only</option>
-          <option value="no">inactive only</option>
         </select>
       )}
       {tab === "discoveries" && (

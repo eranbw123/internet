@@ -42,8 +42,31 @@ function message(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-export function InterestsWorkspace({ onClose }: { onClose?: () => void }) {
-  const [view, setView] = useState<View>("list");
+interface WorkspaceProps {
+  onClose?: () => void;
+  /** Controlled view. The phone's bottom tab bar owns which of the three
+   * workspace surfaces is showing (App.tsx), so it drives this rather than
+   * the component keeping a second, competing tab strip on a 393px screen. */
+  view?: View;
+  onViewChange?: (v: View) => void;
+  /** Reports the pending-offer count up so the tab bar can badge it from
+   * launch instead of only after the inbox has been visited once. */
+  onOfferCount?: (n: number) => void;
+  /** Drop the workspace's own header (title, tab strip, Close) -- on a phone
+   * the app header and the tab bar already say where you are, and repeating
+   * it cost 190px, 22% of the viewport, before any content. */
+  chromeless?: boolean;
+}
+
+export function InterestsWorkspace({
+  onClose, view: viewProp, onViewChange, onOfferCount, chromeless,
+}: WorkspaceProps) {
+  const [ownView, setOwnView] = useState<View>("list");
+  const view = viewProp ?? ownView;
+  const setView = useCallback((v: View) => {
+    setOwnView(v);
+    onViewChange?.(v);
+  }, [onViewChange]);
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [offers, setOffers] = useState<Offer[]>([]);
   // The last interest stopped from the list, so its row can offer an immediate
@@ -85,6 +108,8 @@ export function InterestsWorkspace({ onClose }: { onClose?: () => void }) {
       .finally(() => { if (!cancelled) setLoading(false); });
     return () => { cancelled = true; };
   }, [refresh]);
+
+  useEffect(() => { onOfferCount?.(offers.length); }, [offers.length, onOfferCount]);
 
   const existingKeys = useMemo(() => (stats?.interests ?? []).map((i) => i.key), [stats]);
   const parentOptions = useMemo(
@@ -249,6 +274,7 @@ export function InterestsWorkspace({ onClose }: { onClose?: () => void }) {
 
   return (
     <div className="interests-workspace" data-testid="interests-workspace">
+      {chromeless ? null : (
       <header className="ws-header">
         <h1 className="ws-title">Interests</h1>
         <nav className="ws-tabs" role="tablist" aria-label="Interests views">
@@ -286,6 +312,7 @@ export function InterestsWorkspace({ onClose }: { onClose?: () => void }) {
           )}
         </div>
       </header>
+      )}
 
       {isMockActive() && (
         <p className="ws-mock-banner" role="status">
@@ -303,6 +330,7 @@ export function InterestsWorkspace({ onClose }: { onClose?: () => void }) {
         {view === "list" && (
           <InterestsList
             stats={stats}
+            onCreate={chromeless ? () => setEditor({ mode: "create" }) : undefined}
             loading={loading}
             busyKey={busyKey}
             onEdit={openEditor}

@@ -28,6 +28,7 @@ import "@xyflow/react/dist/style.css";
 import type { EdgeKind, InterestEdge, InterestStat } from "./types";
 import { defaultElk, type ElkLike } from "../graph/elkLayout";
 import { useThemeTokens } from "../useThemeTokens";
+import { useIsMobile } from "../useIsMobile";
 import { exactTitle, formatDay } from "../time";
 import { BidiText, Quote, guessLang } from "./Bidi";
 
@@ -87,8 +88,70 @@ interface Props {
   loading: boolean;
 }
 
+/** The phone's stand-in for the graph.
+ *
+ * A stress-laid similarity mesh of 30 interests is a genuinely good picture on
+ * a laptop and a genuinely bad one on a 393px phone: measured, the node labels
+ * rendered at roughly 5px and nothing in it could be read, let alone tapped.
+ * The information the graph carries -- which two interests are connected, how
+ * strongly, by what kind of evidence -- is a ranked list, so on a phone it is
+ * shown as one: strongest connection first, each row a 44px tap target that
+ * opens the same evidence panel the canvas' edge click opens. */
+function EdgeList({
+  shown, byKey, selected, onSelect,
+}: {
+  shown: InterestEdge[];
+  byKey: Map<string, InterestStat>;
+  selected: InterestEdge | null;
+  onSelect: (e: InterestEdge | null) => void;
+}) {
+  const ranked = useMemo(() => [...shown].sort((a, b) => b.weight - a.weight), [shown]);
+  if (ranked.length === 0) {
+    return <p className="ws-empty">No connections at this weight. Lower the minimum above.</p>;
+  }
+  return (
+    <ul className="cx-list" data-testid="cx-list">
+      {ranked.map((e, i) => {
+        const a = byKey.get(e.a);
+        const b = byKey.get(e.b);
+        const isSel = selected === e;
+        return (
+          <li key={`${e.a}-${e.b}-${i}`}>
+            <button
+              type="button"
+              className={`cx-edge ${isSel ? "is-selected" : ""}`}
+              aria-pressed={isSel}
+              onClick={() => onSelect(isSel ? null : e)}
+            >
+              <span className="cx-edge-pair">
+                <BidiText className="cx-edge-title" block lang={guessLang(a?.title ?? e.a)}>
+                  {a?.title ?? e.a}
+                </BidiText>
+                <span className="cx-edge-b">
+                  <span className="cx-edge-x" aria-hidden="true">{"↔"}</span>
+                  <BidiText className="cx-edge-title" lang={guessLang(b?.title ?? e.b)}>
+                    {b?.title ?? e.b}
+                  </BidiText>
+                </span>
+              </span>
+              <span className="cx-edge-meta">
+                <span className={`chip cx-chip-${e.kind}`}>{KIND_LABEL[e.kind]}</span>
+                {e.evidence.lift !== undefined && (
+                  <span className="prov-muted">{e.evidence.lift.toFixed(1)}x more than chance</span>
+                )}
+                <span className="cx-edge-weight">{e.weight.toFixed(2)}</span>
+              </span>
+            </button>
+          </li>
+        );
+      })}
+    </ul>
+  );
+}
+
 function Graph({ edges, interests, loading }: Props) {
   const tokens = useThemeTokens(TOKENS);
+  const isMobile = useIsMobile();
   const [minWeight, setMinWeight] = useState(0.4);
   const [selectedEdge, setSelectedEdge] = useState<InterestEdge | null>(null);
   const [positions, setPositions] = useState<Record<string, { x: number; y: number }> | null>(null);
@@ -223,6 +286,9 @@ function Graph({ edges, interests, loading }: Props) {
       </div>
 
       <div className="cx-body">
+        {isMobile ? (
+          <EdgeList shown={shown} byKey={byKey} selected={selectedEdge} onSelect={setSelectedEdge} />
+        ) : (
         <div className="cx-canvas">
           {positions === null ? (
             <p className="ws-loading">Laying out...</p>
@@ -247,6 +313,7 @@ function Graph({ edges, interests, loading }: Props) {
             </ReactFlow>
           )}
         </div>
+        )}
 
         <aside className="cx-inspector">
           {selectedEdge ? (

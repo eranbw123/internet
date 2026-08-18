@@ -7,11 +7,31 @@ import { CompareView } from "./compare/CompareView";
 import { InterestsWorkspace } from "./interests/InterestsWorkspace";
 import { formatHash, parseHash, readBootstrap } from "./deepLink";
 import { useIsMobile } from "./useIsMobile";
+import { MobileNav, type MobileSurface } from "./MobileNav";
+import { useScrollCollapse } from "./useScrollCollapse";
 import { ThemeToggle } from "./ThemeToggle";
 import type { GraphSeed } from "./graph/useGraphData";
 import type { ID, Tab } from "./types";
 
 const MIN_INSPECTOR_WIDTH = 280;
+
+/** The explorer's three desktop panes, as the three positions of the phone's
+ * segmented switcher. Order matters: it reads left-to-right as the journey
+ * through the app -- pick a result, look at its trace, read the detail. */
+type ExplorePane = "results" | "graph" | "details";
+const PANES: ExplorePane[] = ["results", "graph", "details"];
+const PANE_LABEL: Record<ExplorePane, string> = {
+  results: "Results",
+  graph: "Trace",
+  details: "Details",
+};
+const SURFACE_TITLE: Record<MobileSurface, string> = {
+  explore: "Explore",
+  interests: "Interests",
+  offers: "Suggested for you",
+  connections: "Connections",
+  compare: "Compare",
+};
 const INSPECTOR_WIDTH_KEY = "observatory-inspector-width";
 
 export function App() {
@@ -35,8 +55,15 @@ export function App() {
     () => new URLSearchParams(window.location.search).has("interests"),
   );
   const [compareRunId, setCompareRunId] = useState<string | null>(null);
-  const [drawerOpen, setDrawerOpen] = useState(false);
-  const [sheetOpen, setSheetOpen] = useState(false);
+  // The phone's navigation state. On a phone the app is one full-screen
+  // surface at a time driven by the bottom tab bar (MobileNav), and the
+  // explorer's three desktop panes become three positions of a segmented
+  // switcher -- see the `mobile navigation` comment on the render below.
+  const [surface, setSurface] = useState<MobileSurface>(
+    () => (new URLSearchParams(window.location.search).has("interests") ? "interests" : "explore"),
+  );
+  const [explorePane, setExplorePane] = useState<ExplorePane>("results");
+  const [offerCount, setOfferCount] = useState<number | null>(null);
   const [selectedRowKey, setSelectedRowKey] = useState<string | null>(null);
   // Both halves, because they address different things: the panel is fetched
   // by key (/api/interest/<key>), while trace_nodes carry the numeric id as
@@ -89,7 +116,7 @@ export function App() {
 
   function selectDiscovery(row: Record<string, unknown>, tab: Tab) {
     setSelectedRowKey(rowKey(tab, row, -1));
-    if (tab !== "interests") setSelectedInterest(null);
+    setSelectedInterest(null);
     // Each explorer tab's row.id is a primary key from a DIFFERENT table
     // (interests.id, search_generations.id, search_missions.id, ...) --
     // entity_id is only unique WITHIN one entity_type (see db.py's
@@ -112,30 +139,23 @@ export function App() {
         // graph, with the Inspector opened directly on its node.
         setSeed({ run_id: row.run_id as number });
         setSelectedNodeId(row.node_id as ID);
-        if (isMobile) {
-          setDrawerOpen(false);
-          // This branch sets selection state directly instead of going through
-          // selectNode(), so it also has to open the sheet -- otherwise the
-          // Inspector content existed but stayed invisible and the tap read as
-          // "nothing happened".
-          setSheetOpen(true);
-        }
+        // This branch sets selection state directly instead of going through
+        // selectNode(), so it also has to move the phone to the pane that
+        // shows the result -- otherwise the Inspector content existed but
+        // stayed invisible and the tap read as "nothing happened".
+        if (isMobile) setExplorePane("details");
         return;
       }
     } else if (tab === "discoveries" && row.item_id != null) {
       setSeed({ entity_type: "candidate_items", entity_id: row.item_id as string | number });
-    } else if (tab === "interests" && row.key != null && row.id != null) {
-      // Opens the interest itself rather than seeding the graph. Seeding
-      // resolved to the newest trace node carrying this entity, which is a
-      // `match` node 13,763 times out of 13,857 -- i.e. whichever candidate
-      // most recently keyword-matched, an arbitrary trace. The panel keeps a
-      // "Show latest trace" button for when that IS what you wanted.
-      setSelectedInterest({ key: row.key as string, id: row.id as ID });
+    } else if (tab === "extractor") {
+      // An extractor run is not a traced entity -- it has no trace_nodes row
+      // to seed a graph from. The offers it produced are the thing worth
+      // looking at, and they live in the inbox, so the row goes there.
+      setSelectedInterest(null);
       setSelectedNodeId(null);
-      if (isMobile) {
-        setDrawerOpen(false);
-        setSheetOpen(true);
-      }
+      if (isMobile) setSurface("offers");
+      else setInterestsOpen(true);
       return;
     } else if (tab === "generations" && row.id != null) {
       setSeed({ entity_type: "search_generations", entity_id: row.id as string | number });
@@ -143,13 +163,14 @@ export function App() {
       setSeed({ entity_type: "search_missions", entity_id: row.id as string | number });
     }
     setSelectedNodeId(null);
-    if (isMobile) setDrawerOpen(false);
+    // A trace row seeds the graph, so that is the pane worth showing.
+    if (isMobile) setExplorePane("graph");
   }
 
   function selectNode(id: ID) {
     setSelectedNodeId(id);
     setSelectedInterest(null);
-    if (isMobile) setSheetOpen(true);
+    if (isMobile) setExplorePane("details");
   }
 
   /** The right-hand pane shows an interest when one is open, otherwise the
@@ -189,10 +210,139 @@ export function App() {
     window.open("/", "_blank", "noopener");
   }
 
+  /* --- mobile navigation ---------------------------------------------------
+
+     A phone gets a different information architecture, not a squeezed copy of
+     the desktop one. Measured on a 393x852 iPhone 15, the desktop shell put
+     the whole app behind a 32x26 hamburger and opened on an empty graph
+     canvas reading "Select a discovery from the list" -- a first screen with
+     no content on it at all.
+
+     The model here is the platform-native one:
+
+       * a bottom tab bar carries the five destinations (MobileNav), so the
+         offers inbox -- the surface the owner most wants on the sofa -- is one
+         thumb tap from anywhere, with its pending count always visible;
+       * the explorer's three desktop panes become three positions of a
+         segmented switcher, one full-screen pane at a time. Selecting a row
+         advances the switcher itself (a trace row -> Graph, an interest ->
+         Details), so navigation is automatic going in and the switcher is the
+         way back. That replaces the old off-canvas drawer + bottom sheet,
+         which had no visible back affordance and left a dead 118px strip of
+         graph beside the drawer.
+
+     The interests workspace stays mounted for the whole session on a phone:
+     switching tabs is then instant rather than a refetch and a spinner, and
+     the tab bar can show the offer count from launch instead of only after
+     you visit the inbox. */
+  // Declared unconditionally (hooks cannot sit behind the isMobile branch);
+  // `enabled` makes it inert on a desktop, where nothing collapses.
+  const chromeCollapsed = useScrollCollapse(isMobile, surface + ":" + explorePane);
+
+  if (isMobile) {
+    const wsView = surface === "offers" ? "offers" : surface === "connections" ? "connections" : "list";
+    const onWorkspace = surface === "interests" || surface === "offers" || surface === "connections";
+    return (
+      <div
+        className={`app mobile ${chromeCollapsed ? "is-chrome-collapsed" : ""}`}
+        data-testid="app"
+      >
+        <header className="app-header">
+          <span className="app-title">{SURFACE_TITLE[surface]}</span>
+          <ThemeToggle />
+        </header>
+        <div className="app-body">
+          {surface === "explore" && (
+            <div className="pane-mobile" data-testid="explore-surface">
+              <nav className="pane-switch" role="tablist" aria-label="Explorer panes" data-testid="pane-switch">
+                {PANES.map((p) => (
+                  <button
+                    key={p}
+                    type="button"
+                    role="tab"
+                    data-pane={p}
+                    aria-selected={explorePane === p}
+                    className={explorePane === p ? "is-selected" : ""}
+                    onClick={() => setExplorePane(p)}
+                  >
+                    {PANE_LABEL[p]}
+                  </button>
+                ))}
+              </nav>
+              {/* Results keeps its own filter/page state, so it is hidden
+                  rather than unmounted. The graph is mounted on demand: React
+                  Flow measures its container at mount, and a container that is
+                  display:none measures 0x0, which is how a fitted graph ends
+                  up at an unusable zoom. */}
+              <div className="pane-mobile-body" hidden={explorePane !== "results"}>
+                <Explorer
+                  onSelectDiscovery={selectDiscovery}
+                  onOpenRawDb={bootstrap.public ? undefined : openRawDb}
+                  selectedRowKey={selectedRowKey}
+                />
+              </div>
+              {explorePane === "graph" && (
+                <div className="pane-mobile-body">
+                  <GraphCanvas seed={seed} selectedNodeId={selectedNodeId} onSelectNode={selectNode} isMobile />
+                </div>
+              )}
+              {explorePane === "details" && (
+                <div className="pane-mobile-body pane-mobile-details">
+                  {/* On a desktop "Select a node to inspect it." is fine: the
+                      graph is on screen beside the inspector, so the
+                      instruction names something you can see. On a phone the
+                      panes are exclusive, so tapping Details with no node
+                      chosen was a dead end -- an instruction to do something
+                      that is not reachable from where you are standing. Say
+                      where the nodes are, and offer the way back. */}
+                  {selectedNodeId == null && !selectedInterest ? (
+                    <div className="pane-empty" data-testid="details-empty">
+                      <p>{seed ? "Tap a node in the trace to inspect it." : "Pick a discovery in Results, then tap a node in its trace."}</p>
+                      <button
+                        type="button"
+                        className="btn"
+                        onClick={() => setExplorePane(seed ? "graph" : "results")}
+                      >
+                        {seed ? "Back to the trace" : "Back to results"}
+                      </button>
+                    </div>
+                  ) : (
+                    rightPane()
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+          {surface === "compare" && (
+            <div className="pane-mobile">
+              <div className="pane-mobile-body">
+                <CompareView
+                  initialA={compareRunId ?? undefined}
+                  onSelectNode={(id) => {
+                    setSurface("explore");
+                    selectNode(id);
+                  }}
+                />
+              </div>
+            </div>
+          )}
+          <div className="surface-holder" hidden={!onWorkspace}>
+            <InterestsWorkspace
+              view={wsView}
+              onViewChange={(v) => setSurface(v === "list" ? "interests" : v)}
+              onOfferCount={setOfferCount}
+              chromeless
+            />
+          </div>
+        </div>
+        <MobileNav surface={surface} onSelect={setSurface} offerCount={offerCount} />
+      </div>
+    );
+  }
+
   return (
-    <div className={`app ${isMobile ? "mobile" : "desktop"} ${resizing ? "resizing" : ""}`} data-testid="app">
+    <div className={`app desktop ${resizing ? "resizing" : ""}`} data-testid="app">
       <header className="app-header">
-        <button className="drawer-toggle" onClick={() => setDrawerOpen((v) => !v)} aria-label="Toggle explorer">☰</button>
         <span className="app-title">Observatory</span>
         <button onClick={() => setInterestsOpen((v) => !v)}>
           {interestsOpen ? "Close interests" : "Interests"}
@@ -206,14 +356,13 @@ export function App() {
         </div>
       ) : (
       <div className="app-body">
-        <div className={`pane pane-explorer ${isMobile ? "drawer" : ""} ${drawerOpen ? "open" : ""}`}>
+        <div className="pane pane-explorer">
           <Explorer
             onSelectDiscovery={selectDiscovery}
             onOpenRawDb={bootstrap.public ? undefined : openRawDb}
             selectedRowKey={selectedRowKey}
           />
         </div>
-        {isMobile && drawerOpen && <div className="drawer-scrim" onClick={() => setDrawerOpen(false)} />}
         <div className="pane pane-graph">
           {compareOpen ? (
             <CompareView
@@ -225,24 +374,14 @@ export function App() {
               }}
             />
           ) : (
-            <GraphCanvas seed={seed} selectedNodeId={selectedNodeId} onSelectNode={selectNode} isMobile={isMobile} />
+            <GraphCanvas seed={seed} selectedNodeId={selectedNodeId} onSelectNode={selectNode} />
           )}
         </div>
-        {!isMobile && (
-          <>
-            <div className="pane-resizer" title="Drag to resize" onPointerDown={startInspectorResize} />
-            <div className="pane pane-inspector" style={{ width: inspectorWidth }}>
-              {rightPane()}
-            </div>
-          </>
-        )}
-      </div>
-      )}
-      {isMobile && !interestsOpen && (
-        <div className={`bottom-sheet ${sheetOpen ? "open" : ""}`} data-testid="bottom-sheet">
-          <div className="bottom-sheet-handle" onClick={() => setSheetOpen(false)} />
-          {rightPane(() => setSheetOpen(false))}
+        <div className="pane-resizer" title="Drag to resize" onPointerDown={startInspectorResize} />
+        <div className="pane pane-inspector" style={{ width: inspectorWidth }}>
+          {rightPane()}
         </div>
+      </div>
       )}
     </div>
   );
