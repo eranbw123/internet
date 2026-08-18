@@ -127,6 +127,9 @@ CREATE TABLE IF NOT EXISTS notifications (
     attempts  INTEGER NOT NULL DEFAULT 1
 );
 
+-- HELD: n-delivery -- do not alter this table or build delivered-item engagement
+-- learning before reading entry 'n-delivery' in C:\Users\eranb\.claude\held\HELD.md.
+-- The *unit* of feedback may change under the pending Output Layer decision.
 CREATE TABLE IF NOT EXISTS feedback (
     id              INTEGER PRIMARY KEY,
     item_id         INTEGER NOT NULL REFERENCES candidate_items(id),
