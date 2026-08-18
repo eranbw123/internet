@@ -870,7 +870,7 @@ def _offers_cmd(conn, cfg, args):
         path = args.import_path or cfg.interest_candidates_path
         return _run_job(conn, "offers-import", lambda: _offers_import_cmd(conn, cfg, path))
     if args.sweep:
-        return _run_job(conn, "offers-sweep", lambda: _offers_sweep_cmd(conn))
+        return _run_job(conn, "offers-sweep", lambda: _offers_sweep_cmd(conn, cfg))
     for key, action in (
         (args.accept, "accept"), (args.reject, "reject"),
         (args.snooze, "snooze"), (args.undo, "undo"),
@@ -880,50 +880,92 @@ def _offers_cmd(conn, cfg, args):
     return _offers_list(conn, args.status)
 
 
-def _offers_import_cmd(conn, cfg, path):
-    """Import the candidates artifact, and say out loud what it did -- or why
-    it did nothing. The summary is printed on EVERY path, including the ones
-    that import zero offers: "already imported" and "no candidates" are the
-    normal outcomes of an hourly idempotent job, and a log line saying so is
-    the difference between a job that is working and a job that has been dead
-    for a week. From the outside those two look identical otherwise."""
-    print_safe(f"offers --import: reading {path}")
+def _import_and_top_up(conn, cfg, path, trigger):
+    """Read the candidates artifact into the inbox, then refill it. Returns
+    (exit_code, did_work).
+
+    One body, three callers, because the inbox has exactly three things that
+    can change what it should contain and all of them want this same pair of
+    steps:
+
+      * a NEW artifact exists      -- _extract_interests_cmd, the moment its
+                                      reduce stage publishes one
+      * the owner decided          -- offers.top_up_after_decision, already
+                                      wired into manage.py's decide path
+      * a timer freed a slot       -- _offers_sweep_cmd, when the sweep has
+                                      actually expired or woken something
+
+    `import_artifact` is idempotent on the artifact sha, so it proposes from a
+    genuinely new artifact exactly once and attaches its evidence exactly once.
+    `top_up` deliberately ignores the sha and re-reads the file, which is what
+    reaches the candidates that ranked below a run's cap. Running both is what
+    makes "something changed" a complete answer rather than half of one.
+    """
+    print_safe(f"offers[{trigger}]: reading {path}")
     summary = offers.import_artifact(conn, path, interests_path=cfg.interests_path)
     print_safe(json.dumps(summary, ensure_ascii=False, indent=2))
-    # The top-up runs on the SAME hourly tick rather than as a fourth Scheduled
-    # Task. It reads the same artifact this import just read, applies the same
-    # gates, and shares this job's heartbeat -- a separate task would duplicate
-    # the file read and the failure reporting to no end. It runs even when the
-    # import above did nothing, which is the normal case: the import is
-    # idempotent on the artifact's sha256, so once an artifact has been read
-    # its remaining candidates are reachable ONLY through the top-up.
-    topped = offers.top_up(conn, path, interests_path=cfg.interests_path, trigger="hourly")
+    topped = offers.top_up(conn, path, interests_path=cfg.interests_path, trigger=trigger)
     print_safe(json.dumps(topped, ensure_ascii=False, indent=2))
-    print_safe(f"offers --top-up: {topped['reason']}")
+    print_safe(f"offers[{trigger}] top-up: {topped['reason']}")
     if topped.get("exhausted") and not topped.get("error"):
         # Not a failure: a short inbox is the correct outcome when nothing
         # qualifies. It IS the signal that the producer, not the ranker, is
         # what the inbox is now waiting on -- so it is said out loud.
         print_safe(
-            f"offers --top-up: inbox is {topped['live_after']}/{topped['target']} and the "
-            f"artifact is exhausted -- the next extractor run is what fills it"
+            f"offers[{trigger}] top-up: inbox is {topped['live_after']}/{topped['target']} "
+            f"and the artifact is exhausted -- the next extractor run is what fills it"
         )
+    did_work = bool(summary.get("offered") or topped.get("offered"))
     if _import_is_failure(summary):
         # Non-zero, so _run_job stamps job:offers-import:last_fail and
         # `health` starts counting this job as failing.
-        print_safe(f"offers --import: FAILED -- {summary['error']}")
-        return 2
+        print_safe(f"offers[{trigger}]: FAILED -- {summary['error']}")
+        return 2, did_work
     if summary.get("error"):
-        print_safe(f"offers --import: nothing to do -- {summary['error']}")
+        print_safe(f"offers[{trigger}]: nothing new in the artifact -- {summary['error']}")
     else:
         print_safe(
-            f"offers --import: {summary['offered']} offered from "
+            f"offers[{trigger}]: {summary['offered']} offered from "
             f"{summary['imported']} candidates (artifact {summary['artifact_sha256'][:12]})"
         )
-    return 0
+    return 0, did_work
 
 
-def _offers_sweep_cmd(conn):
+def _offers_import_cmd(conn, cfg, path):
+    """The daily RECONCILE, not the thing that keeps the inbox current.
+
+    The inbox is refilled by events now -- a new artifact triggers the import
+    at the end of the extractor job, an owner decision triggers it in the
+    decide path, and a sweep that frees a slot triggers it here in the same
+    process. This runs once a day and should therefore find nothing to do.
+
+    It is kept anyway, and only because of what this system keeps being bitten
+    by. A pure event chain has no way to notice its own silence: if a trigger
+    is ever missed the inbox simply stops refilling, and the owner discovers it
+    the way he discovered five days of dead news collection -- by eventually
+    wondering. This is the watchdog for that. The valuable outcome is the
+    boring one, and the interesting one is loud: if a once-a-day reconcile ever
+    DOES import or top up an offer, then an event that should have fired did
+    not, and that line is the early warning.
+    """
+    code, did_work = _import_and_top_up(conn, cfg, path, "reconcile")
+    if did_work:
+        print_safe(
+            "offers[reconcile]: WARNING -- this added offers, which means an event "
+            "trigger was missed. The inbox is meant to be current before this runs: "
+            "check that internet-discovery-interest-extract is completing (it imports "
+            "at the end of its own run) and that the sweep and the decide path are "
+            "reaching their top-up."
+        )
+    elif code == 0:
+        print_safe(
+            "offers[reconcile]: nothing to reconcile -- the event path is keeping up, "
+            "which is what this job existing is meant to confirm"
+        )
+    return code
+
+
+def _offers_sweep_cmd(conn, cfg):
     """Every timer-driven transition in the offer/interest lifecycle: expiry,
     snooze wake-up, decay, auto-pause. `offers.sweep` either performs those
     transitions or reports, in `skipped`, that it deliberately refused to
@@ -948,6 +990,18 @@ def _offers_sweep_cmd(conn):
         print_safe("offers --sweep: nothing was due (no expiry, wake, decay or auto-pause)")
     else:
         print_safe(f"offers --sweep: {moved} lifecycle transition(s)")
+
+    # The third thing that can change what the inbox should hold, and the one
+    # with no other trigger. An owner decision frees a slot and the decide path
+    # refills it; a new artifact arrives and the extractor job imports it. But
+    # an offer reaching its expiry frees a slot on a TIMER, with no click and no
+    # new artifact -- so without this the inbox would sit one short until the
+    # next extraction, which may be a day away. Only when the sweep actually
+    # moved something: a sweep that did nothing has changed nothing to react to.
+    if moved:
+        topped = offers.top_up(conn, cfg.interest_candidates_path,
+                               interests_path=cfg.interests_path, trigger="sweep")
+        print_safe(f"offers --sweep: top-up after {moved} transition(s) -- {topped['reason']}")
     return 0
 
 
@@ -1251,6 +1305,24 @@ def _extract_interests_cmd(conn, cfg, args):
     if after_mtime is None:
         _say(f"extract-interests: reduce exited 0 but wrote no artifact at {artifact}")
         return EXTRACT_UNPRODUCTIVE
+
+    # THE event the inbox actually cares about: a fresh artifact exists, right
+    # now, in this process. So the consumer runs here rather than being
+    # discovered by a poll minutes or an hour later.
+    #
+    # The producer triggering the consumer is what makes this event-driven
+    # without a listener: no watcher daemon to supervise and restart, no
+    # polling interval to tune, and -- the part a FileSystemWatcher cannot give
+    # for free -- no race between "the file is being written" and "the file is
+    # being read", because reduce has already exited by the time this line runs.
+    # It covers a hand-run `python -m app extract-interests` for the same
+    # reason it covers the scheduled one: the trigger is in the command, not in
+    # the schedule.
+    _say("extract-interests: artifact refreshed -- importing it now")
+    import_code, _did = _import_and_top_up(conn, cfg, str(artifact), "extract")
+    if import_code:
+        _say("extract-interests: the extraction succeeded but its import did not")
+        return import_code
     # The honesty check. `reduce` exiting 0 is not proof anything happened: if
     # map had pending work and finished with just as much still pending, it
     # spent browser time and digested nothing, and the next import will

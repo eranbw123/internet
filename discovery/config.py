@@ -81,11 +81,15 @@ class Config:
     # is deliberate -- outside the digest window (digest_time..digest_window_end),
     # and at an hour the owner is not using Chrome interactively.
     interest_extract_time: str = "03:30"
-    # Local, offline, and idempotent on the artifact's sha256, so running it
-    # hourly costs a file hash and a state lookup. Hourly (not daily) so an
-    # artifact produced by hand -- which is exactly how the first five offers
-    # arrived -- reaches the inbox within the hour instead of the next night.
-    offers_import_interval_seconds: int = 3600
+    # NOT the thing that keeps the inbox current -- that is event-driven now
+    # (see _import_and_top_up). A new artifact is imported by the extractor job
+    # the moment its reduce stage publishes one; an owner decision refills in
+    # the decide path; a sweep that frees a slot refills in the same process.
+    # The owner asked for a listener on pending interests, "not every x hours",
+    # and this is what is left after that: a once-a-day reconcile that should
+    # find nothing, kept purely so the event chain cannot fail silently. If it
+    # ever DOES add an offer, an event was missed, and it says so loudly.
+    offers_import_interval_seconds: int = 24 * 3600
     # Local and offline too. The brief is "at least daily"; 6h is four
     # chances a day, so a machine asleep or off through one slot still sweeps
     # that day instead of silently skipping a day of the 30/45-day clocks.
@@ -256,7 +260,7 @@ def load():
         digest_window_end=os.environ.get("DISCOVERY_DIGEST_WINDOW_END", "23:00"),
         interest_extract_time=os.environ.get("DISCOVERY_INTEREST_EXTRACT_TIME", "03:30"),
         offers_import_interval_seconds=int(
-            os.environ.get("DISCOVERY_OFFERS_IMPORT_INTERVAL", "3600")
+            os.environ.get("DISCOVERY_OFFERS_IMPORT_INTERVAL", str(24 * 3600))
         ),
         offers_sweep_interval_seconds=int(
             os.environ.get("DISCOVERY_OFFERS_SWEEP_INTERVAL", str(6 * 3600))
