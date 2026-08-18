@@ -991,7 +991,7 @@ def _extractor_status(python, script, repo_root, timeout=180):
         proc = subprocess.run(
             [python, str(script), "status"], cwd=str(repo_root),
             capture_output=True, text=True, errors="replace", timeout=timeout,
-            env=_extractor_env(),
+            env=_extractor_env(), stdin=subprocess.DEVNULL,
         )
     except (OSError, subprocess.SubprocessError) as e:
         _say(f"extract-interests: status unavailable ({e})")
@@ -1030,7 +1030,14 @@ def _run_extractor_stage(python, script, repo_root, stage_args, timeout):
         proc = subprocess.run(
             [python, str(script), *stage_args], cwd=str(repo_root),
             capture_output=True, text=True, errors="replace", timeout=timeout,
-            env=_extractor_env(),
+            # capture_output already gives stdout/stderr their own pipes, so
+            # this child cannot inherit the job's log-file handle -- the leak
+            # that kept logs/web-tick-*.log locked for days (see
+            # health.preflight_gate). stdin is the one handle capture_output
+            # does NOT replace, and it is inherited by default, so it is closed
+            # explicitly here: nothing in this path should ever be able to
+            # block on a read from a console that is not there.
+            env=_extractor_env(), stdin=subprocess.DEVNULL,
         )
     except subprocess.TimeoutExpired as e:
         _echo_stage(label, e.stdout, e.stderr)
