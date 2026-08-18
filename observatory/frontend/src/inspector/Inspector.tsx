@@ -4,6 +4,7 @@ import { labelScore } from "../graph/assemble";
 import type { ID, ModelCallDetail, NodeDetail, PromptTemplate } from "../types";
 import { MonospaceViewer } from "./MonospaceViewer";
 import { splitPromptSections } from "./promptSections";
+import { formatInstant } from "../time";
 
 // Tab identity is its label; only tabs whose content is actually non-empty
 // for the selected node are offered (most nodes carry one or two payloads,
@@ -644,10 +645,10 @@ function Connections({ title, edges, onSelectNode }: {
 // pipeline.py/trace.py timestamps are ISO with an explicit +00:00 offset
 // (always UTC -- see PROJECT_STATE.md's "All timestamps UTC" note); rendered
 // as "2026-08-12 07:56:58 UTC" instead of the raw ISO string.
+// Used to relabel the stored instant "<date> <time> UTC" -- honest, but it
+// left the owner doing the arithmetic on every row.
 function formatTimestamp(iso: string | null): string | null {
-  if (!iso) return iso;
-  const m = /^(\d{4}-\d{2}-\d{2})T(\d{2}:\d{2}:\d{2})(?:\.\d+)?\+00:00$/.exec(iso);
-  return m ? `${m[1]} ${m[2]} UTC` : iso;
+  return iso ? formatInstant(iso) : iso;
 }
 
 function chipKind(status: string): string {

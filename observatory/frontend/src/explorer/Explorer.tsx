@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { fetchInterests, listRows, type ListFilters } from "../api";
 import type { InterestOption, ListResponse, Tab } from "../types";
+import { exactTitle, formatInstant } from "../time";
 
 const TABS: { key: Tab; label: string }[] = [
   { key: "discoveries", label: "Discoveries" },
@@ -195,7 +196,7 @@ function RowSummary({ tab, row }: { tab: Tab; row: Record<string, unknown> }) {
     return (
       <>
         <div className="row-top">
-          <span className="row-time">{at}</span>
+          <span className="row-time" title={exactTitle(at)}>{formatInstant(at)}</span>
           <span className="row-interest">{interest}</span>
         </div>
         <div className="row-title">{String(row.title ?? row.url ?? "(untitled)")}</div>
@@ -211,7 +212,7 @@ function RowSummary({ tab, row }: { tab: Tab; row: Record<string, unknown> }) {
     return (
       <>
         <div className="row-top">
-          <span className="row-time">{at}</span>
+          <span className="row-time" title={exactTitle(at)}>{formatInstant(at)}</span>
           <span className="row-kind">{String(row.kind ?? "")}</span>
         </div>
         <div className="row-title">{String(row.label ?? "")}</div>
@@ -245,7 +246,7 @@ function RowSummary({ tab, row }: { tab: Tab; row: Record<string, unknown> }) {
     return (
       <>
         <div className="row-top">
-          <span className="row-time">{at}</span>
+          <span className="row-time" title={exactTitle(at)}>{formatInstant(at)}</span>
           <span className="row-interest">{interest}</span>
         </div>
         <div className="row-title">
@@ -262,7 +263,7 @@ function RowSummary({ tab, row }: { tab: Tab; row: Record<string, unknown> }) {
   return (
     <>
       <div className="row-top">
-        <span className="row-time">{at}</span>
+        <span className="row-time" title={exactTitle(at)}>{formatInstant(at)}</span>
         <span className="row-interest">{interest}</span>
       </div>
       <div className="row-title">{String(row.label ?? row.rationale ?? row.id ?? "")}</div>

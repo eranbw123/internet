@@ -11,6 +11,7 @@ import { formatEdgeLabel } from "./assemble";
 import { computeLayout, defaultElk, laneLabel, type LayoutResult, type PositionedNode } from "./elkLayout";
 import type { ID } from "../types";
 import { useThemeTokens } from "../useThemeTokens";
+import { exactTitle, formatClock } from "../time";
 
 function statusClass(status: string | null): string {
   if (!status) return "";
@@ -55,9 +56,10 @@ function thresholdVerdict(label: string | null): { text: string; passed: boolean
 // card's already-tight meta row for a date the card's own position in the
 // graph already conveys ("today," implicitly) -- the Inspector's Overview
 // tab keeps the full timestamp for whoever actually needs the date.
+// Was a regex pulling the UTC clock straight out of the ISO string, so a node
+// that ran at 17:23 local read 14:23.
 function shortTime(iso: string | null): string | null {
-  const m = /T(\d\d:\d\d:\d\d)/.exec(iso || "");
-  return m ? m[1] : iso;
+  return iso ? formatClock(iso) : iso;
 }
 
 function NodeCard({ data }: NodeProps) {
@@ -92,7 +94,11 @@ function NodeCard({ data }: NodeProps) {
       <div className="node-meta">
         {n.status && <span className="node-status">{n.status}</span>}
         {duration && <span className="node-duration">{duration}</span>}
-        {n.started_at && <span className="node-time">{shortTime(n.started_at)}</span>}
+        {n.started_at && (
+          <span className="node-time" title={exactTitle(n.started_at)}>
+            {shortTime(n.started_at)}
+          </span>
+        )}
       </div>
     </div>
   );
