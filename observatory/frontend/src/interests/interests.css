@@ -1334,7 +1334,20 @@ input[type="range"]::-moz-range-thumb {
       gap: 10px;
     }
     .cell-actions .btn { min-height: 44px; }
-    .offers-inbox { padding: 8px 12px; }
+    /* Offers go two across for the same reason the interest cards do, plus
+       one of its own: full width, the Accept button measured 1580px for a
+       one-word label, which reads as a banner rather than a button. Two
+       across also puts a second offer on screen in a viewport that otherwise
+       shows exactly one. The count line spans both columns. */
+    .offers-inbox {
+      padding: 8px 12px;
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      align-items: start;
+      gap: 10px;
+    }
+    .offers-count { grid-column: 1 / -1; }
+    .ws-empty { grid-column: 1 / -1; }
     .offer-buttons .btn { min-height: 44px; }
     .offer-buttons-row .btn { min-height: 44px; }
   }
