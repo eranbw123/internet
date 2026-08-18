@@ -500,3 +500,17 @@ button[aria-selected="true"], button.active, button[aria-pressed="true"] {
   box-shadow: 0 4px 12px var(--shadow-strong);
 }
 .toolbar-overflow-menu button { text-align: left; white-space: nowrap; }
+
+/* Home-screen (standalone) mode on iOS. viewport-fit=cover lets the page
+   paint edge to edge, which also means it paints UNDER the notch and the
+   home indicator -- so inset the shell by the safe areas. Scoped to
+   display-mode:standalone so the desktop layout is untouched. */
+@media (display-mode: standalone) {
+  body {
+    padding-top: env(safe-area-inset-top);
+    padding-bottom: env(safe-area-inset-bottom);
+    padding-left: env(safe-area-inset-left);
+    padding-right: env(safe-area-inset-right);
+    box-sizing: border-box;
+  }
+}
