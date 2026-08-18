@@ -108,7 +108,7 @@ def _redact_row(row):
 
 # --- /api/list ---------------------------------------------------------------
 
-TABS = ("discoveries", "interests", "generations", "missions", "failed")
+TABS = ("discoveries", "extractor", "generations", "missions", "failed")
 DEFAULT_LIMIT = 50
 MAX_LIMIT = 50
 
@@ -124,7 +124,7 @@ def list_rows(conn, tab, filters=None, search="", limit=None, offset=0):
     filters = filters or {}
     builder = {
         "discoveries": _discoveries_query,
-        "interests": _interests_query,
+        "extractor": _extractor_runs_query,
         "generations": _generations_query,
         "missions": _missions_query,
         "failed": _failed_query,
@@ -253,6 +253,59 @@ def _discoveries_query(filters, search):
         params.extend([q, q, q, q, q, q, q, q])
     where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
     return base, where_sql, params, "ORDER BY ci.id DESC"
+
+
+def _extractor_runs_query(filters, search):
+    """Recent runs of the interest extractor.
+
+    There is no runs table to read: nothing records an extractor invocation as
+    such. What IS recorded is the artifact each run wrote -- every offer row
+    carries the `artifact_sha256` it was imported from and the `generated_at`
+    the extractor stamped on it -- so a run is reconstructed by grouping the
+    offers it produced. Verified against the live database: two artifacts,
+    five offers each, and the MIN(created_at) per group matches the
+    `offers:artifact:<sha>` import stamps in service_state to the second.
+
+    The limit of that reconstruction, which the UI says out loud rather than
+    hiding: a run that produced no offers at all leaves nothing behind to
+    group, so it cannot appear here. If the extractor's scheduling work grows a
+    real run table, this query is the only thing that has to change -- the
+    /api/list contract and the whole client side stay as they are.
+
+    The aggregate is the innermost subquery so that the caller's WHERE and
+    ORDER BY (and its COUNT(*) wrapper, which does not see order_sql) apply to
+    RUNS rather than to individual offers.
+    """
+    base = """
+        SELECT * FROM (
+            SELECT
+                o.artifact_sha256 AS artifact_sha256,
+                o.generated_at AS generated_at,
+                MIN(o.created_at) AS imported_at,
+                MAX(o.decided_at) AS last_decided_at,
+                COUNT(*) AS offers,
+                SUM(CASE WHEN o.status = 'offered' THEN 1 ELSE 0 END) AS waiting,
+                SUM(CASE WHEN o.status = 'accepted' THEN 1 ELSE 0 END) AS accepted,
+                SUM(CASE WHEN o.status = 'rejected' THEN 1 ELSE 0 END) AS rejected,
+                SUM(CASE WHEN o.status = 'snoozed' THEN 1 ELSE 0 END) AS snoozed,
+                SUM(CASE WHEN o.kind = 'new' THEN 1 ELSE 0 END) AS kind_new,
+                SUM(CASE WHEN o.kind = 'bridge' THEN 1 ELSE 0 END) AS kind_bridge,
+                SUM(CASE WHEN o.kind = 'retire' THEN 1 ELSE 0 END) AS kind_retire,
+                MAX(o.score) AS top_score
+            FROM interest_offers o
+            WHERE o.artifact_sha256 IS NOT NULL
+            GROUP BY o.artifact_sha256, o.generated_at
+        ) r
+    """
+    clauses, params = [], []
+    if search:
+        q = _like(search)
+        clauses.append("(r.artifact_sha256 LIKE ? ESCAPE '\\' OR r.generated_at LIKE ? ESCAPE '\\')")
+        params.extend([q, q])
+    where_sql = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+    # generated_at is the extractor's own stamp and is what "recent runs"
+    # means; imported_at only says when this machine got round to reading it.
+    return base, where_sql, params, "ORDER BY r.generated_at DESC"
 
 
 def _interests_query(filters, search):

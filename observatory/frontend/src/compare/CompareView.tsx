@@ -5,7 +5,9 @@ import { MonospaceViewer } from "../inspector/MonospaceViewer";
 import { GraphCanvas } from "../graph/GraphCanvas";
 
 interface Props {
-  onClose: () => void;
+  /** Optional: on a phone the bottom tab bar is the way out of this surface,
+   * so there is no in-view Close button to render. */
+  onClose?: () => void;
   /** Pre-filled from "Compare this run" in the Inspector, so the view can be
    * opened with an input already in hand instead of demanding a number the UI
    * never showed anywhere. */
@@ -82,7 +84,7 @@ export function CompareView({ onClose, initialA, onSelectNode }: Props) {
             <input placeholder="B id" aria-label="B id" value={b} onChange={(e) => setB(e.target.value)} />
           </>
         )}
-        <button onClick={onClose}>Close compare</button>
+        {onClose && <button onClick={onClose}>Close compare</button>}
       </div>
       {error && <div className="compare-error">{error}</div>}
       {result?.kind === "run" && <RunCompare result={result} a={a} b={b} onSelectNode={onSelectNode} />}

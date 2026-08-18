@@ -43,23 +43,15 @@ describe("Explorer", () => {
     expect(await screen.findByRole("option", { name: /Retired Topic \(inactive\)/ })).toBeInTheDocument();
   });
 
-  it("swaps the interest picker for an active-state filter on the Interests tab", async () => {
+  it("drops the interest picker on the Extractor runs tab", async () => {
+    // A run belongs to no interest -- it is one artifact covering all of them
+    // -- so the picker would filter on a column the rows do not have. The
+    // artifact digest is the only handle, and the search box already takes it.
     render(<Explorer onSelectDiscovery={() => {}} onOpenRawDb={() => {}} />);
-    fireEvent.click(await screen.findByRole("tab", { name: /Interests/ }));
-    // Filtering interests BY interest is a self-filter, and the backend
-    // ignored it there anyway (verified live: it returned all 46 rows).
+    fireEvent.click(await screen.findByRole("tab", { name: /Extractor runs/ }));
     expect(screen.queryByLabelText("Interest")).toBeNull();
-    expect(screen.getByLabelText("Active state")).toBeInTheDocument();
-  });
-
-  it("sends the active filter the backend now understands", async () => {
-    render(<Explorer onSelectDiscovery={() => {}} onOpenRawDb={() => {}} />);
-    fireEvent.click(await screen.findByRole("tab", { name: /Interests/ }));
-    fireEvent.change(screen.getByLabelText("Active state"), { target: { value: "no" } });
     await waitFor(() => {
-      expect(listRows).toHaveBeenCalledWith("interests", expect.objectContaining({
-        filters: expect.objectContaining({ active: "no" }),
-      }));
+      expect(listRows).toHaveBeenCalledWith("extractor", expect.anything());
     });
   });
 
@@ -114,15 +106,33 @@ describe("Explorer", () => {
     expect(listRows.mock.calls.filter((c) => c[1].search === "ab")).toHaveLength(0);
   });
 
-  it("renders interests rows with their real columns", async () => {
+  it("renders extractor runs with what the run produced", async () => {
     listRows.mockResolvedValue(listResponse([
-      { id: 1, key: "narcolepsy-eds", title: "Narcolepsy & EDS", active: 0, layer: "owner", discoveries_count: 12, missions_count: 3 },
-    ], "interests"));
+      {
+        artifact_sha256: "f5019b0271c6e3c9390c8b95cc0e46714ffb651836b84868aa4def34d0d7fc90",
+        generated_at: "2026-08-18T15:48:32Z", imported_at: "2026-08-18T15:51:12+00:00",
+        offers: 5, waiting: 3, accepted: 1, rejected: 1, top_score: 0.823,
+      },
+    ], "extractor"));
     render(<Explorer onSelectDiscovery={() => {}} onOpenRawDb={() => {}} />);
-    fireEvent.click(await screen.findByRole("tab", { name: /Interests/ }));
-    // `status` is a column interests does not have -- that line was always blank.
-    expect(await screen.findByText("inactive")).toBeInTheDocument();
-    expect(screen.getByText("12 discoveries")).toBeInTheDocument();
+    fireEvent.click(await screen.findByRole("tab", { name: /Extractor runs/ }));
+    expect(await screen.findByText(/5 candidates/)).toBeInTheDocument();
+    expect(screen.getByText(/3 still waiting/)).toBeInTheDocument();
+    expect(screen.getByText("2 decided")).toBeInTheDocument();
+    // The artifact digest is the run's only identity -- show enough of it to
+    // match against the file on disk.
+    expect(screen.getByText("f5019b0271c6")).toBeInTheDocument();
+  });
+
+  it("takes an extractor run to the offers it produced, not to a graph", async () => {
+    const onSelect = vi.fn();
+    listRows.mockResolvedValue(listResponse([
+      { artifact_sha256: "abc123def456789", generated_at: "2026-08-18T15:48:32Z", offers: 2, waiting: 2 },
+    ], "extractor"));
+    render(<Explorer onSelectDiscovery={onSelect} onOpenRawDb={() => {}} />);
+    fireEvent.click(await screen.findByRole("tab", { name: /Extractor runs/ }));
+    fireEvent.click((await screen.findByText(/2 candidates/)).closest("li")!);
+    expect(onSelect).toHaveBeenCalledWith(expect.objectContaining({ artifact_sha256: "abc123def456789" }), "extractor");
   });
 
   it("activates a row from the keyboard", async () => {
@@ -152,7 +162,8 @@ describe("Explorer", () => {
 describe("rowKey", () => {
   it("keys each tab's rows by that tab's own id column", () => {
     expect(rowKey("discoveries", { item_id: 7 }, 0)).toBe("discoveries:7");
-    expect(rowKey("interests", { id: 3 }, 0)).toBe("interests:3");
+    expect(rowKey("generations", { id: 3 }, 0)).toBe("generations:3");
+    expect(rowKey("extractor", { artifact_sha256: "deadbeef" }, 0)).toBe("extractor:deadbeef");
     expect(rowKey("failed", { node_id: 9 }, 0)).toBe("failed:9");
   });
 

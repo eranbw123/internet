@@ -235,14 +235,66 @@ class ObservatoryListTests(unittest.IsolatedAsyncioTestCase):
         r = await self._get("/observatory/api/list?tab=discoveries&search=zz_yy%25xx")
         self.assertEqual(r.json()["total"], 0)
 
-    async def test_interests_tab(self):
+    async def test_extractor_runs_tab(self):
+        """The explorer's Interests tab is now Extractor runs.
+
+        Nothing records an extractor invocation, so a run is reconstructed by
+        grouping the offers that share an artifact -- see
+        db.py's _extractor_runs_query. What this pins is that the grouping
+        really is per-run: two artifacts must come back as two rows with their
+        own counts, not as one row or as five separate offers.
+        """
+        raw = sqlite3.connect(self.db_path)
+        raw.executescript(
+            """
+            INSERT INTO interest_offers
+                (key, kind, title, description, score, status, artifact_sha256,
+                 generated_at, created_at)
+            VALUES
+                ('o-a1', 'new', 'A one', '', 0.90, 'offered',  'sha-aaa', '2026-08-18T10:00:00Z', '2026-08-18T10:05:00Z'),
+                ('o-a2', 'new', 'A two', '', 0.70, 'accepted', 'sha-aaa', '2026-08-18T10:00:00Z', '2026-08-18T10:05:00Z'),
+                ('o-a3', 'new', 'A three', '', 0.60, 'rejected','sha-aaa', '2026-08-18T10:00:00Z', '2026-08-18T10:05:00Z'),
+                ('o-b1', 'new', 'B one', '', 0.50, 'offered',  'sha-bbb', '2026-08-18T12:00:00Z', '2026-08-18T12:30:00Z');
+            """
+        )
+        raw.commit()
+        raw.close()
+
+        body = (await self._get("/observatory/api/list?tab=extractor")).json()
+        # This class shares one fixture database across its tests, so assert
+        # against the rows this test inserted rather than against the total.
+        shas = [r["artifact_sha256"] for r in body["rows"]]
+        self.assertIn("sha-aaa", shas)
+        self.assertIn("sha-bbb", shas)
+        self.assertEqual(shas.count("sha-aaa"), 1, "three offers, one artifact, one run")
+        # Newest run first: generated_at is the extractor's own stamp.
+        self.assertLess(shas.index("sha-bbb"), shas.index("sha-aaa"))
+        older = next(r for r in body["rows"] if r["artifact_sha256"] == "sha-aaa")
+        self.assertEqual(older["offers"], 3)
+        self.assertEqual(older["waiting"], 1)
+        self.assertEqual(older["accepted"], 1)
+        self.assertEqual(older["rejected"], 1)
+        self.assertEqual(older["top_score"], 0.90)
+        # imported_at is the earliest row the import wrote, which is what the
+        # `offers:artifact:<sha>` stamp in service_state records too.
+        self.assertEqual(older["imported_at"], "2026-08-18T10:05:00Z")
+
+    async def test_extractor_runs_can_be_searched_by_artifact(self):
+        raw = sqlite3.connect(self.db_path)
+        raw.execute(
+            "INSERT INTO interest_offers (key, kind, title, description, score, status,"
+            " artifact_sha256, generated_at, created_at) VALUES"
+            " ('o-c1', 'new', 'C one', '', 0.4, 'offered', 'sha-ccc', '2026-08-18T09:00:00Z', '2026-08-18T09:01:00Z')"
+        )
+        raw.commit()
+        raw.close()
+        body = (await self._get("/observatory/api/list?tab=extractor&search=sha-ccc")).json()
+        self.assertEqual(body["total"], 1)
+        self.assertEqual(body["rows"][0]["artifact_sha256"], "sha-ccc")
+
+    async def test_the_removed_interests_tab_is_refused_rather_than_silently_empty(self):
         r = await self._get("/observatory/api/list?tab=interests")
-        self.assertEqual(r.status_code, 200)
-        rows = r.json()["rows"]
-        self.assertEqual(len(rows), 1)
-        self.assertEqual(rows[0]["key"], "fixture-interest")
-        self.assertEqual(rows[0]["missions_count"], 3)
-        self.assertEqual(rows[0]["discoveries_count"], 3)
+        self.assertEqual(r.status_code, 400)
 
     async def test_generations_tab(self):
         r = await self._get("/observatory/api/list?tab=generations")
@@ -1476,22 +1528,14 @@ class ObservatoryInterestFilteringTests(unittest.IsolatedAsyncioTestCase):
         actives = [bool(r["active"]) for r in rows]
         self.assertEqual(actives, sorted(actives, reverse=True), "inactive interests sorted above active ones")
 
-    async def test_interests_tab_can_filter_by_active_state(self):
-        raw = sqlite3.connect(self.db_path)
-        raw.execute("UPDATE interests SET active = 0 WHERE id = (SELECT MIN(id) FROM interests)")
-        raw.commit()
-        total = raw.execute("SELECT COUNT(*) FROM interests").fetchone()[0]
-        raw.close()
-
-        active = (await self.ds.client.get("/observatory/api/list?tab=interests&active=yes")).json()
-        inactive = (await self.ds.client.get("/observatory/api/list?tab=interests&active=no")).json()
-        self.assertEqual(inactive["total"], 1)
-        self.assertEqual(active["total"] + inactive["total"], total)
-        self.assertTrue(all(r["active"] == 0 for r in inactive["rows"]))
-
-    async def test_unknown_active_value_is_ignored_rather_than_erroring(self):
-        total = (await self.ds.client.get("/observatory/api/list?tab=interests")).json()["total"]
-        body = (await self.ds.client.get("/observatory/api/list?tab=interests&active=maybe")).json()
+    async def test_a_filter_the_extractor_tab_does_not_have_is_ignored(self):
+        """The explorer's Interests tab -- and with it the active-state filter
+        this class used to cover -- is gone; the interests workspace owns that
+        surface now. What survives is the rule the old test was really about:
+        an unrecognised filter is dropped rather than 500ing or silently
+        emptying the result set."""
+        total = (await self.ds.client.get("/observatory/api/list?tab=extractor")).json()["total"]
+        body = (await self.ds.client.get("/observatory/api/list?tab=extractor&active=maybe")).json()
         self.assertEqual(body["total"], total)
 
     async def test_interests_endpoint_is_not_swallowed_by_the_interest_key_route(self):
@@ -1852,6 +1896,35 @@ class ObservatoryThemeTokenTests(unittest.TestCase):
         self.assertGreaterEqual(self.contrast(self.light["--ok"], "#ffffff"), self.TEXT)
         self.assertGreaterEqual(self.contrast(self.light["--active-text"], "#ffffff"), self.TEXT)
         self.assertGreaterEqual(self.contrast(self.light["--fg-faint"], "#ffffff"), self.TEXT)
+
+    def test_the_mobile_breakpoint_is_defined_once(self):
+        """One definition of "mobile", read by both the JS and the CSS.
+
+        useIsMobile.ts drives which layout React renders (a bottom tab bar and
+        one pane at a time, or the three-pane desktop shell) and the two
+        stylesheets drive how that layout is painted. If the query strings
+        disagree, a viewport in the gap gets React's phone markup with the
+        desktop stylesheet, or the reverse -- half of each layout, which is
+        exactly the failure this pins. The JS reads the query through
+        matchMedia rather than keeping its own pixel constant; this asserts the
+        CSS copies say the same thing.
+        """
+        root = os.path.join(self._HERE, "observatory", "frontend", "src")
+        ts = self._read(os.path.join(root, "useIsMobile.ts"))
+        m = re.search(r'MOBILE_MEDIA_QUERY\s*[:=][^"]*"([^"]+)"', ts, re.S)
+        self.assertIsNotNone(m, "useIsMobile.ts no longer declares MOBILE_MEDIA_QUERY as a literal")
+        query = m.group(1)
+        # It has to actually cover a phone held both ways: an iPhone 15 is
+        # 393x852 upright and 852x393 on its side, and only the second clause
+        # catches the second of those.
+        self.assertIn("max-width: 768px", query)
+        self.assertIn("max-height: 500px", query)
+        for name in ("styles.css", os.path.join("interests", "interests.css")):
+            css = self._read(os.path.join(root, name))
+            self.assertIn(
+                "@media %s" % query, css,
+                "%s does not carry the same mobile breakpoint as useIsMobile.ts (%r)" % (name, query),
+            )
 
     def test_no_colour_literal_survives_outside_tokens_css(self):
         """The migration's finish line, kept as a guard.

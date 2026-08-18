@@ -29,6 +29,7 @@ import { useState } from "react";
 import type { EvidenceQuote, InterestEdge, Offer, ScoreTerms } from "./types";
 import { SCORE_TERM_WEIGHTS, retireTargetKey } from "./types";
 import { BidiText, Quote, guessLang } from "./Bidi";
+import { useIsMobile } from "../useIsMobile";
 import { exactTitle, formatDay } from "../time";
 
 /** How many quotes are visible before the expander. Three is enough to show a
@@ -124,6 +125,7 @@ interface TermsProps {
  * value as a bar, its weight, and the product it contributes. The products sum
  * to the composite shown on the card. */
 export function ScoreTermsBreakdown({ terms, score }: TermsProps) {
+  const isMobile = useIsMobile();
   const rows = SCORE_TERM_WEIGHTS
     .map(({ term, weight, label }) => ({
       label, weight,
@@ -134,12 +136,14 @@ export function ScoreTermsBreakdown({ terms, score }: TermsProps) {
 
   const total = rows.reduce((s, r) => s + r.weight * r.value, 0);
 
-  return (
-    <section className="prov-section">
-      <h4 className="prov-heading">
-        Why it ranks {score !== null ? dec2(score) : ""}
-        <span className="prov-count">weight x value</span>
-      </h4>
+  const heading = (
+    <>
+      Why it ranks {score !== null ? dec2(score) : ""}
+      <span className="prov-count">weight x value</span>
+    </>
+  );
+  const body = (
+    <>
       <ul className="prov-terms">
         {rows.map((r) => (
           <li className="prov-term" key={r.label}>
@@ -162,6 +166,25 @@ export function ScoreTermsBreakdown({ terms, score }: TermsProps) {
         <strong>{total.toFixed(3).replace(/^0/, "")}</strong>
         <span className="prov-muted">rounds to {dec2(total)}</span>
       </div>
+    </>
+  );
+
+  // On a phone this arithmetic sits between the quotes -- which the owner
+  // reads -- and Accept/Reject, which they came to press. It is the one part
+  // of the card that is analyst detail rather than sofa reading, so it folds
+  // away there and stays open everywhere else.
+  if (isMobile) {
+    return (
+      <details className="prov-section prov-fold">
+        <summary className="prov-heading">{heading}</summary>
+        {body}
+      </details>
+    );
+  }
+  return (
+    <section className="prov-section">
+      <h4 className="prov-heading">{heading}</h4>
+      {body}
     </section>
   );
 }

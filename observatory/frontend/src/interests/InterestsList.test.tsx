@@ -113,4 +113,58 @@ describe("InterestsList", () => {
     fireEvent.click(within(row).getByText("Edit"));
     expect(onEdit).toHaveBeenCalledWith(expect.objectContaining({ key: "nbis-nebius" }));
   });
+
+  it("opens the editor from anywhere on the row, not just the Edit button", () => {
+    // A 38x25 button in the last column was the only way in, which on a phone
+    // is the hardest thing on the screen to hit.
+    const { onEdit } = renderList();
+    fireEvent.click(within(screen.getByTestId("interest-row-nbis-nebius")).getByText("NBIS / Nebius"));
+    expect(onEdit).toHaveBeenCalledWith(expect.objectContaining({ key: "nbis-nebius" }));
+  });
+
+  it("opens the editor from the keyboard on a focused row", () => {
+    const { onEdit } = renderList();
+    fireEvent.keyDown(screen.getByTestId("interest-row-nbis-nebius"), { key: "Enter" });
+    expect(onEdit).toHaveBeenCalledWith(expect.objectContaining({ key: "nbis-nebius" }));
+  });
+
+  it("keeps the row a table row for a screen reader", () => {
+    // The click shortcut must not cost the table its structure -- a
+    // role="button" on the <tr> would take every row and cell relationship
+    // away from assistive tech in exchange for a convenience.
+    renderList();
+    expect(screen.getByTestId("interest-row-nbis-nebius").getAttribute("role")).toBeNull();
+  });
+
+  it("asks before stopping an interest, and names the one it will stop", () => {
+    const { onRetire } = renderList();
+    const row = screen.getByTestId("interest-row-nbis-nebius");
+    fireEvent.click(within(row).getByText("Stop"));
+    expect(onRetire).not.toHaveBeenCalled();
+    expect(within(row).getByText(/Stop collecting/)).toBeInTheDocument();
+    expect(within(row).getByText("NBIS / Nebius", { selector: "strong" })).toBeInTheDocument();
+    fireEvent.click(within(row).getByText("Stop it"));
+    expect(onRetire).toHaveBeenCalledWith(expect.objectContaining({ key: "nbis-nebius" }));
+  });
+
+  it("lets the confirmation be backed out of", () => {
+    const { onRetire } = renderList();
+    const row = screen.getByTestId("interest-row-nbis-nebius");
+    fireEvent.click(within(row).getByText("Stop"));
+    fireEvent.click(within(row).getByText("Cancel"));
+    expect(onRetire).not.toHaveBeenCalled();
+    expect(within(row).getByText("Stop")).toBeInTheDocument();
+  });
+
+  it("does not open the editor when the row's own buttons are pressed", () => {
+    // The row is a click target now, so every control inside it has to stop
+    // the event or the editor opens behind whatever action was pressed.
+    const { onEdit, onRetire } = renderList();
+    const row = screen.getByTestId("interest-row-nbis-nebius");
+    fireEvent.click(within(row).getByText("Stop"));
+    expect(onEdit).not.toHaveBeenCalled();
+    fireEvent.click(within(row).getByText("Cancel"));
+    expect(onEdit).not.toHaveBeenCalled();
+    expect(onRetire).not.toHaveBeenCalled();
+  });
 });

@@ -551,20 +551,114 @@ class ObservatoryE2EMobileTests(_E2EFixture, unittest.TestCase):
 
     # -- iPhone-width pass ----------------------------------------------------
 
-    def test_06_iphone_viewport_drawer_and_sheet(self):
+    def test_06_iphone_viewport_bottom_nav_and_pane_switcher(self):
+        """The phone shell: a bottom tab bar, and one pane at a time.
+
+        This replaces an off-canvas drawer plus a bottom sheet. That model
+        opened the app on an empty graph canvas reading "Select a discovery
+        from the list" -- the list itself being hidden behind a 32x26
+        hamburger -- and once the sheet was dismissed there was no visible way
+        back to it. What is asserted here is the shape of the replacement:
+        content on the first screen, five destinations always reachable, and a
+        switcher that advances by itself as you drill in, so it doubles as the
+        way back.
+        """
         self.set_viewport(IPHONE_VIEWPORT)
         self.navigate("/observatory/")
         self.wait_for("!!document.querySelector('[data-testid=\"app\"]')")
         self.assertTrue(self.js("document.querySelector('[data-testid=\"app\"]').className.includes('mobile')"))
-        # explorer starts closed (a drawer), opens via the header toggle
-        self.assertFalse(self.js("document.querySelector('.pane-explorer').classList.contains('open')"))
-        self.click(".drawer-toggle")
-        self.wait_for("document.querySelector('.pane-explorer').classList.contains('open')")
-        self.wait_for("document.querySelectorAll('.explorer-row').length > 0")
+
+        # The first screen carries content, not an empty canvas.
+        self.wait_for("document.querySelectorAll('.explorer-row').length > 0",
+                      message="the phone opened straight onto results")
+
+        self.assertEqual(
+            self.js("[...document.querySelectorAll('.mobile-nav-item')].map(b => b.dataset.surface)"),
+            ["explore", "interests", "offers", "connections", "compare"],
+        )
+
+        # Picking a result advances the switcher to the trace...
         self.click(".explorer-row")
+        self.wait_for("document.querySelector('[data-pane=\"graph\"]').getAttribute('aria-selected') === 'true'",
+                      message="selecting a result moved the phone to the trace pane")
         self.wait_for("document.querySelectorAll('.node-card').length > 0")
+
+        # ...and picking a node advances it again, to the inspector.
         self.click(".node-card")
-        self.wait_for("document.querySelector('[data-testid=\"bottom-sheet\"]')?.classList.contains('open')")
+        self.wait_for("document.querySelector('[data-pane=\"details\"]').getAttribute('aria-selected') === 'true'",
+                      message="selecting a node moved the phone to the details pane")
+        self.wait_for("!!document.querySelector('[data-testid=\"inspector\"]')")
+
+        # The switcher is the way back -- the results pane kept its rows.
+        self.click('[data-pane="results"]')
+        self.wait_for("document.querySelectorAll('.explorer-row').length > 0")
+
+        # The offers inbox is one tap from anywhere, which is the whole point
+        # of the tab bar.
+        self.click('[data-surface="offers"]')
+        self.wait_for("!!document.querySelector('[data-testid=\"interests-workspace\"]')",
+                      message="the tab bar reached the offers inbox in one tap")
+
+    def test_06d_phone_never_scrolls_sideways_and_can_be_tapped(self):
+        """Two things a phone layout has to get right, measured rather than
+        eyeballed, on every surface the tab bar reaches.
+
+        Both were broken before: the explorer's interest filter <select> took
+        its width from its longest option (461px inside a 319px pane) and the
+        interests table was 870px wide in a 359px container, so the page itself
+        scrolled sideways; and 87 controls on the interests screen alone were
+        under the 44x44 tap floor, the smallest being 68x16 filter chips.
+
+        The floor asserted here is 36px rather than 44px, and it skips inline
+        text links: a <button> inside running prose cannot be made 44px tall
+        without wrecking the paragraph, so those get an overlaid hit area
+        instead (see .link-button::after in interests.css), which a bounding
+        box cannot see.
+        """
+        self.set_viewport(IPHONE_VIEWPORT)
+        self.navigate("/observatory/?interests=mock")
+        self.wait_for("!!document.querySelector('[data-testid=\"app\"]')")
+
+        probe = (
+            "(() => {"
+            "  const small = [...document.querySelectorAll('button,select,input,[role=\"tab\"]')]"
+            "    .filter(el => {"
+            "      if (el.classList.contains('link-button')) return false;"
+            "      if (el.classList.contains('connection-link')) return false;"
+            "      if (el.classList.contains('connection-showall')) return false;"
+            "      if (el.type === 'checkbox' || el.type === 'range') return false;"
+            "      if (el.closest('.react-flow')) return false;"
+            "      const r = el.getBoundingClientRect();"
+            "      if (!r.width && !r.height) return false;"
+            "      return r.height < 36 || r.width < 36;"
+            "    })"
+            "    .map(el => el.tagName + '.' + (el.className || '') + ' '"
+            "               + Math.round(el.getBoundingClientRect().width) + 'x'"
+            "               + Math.round(el.getBoundingClientRect().height));"
+            "  return JSON.stringify({"
+            "    scrollW: document.documentElement.scrollWidth,"
+            "    clientW: document.documentElement.clientWidth,"
+            "    small,"
+            "  });"
+            "})()"
+        )
+
+        for surface in ("explore", "interests", "offers", "connections", "compare"):
+            self.click(f'[data-surface="{surface}"]')
+            self.wait_for(
+                f"document.querySelector('[data-surface=\"{surface}\"]').getAttribute('aria-current') === 'page'"
+            )
+            time.sleep(1.0)
+            report = json.loads(self.js(probe))
+            self.assertLessEqual(
+                report["scrollW"], report["clientW"],
+                f"the {surface} surface makes the page scroll sideways: "
+                f"{report['scrollW']}px of content in a {report['clientW']}px viewport",
+            )
+            self.assertEqual(
+                report["small"], [],
+                f"controls under the tap floor on the {surface} surface: {report['small']}",
+            )
 
     def test_06b_mobile_lands_zoomed_in_enough_to_read(self):
         """A phone must not open on the unreadable fit-all view.
@@ -574,11 +668,15 @@ class ObservatoryE2EMobileTests(_E2EFixture, unittest.TestCase):
         even fit -- which rendered 220px cards 22px wide. The initial fit now
         frames the emphasized path (~7 nodes) with a zoom floor, and focus mode
         defaults on for phones.
+
+        Since the phone layout landed, the pipeline is also laid out DOWN
+        rather than RIGHT there (elkLayout.ts), which is what finally lets the
+        fit succeed instead of clamping: a trace is about one card wide that
+        way, so it frames at roughly full size.
         """
         self.set_viewport(IPHONE_VIEWPORT)
         self.navigate("/observatory/")
         self.wait_for("!!document.querySelector('[data-testid=\"app\"]')")
-        self.click(".drawer-toggle")
         self.wait_for("document.querySelectorAll('.explorer-row').length > 0")
         self.click(".explorer-row")
         self.wait_for("document.querySelectorAll('.node-card').length > 0")

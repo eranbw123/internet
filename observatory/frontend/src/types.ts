@@ -171,7 +171,7 @@ export interface ModelCallCompareResponse {
 
 export type CompareResponse = RunCompareResponse | ModelCallCompareResponse;
 
-export type Tab = "discoveries" | "interests" | "generations" | "missions" | "failed";
+export type Tab = "discoveries" | "extractor" | "generations" | "missions" | "failed";
 
 // Bootstrap payload embedded by plugin.py's _shell_html() as
 // <script id="observatory-bootstrap" type="application/json">...</script>,
