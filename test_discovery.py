@@ -8449,6 +8449,49 @@ def _candidate(**overrides):
     return base
 
 
+# Distinct enough to survive near-duplicate suppression: every candidate's
+# signal tokens are disjoint from every other's. `_candidate(key=...)` alone is
+# NOT distinct -- it keeps the shared title and signals, which is exactly the
+# near-duplicate case, so a test that wants N separate offers must use this.
+_DISTINCT_THEMES = [
+    ("orexin-wakefulness", "Orexin wakefulness", ["orexin", "hypocretin"]),
+    ("perovskite-tandem", "Perovskite tandem cells", ["perovskite", "tandem"]),
+    ("mitochondrial-uncoupling", "Mitochondrial uncoupling", ["mitochondria", "uncoupling"]),
+    ("harbour-dredging", "Harbour dredging", ["dredging", "harbour"]),
+    ("basque-linguistics", "Basque linguistics", ["basque", "euskara"]),
+    ("lattice-cryptography", "Lattice cryptography", ["lattice", "kyber"]),
+    ("sourdough-fermentation", "Sourdough fermentation", ["sourdough", "levain"]),
+    ("tokamak-confinement", "Tokamak confinement", ["tokamak", "stellarator"]),
+    ("gregorian-chant", "Gregorian chant", ["gregorian", "plainsong"]),
+    ("mangrove-restoration", "Mangrove restoration", ["mangrove", "estuary"]),
+    ("cuneiform-tablets", "Cuneiform tablets", ["cuneiform", "sumerian"]),
+    ("hydrofoil-ferries", "Hydrofoil ferries", ["hydrofoil", "catamaran"]),
+    ("volcanic-tephra", "Volcanic tephra", ["tephra", "pyroclastic"]),
+    ("bookbinding-vellum", "Bookbinding vellum", ["bookbinding", "vellum"]),
+    ("axolotl-regeneration", "Axolotl regeneration", ["axolotl", "blastema"]),
+    ("permafrost-methane", "Permafrost methane", ["permafrost", "clathrate"]),
+]
+
+
+def _distinct_candidates(n, **overrides):
+    """`n` candidates that share no signal tokens, each comfortably over the
+    floors, in descending score order (recency_days is the tie-breaker)."""
+    assert n <= len(_DISTINCT_THEMES), "add more themes to _DISTINCT_THEMES"
+    out = []
+    for i, (key, title, signals) in enumerate(_DISTINCT_THEMES[:n]):
+        base = dict(
+            key=key, title=title, positive_signals=signals, negative_signals=[],
+            description=f"{title} -- research thread.",
+            durability={"n_convs": 8, "active_months": 4, "recency_days": i},
+            evidence=[{"date": "2026-08-01", "quote": f"{title} question", "lang": "en",
+                       "depth": 0.7, "conversation_id": f"chatgpt:{9000 + i}"}],
+            similarity_to_existing=[],
+        )
+        base.update(overrides)
+        out.append(_candidate(**base))
+    return out
+
+
 def _artifact(candidates, version=2, generated_at="2026-08-17T00:00:00Z"):
     return {
         "contract_version": version,
@@ -8554,14 +8597,16 @@ class OfferRankingTests(unittest.TestCase):
         self.assertFalse(ok)
         self.assertIn("below floor", why)
 
-    def test_rank_caps_the_run_and_reserves_the_serendipity_slot(self):
-        scored = [dict(_candidate(key=f"k{i}"), score=0.9 - i * 0.01) for i in range(8)]
+    def test_rank_caps_the_run_at_the_inbox_target_and_reserves_the_serendipity_slot(self):
+        scored = [dict(_candidate(key=f"k{i}"), score=0.9 - i * 0.01) for i in range(14)]
         scored.append(dict(_candidate(key="wildcard", exploratory=True), score=0.46))
         chosen = offers.rank(scored, offers.DEFAULT_RULES)
         keys = [c["key"] for c in chosen]
-        self.assertEqual(len(keys), 5)                     # inbox stays a 2-minute decision
+        # The cap is the inbox target -- the owner asked for ten suggestions,
+        # so ten is what a full run fills.
+        self.assertEqual(len(keys), offers.DEFAULT_RULES.target_inbox_size)
         self.assertIn("wildcard", keys)                     # the reserved slot
-        self.assertEqual(keys[:4], ["k0", "k1", "k2", "k3"])
+        self.assertEqual(keys[:9], [f"k{i}" for i in range(9)])
 
     def test_rank_is_deterministic_on_ties(self):
         scored = [dict(_candidate(key=k), score=0.6) for k in ("zeta", "alpha", "mid")]
@@ -8796,18 +8841,20 @@ class OfferStoreTests(unittest.TestCase):
         self.assertEqual(interests.load_blocked(interests_path)[0], "crypto")
         self.assertIn("binding-of-isaac-progression", interests.load_blocked(interests_path))
 
-    def test_at_most_five_offers_per_run_reach_the_inbox(self):
-        many = [
-            _candidate(key=f"theme-{i}", title=f"Theme {i}",
-                       positive_signals=[f"theme{i}"],
-                       durability={"n_convs": 8, "active_months": 4, "recency_days": i})
-            for i in range(9)
-        ]
-        path = self._write_artifact(_artifact(many))
+    def test_a_run_fills_the_inbox_to_the_target_and_stops(self):
+        # Thirteen candidates with genuinely distinct signals -- distinct
+        # matters, because near-duplicates are suppressed rather than counted
+        # (see the near-duplicate tests below).
+        path = self._write_artifact(_artifact(_distinct_candidates(13)))
         summary = offers.import_artifact(self.conn, path, now=OFFER_NOW)
-        self.assertEqual(summary["offered"], 5)
-        self.assertEqual(summary["not_selected"], 4)
-        self.assertEqual(len(offers.inbox(self.conn)), 5)
+        target = offers.DEFAULT_RULES.target_inbox_size
+        self.assertEqual(summary["offered"], target)
+        self.assertEqual(summary["not_selected"], 13 - target)
+        self.assertEqual(len(offers.inbox(self.conn)), target)
+        self.assertEqual(offers.live_offer_count(self.conn), target)
+        # The ones that did not make it say so, and stay in the artifact.
+        outranked = [r for r in summary["reasons"] if "outranked" in r["why"]]
+        self.assertEqual(len(outranked), 13 - target)
 
     def test_a_v1_artifact_produces_no_offers_and_is_not_re_read(self):
         path = self._write_artifact(
@@ -10446,13 +10493,15 @@ class OfferLearningColdStartTests(unittest.TestCase):
     def test_the_serendipity_slot_is_filled_even_when_it_ranks_last(self):
         strong = [_candidate(key=f"strong-{i}", expected_yield=1.0,
                              durability={"n_convs": 8, "active_months": 4, "recency_days": 0})
-                  for i in range(5)]
+                  for i in range(12)]
         explorer = _candidate(key="one-deliberately-odd-pick", exploratory=True,
                               expected_yield=0.4,
                               durability={"n_convs": 4, "active_months": 2, "recency_days": 40})
         chosen, _skipped = offer_learning.rank(
             strong + [explorer], offer_learning.learn([], now=OFFER_NOW), now=OFFER_NOW)
-        self.assertEqual(len(chosen), 5)                       # the inbox stays a 2-minute job
+        # The learning path ranks through offers.rank(), so it inherits the
+        # inbox target rather than carrying a second copy of the number.
+        self.assertEqual(len(chosen), offers.DEFAULT_RULES.target_inbox_size)
         self.assertIn("one-deliberately-odd-pick", [item.key for item in chosen])
         (slot,) = [item for item in chosen if item.exploratory]
         self.assertIn("serendipity slot", offer_learning.explain(slot))

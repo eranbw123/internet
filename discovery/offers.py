@@ -41,7 +41,8 @@ import json
 import math
 import os
 import re
-from dataclasses import dataclass
+import sqlite3
+from dataclasses import dataclass, replace
 from datetime import datetime, timedelta, timezone
 
 from . import db, matching, personal_state
@@ -143,8 +144,29 @@ class Rules:
     semantic_dup_similarity: float = 0.70
     signal_overlap_attach: float = 0.50
 
-    # Inbox volume: a two-minute ritual, not a feed.
-    max_offers_per_run: int = 5
+    # Dedup between two OFFERS, which is a different question from dedup
+    # between a candidate and an interest -- see _evidence_overlap(). Measured
+    # on the live inbox 2026-08-18: the four duplicate pairs sat at exactly
+    # .50 shared evidence and the nearest distinct pair at .25, a clean 2x gap
+    # with nothing in between, so the bar sits at the bottom of the duplicate
+    # cluster. `min_shared` stops a pair of two-conversation offers tripping
+    # the ratio on a single shared conversation.
+    evidence_overlap_duplicate: float = 0.50
+    evidence_overlap_min_shared: int = 2
+
+    # Inbox volume. `target_inbox_size` is the standing invariant the owner
+    # asked for: the inbox aims to hold this many LIVE offers at all times --
+    # topped up on the hourly import tick and again the moment he decides one,
+    # so working through the inbox refills it instead of draining it. Only
+    # status 'offered' counts (see live_offer_count).
+    #
+    # `max_offers_per_run` is the per-run burst cap and is deliberately equal
+    # to the target: a cap BELOW the target would just mean the inbox fills in
+    # two steps inside one tick, which is two numbers describing one rule.
+    # Both budgets are additionally clamped to the room left under the target,
+    # so neither an import nor a top-up can overshoot it.
+    target_inbox_size: int = 10
+    max_offers_per_run: int = 10
     serendipity_slots: int = 1
 
     # Offer clocks, in days.
@@ -320,6 +342,78 @@ def passes_floors(candidate, score, rules=None):
     return True, ""
 
 
+def evidence_conversations(row):
+    """Every conversation id an offer or candidate rests on, from both places
+    the contract puts them: the `source_conversations` list and the per-quote
+    `conversation_id` on each evidence entry."""
+    ids = set()
+    raw = row.get("source_conversations") or []
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw or "[]")
+        except ValueError:
+            raw = []
+    ids |= {str(c) for c in raw if c}
+    evidence = row.get("evidence") or []
+    if isinstance(evidence, str):
+        try:
+            evidence = json.loads(evidence or "[]")
+        except ValueError:
+            evidence = []
+    for entry in evidence:
+        if isinstance(entry, dict) and entry.get("conversation_id"):
+            ids.add(str(entry["conversation_id"]))
+    return ids
+
+
+def _evidence_overlap(a_convs, b_convs):
+    """(share, shared) -- the share of the SMALLER side's conversations that
+    both sides rest on.
+
+    This is the dedup layer that judges one offer against another, and it is
+    deliberately NOT lexical. Two offers written from the same handful of
+    conversations are the same idea however differently the producer worded
+    them, and two offers with similar words drawn from different conversations
+    usually are not. Measured on the live inbox (2026-08-18, all 45 pairs of
+    the 10 offers), this separates the four duplicate pairs at .50 from the
+    nearest distinct pair at .25 with nothing in between -- while the repo's
+    lexical rule found only two of the four:
+
+      * 'extraction-shooters-competitive-fps' vs 'competitive-shooter-
+        performance' overlap only .35 lexically, yet both come out of the same
+        aim-training and mouse-sensitivity conversations.
+      * 'roguelike-souls-run-design' vs 'game-systems-theorycrafting' share no
+        key token at all, yet both describe tear-delay stat math and build
+        interaction, from the same two conversations.
+
+    And it correctly leaves alone the pair that only LOOKS duplicate:
+    'roguelike-souls-run-design' vs 'roguelike-run-progression-design' share a
+    key stem but just one conversation, and are two real interests.
+
+    Being evidence-based it is also language-independent, which a quarter of
+    this corpus needs -- token overlap is least reliable exactly on the Hebrew
+    conversations.
+    """
+    if not a_convs or not b_convs:
+        return 0.0, 0
+    shared = a_convs & b_convs
+    return len(shared) / min(len(a_convs), len(b_convs)), len(shared)
+
+
+def _similarity_to(candidate, key):
+    """The producer's similarity between this candidate and one named key, 0
+    when it reported none. The producer scores similarity against the INTEREST
+    set, so this is usually 0 for an offer peer -- it is read anyway so that
+    the rare case where a peer's key does appear (a theme that was an interest
+    when the artifact was generated) is honoured rather than ignored."""
+    sims = [
+        _as_number(entry.get("sim", entry.get("similarity")), 0.0)
+        for entry in candidate.get("similarity_to_existing") or []
+        if isinstance(entry, dict) and entry.get("key") == key
+    ]
+    return max(sims) if sims else 0.0
+
+
 def max_similarity(candidate):
     """The strongest similarity the producer reported against any existing
     interest, 0 when it reported none."""
@@ -464,33 +558,48 @@ def add_offer_event(conn, key, actor, action, from_status=None, to_status=None, 
 def insert_offer(conn, offer, *, actor=IMPORTER, now=None):
     """Create one offer row at status 'proposed' and log its birth. Returns
     the stored offer, or None when the key already exists -- re-importing an
-    artifact must never duplicate or mutate a decided offer."""
+    artifact must never duplicate or mutate a decided offer.
+
+    The read-then-insert is checked twice: once here, and once by the UNIQUE
+    index on `key`. The second check is the one that matters now that an hourly
+    import and a click-driven top-up can run at the same moment -- between the
+    SELECT and the INSERT, the other run may have offered this very key. That
+    is a legitimate outcome, not a failure: the row exists, which is what both
+    runs wanted, so the loser returns None exactly as if it had lost the SELECT.
+    """
     now = _now(now)
     if get_offer(conn, offer["key"]) is not None:
         return None
-    conn.execute(
-        """
-        INSERT INTO interest_offers
-            (key, kind, title, description, positive_signals, negative_signals,
-             suggested_min_score, suggested_sources, parent_key, related_keys,
-             score, score_terms, evidence, source_conversations, durability,
-             similarity, exploratory, status, artifact_sha256, generated_at, created_at)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-        """,
-        (
-            offer["key"], offer.get("kind", "new"), offer.get("title") or offer["key"],
-            offer.get("description", ""),
-            _dump(offer.get("positive_signals", [])), _dump(offer.get("negative_signals", [])),
-            offer.get("suggested_min_score"),
-            _dump(offer.get("suggested_sources") or ["web_search"]),
-            offer.get("parent_key"), _dump(offer.get("related_keys", [])),
-            offer.get("score"), _dump(offer.get("score_terms", {})),
-            _dump(offer.get("evidence", [])), _dump(offer.get("source_conversations", [])),
-            _dump(offer.get("durability", {})), _dump(offer.get("similarity", [])),
-            1 if offer.get("exploratory") else 0, PROPOSED,
-            offer.get("artifact_sha256", ""), offer.get("generated_at", ""), _stamp(now),
-        ),
+    columns = (
+        offer["key"], offer.get("kind", "new"), offer.get("title") or offer["key"],
+        offer.get("description", ""),
+        _dump(offer.get("positive_signals", [])), _dump(offer.get("negative_signals", [])),
+        offer.get("suggested_min_score"),
+        _dump(offer.get("suggested_sources") or ["web_search"]),
+        offer.get("parent_key"), _dump(offer.get("related_keys", [])),
+        offer.get("score"), _dump(offer.get("score_terms", {})),
+        _dump(offer.get("evidence", [])), _dump(offer.get("source_conversations", [])),
+        _dump(offer.get("durability", {})), _dump(offer.get("similarity", [])),
+        1 if offer.get("exploratory") else 0, PROPOSED,
+        offer.get("artifact_sha256", ""), offer.get("generated_at", ""), _stamp(now),
     )
+    try:
+        conn.execute(
+            """
+            INSERT INTO interest_offers
+                (key, kind, title, description, positive_signals, negative_signals,
+                 suggested_min_score, suggested_sources, parent_key, related_keys,
+                 score, score_terms, evidence, source_conversations, durability,
+                 similarity, exploratory, status, artifact_sha256, generated_at, created_at)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            columns,
+        )
+    except sqlite3.IntegrityError:
+        # Another run offered this key between the SELECT above and this
+        # INSERT. The row exists, which is what both runs wanted.
+        conn.rollback()
+        return None
     conn.commit()
     add_offer_event(
         conn, offer["key"], actor, "propose", None, PROPOSED,
@@ -743,6 +852,294 @@ def _import_state_key(sha):
     return f"offers:artifact:{sha}"
 
 
+# --- the inbox target ----------------------------------------------------------
+#
+# The owner's ask, in his words: "I want interests to like aim to always have 10
+# suggestions ... it should fill automatically to 10 suggested interests. And
+# when I accept or reject, it should run again."
+#
+# Two mechanisms carry that, and they are the same arithmetic run from two
+# places: the hourly `offers --import` tick tops up on a clock, and
+# observatory/manage.py tops up the instant a decision is recorded, so working
+# through the inbox refills it instead of draining it.
+
+TOPUP_STATE_KEY = "offers:topup:last"
+
+
+def live_offer_count(conn):
+    """How many offers the owner is actually being asked to decide right now --
+    the number the target is about.
+
+    ONLY status 'offered' counts. 'snoozed' is deliberately excluded even
+    though a snoozed offer is undecided: the owner said "not now" and the
+    inbox hides it until its timer wakes it, so counting it would leave the
+    inbox he can SEE short by exactly the number of things he chose not to look
+    at. 'proposed' is excluded because it is the momentary state between
+    insert_offer() and offer(), never a resting place. Every decided status
+    (accepted, rejected, expired) is out by definition.
+    """
+    return conn.execute(
+        "SELECT COUNT(*) FROM interest_offers WHERE status = ?", (OFFERED,)
+    ).fetchone()[0]
+
+
+def _reserved_count(conn):
+    """Offers occupying a slot under the target: everything the owner can see,
+    plus the momentary 'proposed' rows a run has just inserted and is about to
+    show.
+
+    Counting 'proposed' is what closes the one window in which two concurrent
+    runs could together overshoot: run A inserts its row, run B counts the
+    inbox before A has transitioned it, and both conclude there is room. This
+    is the budget's number; live_offer_count() stays the owner's number, and
+    the two differ only for the microseconds a promotion is in flight.
+
+    _promote() never leaves a row parked at 'proposed' -- if the transition
+    fails the row is removed again -- so a crashed run cannot leak a slot that
+    nothing would ever fill or free.
+    """
+    return conn.execute(
+        "SELECT COUNT(*) FROM interest_offers WHERE status IN (?, ?)", (PROPOSED, OFFERED)
+    ).fetchone()[0]
+
+
+def _budget(conn, rules, cap=None):
+    """(live, how many offers this run may add). Clamped to the room left under
+    the target, so no single run can overshoot it -- and clamped at zero, so a
+    target that has been lowered never removes anything. Offers are only ever
+    added by a run; they leave only by the owner's decision or by the sweep's
+    timers."""
+    live = live_offer_count(conn)
+    room = max(rules.target_inbox_size - _reserved_count(conn), 0)
+    return live, min(room, rules.max_offers_per_run if cap is None else cap)
+
+
+def _peer(key, title, signals, status, row=None):
+    return {
+        "key": key,
+        "normalized": normalize_key(key),
+        "tokens": signal_tokens(title, signals or []),
+        "status": status,
+        "convs": evidence_conversations(row or {}),
+    }
+
+
+def _pending_peers(conn, rules=None, now=None):
+    """The offers a new candidate must not near-duplicate.
+
+    Undecided offers (proposed/offered/snoozed) are here because two
+    paraphrases of one idea sitting side by side in a ten-slot inbox is the
+    failure this set exists to prevent. Offers rejected inside the block window
+    are here because the owner already said no to that idea, and
+    blocked_offer_keys() only catches an exact token hit -- a rephrasing of a
+    rejected offer would otherwise walk straight back in.
+
+    Accepted offers are NOT here: they became interests, so `existing` already
+    covers them, through the same rules. Expired offers are NOT here either --
+    expiry means "no decision in 45 days", which is not a refusal, and treating
+    it as one would wall a theme off forever on the strength of the owner
+    having been busy.
+    """
+    rules = rules or DEFAULT_RULES
+    since = _stamp(_now(now) - timedelta(days=rules.reject_block_days))
+    rows = conn.execute(
+        """
+        SELECT key, title, positive_signals, status, source_conversations, evidence
+          FROM interest_offers
+         WHERE status IN (?, ?, ?)
+            OR (status = ? AND COALESCE(decided_at, created_at) >= ?)
+        """,
+        (PROPOSED, OFFERED, SNOOZED, REJECTED, since),
+    ).fetchall()
+    return [
+        _peer(r["key"], r["title"], json.loads(r["positive_signals"] or "[]"), r["status"],
+              row={"source_conversations": r["source_conversations"], "evidence": r["evidence"]})
+        for r in rows
+    ]
+
+
+def top_up(conn, path, *, interests_path=None, rules=None, now=None, actor=IMPORTER,
+           trigger="topup"):
+    """Refill the inbox toward `rules.target_inbox_size` from candidates the
+    artifact on disk already holds. Returns a summary; never raises.
+
+    This is import_artifact()'s other half, and the half that makes the inbox
+    self-sustaining. import_artifact() is idempotent on the artifact's sha256 --
+    which is right, because proposing from a NEW artifact and attaching its
+    evidence must happen exactly once -- but that same idempotency is why the
+    inbox could only ever shrink: once an artifact had been imported, nothing
+    looked at it again, and every candidate that ranked below the run's cap sat
+    unused on disk. Measured on production 2026-08-18: 30 candidates in the
+    artifact, 24 of them dropped for no reason but "outranked this run".
+
+    So top_up deliberately does NOT consult the sha. It re-reads the artifact
+    every run and promotes the best still-qualified candidates until the inbox
+    holds `target_inbox_size` live offers. That makes it cheap enough to run on
+    every click: one file read, one JSON parse and pure arithmetic -- no
+    network, no model, no browser, and no LLM call anywhere in the path.
+
+    Every gate still applies, unchanged: the blocklist, the 180-day reject
+    window, both dedup layers against existing interests, near-duplicate
+    suppression against the offers already in the inbox, the durability gate
+    and the score floor. **A short inbox is the correct outcome when nothing
+    else qualifies.** Padding it with a candidate that fails the floors, or
+    with a paraphrase of an offer already sitting there, would be a worse bug
+    than an inbox of six. That case is reported as `exhausted: True`, which is
+    the honest signal that what the inbox needs is new extraction, not more
+    ranking -- and it is reported rather than acted on, because the extractor
+    is a 25-minute browser job and nothing that runs on a click may start one.
+
+    `reason` is set on EVERY path, including every path that adds nothing.
+    Two multi-day outages in this system were jobs that did nothing and
+    reported success; a top-up that ran and added no offers has to say which
+    of "already full", "nothing qualifies" and "I could not read the artifact"
+    it was.
+    """
+    rules = rules or DEFAULT_RULES
+    now = _now(now)
+    live_before = live_offer_count(conn)
+    summary = {
+        "imported": 0, "offered": 0, "skipped_existing": 0, "skipped_floor": 0,
+        "skipped_dedup": 0, "skipped_blocked": 0, "attached": 0, "not_selected": 0,
+        "offers": [], "promoted": [], "reasons": [], "artifact_sha256": "", "error": "",
+        "live_before": live_before, "live_after": live_before,
+        "target": rules.target_inbox_size, "deficit": max(rules.target_inbox_size - live_before, 0),
+        "qualified": 0, "exhausted": False, "trigger": trigger, "reason": "",
+    }
+
+    def done(reason):
+        summary["reason"] = reason
+        summary["live_after"] = live_offer_count(conn)
+        _record_topup(conn, summary)
+        return summary
+
+    if summary["deficit"] <= 0:
+        return done(
+            f"target already met: {live_before} live offer(s) >= target "
+            f"{rules.target_inbox_size}; nothing promoted"
+        )
+
+    try:
+        summary["artifact_sha256"] = artifact_sha256(path)
+    except OSError as e:
+        summary["error"] = f"artifact unreadable: {e}"
+        return done(
+            f"{summary['deficit']} short of the target and the artifact could not be "
+            f"read ({e}) -- nothing promoted"
+        )
+
+    state = personal_state.load_optional(path)
+    if state is None:
+        summary["error"] = "artifact missing, malformed or unsupported version"
+        return done(
+            f"{summary['deficit']} short of the target and the artifact is missing, "
+            f"malformed or an unsupported version -- nothing promoted"
+        )
+    if not state.candidates:
+        summary["exhausted"] = True
+        return done(
+            f"{summary['deficit']} short of the target and the contract_version "
+            f"{state.contract_version} artifact carries no candidates at all -- "
+            f"this needs a new extraction, not more ranking"
+        )
+
+    blocked = blocked_offer_keys(conn, rules, now)
+    if interests_path:
+        try:
+            blocked |= {t.lower() for t in load_blocked(interests_path)}
+        except (OSError, ValueError):
+            pass  # a missing/malformed interests.json must not stop a top-up
+    existing = _existing_interests(conn)
+    existing_offer_keys = {
+        normalize_key(r["key"]) for r in conn.execute("SELECT key FROM interest_offers")
+    }
+
+    pool = _qualify(
+        conn, state, summary["artifact_sha256"], blocked=blocked, existing=existing,
+        existing_offer_keys=existing_offer_keys, rules=rules, now=now,
+        summary=summary, attach=False,       # the attach write belongs to the import
+    )
+    summary["qualified"] = len(pool)
+
+    _, budget = _budget(conn, rules)
+    _promote(
+        conn, pool, budget=budget, rules=rules, actor=actor, now=now,
+        sha=summary["artifact_sha256"], summary=summary, trigger=trigger,
+    )
+
+    live_after = live_offer_count(conn)
+    short = max(rules.target_inbox_size - live_after, 0)
+    summary["exhausted"] = short > 0
+    if summary["offered"] and not short:
+        reason = (
+            f"topped up {summary['offered']} offer(s) -- inbox {live_before} -> "
+            f"{live_after} of {rules.target_inbox_size}: "
+            + ", ".join(summary["offers"])
+        )
+    elif summary["offered"]:
+        reason = (
+            f"topped up {summary['offered']} offer(s) -- inbox {live_before} -> "
+            f"{live_after}, still {short} short of {rules.target_inbox_size}: the "
+            f"artifact is exhausted ({len(state.candidates)} candidates, none of the "
+            f"rest qualify). New extraction is what this needs, not more ranking"
+        )
+    else:
+        reason = (
+            f"{short} short of the target and nothing was promoted: of "
+            f"{len(state.candidates)} candidates in the artifact none qualified "
+            f"(already offered {summary['skipped_existing']}, blocked "
+            f"{summary['skipped_blocked']}, duplicate/near-duplicate "
+            f"{summary['skipped_dedup']}, below the floors {summary['skipped_floor']}). "
+            f"A short inbox is correct here -- new extraction is what this needs"
+        )
+    return done(reason)
+
+
+def _record_topup(conn, summary):
+    """One heartbeat row per top-up, so "did the refill run, and what did it
+    decide" is answerable from the DB rather than from log archaeology. Written
+    on every path, including the ones that promote nothing."""
+    try:
+        db.state_set(conn, TOPUP_STATE_KEY, json.dumps({
+            "at": _stamp(_now()),
+            "trigger": summary.get("trigger"),
+            "live_before": summary.get("live_before"),
+            "live_after": summary.get("live_after"),
+            "target": summary.get("target"),
+            "offered": summary.get("offered"),
+            "offers": summary.get("offers"),
+            "exhausted": summary.get("exhausted"),
+            "error": summary.get("error"),
+            "reason": summary.get("reason"),
+        }, ensure_ascii=False))
+    except Exception:       # noqa: BLE001 -- a heartbeat must never fail a refill
+        pass
+
+
+def top_up_after_decision(conn, path, *, interests_path=None, rules=None, now=None):
+    """The click-driven refill, wrapped so it can never cost the owner his
+    decision.
+
+    The decision is the important write and it is already committed by the time
+    this runs; the refill is best-effort garnish on the same request. So every
+    exception is swallowed here -- a locked DB, a half-written artifact, a
+    disk that just filled -- and reported in the return value instead. The
+    owner taps Accept, the accept stands, and the worst case is an inbox that
+    stays one short until the hourly tick.
+
+    Returns the top_up summary, or a dict carrying `error` when it could not
+    run at all. Never raises.
+    """
+    try:
+        return top_up(conn, path, interests_path=interests_path, rules=rules,
+                      now=now, trigger="decision")
+    except Exception as e:      # noqa: BLE001 -- see the docstring
+        return {
+            "ok": False, "offered": 0, "offers": [], "error": f"{type(e).__name__}: {e}",
+            "reason": "the refill failed; the decision itself is unaffected",
+        }
+
+
 def import_artifact(conn, path, *, interests_path=None, rules=None, now=None, actor=IMPORTER):
     """Turn a contract-v2 artifact's `candidates[]` into offers, exactly once
     per artifact.
@@ -762,7 +1159,9 @@ def import_artifact(conn, path, *, interests_path=None, rules=None, now=None, ac
     summary = {
         "imported": 0, "offered": 0, "skipped_existing": 0, "skipped_floor": 0,
         "skipped_dedup": 0, "skipped_blocked": 0, "attached": 0, "not_selected": 0,
-        "offers": [], "reasons": [], "artifact_sha256": "", "error": "",
+        "offers": [], "promoted": [], "reasons": [], "artifact_sha256": "", "error": "",
+        "live_before": live_offer_count(conn), "live_after": live_offer_count(conn),
+        "target": (rules or DEFAULT_RULES).target_inbox_size,
     }
     try:
         sha = artifact_sha256(path)
@@ -798,7 +1197,45 @@ def import_artifact(conn, path, *, interests_path=None, rules=None, now=None, ac
         normalize_key(r["key"]) for r in conn.execute("SELECT key FROM interest_offers")
     }
 
-    selected_pool = []
+    selected_pool = _qualify(
+        conn, state, sha, blocked=blocked, existing=existing,
+        existing_offer_keys=existing_offer_keys, rules=rules, now=now,
+        summary=summary, attach=True,
+    )
+
+    live_before, budget = _budget(conn, rules)
+    summary["live_before"] = live_before
+    summary["target"] = rules.target_inbox_size
+    _promote(
+        conn, selected_pool, budget=budget, rules=rules, actor=actor, now=now,
+        sha=sha, summary=summary, trigger="import",
+    )
+    summary["live_after"] = live_offer_count(conn)
+
+    db.state_set(conn, _import_state_key(sha), _stamp(now))
+    return summary
+
+
+def _qualify(conn, state, sha, *, blocked, existing, existing_offer_keys,
+             rules, now, summary, attach):
+    """The candidate funnel, shared by import_artifact() and top_up(): every
+    candidate in the artifact is normalized, judged against the blocklist, the
+    existing interests and the floors, and either dropped with a written
+    reason or returned scored.
+
+    `attach` is the one behavioural difference between the two callers. Dedup
+    layer 2 has a side effect -- it writes the candidate's quotes onto the
+    interest that already covers it -- and that belongs to the once-per-artifact
+    import, not to a top-up that may run several times an hour. With
+    attach=False the same verdict is recorded as a reason and nothing is
+    written, so a click-driven refill can never spam interest_events.
+
+    Dedup against PENDING offers is deliberately NOT done here: it depends on
+    the set of offers that exists as each promotion happens, which is
+    _promote's business, so that one run cannot promote two near-duplicates of
+    each other.
+    """
+    pool = []
     existing_keys = {i["key"] for i in existing}
     for raw in state.candidates:
         candidate = _normalize_candidate(raw, sha, state.generated_at)
@@ -823,9 +1260,19 @@ def import_artifact(conn, path, *, interests_path=None, rules=None, now=None, ac
             summary["reasons"].append({"key": key, "why": detail})
             continue
         if verdict == "attach":
-            _attach_evidence(conn, detail["interest_key"], candidate, sha)
-            summary["attached"] += 1
-            summary["reasons"].append({"key": key, "why": detail["why"]})
+            if attach:
+                _attach_evidence(conn, detail["interest_key"], candidate, sha)
+                summary["attached"] += 1
+                summary["reasons"].append({"key": key, "why": detail["why"]})
+            else:
+                summary["skipped_dedup"] += 1
+                summary["reasons"].append({
+                    "key": key,
+                    "why": detail["why"].replace(
+                        "attached as evidence, not offered",
+                        "already covered by that interest, not offered",
+                    ),
+                })
             continue
         if verdict == "duplicate":
             summary["skipped_dedup"] += 1
@@ -839,32 +1286,86 @@ def import_artifact(conn, path, *, interests_path=None, rules=None, now=None, ac
             continue
         candidate["score"] = score
         candidate["score_terms"] = terms
-        selected_pool.append(candidate)
+        pool.append(candidate)
+    return pool
 
-    chosen = rank(selected_pool, rules)
-    chosen_keys = {c["key"] for c in chosen}
-    for candidate in selected_pool:
-        if candidate["key"] not in chosen_keys:
+
+def _promote(conn, pool, *, budget, rules, actor, now, sha, summary, trigger):
+    """Turn the best DISTINCT candidates in `pool` into live offers, up to
+    `budget` of them, and write down what happened to every one that did not
+    make it.
+
+    Two things make this a walk rather than a slice of rank():
+
+    * Distinctness beats the number. Each promotion joins the peer set the
+      next candidate is judged against, so one run can never place two
+      near-duplicates of each other in the inbox -- and when the only
+      candidates left near-duplicate something already there, the run stops
+      SHORT of the target rather than padding it. Ten suggestions containing
+      two duplicate pairs is a worse inbox than eight distinct ones.
+    * The live count is re-read before every insert, so an hourly import and a
+      click-driven top-up racing each other cannot together overshoot the
+      target. They rank the same pool in the same deterministic order, so they
+      choose the same keys, and `interest_offers.key` being UNIQUE makes each
+      one land exactly once -- the loser of a race sees insert_offer() return
+      None and moves on.
+    """
+    peers = list(_pending_peers(conn, rules, now))
+    remaining = budget
+    # rank() is asked for the whole pool in order, not for `budget` of it: the
+    # walk below does the cutting, because a candidate skipped as a duplicate
+    # must let the next one through rather than consuming a slot.
+    for candidate in rank(pool, replace(rules, max_offers_per_run=max(len(pool), 1))):
+        key = candidate["key"]
+        if remaining <= 0:
             summary["not_selected"] += 1
             summary["reasons"].append(
-                {"key": candidate["key"], "why": "outranked this run; the artifact keeps it"}
+                {"key": key, "why": "outranked this run; the artifact keeps it"}
             )
-
-    for candidate in chosen:
+            continue
+        verdict, detail = dedup_verdict(candidate, (), frozenset(), rules, pending=peers)
+        if verdict == "duplicate":
+            summary["skipped_dedup"] += 1
+            summary["reasons"].append({"key": key, "why": detail})
+            continue
+        if _reserved_count(conn) >= rules.target_inbox_size:
+            # A concurrent run filled the inbox while this one was ranking.
+            summary["not_selected"] += 1
+            summary["reasons"].append(
+                {"key": key, "why": "the inbox reached the target before this run offered it"}
+            )
+            continue
         if insert_offer(conn, candidate, actor=actor, now=now) is None:
             summary["skipped_existing"] += 1
+            summary["reasons"].append({"key": key, "why": "another run offered this key first"})
             continue
         summary["imported"] += 1
-        offer(conn, candidate["key"], actor=actor,
-              detail={"score": candidate["score"], "artifact_sha256": sha})
+        try:
+            offer(conn, key, actor=actor, detail={
+                "score": candidate["score"], "artifact_sha256": sha, "trigger": trigger,
+            })
+        except Exception:       # noqa: BLE001 -- re-raised below
+            # Never leave a row parked at 'proposed'. It is invisible to the
+            # owner and yet counts against the target, so it would silently
+            # shrink the inbox by one, for good.
+            conn.execute(
+                "DELETE FROM interest_offers WHERE key = ? AND status = ?", (key, PROPOSED)
+            )
+            conn.commit()
+            raise
         summary["offered"] += 1
-        summary["offers"].append(candidate["key"])
-
-    db.state_set(conn, _import_state_key(sha), _stamp(now))
+        summary["offers"].append(key)
+        summary["promoted"].append({
+            "key": key, "score": candidate["score"],
+            "exploratory": bool(candidate.get("exploratory")),
+        })
+        peers.append(_peer(key, candidate.get("title"),
+                           candidate.get("positive_signals") or [], OFFERED, row=candidate))
+        remaining -= 1
     return summary
 
 
-def dedup_verdict(candidate, existing, blocked, rules=None):
+def dedup_verdict(candidate, existing, blocked, rules=None, pending=()):
     """Three dedup layers, cheapest first (the item pipeline's philosophy):
 
     1. key/slug normalization against the existing interests -- catches an
@@ -878,6 +1379,25 @@ def dedup_verdict(candidate, existing, blocked, rules=None):
        dedup never had; the earlier redesign's dedup bug was exactly this
        gap at the item level.
 
+    `pending` applies those same three layers to offers that are ALREADY in
+    the inbox (see _pending_peers). Until it existed, dedup was semantic
+    against interests but exact-key-only against offers, so two near-duplicate
+    candidates could sit side by side in the inbox -- measured on production
+    2026-08-18, two such pairs were live at once
+    ('concentrated-portfolio-construction' vs
+    'portfolio-construction-conviction-risk', .65 overlap;
+    'handheld-pc-gaming-steamos' vs 'handheld-pc-gaming-linux', .50). That was
+    survivable while the extractor ran by hand and was not survivable once it
+    runs nightly into a ten-slot inbox: every night would add another pair and
+    the owner would reject the same idea again and again.
+
+    A pending peer produces 'duplicate', never 'attach': attaching means
+    writing evidence onto an INTEREST row, and an offer is not an interest --
+    it has no evidence sink and mutating a row the owner is mid-decision on
+    would be the wrong kind of surprise. Suppressing is also the safe verdict
+    with respect to the lifecycle: it only ever declines to create a NEW offer
+    and never touches the peer, so a decided offer still cannot be re-decided.
+
     Returns (verdict, detail) with verdict in ok|blocked|attach|duplicate.
     """
     rules = rules or DEFAULT_RULES
@@ -887,6 +1407,36 @@ def dedup_verdict(candidate, existing, blocked, rules=None):
 
     if key in blocked or normalized in blocked or any(t in blocked for t in tokens):
         return "blocked", "key or signal tokens are blocked (rejected offer or blocklist)"
+
+    for peer in pending:
+        if peer["normalized"] == normalized:
+            return "duplicate", (
+                f"normalizes onto offer {peer['key']!r} (status {peer['status']})"
+            )
+        if tokens and peer["tokens"]:
+            overlap = len(tokens & peer["tokens"]) / len(tokens)
+            if overlap >= rules.signal_overlap_attach:
+                return "duplicate", (
+                    f"{overlap:.0%} signal overlap with offer {peer['key']!r} "
+                    f"(status {peer['status']}): near-duplicate of something already "
+                    f"in the inbox, suppressed rather than offered alongside it"
+                )
+        share, shared = _evidence_overlap(
+            evidence_conversations(candidate), peer.get("convs") or set()
+        )
+        if (share >= rules.evidence_overlap_duplicate
+                and shared >= rules.evidence_overlap_min_shared):
+            return "duplicate", (
+                f"{share:.0%} of its evidence ({shared} conversation(s)) is the same "
+                f"evidence as offer {peer['key']!r} (status {peer['status']}): the same "
+                f"idea in different words, suppressed rather than offered alongside it"
+            )
+        peer_sim = _similarity_to(candidate, peer["key"])
+        if peer_sim >= rules.semantic_dup_similarity:
+            return "duplicate", (
+                f"semantic similarity {peer_sim:.2f} to offer {peer['key']!r} "
+                f"(>= {rules.semantic_dup_similarity:.2f})"
+            )
 
     for interest in existing:
         if interest["normalized"] == normalized and candidate.get("kind") != "revive":
