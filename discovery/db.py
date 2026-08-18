@@ -579,6 +579,9 @@ def notification_id_for_score(conn, score_id):
     return row["id"] if row else None
 
 
+# HELD: n-delivery -- schema/semantics of `feedback` may change under the pending
+# Output Layer decision; read entry 'n-delivery' in C:\Users\eranb\.claude\held\HELD.md
+# before extending feedback writes or building delivery-engagement learning on them.
 def add_feedback(conn, item_id, interest_id, verdict, note="", original_score=None):
     cur = conn.execute(
         """
