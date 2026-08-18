@@ -95,7 +95,14 @@ class Config:
     # batch and the next night resumes -- and stopping map on a deadline is
     # what guarantees `reduce` still gets to run and publish an artifact.
     interest_extract_map_seconds: int = 60 * 60
-    interest_extract_reduce_seconds: int = 20 * 60
+    # 30 minutes, from a measurement rather than a guess: the first end-to-end
+    # run took 13.0m for reduce, of which 12.9m was a single claude.ai
+    # completion (57,723 chars over 435 themes). The extractor's own default
+    # `reduce --timeout` is 900s for that one call, so the stage budget has to
+    # sit comfortably above it -- and the digest pool only grows. A 20-minute
+    # budget would have left about seven minutes of headroom and started
+    # killing a stage that was working.
+    interest_extract_reduce_seconds: int = 30 * 60
     # Immediate discovery delivery (opt-in). Off by default: DISCOVERY items
     # wait for the daily digest, exactly as before. On (DISCOVERY_IMMEDIATE=1),
     # deliver() also pushes freshly-scored above-bar discoveries the moment a
@@ -240,7 +247,7 @@ def load():
             os.environ.get("DISCOVERY_INTEREST_EXTRACT_MAP_SECONDS", str(60 * 60))
         ),
         interest_extract_reduce_seconds=int(
-            os.environ.get("DISCOVERY_INTEREST_EXTRACT_REDUCE_SECONDS", str(20 * 60))
+            os.environ.get("DISCOVERY_INTEREST_EXTRACT_REDUCE_SECONDS", str(30 * 60))
         ),
         immediate_discovery=os.environ.get("DISCOVERY_IMMEDIATE", "").strip().lower()
         in ("1", "true"),
