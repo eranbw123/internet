@@ -18,11 +18,12 @@
  *     about to block.
  */
 import { useState } from "react";
+import { useIsMobile } from "../useIsMobile";
 import type { InterestEdge, Offer } from "./types";
 import { isDecidable, retireTargetKey } from "./types";
 import { BidiText, guessLang } from "./Bidi";
 import { exactTitle, formatDay } from "../time";
-import { OfferProvenance } from "./Provenance";
+import { OfferProvenance, durabilityBits } from "./Provenance";
 
 /** The bar a retirement offer proposes as the alternative to retiring. */
 const LOWER_BAR_TO = 0.78;
@@ -64,6 +65,31 @@ function OfferCard({
   const [confirmingReject, setConfirmingReject] = useState(false);
   const isRetire = offer.kind === "retire";
   const decidable = isDecidable(offer.status);
+  const isMobile = useIsMobile();
+
+  /* On a phone the description and the whole provenance block fold away
+     behind one summary. Measured at 393x852: a single offer ran to 2.4
+     screens, so the inbox at its target of ten was 24 screens of scrolling
+     with the Accept/Reject buttons two screens below every title, and no way
+     to see how many were waiting. Folded, a card is ~250px and the whole
+     queue is three screens you can triage with a thumb; one tap opens the
+     evidence for the one you actually want to read, which is the reading the
+     owner asked to be comfortable rather than the reading he has to scroll
+     past nine times.
+
+     The summary is not a bare "details" label: it carries the durability
+     facts (how many conversations, over how long, how recently), which is the
+     line that answers "is this a real interest or a passing errand?" -- so a
+     folded card still says enough to decide against. */
+  const body = (
+    <>
+      <p className="offer-desc">
+        <BidiText lang={guessLang(offer.description)}>{offer.description}</BidiText>
+      </p>
+      <OfferProvenance offer={offer} edges={edges} />
+    </>
+  );
+  const bits = durabilityBits(offer);
 
   return (
     <article
@@ -98,11 +124,19 @@ function OfferCard({
       <h3 className="offer-title">
         <BidiText lang={guessLang(offer.title)}>{offer.title}</BidiText>
       </h3>
-      <p className="offer-desc">
-        <BidiText lang={guessLang(offer.description)}>{offer.description}</BidiText>
-      </p>
-
-      <OfferProvenance offer={offer} edges={edges} />
+      {isMobile ? (
+        <details className="offer-why">
+          <summary>
+            <span className="offer-why-label">
+              {isRetire ? "Why it is being proposed for retirement" : "Why this one"}
+            </span>
+            {bits.length > 0 && <span className="offer-why-bits">{bits.join(" · ")}</span>}
+          </summary>
+          {body}
+        </details>
+      ) : (
+        body
+      )}
 
       {error && <p className="offer-error" role="alert">{error}</p>}
 
@@ -164,21 +198,32 @@ function OfferCard({
             >
               Accept
             </button>
-            <button type="button" className="btn" disabled={busy} onClick={() => onEdit(offer)}>
-              Edit and accept
-            </button>
-            <button
-              type="button" className="btn" disabled={busy}
-              onClick={() => onDecide({ offer, action: "snooze" })}
-            >
-              Snooze 30d
-            </button>
-            <button
-              type="button" className="btn btn-quiet" disabled={busy}
-              onClick={() => setConfirmingReject(true)}
-            >
-              Reject
-            </button>
+            {/* Accept keeps a full-width row of its own; the other three
+                share one. Four stacked full-width buttons cost 220px of a
+                426px card on a phone, over half of every card in a
+                ten-offer inbox, and the rule they were following ("one
+                consequential decision per full-width button") was written
+                against a wrapped row of 30px buttons. Three across 345px is
+                115x44 each -- comfortably over the tap floor -- and the only
+                destructive one, Reject, already asks again before it blocks
+                anything. */}
+            <div className="offer-buttons-row">
+              <button type="button" className="btn" disabled={busy} onClick={() => onEdit(offer)}>
+                Edit
+              </button>
+              <button
+                type="button" className="btn" disabled={busy}
+                onClick={() => onDecide({ offer, action: "snooze" })}
+              >
+                Snooze 30d
+              </button>
+              <button
+                type="button" className="btn btn-quiet" disabled={busy}
+                onClick={() => setConfirmingReject(true)}
+              >
+                Reject
+              </button>
+            </div>
           </div>
         </footer>
       )}
@@ -198,14 +243,23 @@ export function OffersInbox({ offers, edges, busyId, errors, onDecide, onEdit, l
           that have stopped producing. You accept, reject or snooze each one.
         </p>
         <p className="prov-muted">
-          New suggestions appear after the extractor runs; it proposes at most five per run,
-          so an empty inbox is the normal state rather than a sign something is broken.
+          New suggestions appear after the extractor runs, so an empty inbox is the normal
+          state rather than a sign something is broken.
         </p>
       </div>
     );
   }
   return (
     <div className="offers-inbox" data-testid="offers-inbox">
+      {/* How many are waiting. Without it the inbox is an unbounded scroll:
+          you cannot tell whether you are three offers from the end or
+          thirteen, which is the difference between triaging it now and
+          putting it off. Deliberately derived from the list rather than any
+          per-run cap -- the extractor's ceiling is the extractor's business
+          and has already moved once. */}
+      <p className="offers-count" data-testid="offers-count">
+        <strong>{offers.length}</strong> {offers.length === 1 ? "suggestion" : "suggestions"} waiting
+      </p>
       {offers.map((offer) => (
         <OfferCard
           key={offer.id}

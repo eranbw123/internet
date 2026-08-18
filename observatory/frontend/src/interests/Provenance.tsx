@@ -296,15 +296,20 @@ interface ProvenanceProps {
 
 /** Durability, in the one line that answers "is this a real interest or a
  * passing errand?" -- the distinction the whole generator design turns on. */
-export function DurabilityLine({ offer }: { offer: Offer }) {
+export function durabilityBits(offer: Offer): string[] {
   const d = offer.durability;
-  if (!d || d.n_convs === undefined) return null;
-  const bits = [
+  if (!d || d.n_convs === undefined) return [];
+  return [
     `${d.n_convs} conversations`,
     months(d.active_months),
     d.span_days ? `over ${d.span_days} days` : "",
     d.recency_days !== undefined ? `last one ${d.recency_days} days ago` : "",
-  ].filter(Boolean);
+  ].filter(Boolean) as string[];
+}
+
+export function DurabilityLine({ offer }: { offer: Offer }) {
+  const bits = durabilityBits(offer);
+  if (bits.length === 0) return null;
   return <p className="prov-durability">{bits.join(" · ")}</p>;
 }
 

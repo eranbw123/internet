@@ -1112,6 +1112,48 @@ input[type="range"]::-moz-range-thumb {
 
   /* ---- offers inbox ---------------------------------------------------- */
   .offers-inbox { padding: 12px; gap: 12px; }
+  .offers-count {
+    margin: 0;
+    font-size: 13px;
+    color: var(--fg-muted);
+  }
+  .offers-count strong { color: var(--fg); font-size: 15px; }
+
+  /* The evidence fold. A summary that is a real 44px control and says what is
+     inside it, not a bare triangle. */
+  .offer-why { margin: 6px 0 2px; }
+  .offer-why > summary {
+    display: flex;
+    flex-direction: column;
+    justify-content: center;
+    gap: 2px;
+    min-height: 44px;
+    padding: 6px 10px;
+    border: 1px solid var(--border);
+    border-radius: 8px;
+    background: var(--surface);
+    cursor: pointer;
+    list-style: none;
+  }
+  .offer-why > summary::-webkit-details-marker { display: none; }
+  .offer-why-label {
+    font-size: 13px;
+    font-weight: 600;
+    color: var(--fg);
+  }
+  .offer-why-label::after {
+    content: "›";
+    margin-inline-start: 5px;
+    display: inline-block;
+    transition: transform .15s ease;
+  }
+  .offer-why[open] > summary { margin-bottom: 8px; }
+  .offer-why[open] .offer-why-label::after { content: "⌄"; }
+  .offer-why-bits {
+    font-size: 12px;
+    line-height: 1.35;
+    color: var(--fg-muted);
+  }
   .offer-card { padding: 12px 14px; border-radius: 12px; }
   .offer-title { font-size: 17px; line-height: 1.3; }
   .offer-desc { font-size: 14px; }
@@ -1151,6 +1193,21 @@ input[type="range"]::-moz-range-thumb {
     min-height: 46px;
     font-size: 15px;
   }
+  /* Accept stays full width; Edit / Snooze / Reject share one row. */
+  .offer-buttons-row {
+    display: flex;
+    gap: 8px;
+  }
+  .offer-buttons-row .btn {
+    flex: 1 1 0;
+    min-width: 0;
+    width: auto;
+    min-height: 44px;
+    padding: 0 6px;
+    font-size: 14px;
+  }
+  /* Quiet, but still legible as a target when it sits in a row of three. */
+  .offer-buttons-row .btn-quiet { border: 1px solid var(--border); }
 
   /* ---- editor, as a full-screen sheet ---------------------------------- */
   .editor-scrim {
