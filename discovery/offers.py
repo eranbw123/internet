@@ -756,6 +756,73 @@ def wake(conn, key, *, actor=TIMER):
     )
 
 
+def supersede(conn, loser_key, winner_key, *, actor=IMPORTER, note="", now=None, why=""):
+    """Fold a duplicate offer into the one it duplicates, keeping the evidence.
+
+    Two offers that rest on the same conversations are one idea the producer
+    wrote up twice, and the owner should be asked about it once. Discarding the
+    loser outright would throw away real quotes from real conversations, so its
+    evidence and source conversations are merged onto the survivor first --
+    the survivor comes out strictly better-evidenced than either was -- and
+    only then is the loser retired from the inbox.
+
+    The loser lands on 'expired', which is the one terminal status that carries
+    no judgement: unlike 'rejected' it does not blocklist the theme's tokens
+    for 180 days, which matters enormously here, because the survivor shares
+    those very tokens and would blocklist itself. The `supersede` action and
+    the `superseded_by` detail on the event chain are what make it readable
+    later as a merge rather than as a timeout.
+
+    Refuses to touch a decided offer: only an undecided one (proposed, offered
+    or snoozed) can be superseded, and the lifecycle's own transition table is
+    what enforces it. An accepted or rejected offer is the owner's word and is
+    never rewritten.
+    """
+    now = _now(now)
+    loser = get_offer(conn, loser_key)
+    winner = get_offer(conn, winner_key)
+    if loser is None:
+        raise UnknownOffer(loser_key)
+    if winner is None:
+        raise UnknownOffer(winner_key)
+    if loser["status"] not in (PROPOSED, OFFERED, SNOOZED):
+        raise InvalidTransition(
+            f"offer {loser_key!r} is {loser['status']}: a decided offer is never superseded"
+        )
+
+    # --- merge the evidence onto the survivor, oldest quote first -----------
+    seen = {(e.get("conversation_id"), e.get("quote")) for e in winner["evidence"]}
+    added = [e for e in loser["evidence"] if (e.get("conversation_id"), e.get("quote")) not in seen]
+    evidence = list(winner["evidence"]) + added
+    convs = list(winner["source_conversations"])
+    convs += [c for c in loser["source_conversations"] if c not in set(convs)]
+    conn.execute(
+        "UPDATE interest_offers SET evidence = ?, source_conversations = ? WHERE key = ?",
+        (_dump(evidence), _dump(convs), winner_key),
+    )
+    conn.commit()
+    add_offer_event(
+        conn, winner_key, actor, "absorb", winner["status"], winner["status"],
+        {
+            "absorbed": loser_key, "why": why, "note": note,
+            "evidence_added": len(added), "conversations_added": len(convs) - len(winner["source_conversations"]),
+        },
+    )
+    updated = _transition(
+        conn, loser_key, EXPIRED, actor=actor, action="supersede",
+        detail={
+            "superseded_by": winner_key, "why": why, "note": note,
+            "evidence_merged_into_winner": len(added),
+        },
+        sets={"decided_at": _stamp(now), "decided_note": note or f"superseded by {winner_key}"},
+        now=now,
+    )
+    return {
+        "loser": updated, "winner": get_offer(conn, winner_key),
+        "evidence_added": len(added), "why": why,
+    }
+
+
 def interest_entry(offer_row, accepted_at=""):
     """The interests.json entry an accepted offer becomes, carrying an
     `offered_by` back-reference so the interest's origin survives in the file
