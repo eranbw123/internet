@@ -890,6 +890,24 @@ def _offers_import_cmd(conn, cfg, path):
     print_safe(f"offers --import: reading {path}")
     summary = offers.import_artifact(conn, path, interests_path=cfg.interests_path)
     print_safe(json.dumps(summary, ensure_ascii=False, indent=2))
+    # The top-up runs on the SAME hourly tick rather than as a fourth Scheduled
+    # Task. It reads the same artifact this import just read, applies the same
+    # gates, and shares this job's heartbeat -- a separate task would duplicate
+    # the file read and the failure reporting to no end. It runs even when the
+    # import above did nothing, which is the normal case: the import is
+    # idempotent on the artifact's sha256, so once an artifact has been read
+    # its remaining candidates are reachable ONLY through the top-up.
+    topped = offers.top_up(conn, path, interests_path=cfg.interests_path, trigger="hourly")
+    print_safe(json.dumps(topped, ensure_ascii=False, indent=2))
+    print_safe(f"offers --top-up: {topped['reason']}")
+    if topped.get("exhausted") and not topped.get("error"):
+        # Not a failure: a short inbox is the correct outcome when nothing
+        # qualifies. It IS the signal that the producer, not the ranker, is
+        # what the inbox is now waiting on -- so it is said out loud.
+        print_safe(
+            f"offers --top-up: inbox is {topped['live_after']}/{topped['target']} and the "
+            f"artifact is exhausted -- the next extractor run is what fills it"
+        )
     if _import_is_failure(summary):
         # Non-zero, so _run_job stamps job:offers-import:last_fail and
         # `health` starts counting this job as failing.

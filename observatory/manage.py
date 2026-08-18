@@ -429,6 +429,36 @@ def _resolve_offer_key(conn, ident):
     return ident
 
 
+def _refill(conn, cfg):
+    """Top the inbox back up the moment a decision frees a slot, so working
+    through the inbox refills it instead of draining it -- the owner's other
+    half of "aim to always have 10 suggestions".
+
+    Three properties make this safe to run inside his click:
+
+    * It is fast. One file read, one JSON parse and pure arithmetic -- no
+      network, no model, no browser. Nothing here can start the 25-minute
+      extractor; when the artifact runs dry this reports it and stops.
+    * It cannot fail his decision. The decision is already committed by the
+      time this runs, and top_up_after_decision() swallows every exception and
+      reports it in the payload instead. The worst case is an inbox that stays
+      one short until the hourly tick.
+    * It cannot double-fill against that hourly tick: both are clamped to the
+      room under the target and both lose an insert race to UNIQUE(key).
+    """
+    summary = offers.top_up_after_decision(
+        conn, cfg.interest_candidates_path, interests_path=cfg.interests_path
+    )
+    return {
+        "offered": summary.get("offered", 0),
+        "offers": summary.get("offers", []),
+        "live": summary.get("live_after"),
+        "target": summary.get("target"),
+        "reason": summary.get("reason", ""),
+        "error": summary.get("error", ""),
+    }
+
+
 async def offer_decide_view(request, datasette):
     denied = _write_guard(datasette, request)
     if denied:
@@ -463,7 +493,8 @@ async def offer_decide_view(request, datasette):
             result = offers.snooze(conn, key, days=days, note=note)
             return _json({"ok": True, "action": action, "key": key,
                           "status": result["status"],
-                          "snoozed_until": result["snoozed_until"]})
+                          "snoozed_until": result["snoozed_until"],
+                          "inbox": _refill(conn, cfg)})
 
         if action == "reject":
             result = offers.reject(conn, key, note=note,
@@ -471,7 +502,8 @@ async def offer_decide_view(request, datasette):
             return _json({"ok": True, "action": action, "key": key,
                           "status": result["status"],
                           "blocked_terms": result["blocked_terms"],
-                          "blocked_terms_written": result["blocked_terms_written"]})
+                          "blocked_terms_written": result["blocked_terms_written"],
+                          "inbox": _refill(conn, cfg)})
 
         # accept, with or without edits -- "edit, then accept" is one request.
         failed = _preflight_accept(conn, key, edits)
@@ -498,6 +530,7 @@ async def offer_decide_view(request, datasette):
             "deactivated": getattr(sync_result, "deactivated", []),
             "missions_cancelled": getattr(sync_result, "missions_cancelled", 0),
             "mtime": interests_write.file_mtime(cfg.interests_path),
+            "inbox": _refill(conn, cfg),
         })
     except (offers.OfferError, interests_write.ValidationError,
             interests_write.ConflictError, interests_write.NotFound) as e:
