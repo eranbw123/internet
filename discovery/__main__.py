@@ -37,6 +37,12 @@
                   promotion/decay (a no-op unless DISCOVERY_DYNAMIC_INTERESTS)
     health        job staleness, provider reachability, pending sends;
                   --notify alerts on degraded/recovery (rate-limited)
+    pause         freeze the LLM-spending scheduled commands: run-once,
+                  web-tick and digest exit immediately (0 tokens, no
+                  provider construction) until `resume`; `listen --drain`
+                  and `health` keep running so feedback buttons and the
+                  remote resume path stay alive. --why records a note.
+    resume        lift `pause`
     personal-state  print the ai repo's personal-state contract artifact
     teach         rank scored-but-unlabeled items by expected information
                   value and record labels; --list/--explain/--send
@@ -141,6 +147,11 @@ def main(argv=None):
         "--notify", action="store_true",
         help="alert on degraded/recovery over Telegram, rate-limited",
     )
+    pa = sub.add_parser(
+        "pause", help="freeze run-once/web-tick/digest until `resume` (0 LLM spend)"
+    )
+    pa.add_argument("--why", default="", help="optional note echoed by health and the skip message")
+    sub.add_parser("resume", help="lift `pause`")
     it = sub.add_parser(
         "interests", help="layered interest state: list, --why <key>, --refresh"
     )
@@ -248,7 +259,21 @@ def main(argv=None):
         conn.close()   # Windows keeps the .db file locked otherwise
 
 
+# Commands that spend LLM/API calls when the OS scheduler fires them. `pause`
+# freezes exactly these; `listen --drain` (one free Telegram getUpdates -- it
+# keeps feedback buttons responsive while paused) and `health` (free local
+# checks, pause-aware in health.check) deliberately keep running.
+PAUSE_GATED = ("run-once", "web-tick", "digest")
+
+
 def _dispatch(conn, cfg, args, provider):
+    # Checked before any provider construction or _run_job heartbeat: a gated
+    # invocation is a deliberate no-op, not a run -- run_ok/last_ok would lie.
+    if args.command in PAUSE_GATED and db.state_get(conn, "paused") == "1":
+        why = db.state_get(conn, "paused_why") or ""
+        note = f" ({why})" if why else ""
+        print(f"paused{note} -- {args.command} skipped; `python -m app resume` lifts it")
+        return 0
     if args.command == "init":
         result = _sync_interests(conn, cfg)
         if result is None:
@@ -290,6 +315,17 @@ def _dispatch(conn, cfg, args, provider):
         print_safe(stats.report(conn, args.days, cfg))
     elif args.command == "health":
         return _health_cmd(conn, cfg, provider(), args)
+    elif args.command == "pause":
+        db.state_set(conn, "paused", "1")
+        db.state_set(conn, "paused_why", args.why)
+        print(
+            "paused -- run-once/web-tick/digest exit immediately until `resume`"
+            " (feedback drain and health keep running)"
+        )
+    elif args.command == "resume":
+        db.state_set(conn, "paused", "0")
+        db.state_set(conn, "paused_why", "")
+        print("resumed")
     elif args.command == "interests":
         return _interests_cmd(conn, cfg, args)
     elif args.command == "personal-state":

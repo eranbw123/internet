@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
 """Register/remove/inspect the six Windows Task Scheduler tasks that run the
 discovery engine as an appliance -- no in-process scheduler, no session-child
-tick loop. Every task shells out to ops/run.cmd, which calls `python -m app`.
+tick loop. Every task shells out to ops/run.cmd, which calls `python -m app`,
+via wscript + ops/hidden.vbs so no console window ever appears on a trigger.
 
     python ops/install_tasks.py --dry-run       # print XML + commands, register nothing
     python ops/install_tasks.py --install       # create/update all six tasks
@@ -135,10 +136,19 @@ def _current_user():
 def _action_command(app_args, script="run.cmd"):
     repo_root = config.REPO_ROOT
     run_cmd = str(repo_root / "ops" / script)
-    command = r"C:\Windows\System32\cmd.exe"
+    hidden_vbs = str(repo_root / "ops" / "hidden.vbs")
+    # wscript (a GUI-subsystem host) runs ops/hidden.vbs, which starts the
+    # real command with a hidden window: an InteractiveToken console action
+    # would otherwise flash a cmd window in the user's session on every
+    # trigger (collect-web alone fires every 60s). hidden.vbs waits on the
+    # child and propagates its exit code, so IgnoreNew / RestartOnFailure /
+    # Last Result behave exactly as with a direct console action.
+    command = r"C:\Windows\System32\wscript.exe"
     # /d is mandatory: this machine has a cmd AutoRun hook that otherwise runs
     # on every cmd.exe invocation and breaks the working directory.
-    arguments = " ".join([f'/d /c "{run_cmd}"'] + list(app_args))
+    arguments = " ".join(
+        ["//B", "//Nologo", f'"{hidden_vbs}"', r"C:\Windows\System32\cmd.exe",
+         f'/d /c "{run_cmd}"'] + list(app_args))
     return command, arguments, str(repo_root)
 
 

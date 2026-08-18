@@ -1,6 +1,33 @@
 # PROJECT_STATE.md — `internet`
 
-Updated 2026-08-12. Imported by `CLAUDE.md`. Current state only — not a log.
+Updated 2026-08-13. Imported by `CLAUDE.md`. Current state only — not a log.
+
+## pause switch (owner token freeze)
+`python -m app pause [--why]` / `resume` set `service_state` keys
+`paused`/`paused_why`. `__main__.PAUSE_GATED` = run-once/web-tick/digest:
+while paused each exits 0 at the very top of `_dispatch` — before provider
+construction and before `_run_job`, so no `run_ok`/`last_ok` is stamped for
+a skipped run. `listen --drain` and `health` deliberately keep running
+(free — feedback buttons and the remote resume path stay alive).
+`health.check` is pause-aware: staleness/provider never set `degraded`
+while paused, the provider preflight is skipped ("not checked (paused)"),
+and `format_report` leads with a PAUSED line. The flag is the guarantee —
+it works even when `schtasks /change` is ACCESS DENIED (tasks registered
+from an elevated shell deny an unelevated process; observed live
+2026-08-13 until a task re-registration made them changeable again).
+Telegram control lives in engine-control: global `/pause` · `/resume`
+(all-stop: worker dispatch + this flag + best-effort `schtasks
+/disable|/enable` over the six tasks, via `newsops.pause/resume`) and
+`/news pause`/`/news resume` for the appliance alone. While fully paused
+the feedback drain task is disabled too — product-bot button presses
+queue on Telegram (~24h retention) and are drained after resume.
+Live-verified 2026-08-13 through the real scheduled task ("web-tick
+skipped" in the task log). `internet-discovery-update` (the 30-min
+self-updater; its `self_update.py` re-registers ALL tasks via
+`install_tasks.py --install` on every run, resetting manual task state)
+is deliberately NOT in the pause/resume task set and was disabled outright
+2026-08-13 (owner all-stop); re-enable: `schtasks /change /tn
+internet-discovery-update /enable`. 3 new CLITests (492 → 495).
 
 ## provider fallback
 `discovery/providers/fallback.py`: `FallbackProvider` wraps two real providers;
@@ -1053,6 +1080,23 @@ drain instead of lost. Send-retry policy moved onto `Config`
 3/15min module-constant defaults, which stay as `db.pending_notifications`'s
 own fallback); `pipeline._send_one` bumps `send_failed` on a failed send.
 
+## hidden task launch (2026-08-13): no console windows from scheduled tasks
+`ops/hidden.vbs` (new) + `install_tasks._action_command()`: every task action
+is now `wscript.exe //B //Nologo ops\hidden.vbs cmd.exe /d /c ops\<script> ...`
+— wscript is a GUI-subsystem host, so no console ever flashes in the
+interactive session (`collect-web` fires every 60s; the owner was seeing a
+cmd window blink each time). hidden.vbs waits on the child and propagates
+its exit code, so IgnoreNew/RestartOnFailure/Last Result are unchanged.
+Machine-wide convention, not just this repo: `C:\projects\engine-control`
+(control.py tick/listener installers + claude_runner.py's ec-* task lane,
+which now writes a `launch.cmd` into the run's artifact dir to stay under
+schtasks' ~240-char /tr cap) and `C:\Users\eranb\ssh_watch` each carry their
+own copy of hidden.vbs. Any future Scheduled Task (engine-lab one-shots
+included) must launch through it. Elevation trap: tasks registered from an
+elevated shell can't be overwritten unelevated (`--install` fails Access
+denied); fix is a one-time elevated delete, then unelevated re-create.
+1 new test (`test_action_launches_hidden_via_wscript`).
+
 ## personal-state contract (consumer side)
 `discovery/personal_state.py` is the ONLY reader of the `ai` repo's derived
 personal-state artifact (schema owned by `ai`'s `PERSONAL_STATE_CONTRACT.md`);
@@ -1626,3 +1670,56 @@ deliberately three: the `manage.routes()` splice + `skip_csrf` + the POST
 dispatch in `interest_index_view` (`plugin.py`), and `ds._observatory_cfg`
 (`app.py`). Tests: 61 offline cases in `test_observatory_manage.py`
 (Hebrew/English fixtures throughout, no browser).
+## offer-decision learning (PR N, first half)
+`discovery/offer_learning.py` (new, stdlib-only, no provider) turns the
+owner's decisions on offers into a ranking effect on the *next* batch. It
+learns from offer decisions ONLY. Anything derived from delivered items
+(clicks, digest engagement, up/down/fire) is deliberately NOT built: the
+separate "Output Layer" brief rewrites the `feedback` table and the unit of
+feedback itself, so this module never reads or writes `feedback` —
+`Priors.domain_stats` is the recorded-but-unread socket that half plugs into.
+
+Division of labour with `offers.py`: **offers owns "no means no"** — lifecycle,
+`blocked_offer_keys`/`blocked_terms_for`, `dedup_verdict`,
+`score_candidate`/`passes_floors`/`rank`, `normalize_key`/`signal_tokens`,
+the retirement cool-off. All of it is imported, none reimplemented. This
+module owns the *preference* signal: the accept prototype (token cosine ->
++.05 max, §5.6), the bar-suggestion prior (mean of the owner's bar edits,
+needing >=2 of them, clamped to +/-.10), cold start, and snooze suppression of
+a paraphrase while the original sleeps. Scores are READ off the candidate
+(`score`/`score_terms`) when the store already has them, recomputed only when
+it does not.
+
+Storage: one new table, `offer_decision_log` (own file
+`schema_offer_learning.sql`, applied by `offer_learning.ensure_schema()`, not
+by `db.init` — PRs H/I/J are editing `schema.sql` concurrently). It is NOT a
+second event log: `offer_events` is the source of truth and
+`sync_from_offer_events()` projects it, idempotently, adding the three things
+the offer row cannot keep once it is updated in place — the post-edit signal
+tokens, the edit diff, and the interest lifecycle stage (`decaying` vs
+`paused`) a retirement answer came from. The one thing a replay cannot
+recover is the bar the generator suggested before an edited accept overwrote
+it; PR J can pass it via `record_decision(..., proposed_min_score=)` at
+decision time, and without it that decision simply sits out the bar prior.
+
+Polarity is kind-aware: accept=+1 / reject=-1 for every kind EXCEPT `retire`,
+where it inverts (declining "retire this?" is the owner's rescue). A rescue
+propagates no terms in either direction — blocking or boosting an interest
+title's generic words poisons the pool, the same call `blocked_terms_for()`
+makes. `expired` is a timer, never a rejection, and does not count toward
+leaving cold start.
+
+Cold start = fewer than 2 distinct `artifact_sha256` runs of owner decisions
+(falling back to distinct decision days): no prototype bonus, no bar shift,
+cap 5, serendipity slot filled — but exclusions still bite, so something
+rejected in run 1 cannot return in run 2. The exploratory pick keeps its
+reserved slot and opts OUT of the prototype bonus by design. Floors read the
+BASE score, so a learned preference can never lift a candidate over the
+evidence bar.
+
+Seam (pending PR J): `OfferDecisionSource` = `decisions()` + `candidates()`
+(+ `blocked()`). `StoreOfferDecisionSource` is the real one over
+`offer_events`; `MemoryOfferDecisionSource` is the in-memory fake the tests
+also use. Tests: `OfferDecisionRecordTests`, `OfferDecisionSyncTests`,
+`OfferLearningColdStartTests`, `OfferLearningRankingTests`,
+`OfferLearningSeamTests` in `test_discovery.py`, Hebrew fixtures included.
