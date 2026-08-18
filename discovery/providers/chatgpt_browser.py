@@ -88,6 +88,21 @@ FALLBACK_EFFORT = "extended"
 # message is finished. Interval/timeout are generous -- a missed poll just costs
 # one more read, and a truly stuck turn falls back to a normal ProviderError.
 POLL_INTERVAL_SECONDS = 3
+# How long we are willing to wait for a handed-off answer. A thinking model at
+# extended effort takes minutes on a big prompt -- the Council's own planning
+# call (5 advisors + peer review + chairman, see discovery/council.py) was
+# measured still generating at 166s -- and the old 240s ceiling inherited from
+# _completion() cut those off mid-thought, every time, for good. The wait costs
+# nothing when the answer is quick: the loop exits the moment the message
+# reports finished. discovery/missions.py's own tick budget is what bounds the
+# whole job, not this.
+POLL_BUDGET_SECONDS = int(os.environ.get("DISCOVERY_POLL_BUDGET_SECONDS", "600"))
+POLL_READ_TIMEOUT_SECONDS = 30
+# Consecutive failed reads (dropped CDP socket, HTTP 429, a JS error in the
+# tab) tolerated before we stop waiting. Each one costs a reconnect and a
+# short backoff -- the answer itself is on chatgpt.com, not in the socket.
+POLL_MAX_READ_FAILURES = 5
+POLL_BACKOFF_SECONDS = 5
 
 SETUP_HINT = (
     "launch Chrome with --remote-debugging-port={port} and log into "
@@ -232,19 +247,29 @@ class ChatGPTBrowserProvider(LLMProvider):
         # channel, so the send returns a stream_handoff and no inline text --
         # read the answer back by polling the conversation until it's finished.
         # Non-thinking models stream inline and already have their text here.
+        poll_reason = None
         if not text.strip() and conv_id:
-            text, poll_events = self._poll(conn, conv_id, timeout)
+            text, poll_events, poll_reason = self._poll(conv_id, max(timeout, POLL_BUDGET_SECONDS))
             events += poll_events
         self.last_events = events or []
 
         if conv_id:  # best-effort: hide the scratch conversation, never fatal
             try:
-                conn.evaluate(_js_hide_conversation(conv_id), timeout=15)
+                # self._conn(), not the `conn` captured above: _poll() may have
+                # reconnected after a dropped socket, and the stale handle is
+                # closed by then.
+                self._conn().evaluate(_js_hide_conversation(conv_id), timeout=15)
             except Exception:  # noqa: BLE001
                 pass
 
         if not text.strip():
+            # Say WHY it is empty. "empty completion" on its own was a lie by
+            # omission: a still-generating answer whose poll socket dropped
+            # read identically to a genuinely blank reply, and cost five days
+            # of silent web-discovery failure before anyone could see it.
             error = "empty completion from chatgpt.com"
+            if poll_reason:
+                error += f" -- {poll_reason}"
             emit(error=error, events=events or None)
             raise ProviderError(error)
 
@@ -257,24 +282,51 @@ class ChatGPTBrowserProvider(LLMProvider):
         emit(raw_text=text, parsed=parsed, validation=validation, events=events or None)
         return text
 
-    def _poll(self, conn, conv_id, timeout):
+    def _poll(self, conv_id, timeout):
         """Read a handed-off (thinking-model) answer back from the conversation.
         Loops GET /backend-api/conversation/{id} until the assistant's text
-        message reports finished, or `timeout` elapses. A read failure (socket
-        drop mid-poll, HTTP error) is not retried with a fresh send -- that
-        would double-post; we return whatever text arrived (empty -> the caller
-        raises a normal, skippable ProviderError). Second return value is
-        whatever tool/search events the poll payload carried (see _js_poll) --
-        best effort, [] when the provider exposes none."""
-        deadline = time.monotonic() + timeout
-        text = ""
-        events = []
+        message reports finished, or `timeout` elapses.
+
+        A read failure is NOT the end of the answer. The conversation lives on
+        chatgpt.com, not in this websocket, so a dropped CDP socket (Chrome
+        aborts a long-lived one -- WinError 10053, observed at ~166s into a
+        Council call), a throttled read (HTTP 429 while another tool shares the
+        account) or a transient JS error costs exactly one poll: we reconnect
+        and keep reading to the deadline. What we must never do is re-SEND --
+        that double-posts the prompt -- but re-reading is free. The old code
+        broke out of the loop on the first such error and returned empty, which
+        is how a perfectly healthy, still-generating answer became "empty
+        completion from chatgpt.com".
+
+        Returns (text, events, reason). `reason` is None once the message
+        reports finished; otherwise it is a human-readable account of what
+        stopped us, which the caller puts into the ProviderError instead of
+        guessing. `events` is whatever tool/search events the poll payload
+        carried (see _js_poll) -- best effort, [] when there are none.
+        """
+        started = time.monotonic()
+        deadline = started + timeout
+        text, events = "", []
+        polls = consecutive_failures = 0
+        last_error = None
         while time.monotonic() < deadline:
             time.sleep(POLL_INTERVAL_SECONDS)
+            polls += 1
             try:
-                raw = conn.evaluate(_js_poll(conv_id), timeout=30)
-            except (RuntimeError, ConnectionError, OSError):
-                break
+                raw = self._conn().evaluate(_js_poll(conv_id), timeout=POLL_READ_TIMEOUT_SECONDS)
+            except (RuntimeError, ConnectionError, OSError, ProviderError) as e:
+                consecutive_failures += 1
+                last_error = f"{type(e).__name__}: {e}"
+                if consecutive_failures > POLL_MAX_READ_FAILURES:
+                    return text, events, (
+                        f"{consecutive_failures} consecutive failed reads of conversation "
+                        f"{conv_id} after {polls} polls / {time.monotonic() - started:.0f}s "
+                        f"-- last error: {last_error}"
+                    )
+                self._reset()   # the next poll reconnects to the tab
+                time.sleep(POLL_BACKOFF_SECONDS * consecutive_failures)
+                continue
+            consecutive_failures = 0
             if raw is None:
                 continue
             data = raw if isinstance(raw, dict) else json.loads(raw)
@@ -284,8 +336,12 @@ class ChatGPTBrowserProvider(LLMProvider):
                 text = data["text"]
             events += data.get("events") or []
             if data.get("done"):
-                break
-        return text, events
+                return text, events, None
+        recovered = f" (recovered from {last_error})" if last_error else ""
+        return text, events, (
+            f"the answer was still being generated after {timeout}s "
+            f"({polls} polls of conversation {conv_id}){recovered}"
+        )
 
     # --- session --------------------------------------------------------------
 

@@ -31,9 +31,33 @@ def list_tabs(port=9222, timeout=None):
         return json.loads(resp.read().decode("utf-8"))
 
 
+# Paths on the app's own origin that are NOT the app. Another tool sharing this
+# Chrome may park a scratch tab on one purely to get a same-origin JS context --
+# the sibling `ai` repo's corpus_backfill.own_tab() opens <origin>/robots.txt on
+# purpose, precisely so it does not have to touch this appliance's tab. /json
+# lists targets newest-first, so a scratch tab opened seconds ago outranks the
+# real logged-in one, and a bare prefix match hands it straight back. Driving
+# someone else's tab then breaks both sides: they close it mid-request (our
+# websocket dies), and on claude.ai/chatgpt.com a plain-text document is not the
+# signed-in SPA the send JS expects. "No app tab" is the honest answer instead.
+NON_APP_PATHS = frozenset({
+    "/robots.txt", "/favicon.ico", "/sitemap.xml", "/manifest.json", "/ads.txt",
+})
+
+
+def is_app_tab(url):
+    """False for a same-origin scratch/asset page (see NON_APP_PATHS)."""
+    try:
+        path = (urlparse(url).path or "/").lower()
+    except ValueError:
+        return False
+    return path not in NON_APP_PATHS
+
+
 def find_tab(url_prefix, port=9222, timeout=None):
     for tab in list_tabs(port, timeout=timeout):
-        if tab.get("type") == "page" and tab.get("url", "").startswith(url_prefix):
+        url = tab.get("url", "")
+        if tab.get("type") == "page" and url.startswith(url_prefix) and is_app_tab(url):
             return tab
     return None
 

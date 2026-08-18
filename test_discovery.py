@@ -1028,7 +1028,18 @@ class HealthTests(unittest.TestCase):
         with mock.patch("discovery.health.subprocess.run") as run, \
              mock.patch("discovery.health.time.sleep") as sleep:
             self.assertTrue(health.preflight_gate(self.conn, provider, cfg, "stocks"))
-        run.assert_called_once_with(["cmd", "/d", "/c", "chrome.cmd"], check=False, timeout=0)
+        # The DEVNULL trio is load-bearing, not tidiness. Under Task Scheduler
+        # this process's stdout is the job's log file, opened by ops/run.cmd
+        # without FILE_SHARE_WRITE; a Chrome that inherits it holds that file
+        # for its whole life, and every later run of the job then dies inside
+        # cmd at the redirect -- silently, with the scheduler still reporting
+        # success. That is what killed logs/web-tick-20260818.log at 14:44.
+        import subprocess as _sp
+
+        run.assert_called_once_with(
+            ["cmd", "/d", "/c", "chrome.cmd"], check=False, timeout=0,
+            stdin=_sp.DEVNULL, stdout=_sp.DEVNULL, stderr=_sp.DEVNULL,
+        )
         sleep.assert_called_once_with(0)
         self.assertEqual(db.today_counts(self.conn), {})  # recovered -- no provider_down
 
@@ -10616,6 +10627,170 @@ class OfferLearningSeamTests(unittest.TestCase):
         chosen, skipped = source.rank(now=OFFER_NOW)
         self.assertEqual([item.key for item in chosen], ["nbis-nebius"])
         self.assertIn("binding-of-isaac-progression", [item.key for item in skipped])
+
+
+class SilentWebTickRegressionTests(unittest.TestCase):
+    """The 2026-08-13..18 outage: web discovery was dead for five days while
+    every monitor read healthy. Four independent defects lined up, and each
+    one gets a test here.
+
+      1. cdp.find_tab() prefix-matched the origin, so a scratch tab another
+         tool parked on <origin>/robots.txt (the sibling `ai` repo's
+         corpus_backfill.own_tab does exactly that) outranked the real
+         logged-in tab -- /json lists newest first. The provider then drove a
+         tab it did not own, and lost its websocket the moment the owner
+         closed it.
+      2. _poll() treated that dropped socket as "the answer is empty",
+         throwing away a Council reply that was still being generated.
+      3. The resulting ProviderError said "empty completion" and named no
+         cause, so the log could not have explained it even if it had one.
+      4. The tick returned exit 0 regardless, so _run_job stamped
+         job:web:last_ok and `health` kept calling web healthy.
+    """
+
+    # --- 1: never hijack another tool's scratch tab -------------------------
+
+    def test_find_tab_skips_a_scratch_tab_parked_on_the_same_origin(self):
+        listed = [
+            {"type": "page", "url": "https://chatgpt.com/robots.txt"},   # newest, another tool's
+            {"type": "page", "url": "https://chatgpt.com/"},             # the real logged-in tab
+        ]
+        with mock.patch.object(chatgpt_browser.cdp, "list_tabs", return_value=listed):
+            self.assertEqual(chatgpt_browser.cdp.find_chatgpt_tab(9222)["url"], "https://chatgpt.com/")
+
+    def test_only_a_scratch_tab_reads_as_no_tab_at_all(self):
+        # "There is a tab" was the old answer, and it was worse than useless:
+        # preflight passed and every call then failed deep inside the run.
+        with mock.patch.object(
+            chatgpt_browser.cdp, "list_tabs", return_value=[{"type": "page", "url": "https://claude.ai/robots.txt"}]
+        ):
+            self.assertIsNone(chatgpt_browser.cdp.find_claude_tab(9222))
+
+    # --- 2 + 3: a dropped poll is not an empty answer ----------------------
+
+    def test_a_dropped_poll_socket_reconnects_instead_of_losing_the_answer(self):
+        # The first poll dies the way Chrome kills a long-lived CDP socket
+        # (WinError 10053, measured 166s into a real Council call). The answer
+        # is still on chatgpt.com, so the retry reconnects and reads it back.
+        dead = FakeChatGPTConnection(
+            [chatgpt_handoff("c1")],
+            poll_results=[ConnectionAbortedError("[WinError 10053] aborted")],
+        )
+        fresh = FakeChatGPTConnection([], poll_results=[{"text": '{"a": 7}', "done": True}])
+        remaining = [dead, fresh]
+        provider = chatgpt_browser.ChatGPTBrowserProvider(
+            "auto", port=9222, connect=lambda: remaining.pop(0),
+        )
+        with mock.patch.object(chatgpt_browser.time, "sleep"):
+            self.assertEqual(provider.complete_json("s", "p", self.SCHEMA), {"a": 7})
+        self.assertTrue(dead.closed)          # the dead socket was reset, not reused
+        self.assertIn("poll", fresh.calls)    # ...and the answer came off the new one
+
+    def test_a_poll_that_never_finishes_says_why_instead_of_just_empty(self):
+        conn = FakeChatGPTConnection(
+            [chatgpt_handoff("c1")], poll_results=[{"text": "", "done": False}] * 50,
+        )
+        provider = chatgpt_browser.ChatGPTBrowserProvider("auto", port=9222, connect=lambda: conn)
+        clock = iter([0.0, 1.0, 2.0, 999.0])
+        with mock.patch.object(chatgpt_browser.time, "sleep"), \
+                mock.patch.object(chatgpt_browser.time, "monotonic", lambda: next(clock)):
+            with self.assertRaises(ProviderError) as ctx:
+                provider.complete_json("s", "p", self.SCHEMA)
+        message = str(ctx.exception)
+        self.assertIn("empty completion", message)
+        self.assertIn("still being generated", message)   # the part that was missing
+        self.assertIn("c1", message)                      # ...and which conversation
+
+    def test_repeated_read_failures_give_up_with_the_last_error_named(self):
+        conns = [FakeChatGPTConnection([chatgpt_handoff("c9")], poll_results=[OSError("HTTP 429")])]
+        conns += [FakeChatGPTConnection([], poll_results=[OSError("HTTP 429")]) for _ in range(20)]
+        remaining = list(conns)
+        provider = chatgpt_browser.ChatGPTBrowserProvider(
+            "auto", port=9222, connect=lambda: remaining.pop(0),
+        )
+        with mock.patch.object(chatgpt_browser.time, "sleep"):
+            with self.assertRaises(ProviderError) as ctx:
+                provider.complete_json("s", "p", self.SCHEMA)
+        message = str(ctx.exception)
+        self.assertIn("consecutive failed reads", message)
+        self.assertIn("HTTP 429", message)
+
+    # --- 4: a tick that did nothing must not look like a tick that worked ---
+
+    SCHEMA = {"type": "object", "properties": {"a": {"type": "number"}}, "required": ["a"]}
+
+    def _tick_cfg(self):
+        return dataclasses.replace(
+            CFG, mission_provider="fake_mission", mission_low_water=1,
+            missions_per_tick=2, council_missions_per_generation=2,
+        )
+
+    def _conn_with_interest(self):
+        conn = db.connect(":memory:")
+        self.addCleanup(conn.close)
+        db.init(conn)
+        db.upsert_interest(conn, an_interest(key="alpha", title="alpha", sources=["web_search"]))
+        return conn
+
+    def test_a_tick_whose_council_call_failed_is_not_productive_and_says_why(self):
+        conn = self._conn_with_interest()
+        mp = FakeCouncilProvider(mission_batches=[ProviderError("empty completion from chatgpt.com")])
+        with mock.patch.object(providers, "get_provider", return_value=mp):
+            result = missions.web_tick(conn, self._tick_cfg(), provider=FakeProvider({}), dry_run=True)
+        self.assertTrue(result["preflight_ok"])
+        self.assertFalse(result["productive"])
+        self.assertEqual(result["generated"], 0)
+        self.assertIn("empty completion from chatgpt.com", result["reason"])
+        self.assertTrue(result["failures"])
+
+    def test_the_cli_refuses_to_stamp_last_ok_for_a_tick_that_did_nothing(self):
+        from discovery.__main__ import WEB_TICK_UNPRODUCTIVE, _run_job, _web_tick_cmd
+
+        conn = self._conn_with_interest()
+        cfg = self._tick_cfg()
+        mp = FakeCouncilProvider(mission_batches=[ProviderError("empty completion from chatgpt.com")])
+        buf = io.StringIO()
+        with mock.patch.object(providers, "get_provider", return_value=mp), \
+                contextlib.redirect_stdout(buf):
+            code = _run_job(conn, "web", lambda: _web_tick_cmd(conn, FakeProvider({}), cfg, True))
+
+        self.assertEqual(code, WEB_TICK_UNPRODUCTIVE)
+        self.assertIsNone(db.state_get(conn, "job:web:last_ok"))
+        self.assertIsNotNone(db.state_get(conn, "job:web:last_fail"))
+        self.assertEqual(db.today_counts(conn).get("run_failed"), 1)
+        printed = buf.getvalue()
+        self.assertIn("web-tick did nothing", printed)               # it says so
+        self.assertIn("empty completion from chatgpt.com", printed)  # ...and why
+
+    def test_a_productive_tick_still_reports_success(self):
+        from discovery.__main__ import _run_job, _web_tick_cmd
+
+        conn = self._conn_with_interest()
+        cfg = self._tick_cfg()
+        mp = FakeCouncilProvider(
+            mission_batches=[mission_batch("a1", "a2")],
+            search_results={"a1": [], "a2": []},
+        )
+        with mock.patch.object(providers, "get_provider", return_value=mp), \
+                contextlib.redirect_stdout(io.StringIO()):
+            code = _run_job(conn, "web", lambda: _web_tick_cmd(conn, FakeProvider({}), cfg, True))
+        self.assertEqual(code, 0)
+        self.assertIsNotNone(db.state_get(conn, "job:web:last_ok"))
+
+    def test_the_tick_stops_at_its_budget_and_reports_what_it_abandoned(self):
+        # The scheduler fires this every 60s under a 30-minute
+        # ExecutionTimeLimit: a tick that outruns the limit is killed, and a
+        # killed tick reports nothing at all. It has to stop by itself.
+        conn = self._conn_with_interest()
+        cfg = dataclasses.replace(self._tick_cfg(), web_tick_budget_seconds=0)
+        mp = FakeCouncilProvider(mission_batches=[mission_batch("a1", "a2")])
+        with mock.patch.object(providers, "get_provider", return_value=mp):
+            result = missions.web_tick(conn, cfg, provider=FakeProvider({}), dry_run=True)
+        self.assertEqual(result["executed"], 0)
+        self.assertEqual(result["abandoned"], result["leased"])
+        self.assertTrue(result["leased"])
+        self.assertEqual(mp.search_prompts, [])   # no mission was actually run
+        self.assertIn("budget ran out", " ".join(result["failures"]))
 
 
 if __name__ == "__main__":

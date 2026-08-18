@@ -151,6 +151,15 @@ class Config:
     council_feedback_items: int = 10             # recent feedback rows shown to the Council
     council_history_missions: int = 12           # recent missions (label+rationale) shown back
     mission_lease_seconds: int = 900             # RUNNING lease before recover_stale_missions() reclaims it
+    # Wall-clock ceiling on ONE web_tick(). The tick is scheduled every
+    # interval_web_seconds (60s) with MultipleInstances=IgnoreNew and a 30-minute
+    # ExecutionTimeLimit, so a tick that outruns the limit is killed by the
+    # scheduler -- losing its buffered stdout, its heartbeat and its reason,
+    # while every ignored trigger in between still reports LastTaskResult=0.
+    # That is exactly how five days of web discovery disappeared with nothing
+    # in the log. Checked between phases, so the true worst case is this plus
+    # one in-flight provider call; keep it well under the ExecutionTimeLimit.
+    web_tick_budget_seconds: int = 900
     mission_max_attempts: int = 3                # attempts before a mission is retired to FAILED
     mission_retry_seconds: int = 1800            # cool-off before a failed mission is retried
     council_max_consecutive_failures: int = 3    # generation failures before the static fallback kicks in
@@ -267,6 +276,7 @@ def load():
         council_feedback_items=int(os.environ.get("DISCOVERY_COUNCIL_FEEDBACK_ITEMS", "10")),
         council_history_missions=int(os.environ.get("DISCOVERY_COUNCIL_HISTORY_MISSIONS", "12")),
         mission_lease_seconds=int(os.environ.get("DISCOVERY_MISSION_LEASE_SECONDS", "900")),
+        web_tick_budget_seconds=int(os.environ.get("DISCOVERY_WEB_TICK_BUDGET_SECONDS", "900")),
         mission_max_attempts=int(os.environ.get("DISCOVERY_MISSION_MAX_ATTEMPTS", "3")),
         mission_retry_seconds=int(os.environ.get("DISCOVERY_MISSION_RETRY_SECONDS", "1800")),
         council_max_consecutive_failures=int(
