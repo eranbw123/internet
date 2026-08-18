@@ -87,6 +87,22 @@ export function CompareView({ onClose, initialA, onSelectNode }: Props) {
         {onClose && <button onClick={onClose}>Close compare</button>}
       </div>
       {error && <div className="compare-error">{error}</div>}
+      {/* Until both sides are picked this rendered nothing at all -- on a
+          phone that is a full screen of blank white under two dropdowns, which
+          reads as a broken page rather than as a screen waiting for input. */}
+      {!error && !result && (
+        <div className="ws-empty" data-testid="compare-empty">
+          <p><strong>Pick two {kind === "run" ? "runs" : "model calls"} to compare.</strong></p>
+          <p>
+            {kind === "run"
+              ? "Choose a run in A and another in B. You get the two traces side by side, plus"
+                + " what changed between them: which nodes only one run has, and which shared"
+                + " nodes differ."
+              : "Enter two model-call ids. You get the two calls' prompts and responses diffed"
+                + " against each other."}
+          </p>
+        </div>
+      )}
       {result?.kind === "run" && <RunCompare result={result} a={a} b={b} onSelectNode={onSelectNode} />}
       {result?.kind === "model_call" && <ModelCallCompare result={result} />}
     </div>
