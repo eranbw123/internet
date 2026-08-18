@@ -9368,7 +9368,10 @@ class OffersCLITests(unittest.TestCase):
         code, out, _err = self._main("offers", "--import", self.artifact)
         self.assertEqual(code, 0)
         self.assertIn("already imported", out)
-        self.assertIn("nothing to do", out)
+        self.assertIn("nothing new in the artifact", out)
+        # The reconcile exists to be boring. When it finds nothing it says so,
+        # and that line is what tells the owner the EVENT path is keeping up.
+        self.assertIn("the event path is keeping up", out)
 
     def test_scheduled_offer_branches_record_a_job_heartbeat(self):
         """`health` can only report a job it has a heartbeat for. Without
@@ -9391,6 +9394,48 @@ class OffersCLITests(unittest.TestCase):
             self.assertIsNotNone(db.state_get(conn, "job:offers-import:last_fail"))
         finally:
             conn.close()
+
+    def test_a_sweep_that_frees_a_slot_tops_the_inbox_up(self):
+        """The third event, and the one with no other trigger. A decision frees
+        a slot and the decide path refills it; a new artifact arrives and the
+        extractor imports it. But an offer reaching its EXPIRY frees a slot on
+        a timer -- no click, no new artifact -- so without this the inbox would
+        sit short until the next extraction, possibly a day away."""
+        self._main("offers", "--import", self.artifact)
+        conn = db.connect(self.db_path)
+        try:
+            conn.execute(
+                "UPDATE interest_offers SET created_at = ? WHERE status = 'offered'",
+                ("2026-01-01T00:00:00+00:00",),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        code, out, _err = self._main("offers", "--sweep")
+        self.assertEqual(code, 0, out)
+        # Offer timers stay honest even when interest decay is deliberately
+        # not evaluated, so the expiry lands and the top-up follows it.
+        self.assertIn('"expired": 1', out)
+        self.assertIn("top-up after", out)
+
+    def test_a_sweep_that_moved_nothing_does_not_top_up(self):
+        """A sweep that changed nothing has produced no event, so there is
+        nothing to react to and no reason to touch the artifact."""
+        self._main("offers", "--import", self.artifact)
+        code, out, _err = self._main("offers", "--sweep")
+        self.assertEqual(code, 0)
+        self.assertNotIn("top-up after", out)
+
+    def test_the_reconcile_shouts_when_it_finds_work(self):
+        """The backstop's whole value. A pure event chain cannot notice its own
+        silence -- if a trigger is missed the inbox just stops refilling, which
+        is how five days of dead news collection went unnoticed. If this
+        once-a-day job ever DOES add an offer, an event that should have fired
+        did not, and this is the line that says so."""
+        code, out, _err = self._main("offers", "--import", self.artifact)
+        self.assertEqual(code, 0)
+        self.assertIn("WARNING", out)
+        self.assertIn("event trigger was missed", out)
 
     def test_the_sweep_says_out_loud_when_it_did_nothing(self):
         """A sweep that transitions nothing is the normal case, and is
@@ -9442,6 +9487,12 @@ class ExtractInterestsCLITests(unittest.TestCase):
         "    print(json.dumps({'pending_conversations': n, 'failed_conversations': 0,\n"
         "                      'themes': 3, 'corpus': {}}))\n"
         "    raise SystemExit(0)\n"
+        # The extract command now imports whatever reduce publishes, so a stub
+        # writing junk to --out would fail the IMPORT rather than the extraction.
+        # Every stub therefore publishes a real, candidate-free contract-v2
+        # artifact: importable, and a benign no-op ("no candidates"), which keeps
+        # these tests about the thing they are named after.
+        "ARTIFACT = " + repr(_artifact([])) + "\n"
     )
 
     def setUp(self):
@@ -9484,7 +9535,7 @@ class ExtractInterestsCLITests(unittest.TestCase):
         "    raise SystemExit(0)\n"
         "if cmd == 'reduce':\n"
         "    out = sys.argv[sys.argv.index('--out') + 1]\n"
-        "    open(out, 'w').write('{\"candidates\": []}')\n"
+        "    import json as _j; open(out, 'w').write(_j.dumps(ARTIFACT))\n"
         "    print('reduced')\n"
         "    raise SystemExit(0)\n"
     )
@@ -9553,7 +9604,7 @@ class ExtractInterestsCLITests(unittest.TestCase):
             "    raise SystemExit(0)\n"
             "if cmd == 'reduce':\n"
             "    out = sys.argv[sys.argv.index('--out') + 1]\n"
-            "    open(out, 'w').write('{}')\n"
+            "    import json as _j; open(out, 'w').write(_j.dumps(ARTIFACT))\n"
             "    raise SystemExit(0)\n"
         )
         code, out, _err = self._main()
@@ -9579,7 +9630,7 @@ class ExtractInterestsCLITests(unittest.TestCase):
             "    raise SystemExit(0)\n"
             "if cmd == 'reduce':\n"
             "    out = sys.argv[sys.argv.index('--out') + 1]\n"
-            "    open(out, 'w').write('{}')\n"
+            "    import json as _j; open(out, 'w').write(_j.dumps(ARTIFACT))\n"
             "    raise SystemExit(0)\n"
         )
         code, out, _err = self._main()
@@ -9613,7 +9664,7 @@ class ExtractInterestsCLITests(unittest.TestCase):
             "    time.sleep(30)\n"
             "if cmd == 'reduce':\n"
             "    out = sys.argv[sys.argv.index('--out') + 1]\n"
-            "    open(out, 'w').write('{}')\n"
+            "    import json as _j; open(out, 'w').write(_j.dumps(ARTIFACT))\n"
             "    raise SystemExit(0)\n"
         )
         code, out, _err = self._main(env={"DISCOVERY_INTEREST_EXTRACT_MAP_SECONDS": "2"})
@@ -9635,7 +9686,7 @@ class ExtractInterestsCLITests(unittest.TestCase):
             "    time.sleep(120)\n"     # never prints, never exits
             "if cmd == 'reduce':\n"
             "    out = sys.argv[sys.argv.index('--out') + 1]\n"
-            "    open(out, 'w').write('{}')\n"
+            "    import json as _j; open(out, 'w').write(_j.dumps(ARTIFACT))\n"
             "    raise SystemExit(0)\n"
         )
         started = time.monotonic()
@@ -9662,7 +9713,7 @@ class ExtractInterestsCLITests(unittest.TestCase):
             "    raise SystemExit(0)\n"
             "if cmd == 'reduce':\n"
             "    out = sys.argv[sys.argv.index('--out') + 1]\n"
-            "    open(out, 'w').write('{}')\n"
+            "    import json as _j; open(out, 'w').write(_j.dumps(ARTIFACT))\n"
             "    raise SystemExit(0)\n"
         )
         code, out, _err = self._main()
@@ -9683,12 +9734,12 @@ class ExtractInterestsCLITests(unittest.TestCase):
             "    raise SystemExit(0)\n"
             "if cmd == 'reduce':\n"
             "    out = sys.argv[sys.argv.index('--out') + 1]\n"
-            "    open(out, 'w').write(' '.join(sys.argv))\n"
+            "    import json as _j, os as _o; open(_o.path.join(_o.path.dirname(__file__), 'argv.txt'), 'w').write(' '.join(sys.argv)); open(out, 'w').write(_j.dumps(ARTIFACT))\n"
             "    raise SystemExit(0)\n"
         )
         code, _out, _err = self._main(env={"DISCOVERY_INTEREST_EXTRACT_MAX_THEMES": "42"})
         self.assertEqual(code, 0)
-        with open(self.artifact) as fh:
+        with open(os.path.join(self.ai_repo, "argv.txt")) as fh:
             self.assertIn("--max-themes 42", fh.read())
 
     def test_an_ai_checkout_without_the_flag_still_reduces(self):
@@ -9707,7 +9758,7 @@ class ExtractInterestsCLITests(unittest.TestCase):
             "        sys.stderr.write('unrecognized arguments: --max-themes\\n')\n"
             "        raise SystemExit(2)\n"
             "    out = sys.argv[sys.argv.index('--out') + 1]\n"
-            "    open(out, 'w').write('{}')\n"
+            "    import json as _j; open(out, 'w').write(_j.dumps(ARTIFACT))\n"
             "    raise SystemExit(0)\n"
         )
         code, out, _err = self._main()
@@ -9732,12 +9783,59 @@ class ExtractInterestsCLITests(unittest.TestCase):
             "    raise SystemExit(0)\n"
             "if cmd == 'reduce':\n"
             "    out = sys.argv[sys.argv.index('--out') + 1]\n"
-            "    open(out, 'w').write('{}')\n"
+            "    import json as _j; open(out, 'w').write(_j.dumps(ARTIFACT))\n"
             "    raise SystemExit(0)\n"
         )
         code, out, _err = self._main()
         self.assertEqual(code, 0, out)
         self.assertNotIn("made no progress", out)
+
+    def test_a_fresh_artifact_reaches_the_inbox_without_any_timer(self):
+        """The owner asked for the inbox to update when something changes, not
+        every x hours. The producer triggers the consumer: the moment reduce
+        publishes, the extract command imports it IN THE SAME PROCESS -- no
+        watcher daemon to supervise, no interval to tune, and no race between
+        the file being written and the file being read, because reduce has
+        already exited."""
+        self._write_extractor(self.GOOD)
+        code, out, _err = self._main()
+        self.assertEqual(code, 0, out)
+        self.assertIn("artifact refreshed -- importing it now", out)
+        self.assertIn("offers[extract]", out)
+
+    def test_the_import_runs_before_the_productivity_verdict(self):
+        """A fresh artifact must reach the inbox even on a run that is about to
+        be judged unproductive: whether map made progress is a separate
+        question from whether reduce published something worth importing."""
+        self._write_extractor(
+            "if cmd == 'map':\n"
+            "    print('nothing digested')\n"
+            "    raise SystemExit(0)\n"
+            "if cmd == 'reduce':\n"
+            "    import json as _j\n"
+            "    out = sys.argv[sys.argv.index('--out') + 1]\n"
+            "    open(out, 'w').write(_j.dumps(ARTIFACT))\n"
+            "    raise SystemExit(0)\n"
+        )
+        from discovery.__main__ import EXTRACT_UNPRODUCTIVE
+
+        code, out, _err = self._main()
+        self.assertEqual(code, EXTRACT_UNPRODUCTIVE)
+        self.assertIn("offers[extract]", out)
+
+    def test_a_failed_extraction_imports_nothing(self):
+        """No new artifact means no event. The import must not fire on a run
+        whose reduce never published -- there is nothing to react to."""
+        self._write_extractor(
+            "if cmd == 'map':\n"
+            "    raise SystemExit(0)\n"
+            "if cmd == 'reduce':\n"
+            "    sys.stderr.write('boom')\n"
+            "    raise SystemExit(1)\n"
+        )
+        code, out, _err = self._main()
+        self.assertEqual(code, 2)
+        self.assertNotIn("offers[extract]", out)
 
     def test_skip_map_reduces_over_the_existing_digests(self):
         self._write_extractor(self.GOOD)
