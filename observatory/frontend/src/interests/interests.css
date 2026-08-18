@@ -942,6 +942,12 @@ input[type="range"]::-moz-range-thumb {
      cards here, and each card labels its own numbers in place, so there is no
      header row left to pin -- see the big note above this media query.) */
   .interests-list { display: block; height: auto; padding: 12px; }
+  /* Chrome corrects scrollTop whenever content above the reading position
+     changes height, which is exactly what the collapse does -- and the
+     correction reads as a scroll UP, which expanded everything again the
+     instant it collapsed. useScrollCollapse's lockout handles the residue;
+     this stops the browser generating most of it in the first place. */
+  .ws-body { overflow-anchor: none; }
   .table-scroll { flex: none; overflow: visible; }
   .list-controls {
     position: sticky;
@@ -1034,8 +1040,16 @@ input[type="range"]::-moz-range-thumb {
   .funnel-table .cell-interest { grid-column: 1 / -1; max-width: none; }
   .funnel-table .row-title { font-size: 15px; line-height: 1.35; margin-bottom: 5px; }
   .funnel-table .key-chip { overflow-wrap: anywhere; }
+  /* State and sparkline share one row. Measured, the card was 299px tall and
+     only 2.3 of them fit the display; the sparkline's own full-width row cost
+     51px of that for seven 7px bars and a caption. Pairing it with the state
+     chip -- which never fills more than two thirds of the width -- brings the
+     card to ~250px and puts three on screen, which is what makes a 32-item
+     list scannable with a thumb. Both are placed explicitly on row 2 so the
+     six metrics below still auto-place into rows 3 and 4. */
   .funnel-table .cell-state {
-    grid-column: 1 / -1;
+    grid-column: 1 / 3;
+    grid-row: 2;
     display: flex;
     flex-wrap: wrap;
     align-items: center;
@@ -1065,14 +1079,20 @@ input[type="range"]::-moz-range-thumb {
     color: var(--fg-faint);
   }
   .cell-spark {
-    grid-column: 1 / -1;
+    grid-column: 3 / -1;
+    grid-row: 2;
     display: flex;
     flex-direction: column-reverse;
     align-items: flex-start;
-    gap: 4px;
+    /* Hug the top of the row so the bars line up with the state chip beside
+       them, instead of floating at the bottom of whatever height the state
+       cell happens to take when it carries a "decaying / dead weight" pair. */
+    align-self: start;
+    gap: 3px;
   }
-  .cell-spark .spark { height: 26px; }
-  .cell-spark .spark-bar { width: 7px; }
+  .cell-spark::before { white-space: nowrap; }
+  .cell-spark .spark { height: 22px; }
+  .cell-spark .spark-bar { width: 6px; }
 
   .cell-actions {
     grid-column: 1 / -1;

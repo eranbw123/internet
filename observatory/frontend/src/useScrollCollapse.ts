@@ -36,6 +36,15 @@ export function useScrollCollapse(enabled: boolean, resetKey: string): boolean {
 
     let lastTop = 0;
     let lastTarget: EventTarget | null = null;
+    // Collapsing removes ~50px of document from ABOVE the reading position
+    // (the control block's second row lives inside the scroller). Chrome's
+    // scroll anchoring then corrects scrollTop to keep the visible content
+    // still, which arrives here as a 50px scroll UP and expands everything
+    // again -- the header visibly collapsed and instantly came back. The
+    // scroller sets `overflow-anchor: none` so the correction is small, and
+    // this lockout ignores whatever is left of it: for 350ms after a state
+    // change, scroll events only re-baseline, they cannot flip the state.
+    let lockedUntil = 0;
 
     const onScroll = (event: Event) => {
       const target = event.target;
@@ -51,17 +60,22 @@ export function useScrollCollapse(enabled: boolean, resetKey: string): boolean {
         lastTop = top;
         return;
       }
-      const delta = top - lastTop;
-      if (top <= 8) {
-        setCollapsed(false);
+      const now = Date.now();
+      if (now < lockedUntil) {
         lastTop = top;
-      } else if (delta > 6) {
-        setCollapsed(true);
-        lastTop = top;
-      } else if (delta < -6) {
-        setCollapsed(false);
-        lastTop = top;
+        return;
       }
+      const delta = top - lastTop;
+      const change = (next: boolean) => {
+        lastTop = top;
+        setCollapsed((prev) => {
+          if (prev !== next) lockedUntil = Date.now() + 350;
+          return next;
+        });
+      };
+      if (top <= 8) change(false);
+      else if (delta > 6) change(true);
+      else if (delta < -6) change(false);
     };
 
     document.addEventListener("scroll", onScroll, true);
