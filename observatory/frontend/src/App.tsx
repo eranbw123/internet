@@ -4,6 +4,7 @@ import { GraphCanvas } from "./graph/GraphCanvas";
 import { Inspector } from "./inspector/Inspector";
 import { InterestPanel } from "./interest/InterestPanel";
 import { CompareView } from "./compare/CompareView";
+import { InterestsWorkspace } from "./interests/InterestsWorkspace";
 import { formatHash, parseHash, readBootstrap } from "./deepLink";
 import { useIsMobile } from "./useIsMobile";
 import type { GraphSeed } from "./graph/useGraphData";
@@ -25,6 +26,13 @@ export function App() {
     initialHash.nodeId ?? bootstrap.focus?.node_id ?? null,
   );
   const [compareOpen, setCompareOpen] = useState(false);
+  // The interests workspace is a full surface, not a pane: it replaces the
+  // explorer/graph/inspector layout while open (see PR L). Kept as one piece
+  // of state and one conditional below, so the concurrent frontend rewrite has
+  // the smallest possible thing to rebase.
+  const [interestsOpen, setInterestsOpen] = useState(
+    () => new URLSearchParams(window.location.search).has("interests"),
+  );
   const [compareRunId, setCompareRunId] = useState<string | null>(null);
   const [drawerOpen, setDrawerOpen] = useState(false);
   const [sheetOpen, setSheetOpen] = useState(false);
@@ -185,8 +193,16 @@ export function App() {
       <header className="app-header">
         <button className="drawer-toggle" onClick={() => setDrawerOpen((v) => !v)} aria-label="Toggle explorer">☰</button>
         <span className="app-title">Observatory</span>
+        <button onClick={() => setInterestsOpen((v) => !v)}>
+          {interestsOpen ? "Close interests" : "Interests"}
+        </button>
         <button onClick={() => setCompareOpen((v) => !v)}>{compareOpen ? "Close compare" : "Compare"}</button>
       </header>
+      {interestsOpen ? (
+        <div className="app-body">
+          <InterestsWorkspace onClose={() => setInterestsOpen(false)} />
+        </div>
+      ) : (
       <div className="app-body">
         <div className={`pane pane-explorer ${isMobile ? "drawer" : ""} ${drawerOpen ? "open" : ""}`}>
           <Explorer
@@ -219,7 +235,8 @@ export function App() {
           </>
         )}
       </div>
-      {isMobile && (
+      )}
+      {isMobile && !interestsOpen && (
         <div className={`bottom-sheet ${sheetOpen ? "open" : ""}`} data-testid="bottom-sheet">
           <div className="bottom-sheet-handle" onClick={() => setSheetOpen(false)} />
           {rightPane(() => setSheetOpen(false))}
