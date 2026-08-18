@@ -11304,5 +11304,229 @@ class SilentWebTickRegressionTests(unittest.TestCase):
         self.assertIn("budget ran out", " ".join(result["failures"]))
 
 
+# Generated from the live inbox, 2026-08-18. The conversation ids are
+# renamed conv-NN but the SHARING PATTERN is exactly production's --
+# that pattern is what the dedup rule reads, and what this pins.
+_LIVE_INBOX_2026_08_18 = [
+    ('extraction-shooters-competitive-fps',
+     'Extraction shooters, battle royales and competitive FPS practice',
+     ['balance patches changing weapon TTK, loot economy or extraction rules', 'measured comparisons of sensitivity, DPI, polling or audio configurations', 'pro-player settings and routine breakdowns with reasoning'],
+     ['conv-00', 'conv-01', 'conv-02', 'conv-03']),
+    ('competitive-shooter-performance',
+     'Competitive shooter mechanics and performance tuning',
+     ['aim-training protocols with measured results', 'latency, DPI and sensitivity measurement', 'audio/visual config methodology'],
+     ['conv-02', 'conv-03', 'conv-04', 'conv-05']),
+    ('game-systems-theorycrafting',
+     'Game systems theorycrafting and build math',
+     ['datamined formulas, scaling tables or hidden stat derivations', 'build-system teardowns for RPGs and action games', 'patch changes to underlying stat math rather than surface numbers'],
+     ['conv-06', 'conv-07', 'conv-08', 'conv-04']),
+    ('portfolio-construction-conviction-risk',
+     'Concentrated portfolio construction and thesis discipline',
+     ['empirical studies of concentration, drawdown behavior and sizing rules', 'scenario and probability-weighting frameworks with worked math', 'research on correlation clustering that breaks apparent diversification'],
+     ['conv-09', 'conv-10', 'conv-11', 'conv-12']),
+    ('roguelike-souls-run-design',
+     'Roguelike, souls-like and run-based game design',
+     ['mechanics and stat-math breakdowns', 'patch notes changing build systems', 'unlock routing and completion analysis'],
+     ['conv-13', 'conv-14', 'conv-07', 'conv-08']),
+    ('handheld-pc-gaming-steamos',
+     'Handheld PC gaming, SteamOS and Linux compatibility',
+     ['measured FPS/thermal/battery testing', 'Proton and SteamOS release notes', 'compatibility regressions and fixes'],
+     ['conv-15', 'conv-16', 'conv-17', 'conv-13']),
+    ('concentrated-portfolio-construction',
+     'Concentrated portfolio construction and thesis discipline',
+     ['empirical work on concentration and drawdown', 'position-sizing and Kelly-style frameworks', 'correlation regime studies'],
+     ['conv-18', 'conv-19', 'conv-09', 'conv-12']),
+    ('handheld-pc-gaming-linux',
+     'Handheld PC gaming, SteamOS and compatibility tuning',
+     ['Proton, SteamOS or driver releases changing title compatibility', 'benchmarked per-title settings with frame-time data', 'handheld hardware comparisons with thermal and battery measurements'],
+     ['conv-20', 'conv-21', 'conv-15', 'conv-13']),
+    ('roguelike-run-progression-design',
+     'Roguelikes, roguelites and run-based progression design',
+     ['patch notes and balance changes to item pools, unlocks or difficulty tiers', 'designer interviews or post-mortems on run structure and RNG mitigation', 'new roguelite releases with an unusual progression or unlock system'],
+     ['conv-22', 'conv-23', 'conv-17', 'conv-14']),
+    ('evolutionary-mismatch-prehistory',
+     'Evolutionary mismatch, deprivation and human prehistory',
+     ['new archaeological dating or material evidence', 'comparative hunter-gatherer cognition studies', 'developmental deprivation case analysis'],
+     ['conv-24', 'conv-25', 'conv-26', 'conv-27']),
+]
+
+_LIVE_INBOX_SCORES = [0.8988, 0.8230, 0.8205, 0.8147, 0.8079,
+                      0.8022, 0.7947, 0.7883, 0.7755, 0.7113]
+
+
+def _live_offer(entry, score):
+    """One live offer as the store holds it, built from the fixture above."""
+    key, title, signals, convs = entry
+    return {
+        "key": key, "kind": "new", "title": title, "description": "",
+        "positive_signals": list(signals), "negative_signals": [],
+        "suggested_sources": ["web_search"],
+        "evidence": [
+            # The quote is keyed on the CONVERSATION, as in production: when
+            # two offers cite the same conversation they quote the same words,
+            # so a merge dedupes those and keeps only what is genuinely new.
+            {"date": "2026-08-01", "quote": f"{c} quote", "lang": "en",
+             "depth": 0.7, "conversation_id": c}
+            for c in convs
+        ],
+        "source_conversations": list(convs),
+        "durability": {"n_convs": 8, "active_months": 4, "recency_days": 5},
+        "score": score, "score_terms": {}, "similarity": [],
+    }
+
+
+
+class LiveInboxDuplicateRegressionTests(unittest.TestCase):
+    """The four near-duplicate pairs that were actually live in the owner's
+    inbox on 2026-08-18, pinned as fixtures.
+
+    Two of the four are invisible to lexical matching, which is why the inbox
+    check that existed (exact key only) let all four in:
+
+      * 'extraction-shooters-competitive-fps' and
+        'competitive-shooter-performance' share only 35% of their signal
+        tokens -- under the .50 lexical bar -- yet come out of the same
+        aim-training and mouse-sensitivity conversations.
+      * 'roguelike-souls-run-design' and 'game-systems-theorycrafting' share
+        NO key token at all, yet both describe tear-delay stat math, scaling
+        curves and build/item interaction, from the same two conversations.
+
+    So the rule these tests pin is evidence overlap, not word overlap: the
+    share of the smaller offer's source conversations that both offers cite.
+    """
+
+    # The four pairs, loser -> survivor. The survivor of each is the offer
+    # standing on the most evidence, ties broken by score -- see
+    # duplicate_pairs(): the composite score is unanchored, so it is only ever
+    # a tiebreak between offers carrying equal evidence, never a threshold.
+    EXPECTED = {
+        "competitive-shooter-performance": "extraction-shooters-competitive-fps",
+        "roguelike-souls-run-design": "game-systems-theorycrafting",
+        "concentrated-portfolio-construction": "portfolio-construction-conviction-risk",
+        "handheld-pc-gaming-linux": "handheld-pc-gaming-steamos",
+    }
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        for entry, score in zip(_LIVE_INBOX_2026_08_18, _LIVE_INBOX_SCORES):
+            row = _live_offer(entry, score)
+            offers.insert_offer(self.conn, row, now=OFFER_NOW)
+            offers.offer(self.conn, row["key"])
+        self.assertEqual(offers.live_offer_count(self.conn), 10)
+
+    def test_exactly_the_four_real_pairs_are_found(self):
+        found = {loser: winner for loser, winner, _why in offers.duplicate_pairs(self.conn)}
+        self.assertEqual(found, self.EXPECTED)
+
+    def test_the_measured_separation_is_a_clean_gap_with_nothing_in_between(self):
+        """The boundary a human can check: every duplicate pair shares half of
+        the smaller offer's conversations, every other pair at most a quarter,
+        and no pair falls in between. The bar sits at the bottom of the
+        duplicate cluster rather than at a number chosen to look principled."""
+        rows = offers.list_offers(self.conn, status=offers.OFFERED)
+        convs = {r["key"]: offers.evidence_conversations(r) for r in rows}
+        duplicates, distinct = [], []
+        for i, a in enumerate(rows):
+            for b in rows[i + 1:]:
+                share, _n = offers._evidence_overlap(convs[a["key"]], convs[b["key"]])
+                pair = {a["key"], b["key"]}
+                is_dupe = any(pair == {lo, wi} for lo, wi in self.EXPECTED.items())
+                (duplicates if is_dupe else distinct).append(share)
+        self.assertEqual(len(duplicates), 4)
+        self.assertEqual(len(distinct), 41)
+        self.assertEqual(min(duplicates), 0.50)
+        self.assertEqual(max(distinct), 0.25)
+        self.assertGreaterEqual(min(duplicates),
+                                offers.DEFAULT_RULES.evidence_overlap_duplicate)
+        self.assertLess(max(distinct), offers.DEFAULT_RULES.evidence_overlap_duplicate)
+
+    def test_the_pair_that_only_looks_duplicate_by_name_is_left_alone(self):
+        """'roguelike-souls-run-design' and 'roguelike-run-progression-design'
+        share a key stem and read alike, but rest on different conversations --
+        one is stat math, the other meta-progression -- and are two real
+        interests. A lexical rule would have merged them and cost a suggestion.
+        """
+        offers.reconcile_duplicates(self.conn, now=OFFER_NOW)
+        self.assertEqual(
+            offers.get_offer(self.conn, "roguelike-run-progression-design")["status"],
+            offers.OFFERED,
+        )
+
+    def test_reconciling_leaves_six_distinct_offers_and_no_pair_behind(self):
+        summary = offers.reconcile_duplicates(self.conn, now=OFFER_NOW)
+        self.assertEqual(summary["merged"], 4)
+        self.assertEqual(offers.live_offer_count(self.conn), 6)
+        self.assertEqual(offers.duplicate_pairs(self.conn), [])
+        self.assertEqual(
+            sorted(r["key"] for r in offers.inbox(self.conn)),
+            sorted(["extraction-shooters-competitive-fps", "game-systems-theorycrafting",
+                    "portfolio-construction-conviction-risk", "handheld-pc-gaming-steamos",
+                    "roguelike-run-progression-design", "evolutionary-mismatch-prehistory"]),
+        )
+
+    def test_a_merge_keeps_the_losers_evidence_on_the_survivor(self):
+        """Both offers were written from real conversations; a merge must cost
+        the owner none of those quotes."""
+        before = len(offers.get_offer(
+            self.conn, "extraction-shooters-competitive-fps")["evidence"])
+        loser = offers.get_offer(self.conn, "competitive-shooter-performance")
+        offers.reconcile_duplicates(self.conn, now=OFFER_NOW)
+        survivor = offers.get_offer(self.conn, "extraction-shooters-competitive-fps")
+        # The two conversations it did NOT already have are now on the survivor.
+        self.assertEqual(len(survivor["evidence"]), before + 2)
+        self.assertEqual(
+            offers.evidence_conversations(survivor),
+            {"conv-00", "conv-01", "conv-02", "conv-03", "conv-04", "conv-05"},
+        )
+        self.assertTrue(
+            {q["quote"] for q in loser["evidence"]}
+            & {q["quote"] for q in survivor["evidence"]}
+        )
+
+    def test_the_superseded_offer_reads_as_a_merge_not_a_timeout(self):
+        offers.reconcile_duplicates(self.conn, now=OFFER_NOW)
+        loser = offers.get_offer(self.conn, "competitive-shooter-performance")
+        self.assertEqual(loser["status"], offers.EXPIRED)
+        events = offers.offer_events(self.conn, "competitive-shooter-performance")
+        (merge,) = [e for e in events if e["action"] == "supersede"]
+        self.assertEqual(merge["detail"]["superseded_by"],
+                         "extraction-shooters-competitive-fps")
+        self.assertIn("same evidence", merge["detail"]["why"])
+        # ...and the survivor's own chain records what it absorbed.
+        (absorb,) = [e for e in offers.offer_events(
+            self.conn, "extraction-shooters-competitive-fps") if e["action"] == "absorb"]
+        self.assertEqual(absorb["detail"]["absorbed"], "competitive-shooter-performance")
+
+    def test_a_merge_never_blocklists_the_survivors_own_terms(self):
+        """Why a merge expires the loser instead of rejecting it: rejection
+        blocklists the theme's signal tokens for 180 days, and the survivor is
+        built from those very tokens -- a reject-based merge would suppress the
+        survivor and every future offer like it."""
+        offers.reconcile_duplicates(self.conn, now=OFFER_NOW)
+        blocked = offers.blocked_offer_keys(self.conn, now=OFFER_NOW)
+        for key in self.EXPECTED.values():
+            self.assertNotIn(key, blocked)
+            self.assertNotIn(offers.normalize_key(key), blocked)
+
+    def test_a_decided_offer_is_never_superseded(self):
+        offers.accept(self.conn, "competitive-shooter-performance", now=OFFER_NOW)
+        summary = offers.reconcile_duplicates(self.conn, now=OFFER_NOW)
+        self.assertEqual(
+            offers.get_offer(self.conn, "competitive-shooter-performance")["status"],
+            offers.ACCEPTED,
+        )
+        self.assertNotIn("competitive-shooter-performance",
+                         [p["superseded"] for p in summary["pairs"]])
+
+    def test_reconciling_twice_changes_nothing_the_second_time(self):
+        first = offers.reconcile_duplicates(self.conn, now=OFFER_NOW)
+        second = offers.reconcile_duplicates(self.conn, now=OFFER_NOW)
+        self.assertEqual(first["merged"], 4)
+        self.assertEqual(second["merged"], 0)
+        self.assertIn("no near-duplicate pairs", second["reason"])
+        self.assertEqual(offers.live_offer_count(self.conn), 6)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
