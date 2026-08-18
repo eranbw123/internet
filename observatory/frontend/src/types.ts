@@ -105,6 +105,13 @@ export interface NodeDetail {
   /** Calls borrowed from the adjacent node that explains this one; populated
    * only when the node has no calls of its own. */
   related_model_calls: ModelCallDetail[];
+  /** The operational row this node points at (scores, candidate_items,
+   * search_missions, ...) -- whitelisted server-side, redacted like everything
+   * else. Null when the node has no entity or the table isn't whitelisted. */
+  entity_row: Record<string, unknown> | null;
+  /** discovery.models.WEIGHTS, present only alongside a scores row, so
+   * sub-scores can be shown with the weighting that produced final_score. */
+  score_weights: Record<string, number> | null;
   config: unknown;
   run: { id: number; kind: string; status: string } | null;
   inbound_edges: { from: ID; relationship: string; from_label: string; from_node_type: string }[];

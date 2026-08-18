@@ -16,6 +16,7 @@ import json
 import pathlib
 import sqlite3
 
+from discovery import models
 from discovery import trace as trace_mod
 
 # Sibling-set node_type groups bigger than this are collapsed to one
@@ -778,6 +779,11 @@ def node_detail(conn, node_id, database):
         # case costs nothing and no node ever shows a borrowed prompt next to
         # its own.
         "related_model_calls": [] if calls else _related_model_calls(conn, node, database),
+        "entity_row": _entity_row(conn, node),
+        # Shipped alongside a scores row so sub-scores can be shown with the
+        # weighting that actually produced final_score. Read from the pipeline's
+        # own module, so the UI can never drift from the real formula.
+        "score_weights": dict(models.WEIGHTS) if node["entity_type"] == "scores" else None,
         "config": _maybe_json(run["config_json"]) if run else None,
         "run": {"id": run["id"], "kind": run["kind"], "status": run["status"]} if run else None,
         "inbound_edges": [
@@ -794,6 +800,39 @@ def node_detail(conn, node_id, database):
         "truncated": False,   # nothing in this module ever cuts a stored field -- see module docstring
     }
     return trace_mod.redact_json(result)
+
+
+# The operational row behind a node was reachable only by leaving the app for
+# raw Datasette: node_detail() knew entity_type/entity_id and built nothing but
+# a link. So the six sub-scores and their weights, the item body the scorer
+# actually read, dedup decisions, a delivery's retry count and a mission's
+# rationale all existed one JOIN away and were shown nowhere.
+#
+# An explicit whitelist, never interpolation of entity_type into SQL -- the
+# entity_type column is data, and data does not get to name tables.
+_ENTITY_TABLES = frozenset({
+    "scores", "candidate_items", "search_missions", "search_generations",
+    "notifications", "interests",
+})
+
+
+def _entity_row(conn, node):
+    entity_type, entity_id = node["entity_type"], node["entity_id"]
+    if entity_type not in _ENTITY_TABLES or entity_id is None:
+        return None
+    row = _row(conn, f"SELECT * FROM {entity_type} WHERE id = ?", (entity_id,))  # noqa: S608 -- whitelisted above
+    if row is None:
+        return None
+    data = dict(row)
+    if entity_type == "candidate_items" and data.get("duplicate_of"):
+        # "duplicate" nodes say only "same url"; naming the item it duplicated
+        # is the part a reader actually wants.
+        original = _row(
+            conn, "SELECT id, title, url FROM candidate_items WHERE id = ?", (data["duplicate_of"],)
+        )
+        if original is not None:
+            data["duplicate_of_item"] = dict(original)
+    return data
 
 
 def _model_call_detail(c, database):

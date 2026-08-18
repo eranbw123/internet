@@ -32,6 +32,7 @@ function detail(over: Partial<NodeDetail> = {}): NodeDetail {
       summary: null, started_at: null, finished_at: null, error: null,
     },
     input: null, output: null, exact_text: null, model_calls: [], related_model_calls: [],
+    entity_row: null, score_weights: null,
     config: null, run: null, inbound_edges: [], outbound_edges: [], row_urls: {}, truncated: false,
     ...over,
   };
@@ -176,6 +177,58 @@ describe("Inspector", () => {
     fireEvent.click(await screen.findByRole("tab", { name: "Prompt" }));
     fireEvent.click(screen.getByText("Diff vs current template"));
     expect(await screen.findByText(/template has changed since this score/)).toBeInTheDocument();
+  });
+
+  it("breaks a score down into its weighted dimensions", async () => {
+    // The threshold card shows one number; the six dimensions behind it used
+    // to be reachable only through raw Datasette.
+    fetchNode.mockResolvedValue(detail({
+      overview: { ...detail().overview, entity_type: "scores", entity_id: "12" },
+      entity_row: {
+        personal_relevance: 0.82, novelty: 0.4, depth: 0.55, specificity: 0.7,
+        importance: 0.3, surprise: 0.25, final_score: 0.577, confidence: 0.8,
+        reason: "names the specific evidence",
+      },
+      score_weights: { personal_relevance: 0.35, novelty: 0.2, depth: 0.15, importance: 0.15, surprise: 0.15 },
+    }));
+    render(<Inspector nodeId={1} />);
+    expect(await screen.findByText("Score breakdown")).toBeInTheDocument();
+    expect(screen.getByText("personal relevance")).toBeInTheDocument();
+    expect(screen.getByText(/×0.35/)).toBeInTheDocument();
+    // specificity is scored but deliberately outside the weighted sum.
+    expect(screen.getByText(/unweighted/)).toBeInTheDocument();
+    expect(screen.getByText(/names the specific evidence/)).toBeInTheDocument();
+  });
+
+  it("names what a duplicate item duplicated", async () => {
+    fetchNode.mockResolvedValue(detail({
+      overview: { ...detail().overview, entity_type: "candidate_items", entity_id: "5" },
+      entity_row: {
+        title: "A dup", duplicate_of: 2, dup_reason: "same url",
+        duplicate_of_item: { id: 2, title: "The original", url: "https://example.com/x" },
+      },
+    }));
+    render(<Inspector nodeId={1} />);
+    expect(await screen.findByText("The original")).toBeInTheDocument();
+    expect(screen.getByText(/same url/)).toBeInTheDocument();
+  });
+
+  it("shows delivery attempts for a notification node", async () => {
+    fetchNode.mockResolvedValue(detail({
+      overview: { ...detail().overview, entity_type: "notifications", entity_id: "3" },
+      entity_row: { channel: "telegram", attempts: 3, ok: 1, sent_at: null },
+    }));
+    render(<Inspector nodeId={1} />);
+    expect(await screen.findByText("Attempts")).toBeInTheDocument();
+    expect(screen.getByText("3")).toBeInTheDocument();
+    expect(screen.getByText("delivered")).toBeInTheDocument();
+  });
+
+  it("renders no entity section when the node has no entity row", async () => {
+    fetchNode.mockResolvedValue(detail());
+    render(<Inspector nodeId={1} />);
+    await screen.findByTestId("inspector");
+    expect(screen.queryByText("Score breakdown")).toBeNull();
   });
 
   it("offers an Exact text tab for render nodes", async () => {

@@ -39,7 +39,7 @@ if not HAVE_DATASETTE:
         file=sys.stderr,
     )
 
-from discovery import config, db, trace, trace_fixture
+from discovery import config, db, models, trace, trace_fixture
 
 if HAVE_DATASETTE:
     from observatory import db as odb
@@ -1366,6 +1366,84 @@ class ObservatoryPromptVisibilityTests(unittest.IsolatedAsyncioTestCase):
     async def test_prompt_template_rejects_a_non_integer_call(self):
         r = await self.ds.client.get("/observatory/api/prompt-template?call=abc")
         self.assertEqual(r.status_code, 400)
+
+
+@unittest.skipUnless(HAVE_DATASETTE, "datasette not installed")
+class ObservatoryEntityRowTests(unittest.IsolatedAsyncioTestCase):
+    """The operational row behind a node used to be reachable only by leaving
+    the app for raw Datasette -- node_detail() knew entity_type/entity_id and
+    built nothing but a link out of them."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.db_path, cls.cfg = _build_fixture_db()
+
+    def setUp(self):
+        self.ds = build_datasette(self.cfg, public=False)
+        self.raw = sqlite3.connect(self.db_path)
+        self.raw.row_factory = sqlite3.Row
+        self.addCleanup(self.raw.close)
+
+    def _node_of_type(self, node_type):
+        row = self.raw.execute(
+            "SELECT id FROM trace_nodes WHERE node_type = ? AND entity_id IS NOT NULL ORDER BY id ASC LIMIT 1",
+            (node_type,),
+        ).fetchone()
+        self.assertIsNotNone(row, f"fixture has no {node_type} node with an entity")
+        return row["id"]
+
+    async def test_threshold_node_carries_its_scores_row_and_the_weights(self):
+        body = (await self.ds.client.get(f"/observatory/api/node/{self._node_of_type('threshold')}")).json()
+        row = body["entity_row"]
+        self.assertIsNotNone(row, "threshold node returned no scores row")
+        for dimension in ("personal_relevance", "novelty", "depth", "specificity", "importance", "surprise"):
+            self.assertIn(dimension, row)
+        # The weighting must come from the pipeline's own module so the UI can
+        # never drift from the formula that actually produced final_score.
+        self.assertEqual(body["score_weights"], dict(models.WEIGHTS))
+        self.assertNotIn("specificity", body["score_weights"], "specificity is deliberately unweighted")
+
+    async def test_candidate_node_carries_the_item_text_the_scorer_read(self):
+        body = (await self.ds.client.get(f"/observatory/api/node/{self._node_of_type('candidate')}")).json()
+        row = body["entity_row"]
+        self.assertIsNotNone(row)
+        self.assertIn("text", row)
+        self.assertIn("dedup_key", row)
+        self.assertIsNone(body["score_weights"], "weights belong only to a scores row")
+
+    async def test_duplicate_node_names_the_item_it_duplicated(self):
+        row = self.raw.execute(
+            "SELECT id FROM trace_nodes WHERE node_type = 'duplicate' AND entity_id IS NOT NULL LIMIT 1"
+        ).fetchone()
+        if row is None:
+            self.skipTest("fixture has no duplicate node with an entity")
+        body = (await self.ds.client.get(f"/observatory/api/node/{row['id']}")).json()
+        entity = body["entity_row"] or {}
+        if entity.get("duplicate_of"):
+            self.assertIn("duplicate_of_item", entity)
+            self.assertIn("title", entity["duplicate_of_item"])
+
+    async def test_a_node_with_no_entity_gets_no_entity_row(self):
+        row = self.raw.execute(
+            "SELECT id FROM trace_nodes WHERE entity_id IS NULL ORDER BY id ASC LIMIT 1"
+        ).fetchone()
+        if row is None:
+            self.skipTest("fixture has no entity-less node")
+        body = (await self.ds.client.get(f"/observatory/api/node/{row['id']}")).json()
+        self.assertIsNone(body["entity_row"])
+
+    def test_entity_type_is_whitelisted_never_interpolated(self):
+        """entity_type is data, and data does not get to name tables."""
+        conn = odb.open_ro(self.db_path)
+        self.addCleanup(conn.close)
+        hostile = {"entity_type": "candidate_items; DROP TABLE scores--", "entity_id": "1"}
+        self.assertIsNone(odb._entity_row(conn, hostile))
+        # And a plain unlisted table stays unreadable through this path.
+        self.assertIsNone(odb._entity_row(conn, {"entity_type": "trace_runs", "entity_id": "1"}))
+        self.assertTrue(
+            conn.execute("SELECT count(*) FROM scores").fetchone()[0] >= 0,
+            "scores table must still exist",
+        )
 
 
 @unittest.skipUnless(HAVE_DATASETTE, "datasette not installed")
