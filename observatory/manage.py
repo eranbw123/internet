@@ -408,6 +408,27 @@ def _preflight_accept(conn, key, edits):
     return None
 
 
+def _resolve_offer_key(conn, ident):
+    """The path segment -> an offer key.
+
+    The route is documented and tested as /offers/<key>/decide, and a key is
+    what the CLI and the provenance endpoint use. The workspace, though, holds
+    offers as rows with an `id` and reaches for that -- so an all-digit segment
+    is looked up as an id and translated. Offer keys are slugs
+    ('retire:<interest>', 'sleep-architecture-wearables'), never bare integers,
+    so the two namespaces cannot collide and the key lookup still wins.
+    """
+    if offers.get_offer(conn, ident) is not None:
+        return ident
+    if str(ident).isdigit():
+        row = conn.execute(
+            "SELECT key FROM interest_offers WHERE id = ?", (int(ident),)
+        ).fetchone()
+        if row is not None:
+            return row["key"]
+    return ident
+
+
 async def offer_decide_view(request, datasette):
     denied = _write_guard(datasette, request)
     if denied:
@@ -429,6 +450,7 @@ async def offer_decide_view(request, datasette):
     cfg = _cfg(datasette)
     conn = _open_rw(datasette)
     try:
+        key = _resolve_offer_key(conn, key)
         if action == "snooze":
             days = payload.get("days")
             if days is not None:
@@ -563,13 +585,50 @@ async def create_interest_view(request, datasette):
 
 # --- POST /observatory/api/interests/<key> (update / retire) -------------------
 
-async def interest_write_view(request, datasette):
-    """Update one interest, or retire it with {"active": false}.
+# lifecycle -> the `active` flag interests.json carries. Only 'active' and
+# 'decaying' keep collecting; a decaying interest is live but on notice. This
+# is offers.set_lifecycle()'s own derivation, restated here because the wire
+# accepts the lifecycle and the file stores the flag.
+_LIFECYCLE_ACTIVE = {
+    offers.ACTIVE: True, offers.DECAYING: True,
+    offers.PAUSED: False, offers.RETIRED: False,
+}
 
-    A retire is not a column flip: it routes through
-    offers.retire_interest(), so the interest's lifecycle and its append-only
-    event chain say the same thing the decay sweep would have said -- which is
-    what makes the undo below a real state transition rather than a guess.
+
+def _close_retire_offer(conn, key, note):
+    """Retiring an interest answers any open proposal to retire it.
+
+    The mirror image of undo_auto_pause(), which closes the same offer on the
+    way back up. Without this, accepting a retirement leaves the proposal
+    sitting in the inbox asking a question the owner just answered.
+    """
+    retire_key = offers.RETIRE_PREFIX + key
+    row = offers.get_offer(conn, retire_key)
+    if row and row["status"] in (offers.OFFERED, offers.PROPOSED, offers.SNOOZED):
+        offers.reject(conn, retire_key, note=note or "retired by owner")
+        return retire_key
+    return None
+
+
+async def interest_write_view(request, datasette):
+    """Update one interest -- a full edit, a partial edit, or a lifecycle move.
+
+    Three shapes, because the workspace sends all three:
+
+      {"active": false}            retire; {"active": true} un-retires
+      {"lifecycle": "retired"}     the same move, named the way the UI names
+                                   it. `active` is DERIVED from lifecycle and
+                                   never sent alongside it as a second switch.
+      {...fields}                  an edit. Fields not present are carried
+                                   over from the stored entry, so the editor
+                                   can send just what changed -- a full entry
+                                   still works and still means the same thing.
+
+    A retire is not a column flip: it routes through interest_sync, which
+    performs the move via offers.set_lifecycle(), so the interest's lifecycle
+    and its append-only event chain say the same thing the decay sweep would
+    have said -- which is what makes the undo a real state transition rather
+    than a guess.
     """
     denied = _write_guard(datasette, request)
     if denied:
@@ -580,21 +639,107 @@ async def interest_write_view(request, datasette):
     key = request.url_vars["key"]
     cfg = _cfg(datasette)
     expected_mtime = payload.pop("expected_mtime", None)
+    note = payload.pop("note", "") or ""
+
+    lifecycle = payload.pop("lifecycle", None)
+    if lifecycle is not None:
+        if lifecycle not in _LIFECYCLE_ACTIVE:
+            return _error(
+                f"lifecycle must be one of {sorted(_LIFECYCLE_ACTIVE)}, not {lifecycle!r}"
+            )
+        if "active" in payload and bool(payload["active"]) != _LIFECYCLE_ACTIVE[lifecycle]:
+            return _error(
+                "active is derived from lifecycle -- send one or the other, not "
+                "two switches that disagree"
+            )
+        payload["active"] = _LIFECYCLE_ACTIVE[lifecycle]
+
     conn = _open_rw(datasette)
     try:
-        # {"active": false} on its own is a retire and {"active": true} an
-        # un-retire -- both are one flag in interests.json, which sync v2 then
-        # turns into the real lifecycle move. Anything more is a full edit.
-        if set(payload) == {"active"} and isinstance(payload["active"], bool):
-            result = interests_write.set_active(
-                conn, cfg.interests_path, key, payload["active"],
-                expected_mtime=expected_mtime,
-            )
-        else:
+        state = offers.interest_lifecycle(conn, key)
+        if state is None:
+            return _error(f"no such interest: {key}", status=404)
+        current = state["lifecycle"] or offers.ACTIVE
+        wanted = lifecycle
+        if wanted is None and "active" in payload and isinstance(payload["active"], bool):
+            # {"active": false} is the file's spelling of a retire. It only
+            # names a destination when it disagrees with where we already are;
+            # {"active": true} on a decaying interest means "keep collecting",
+            # which is where it already is.
+            if bool(payload["active"]) != _LIFECYCLE_ACTIVE[current]:
+                wanted = offers.ACTIVE if payload["active"] else offers.RETIRED
+
+        fields = {k: v for k, v in payload.items() if k != "active"}
+        result = {}
+
+        if fields:
+            # A partial edit: everything the editor did not send is carried
+            # over from the stored entry. A full entry still works and still
+            # means the same thing.
+            data, _ = interests_write.read_file(cfg.interests_path)
+            index, existing = interests_write.find_entry(data, key)
+            if index < 0:
+                raise interests_write.NotFound(key)
+            # The file's `defaults` block go UNDER the stored entry: 17 of the
+            # 33 interests carry no `sources` of their own and inherit
+            # ["web_search"] from it, so a merge that only saw the entry would
+            # hand validate() an active interest with no sources and 400 on a
+            # majority of the file. The effective value is also what the editor
+            # displayed, so saving it is what the owner just looked at -- the
+            # edited entry does end up spelling the inherited value out, which
+            # is the honest record of what was saved.
+            merged = {**data.get("defaults", {}), **existing, **fields}
+            if wanted is not None:
+                merged["active"] = _LIFECYCLE_ACTIVE[wanted]
             result = interests_write.save(
-                conn, cfg.interests_path, payload,
+                conn, cfg.interests_path, merged,
                 existing_key=key, expected_mtime=expected_mtime,
             )
+            # The file has just been rewritten, so the caller's precondition
+            # token is spent; the lifecycle move below must not re-check it.
+            expected_mtime = None
+
+        if wanted is not None and wanted != current:
+            if _LIFECYCLE_ACTIVE[wanted] != _LIFECYCLE_ACTIVE[current]:
+                # Collecting-ness changes, so the file's `active` flag changes
+                # with it and interest_sync performs the transition -- which is
+                # also what cancels the interest's PENDING missions on the way
+                # down. The file is the source of truth; writing the column
+                # here instead would be undone by the next sync.
+                moved = interests_write.set_active(
+                    conn, cfg.interests_path, key, _LIFECYCLE_ACTIVE[wanted],
+                    expected_mtime=expected_mtime,
+                )
+                result = {**result, **moved}
+            else:
+                # Both states collect (decaying -> active, the "keep watching"
+                # answer to a retirement proposal) or neither does (paused ->
+                # retired). The file's flag is identical either way, so sync
+                # sees nothing to do and the move has to be made directly.
+                offers.set_lifecycle(
+                    conn, key, wanted, actor=offers.OWNER_UI,
+                    action="owner_lifecycle", detail={"note": note},
+                )
+                result.setdefault("key", key)
+                result.setdefault("mtime", interests_write.file_mtime(cfg.interests_path))
+            if not _LIFECYCLE_ACTIVE[wanted]:
+                closed = _close_retire_offer(conn, key, note)
+                if closed:
+                    result["retire_offer_closed"] = closed
+            current = wanted
+        elif not fields:
+            # Asking for the state it is already in is not a conflict. The
+            # workspace's retire flow re-reads stats and only writes when the
+            # lifecycle has not already moved, but a stale tab, a double-click
+            # or a replayed request can still ask for where we already are --
+            # and set_lifecycle() has no retired -> retired transition, so
+            # without this that raises InvalidTransition and surfaces as a 409
+            # the owner would have to interpret. Idempotent is the answer.
+            result = {"key": key, "noop": True,
+                      "mtime": interests_write.file_mtime(cfg.interests_path)}
+
+        result["lifecycle"] = current
+        result["active"] = _LIFECYCLE_ACTIVE[current]
     except (interests_write.ValidationError, interests_write.ConflictError,
             interests_write.NotFound, offers.OfferError) as e:
         return _store_error(e)

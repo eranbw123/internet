@@ -458,6 +458,29 @@ class DecideTests(ManageApiTestCase):
         self.assertEqual(r.status_code, 400)
         self.assertIn("min_scores", r.json()["error"])
 
+    async def test_an_offer_can_be_decided_by_its_row_id_as_well_as_its_key(self):
+        # The route is /offers/<key>/decide and a key is what the CLI uses, but
+        # the workspace holds offers as rows and reaches for `id`. Offer keys
+        # are slugs, never bare integers, so an all-digit segment is
+        # unambiguous and resolves to the same offer.
+        conn = self._conn()
+        try:
+            row = conn.execute(
+                "SELECT id, key FROM interest_offers WHERE status = 'offered' LIMIT 1"
+            ).fetchone()
+            offer_id, offer_key = row["id"], row["key"]
+        finally:
+            conn.close()
+        r = await self.post(f"/observatory/api/offers/{offer_id}/decide",
+                            {"action": "snooze", "days": 30})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["key"], offer_key)
+        conn = self._conn()
+        try:
+            self.assertEqual(offers.get_offer(conn, offer_key)["status"], "snoozed")
+        finally:
+            conn.close()
+
     async def test_a_retirement_offer_is_not_accepted_through_this_endpoint(self):
         conn = self._conn()
         try:
@@ -507,6 +530,50 @@ class FunnelStatsTests(ManageApiTestCase):
         self.assertEqual(row["lifecycle"], "active")
         self.assertFalse(row["auto_paused"])
         self.assertFalse(row["revivable"])
+
+    async def test_matched_counts_keyword_hits_not_just_the_fetching_interest(self):
+        # `collected` asks which interest FETCHED the item; `matched` asks
+        # which interests the item's keywords hit. The gap between them is the
+        # matcher-looseness finding the list view exists to show, so both ride
+        # on the wire and they are not the same number.
+        body = (await self.get("/observatory/api/interests/stats?window=all")).json()
+        for row in body["interests"]:
+            self.assertIsInstance(row["matched"], int)
+        self.assertEqual(body["totals"]["matched"],
+                         sum(r["matched"] for r in body["interests"]))
+
+    async def test_recent_scores_carries_the_raw_tail_newest_first(self):
+        row = next(r for r in
+                   (await self.get("/observatory/api/interests/stats?window=all")).json()["interests"]
+                   if r["key"] == "narcolepsy-eds")
+        # The editor's bar preview counts these directly, so the number that
+        # clears the bar here must equal the above_bar column beside it -- if
+        # they disagree the preview contradicts the table it sits next to.
+        self.assertEqual(len(row["recent_scores"]), 3)
+        self.assertLessEqual(len(row["recent_scores"]), funnel.RECENT_SCORES)
+        self.assertEqual(
+            len([s for s in row["recent_scores"] if s >= row["min_score"]]),
+            row["above_bar"],
+        )
+
+    async def test_active_is_derived_from_lifecycle_not_read_from_the_column(self):
+        # A row whose column and lifecycle disagree is reachable: sync flips
+        # `active` straight from the file's flag while offers.py owns
+        # lifecycle. The wire must not then show a retired interest as still
+        # collecting, so lifecycle is the answer and `active` follows it.
+        conn = self._conn()
+        try:
+            conn.execute(
+                "UPDATE interests SET lifecycle = ?, active = 1 WHERE key = ?",
+                (offers.RETIRED, "speculative-fiction-ideas"))
+            conn.commit()
+        finally:
+            conn.close()
+        row = next(r for r in
+                   (await self.get("/observatory/api/interests/stats?window=all")).json()["interests"]
+                   if r["key"] == "speculative-fiction-ideas")
+        self.assertEqual(row["lifecycle"], "retired")
+        self.assertFalse(row["active"])
 
     async def test_window_is_validated(self):
         self.assertEqual((await self.get("/observatory/api/interests/stats?window=7d")).status_code, 200)
@@ -652,6 +719,131 @@ class InterestWriteTests(ManageApiTestCase):
             "title": "t", "positive_signals": ["x"], "sources": ["web_search"],
         })
         self.assertEqual(r.status_code, 404)
+
+    async def test_lifecycle_is_a_first_class_write_and_derives_active(self):
+        # The workspace names this move "lifecycle: retired"; {"active": false}
+        # is the same move spelled the file's way. Both must work, and the
+        # lifecycle spelling must not need `active` sent beside it.
+        r = await self.post("/observatory/api/interests/speculative-fiction-ideas",
+                            {"lifecycle": "retired"})
+        self.assertEqual(r.status_code, 200, r.text)
+        conn = self._conn()
+        try:
+            row = conn.execute(
+                "SELECT active, lifecycle FROM interests WHERE key = ?",
+                ("speculative-fiction-ideas",)).fetchone()
+            self.assertEqual(row["lifecycle"], "retired")
+            self.assertEqual(row["active"], 0)
+        finally:
+            conn.close()
+
+    async def test_active_and_lifecycle_may_not_disagree(self):
+        r = await self.post("/observatory/api/interests/speculative-fiction-ideas",
+                            {"lifecycle": "retired", "active": True})
+        self.assertEqual(r.status_code, 400)
+        self.assertIn("derived from lifecycle", r.json()["error"])
+
+    async def test_an_unknown_lifecycle_is_rejected(self):
+        r = await self.post("/observatory/api/interests/speculative-fiction-ideas",
+                            {"lifecycle": "dormant"})
+        self.assertEqual(r.status_code, 400)
+
+    async def test_asking_for_the_lifecycle_it_already_has_is_a_no_op_not_a_conflict(self):
+        # The workspace's retire flow re-reads stats and only writes when the
+        # lifecycle has not already moved -- but a stale tab, a double-click or
+        # a replayed request can still ask for the state the interest is in.
+        # set_lifecycle() has no retired -> retired transition, so without this
+        # guard that raises InvalidTransition and surfaces as a 409 the owner
+        # would have to interpret. Idempotent is the correct answer.
+        first = await self.post("/observatory/api/interests/speculative-fiction-ideas",
+                                {"lifecycle": "retired"})
+        self.assertEqual(first.status_code, 200, first.text)
+        again = await self.post("/observatory/api/interests/speculative-fiction-ideas",
+                                {"lifecycle": "retired"})
+        self.assertEqual(again.status_code, 200, again.text)
+        self.assertTrue(again.json()["noop"])
+        self.assertEqual(again.json()["lifecycle"], "retired")
+        self.assertFalse(again.json()["active"])
+
+    async def test_retiring_closes_an_open_retirement_proposal(self):
+        # The mirror of revive, which closes the same offer on the way back up.
+        # Leaving it open would keep the inbox asking a question the owner has
+        # just answered.
+        key = "speculative-fiction-ideas"
+        conn = self._conn()
+        try:
+            offers.insert_offer(conn, {"key": offers.RETIRE_PREFIX + key, "kind": "retire",
+                                       "title": "Retire it?", "related_keys": [key]})
+            offers.offer(conn, offers.RETIRE_PREFIX + key, actor="timer")
+        finally:
+            conn.close()
+        r = await self.post("/observatory/api/interests/" + key, {"lifecycle": "retired"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertEqual(r.json()["retire_offer_closed"], offers.RETIRE_PREFIX + key)
+        conn = self._conn()
+        try:
+            self.assertEqual(
+                offers.get_offer(conn, offers.RETIRE_PREFIX + key)["status"], "rejected")
+        finally:
+            conn.close()
+
+    async def test_a_partial_edit_carries_the_untouched_fields_over(self):
+        # The editor sends what changed. Everything it did not send has to
+        # survive -- a partial save that blanked the description would be a
+        # silent data loss the owner discovers weeks later.
+        original = next(e for e in self._interests_file()["interests"]
+                        if e["key"] == "narcolepsy-eds")
+        r = await self.post("/observatory/api/interests/narcolepsy-eds", {"min_score": 0.81})
+        self.assertEqual(r.status_code, 200, r.text)
+        after = next(e for e in self._interests_file()["interests"]
+                     if e["key"] == "narcolepsy-eds")
+        self.assertEqual(after["min_score"], 0.81)
+        self.assertEqual(after["description"], original["description"])
+        self.assertEqual(after["positive_signals"], original["positive_signals"])
+        self.assertEqual(after["title"], original["title"])
+
+    async def test_a_partial_edit_may_also_move_the_lifecycle(self):
+        # The "keep watching" and "lower the bar" answers to a retirement
+        # proposal are exactly this shape: one field plus a lifecycle, in one
+        # call.
+        conn = self._conn()
+        try:
+            offers.set_lifecycle(conn, "speculative-fiction-ideas", offers.DECAYING,
+                                 actor="timer", action="decay")
+        finally:
+            conn.close()
+        r = await self.post("/observatory/api/interests/speculative-fiction-ideas",
+                            {"lifecycle": "active", "min_score": 0.66})
+        self.assertEqual(r.status_code, 200, r.text)
+        after = next(e for e in self._interests_file()["interests"]
+                     if e["key"] == "speculative-fiction-ideas")
+        self.assertEqual(after["min_score"], 0.66)
+        conn = self._conn()
+        try:
+            row = conn.execute("SELECT active, lifecycle FROM interests WHERE key = ?",
+                               ("speculative-fiction-ideas",)).fetchone()
+            self.assertEqual(row["lifecycle"], "active")
+            self.assertEqual(row["active"], 1)
+        finally:
+            conn.close()
+
+    async def test_a_partial_edit_sees_the_file_s_defaults_block(self):
+        # 17 of the 33 interests in production carry no `sources` of their own
+        # and inherit ["web_search"] from the file's `defaults`. A merge that
+        # only looked at the stored entry would hand validate() an active
+        # interest with no sources and 400 -- on a majority of the file.
+        data = self._interests_file()
+        data.setdefault("defaults", {})["sources"] = ["web_search"]
+        entry = next(e for e in data["interests"] if e["key"] == "narcolepsy-eds")
+        entry.pop("sources", None)
+        _write_interests(self.cfg.interests_path, data)
+
+        r = await self.post("/observatory/api/interests/narcolepsy-eds", {"min_score": 0.77})
+        self.assertEqual(r.status_code, 200, r.text)
+        after = next(e for e in self._interests_file()["interests"]
+                     if e["key"] == "narcolepsy-eds")
+        self.assertEqual(after["min_score"], 0.77)
+        self.assertEqual(after["sources"], ["web_search"])
 
     async def test_get_on_the_collection_path_still_lists_interests(self):
         # POST /api/interests creates; GET /api/interests must keep doing what

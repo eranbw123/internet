@@ -21,6 +21,17 @@ compared against MEASUREMENTS.md directly:
   above_bar  those scores whose final_score cleared the interest's own
              min_score -- the number the bar preview tunes.
   notified   successful notifications for those scores.
+  matched    item_interests rows -- items whose keywords hit this interest,
+             whether or not it was the one that fetched them. Deliberately far
+             larger than `collected` (97% of items match >=2 interests): the
+             gap between the two IS the finding about matcher looseness, so
+             the list view shows both rather than picking one.
+
+`recent_scores` ships the raw tail of final_score values alongside the
+aggregates. The editor's bar preview answers "at this bar, N of the last M
+scored items would clear" on every slider move -- the most useful number there
+is when tuning a bar. Serving it from an endpoint would cost a request per
+keystroke, so the scores ride along with the row instead.
 """
 import re
 
@@ -36,6 +47,12 @@ _WINDOW_RE = re.compile(r"^(\d{1,3})d$")
 # Sparkline resolution: at most this many daily buckets, so ?window=all does
 # not return a thousand-point array nobody can render.
 MAX_SPARK_DAYS = 90
+
+# How many raw final_score values ride along per interest for the editor's bar
+# preview. 120 is MAX_SCORES per cycle -- one full cycle of history, enough to
+# make the preview meaningful without turning a 33-interest payload into a
+# megabyte.
+RECENT_SCORES = 120
 
 
 def parse_window(value):
@@ -123,6 +140,27 @@ def interest_stats(conn, window=DEFAULT_WINDOW, include_inactive=True):
         GROUP BY i.key
     """, (since,) if since else ())
 
+    # Keyword matches, as opposed to `collected` above. An item the youtube
+    # collector fetched for interest A but which also matches B and C counts
+    # once for each of the three here, and only for A there.
+    matched = _counts(conn, f"""
+        SELECT i.key AS key, COUNT(*) AS n FROM item_interests m
+        JOIN interests i ON i.id = m.interest_id
+        {'WHERE m.created_at >= ?' if since else ''}
+        GROUP BY i.key
+    """, (since,) if since else ())
+
+    last_delivered = {
+        r["key"]: r["ts"] for r in conn.execute("""
+            SELECT i.key AS key, MAX(n.sent_at) AS ts FROM notifications n
+            JOIN scores s ON s.id = n.score_id
+            JOIN interests i ON i.id = s.interest_id
+            WHERE n.ok = 1 GROUP BY i.key
+        """).fetchall()
+    }
+
+    recent = _recent_scores(conn, since)
+
     last_above = {
         r["key"]: r["ts"] for r in conn.execute("""
             SELECT i.key AS key, MAX(s.created_at) AS ts FROM scores s
@@ -153,7 +191,14 @@ def interest_stats(conn, window=DEFAULT_WINDOW, include_inactive=True):
             "key": key,
             "title": row["title"],
             "layer": row["layer"],
-            "active": bool(row["active"]),
+            # Derived from lifecycle rather than read from the column.
+            # offers.set_lifecycle() writes the two together (active=1 for
+            # active/decaying, 0 for paused/retired), so they normally agree --
+            # but interest_sync can also flip the column straight from the
+            # file's `active` flag, and a row where the two disagree would make
+            # the UI show a retired interest as collecting. One of them has to
+            # be the answer on the wire; lifecycle is the richer one.
+            "active": lifecycle in (offers.ACTIVE, offers.DECAYING),
             "lifecycle": lifecycle,
             "min_score": row["min_score"],
             "parent_key": _opt(row, "parent_key"),
@@ -165,6 +210,7 @@ def interest_stats(conn, window=DEFAULT_WINDOW, include_inactive=True):
             "positive_signals": len(_json_list(row["positive_signals"])),
             "negative_signals": len(_json_list(row["negative_signals"])),
             "collected": n_collected,
+            "matched": matched.get(key, 0),
             "scored": n_scored,
             "above_bar": n_above,
             "notified": notified.get(key, 0),
@@ -173,6 +219,8 @@ def interest_stats(conn, window=DEFAULT_WINDOW, include_inactive=True):
                          for v in ("fire", "up", "down", "trash")},
             "sparkline": spark.get(key, []),
             "last_above_bar_at": last_above.get(key),
+            "last_delivered_at": last_delivered.get(key),
+            "recent_scores": recent.get(key, []),
             "silence_days": offers.silence_days(conn, key),
             # The design's own dead-weight test, and the reason the sweep
             # exists: work went in (items were collected) and nothing came out.
@@ -190,6 +238,7 @@ def interest_stats(conn, window=DEFAULT_WINDOW, include_inactive=True):
         "interests": len(out),
         "active": sum(1 for r in out if r["active"]),
         "collected": sum(r["collected"] for r in out),
+        "matched": sum(r["matched"] for r in out),
         "scored": sum(r["scored"] for r in out),
         "above_bar": sum(r["above_bar"] for r in out),
         "notified": sum(r["notified"] for r in out),
@@ -198,6 +247,31 @@ def interest_stats(conn, window=DEFAULT_WINDOW, include_inactive=True):
     }
     return {"window": label, "window_days": days, "generated_at": ddb.now(),
             "totals": totals, "interests": out}
+
+
+def _recent_scores(conn, since):
+    """{key: [final_score, ...]} -- newest first, at most RECENT_SCORES each.
+
+    One query for every interest rather than one per interest: a window
+    function partitions by interest and numbers each interest's scores newest
+    first, and the outer select keeps the head of each partition. SQLite has
+    had window functions since 3.25 (2018), and db.py already relies on them.
+    """
+    sql = """
+        SELECT key, final_score FROM (
+            SELECT i.key AS key, s.final_score AS final_score,
+                   ROW_NUMBER() OVER (
+                       PARTITION BY s.interest_id ORDER BY s.created_at DESC, s.id DESC
+                   ) AS rn
+            FROM scores s JOIN interests i ON i.id = s.interest_id
+            {window}
+        ) WHERE rn <= ?
+    """.format(window="WHERE s.created_at >= ?" if since else "")
+    params = ((since, RECENT_SCORES) if since else (RECENT_SCORES,))
+    out = {}
+    for row in conn.execute(sql, params).fetchall():
+        out.setdefault(row["key"], []).append(row["final_score"])
+    return out
 
 
 def _sparklines(conn, since):
