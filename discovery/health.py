@@ -37,8 +37,27 @@ JOB_INTERVALS = {
     "stocks": "interval_stocks_seconds",
     "web": "interval_web_seconds",
     "youtube": "interval_youtube_seconds",
+    # The interest-suggestion pipeline (2026-08-18). These three are here for
+    # the same reason the collectors are: until they were scheduled, nobody
+    # ran them, and once scheduled the only failure mode that matters is the
+    # one nobody notices. A stale `offers-sweep` means the 30-day decay and
+    # 45-day auto-pause clocks have stopped; a stale `offers-import` means new
+    # offers exist on disk and never reached the inbox; a stale
+    # `interest-extract` means no new suggestion is being produced at all.
+    # Staleness here flows into `degraded`, which `health --notify` already
+    # turns into exactly one Telegram alert per cooldown -- no second
+    # notification path.
+    "offers-import": "offers_import_interval_seconds",
+    "offers-sweep": "offers_sweep_interval_seconds",
 }
 DIGEST_INTERVAL_SECONDS = 24 * 3600
+# The extractor's cadence is a daily HH:MM (cfg.interest_extract_time), not a
+# seconds field, so like the digest it gets its period stated here rather than
+# looked up. health_stale_factor (3) then means "no successful extraction in
+# three days" is what raises the alarm -- deliberately loose, because one
+# skipped night (a closed laptop, a logged-out claude.ai tab that got fixed
+# the next day) is not an incident worth waking the owner for.
+EXTRACT_INTERVAL_SECONDS = 24 * 3600
 
 
 def job_name_for_source(source):
@@ -124,6 +143,9 @@ def check(conn, cfg, provider=None):
     ]
     jobs.append(_job_status(conn, "digest", DIGEST_INTERVAL_SECONDS, cfg.health_stale_factor))
     jobs.append(_job_status(conn, "feedback", None, cfg.health_stale_factor))
+    jobs.append(_job_status(
+        conn, "interest-extract", EXTRACT_INTERVAL_SECONDS, cfg.health_stale_factor
+    ))
 
     # While paused (see __main__.PAUSE_GATED) the gated jobs deliberately
     # don't run, so their growing heartbeat age is the intended state, not an
@@ -181,7 +203,10 @@ def format_report(result):
         flag = ""
         if job["interval_seconds"] is not None:
             flag = "  STALE" if job["stale"] else ("  ok" if job["age_seconds"] is not None else "")
-        line = f"  {job['name']:<10}last_ok={age}{flag}"
+        # 16, not 10: "interest-extract" is the longest job name now, and a
+        # report where one column silently stops lining up is a report people
+        # stop reading.
+        line = f"  {job['name']:<16} last_ok={age}{flag}"
         if job["last_fail"]:
             line += f"  last_fail={job['last_fail']}"
         lines.append(line)

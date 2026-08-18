@@ -5361,7 +5361,8 @@ class InstallTasksTests(unittest.TestCase):
 
     def test_tasks_share_the_prefix_and_carry_the_right_app_args(self):
         names = [t.name for t in install_tasks.build_tasks(CFG)]
-        self.assertEqual(len(names), 7)
+        # 7 appliance tasks + the 3 interest-pipeline tasks (2026-08-18).
+        self.assertEqual(len(names), 10)
         self.assertTrue(all(n.startswith("internet-discovery-") for n in names))
         by_name = {t.name: t for t in install_tasks.build_tasks(CFG)}
         self.assertEqual(
@@ -5434,17 +5435,104 @@ class InstallTasksTests(unittest.TestCase):
             code = install_tasks.install(CFG, runner=fake_runner, dry_run=False)
         self.assertEqual(code, 0)
         # One /create + one /query per task -- install() no longer trusts
-        # /create's exit code alone to mean the task actually exists.
-        self.assertEqual(len(calls), 14)
+        # /create's exit code alone to mean the task actually exists. Derived
+        # from _TASK_SPECS rather than restated, so adding a task cannot leave
+        # this assertion quietly checking the wrong number.
+        expected = len(install_tasks.build_tasks(CFG))
+        self.assertEqual(len(calls), 2 * expected)
         creates = [a for a in calls if "/create" in a]
         queries = [a for a in calls if "/query" in a]
-        self.assertEqual(len(creates), 7)
-        self.assertEqual(len(queries), 7)
+        self.assertEqual(len(creates), expected)
+        self.assertEqual(len(queries), expected)
         for args in creates:
             self.assertEqual(args[0], "schtasks")
             self.assertIn("/xml", args)
         for args in queries:
             self.assertEqual(args, ["schtasks", "/query", "/tn", args[-1]])
+
+    # --- the interest-suggestion pipeline's three tasks (2026-08-18) --------
+    # Before these existed, `Get-ScheduledTask internet-discovery-*` covered
+    # collectors, digest, feedback, health and update -- and nothing at all
+    # ran the extractor, the importer or the lifecycle sweep. The sweep was
+    # the costly omission: with no timer, offers never expired, snoozed offers
+    # never woke, and interests never decayed (30d) or auto-paused (45d).
+
+    def test_the_interest_pipeline_has_a_task_for_each_of_its_three_stages(self):
+        by_name = {t.name: t for t in install_tasks.build_tasks(CFG)}
+        for suffix, app_args in (
+            ("interest-extract", ["extract-interests"]),
+            ("offers-import", ["offers", "--import"]),
+            ("offers-sweep", ["offers", "--sweep"]),
+        ):
+            task = by_name[f"internet-discovery-{suffix}"]
+            self.assertEqual(task.app_args, app_args)
+            # All three go through ops/run.cmd like every other `python -m app`
+            # subcommand -- the extractor deliberately did NOT get a second
+            # launcher of its own in the sibling `ai` repo.
+            self.assertEqual(task.script, "run.cmd")
+
+    def test_the_three_pipeline_cadences_come_from_config_not_literals(self):
+        cfg = dataclasses.replace(
+            CFG,
+            offers_import_interval_seconds=1234,
+            offers_sweep_interval_seconds=5678,
+            interest_extract_time="04:44",
+        )
+        by_name = {t.name: t for t in install_tasks.build_tasks(cfg)}
+        self.assertEqual(by_name["internet-discovery-offers-import"].trigger_value, 1234)
+        self.assertEqual(by_name["internet-discovery-offers-sweep"].trigger_value, 5678)
+        self.assertEqual(by_name["internet-discovery-interest-extract"].trigger_value, "04:44")
+
+    def test_the_sweep_fires_at_least_daily(self):
+        """The 30-day decay and 45-day auto-pause rules are only real if
+        something evaluates them. Anything slower than daily makes the
+        lifecycle timers approximate at best."""
+        by_name = {t.name: t for t in install_tasks.build_tasks(CFG)}
+        sweep = by_name["internet-discovery-offers-sweep"]
+        self.assertEqual(sweep.trigger_kind, "interval")
+        self.assertLessEqual(sweep.trigger_value, 24 * 3600)
+
+    def test_the_extractor_fires_once_a_day_not_through_the_digest_window(self):
+        """The regression this guards: build_tasks() used to hand the digest's
+        Repetition (every digest_interval_seconds until digest_window_end) to
+        EVERY task whose trigger kind was "daily". That was invisible while
+        the digest was the only daily task. Applied to the extractor it would
+        have re-fired an hour of browser work up to 30 times a day."""
+        by_name = {t.name: t for t in install_tasks.build_tasks(CFG)}
+        extract = by_name["internet-discovery-interest-extract"]
+        self.assertEqual(extract.trigger_kind, "daily")
+        self.assertEqual(extract.repeat_seconds, 0)
+        self.assertEqual(extract.window_end, "")
+        xml = install_tasks.render_xml(extract)
+        self.assertIn("<CalendarTrigger>", xml)
+        self.assertNotIn("<Repetition>", xml)
+        # The digest keeps its window -- the opt-in did not silently drop it.
+        digest = by_name["internet-discovery-digest"]
+        self.assertEqual(digest.repeat_seconds, CFG.digest_interval_seconds)
+        self.assertIn("<Repetition>", install_tasks.render_xml(digest))
+
+    def test_the_extractor_runs_outside_the_digest_delivery_window(self):
+        """Browser contention. The extractor is the only task here that holds
+        a claude.ai tab for minutes at a time; scheduling it inside
+        digest_time..digest_window_end would overlap the delivery burst."""
+        extract_h, extract_m = (int(x) for x in CFG.interest_extract_time.split(":"))
+        start_h = int(CFG.digest_time.split(":")[0])
+        end_h = int(CFG.digest_window_end.split(":")[0])
+        self.assertFalse(start_h <= extract_h < end_h,
+                         f"{CFG.interest_extract_time} falls inside the digest window")
+        self.assertIsInstance(extract_m, int)
+
+    def test_every_task_gets_a_distinct_log_file(self):
+        """ops/run.cmd names the log from the FULL argument list, and cmd's
+        `>>` holds it without FILE_SHARE_WRITE for the whole run -- two tasks
+        sharing a basename means the second one silently never runs. `offers
+        --import` and `offers --sweep` share a %1, which is exactly the shape
+        of the bug that once cost all three collect tasks their runs."""
+        lognames = [
+            "_".join(t.app_args) or t.script
+            for t in install_tasks.build_tasks(CFG)
+        ]
+        self.assertEqual(len(lognames), len(set(lognames)), lognames)
 
     def test_install_fails_when_the_verification_query_cannot_find_the_task(self):
         def fake_runner(args):
@@ -9198,10 +9286,366 @@ class OffersCLITests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertIn('"expired": 0', out)
 
-    def test_import_of_a_missing_artifact_is_fail_soft(self):
+    def test_import_of_a_missing_artifact_reports_it_and_exits_non_zero(self):
+        """`offers.import_artifact` stays fail-soft -- it returns a summary
+        with a reason instead of raising -- but the CLI must NOT translate
+        that into a successful exit. This is now a scheduled task: an exit 0
+        would stamp job:offers-import:last_ok and tell Task Scheduler,
+        `health` and the owner that the import is fine while the artifact has
+        been missing for a week. Two multi-day outages started exactly that
+        way."""
         code, out, _err = self._main("offers", "--import", os.path.join(self.tmp.name, "no.json"))
-        self.assertEqual(code, 0)
+        self.assertEqual(code, 2)
         self.assertIn("unreadable", out)
+        self.assertIn("FAILED", out)
+
+    def test_a_re_import_of_the_same_artifact_is_a_success_not_a_failure(self):
+        """The steady state of an hourly idempotent job. "already imported"
+        means the artifact was read fine and held nothing new -- the opposite
+        of the unreadable case above -- so it must exit 0, keep the heartbeat
+        fresh, and still say in the log why it did nothing."""
+        first, _out, _err = self._main("offers", "--import", self.artifact)
+        self.assertEqual(first, 0)
+        code, out, _err = self._main("offers", "--import", self.artifact)
+        self.assertEqual(code, 0)
+        self.assertIn("already imported", out)
+        self.assertIn("nothing to do", out)
+
+    def test_scheduled_offer_branches_record_a_job_heartbeat(self):
+        """`health` can only report a job it has a heartbeat for. Without
+        these two keys the sweep could stop running for a month and nothing
+        -- not `health`, not the Telegram alert it drives -- would know."""
+        self._main("offers", "--import", self.artifact)
+        self._main("offers", "--sweep")
+        conn = db.connect(self.db_path)
+        try:
+            self.assertIsNotNone(db.state_get(conn, "job:offers-import:last_ok"))
+            self.assertIsNotNone(db.state_get(conn, "job:offers-sweep:last_ok"))
+        finally:
+            conn.close()
+
+    def test_a_failed_import_records_last_fail_not_last_ok(self):
+        self._main("offers", "--import", os.path.join(self.tmp.name, "no.json"))
+        conn = db.connect(self.db_path)
+        try:
+            self.assertIsNone(db.state_get(conn, "job:offers-import:last_ok"))
+            self.assertIsNotNone(db.state_get(conn, "job:offers-import:last_fail"))
+        finally:
+            conn.close()
+
+    def test_the_sweep_says_out_loud_when_it_did_nothing(self):
+        """A sweep that transitions nothing is the normal case, and is
+        indistinguishable from a sweep that never ran unless it says so."""
+        self._main("offers", "--import", self.artifact)
+        code, out, _err = self._main("offers", "--sweep")
+        self.assertEqual(code, 0)
+        self.assertTrue(
+            "nothing was due" in out or "not evaluated" in out or "transition" in out,
+            out,
+        )
+
+    def test_interactive_offer_branches_do_not_record_a_job_heartbeat(self):
+        """The owner listing their inbox is not a scheduled run. If it stamped
+        job:offers-import:last_ok, opening the inbox by hand would mask a
+        scheduled importer that had been dead for days."""
+        self._main("offers", "--import", self.artifact)
+        conn = db.connect(self.db_path)
+        try:
+            before = db.state_get(conn, "job:offers-import:last_ok")
+        finally:
+            conn.close()
+        self._main("offers")
+        self._main("offers", "--why", "binding-of-isaac-progression")
+        conn = db.connect(self.db_path)
+        try:
+            self.assertEqual(db.state_get(conn, "job:offers-import:last_ok"), before)
+        finally:
+            conn.close()
+
+
+class ExtractInterestsCLITests(unittest.TestCase):
+    """`python -m app extract-interests` -- the scheduled wrapper around the
+    sibling `ai` repo's interest_extractor.py.
+
+    The command itself never talks to a browser; it shells out to the
+    extractor, which does. So these tests stand a fake `interest_extractor.py`
+    up in a temp directory and drive the wrapper's real job: locating the
+    extractor from the already-wired candidates path, budgeting each stage,
+    and -- the part that matters -- refusing to report success for a run that
+    achieved nothing."""
+
+    STATUS_TEMPLATE = (
+        "import json, sys\n"
+        "cmd = sys.argv[1]\n"
+        "if cmd == 'status':\n"
+        "    import os\n"
+        "    n = int(open(os.path.join(os.path.dirname(__file__), 'pending.txt')).read())\n"
+        "    print(json.dumps({'pending_conversations': n, 'failed_conversations': 0,\n"
+        "                      'themes': 3, 'corpus': {}}))\n"
+        "    raise SystemExit(0)\n"
+    )
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = os.path.join(self.tmp.name, "t.db")
+        self.ai_repo = os.path.join(self.tmp.name, "ai")
+        os.makedirs(self.ai_repo)
+        self.artifact = os.path.join(self.ai_repo, "interest_candidates.json")
+        self.script = os.path.join(self.ai_repo, "interest_extractor.py")
+        self._set_pending(5)
+
+    def _set_pending(self, n):
+        with open(os.path.join(self.ai_repo, "pending.txt"), "w") as fh:
+            fh.write(str(n))
+
+    def _write_extractor(self, body):
+        with open(self.script, "w", encoding="utf-8") as fh:
+            # Plain concatenation, not str.format: the status stub is full
+            # of JSON braces a format template would try to interpolate.
+            fh.write(self.STATUS_TEMPLATE + body)
+
+    def _main(self, *argv, env=None):
+        from discovery.__main__ import main
+
+        environ = {"DISCOVERY_INTEREST_CANDIDATES": self.artifact}
+        environ.update(env or {})
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, environ), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(["--db", self.db_path, "extract-interests", *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    # A working extractor: map digests everything, reduce writes the artifact.
+    GOOD = (
+        "if cmd == 'map':\n"
+        "    import os\n"
+        "    open(os.path.join(os.path.dirname(__file__), 'pending.txt'), 'w').write('0')\n"
+        "    print('mapped 5')\n"
+        "    raise SystemExit(0)\n"
+        "if cmd == 'reduce':\n"
+        "    out = sys.argv[sys.argv.index('--out') + 1]\n"
+        "    open(out, 'w').write('{\"candidates\": []}')\n"
+        "    print('reduced')\n"
+        "    raise SystemExit(0)\n"
+    )
+
+    def test_a_good_run_maps_then_reduces_and_stamps_last_ok(self):
+        self._write_extractor(self.GOOD)
+        code, out, _err = self._main()
+        self.assertEqual(code, 0, out)
+        self.assertIn("map start", out)
+        self.assertIn("reduce start", out)
+        self.assertIn("pending 5 -> 0", out)
+        self.assertIn("artifact=rewritten", out)
+        self.assertTrue(os.path.exists(self.artifact))
+        conn = db.connect(self.db_path)
+        try:
+            self.assertIsNotNone(db.state_get(conn, "job:interest-extract:last_ok"))
+        finally:
+            conn.close()
+
+    def test_the_extractor_is_found_from_the_candidates_path_alone(self):
+        """The `internet` -> `ai` hop is already wired through
+        DISCOVERY_INTEREST_CANDIDATES; the scheduled job re-uses it instead of
+        introducing a second path setting that could drift out of step."""
+        self._write_extractor(self.GOOD)
+        code, out, _err = self._main()
+        self.assertEqual(code, 0)
+        self.assertIn(f"repo={self.ai_repo}", out)
+
+    def test_a_missing_extractor_fails_loudly_instead_of_doing_nothing(self):
+        code, out, _err = self._main()   # nothing written to self.script
+        self.assertEqual(code, 2)
+        self.assertIn("no interest_extractor.py", out)
+        conn = db.connect(self.db_path)
+        try:
+            self.assertIsNone(db.state_get(conn, "job:interest-extract:last_ok"))
+            self.assertIsNotNone(db.state_get(conn, "job:interest-extract:last_fail"))
+        finally:
+            conn.close()
+
+    def test_a_dead_claude_tab_fails_the_job_and_skips_reduce(self):
+        """cmd_map raises SystemExit when its claude.ai preflight fails -- the
+        single likeliest failure of this job, and the one that must never look
+        like a good night's run."""
+        self._write_extractor(
+            "if cmd == 'map':\n"
+            "    sys.stderr.write('map: claude.ai is not reachable -- no open tab\\n')\n"
+            "    raise SystemExit(1)\n"
+            "if cmd == 'reduce':\n"
+            "    open(os.path.join('x'), 'w')\n"
+        )
+        code, out, _err = self._main()
+        self.assertEqual(code, 2)
+        self.assertIn("map FAILED", out)
+        self.assertIn("not reducing", out)
+        self.assertNotIn("reduce start", out)
+        self.assertFalse(os.path.exists(self.artifact))
+
+    def test_a_map_that_digests_nothing_is_not_a_success(self):
+        """The honesty check. `reduce` exiting 0 proves an artifact was
+        written, not that anything new went into it. If map had work pending
+        and left just as much pending, the job burned browser time for a
+        byte-identical artifact -- so it must stamp last_fail, not last_ok."""
+        self._write_extractor(
+            "if cmd == 'map':\n"
+            "    print('nothing digested')\n"
+            "    raise SystemExit(0)\n"
+            "if cmd == 'reduce':\n"
+            "    out = sys.argv[sys.argv.index('--out') + 1]\n"
+            "    open(out, 'w').write('{}')\n"
+            "    raise SystemExit(0)\n"
+        )
+        code, out, _err = self._main()
+        from discovery.__main__ import EXTRACT_UNPRODUCTIVE
+
+        self.assertEqual(code, EXTRACT_UNPRODUCTIVE)
+        self.assertIn("map made no progress", out)
+        conn = db.connect(self.db_path)
+        try:
+            self.assertIsNone(db.state_get(conn, "job:interest-extract:last_ok"))
+            self.assertIsNotNone(db.state_get(conn, "job:interest-extract:last_fail"))
+        finally:
+            conn.close()
+
+    def test_an_empty_corpus_is_a_success_not_a_failure(self):
+        """Nothing pending means there was nothing to digest -- the normal
+        outcome of a nightly incremental run on a quiet day. That must not be
+        confused with the unproductive case above."""
+        self._set_pending(0)
+        self._write_extractor(
+            "if cmd == 'map':\n"
+            "    print('nothing to do')\n"
+            "    raise SystemExit(0)\n"
+            "if cmd == 'reduce':\n"
+            "    out = sys.argv[sys.argv.index('--out') + 1]\n"
+            "    open(out, 'w').write('{}')\n"
+            "    raise SystemExit(0)\n"
+        )
+        code, out, _err = self._main()
+        self.assertEqual(code, 0, out)
+
+    def test_reduce_exiting_zero_without_writing_an_artifact_is_a_failure(self):
+        self._write_extractor(
+            "if cmd == 'map':\n"
+            "    import os\n"
+            "    open(os.path.join(os.path.dirname(__file__), 'pending.txt'), 'w').write('0')\n"
+            "    raise SystemExit(0)\n"
+            "if cmd == 'reduce':\n"
+            "    print('pretending')\n"
+            "    raise SystemExit(0)\n"
+        )
+        code, out, _err = self._main()
+        from discovery.__main__ import EXTRACT_UNPRODUCTIVE
+
+        self.assertEqual(code, EXTRACT_UNPRODUCTIVE)
+        self.assertIn("wrote no artifact", out)
+
+    def test_a_map_that_overruns_its_budget_still_lets_reduce_publish(self):
+        """`map` is checkpointed per batch, so stopping it on a deadline costs
+        one batch. Killing the whole task instead would mean no artifact at
+        all -- publishing a slightly staler candidate list beats publishing
+        nothing."""
+        self._write_extractor(
+            "if cmd == 'map':\n"
+            "    import time, os\n"
+            "    open(os.path.join(os.path.dirname(__file__), 'pending.txt'), 'w').write('2')\n"
+            "    time.sleep(30)\n"
+            "if cmd == 'reduce':\n"
+            "    out = sys.argv[sys.argv.index('--out') + 1]\n"
+            "    open(out, 'w').write('{}')\n"
+            "    raise SystemExit(0)\n"
+        )
+        code, out, _err = self._main(env={"DISCOVERY_INTEREST_EXTRACT_MAP_SECONDS": "2"})
+        self.assertIn("hit its 2s budget", out)
+        self.assertIn("reduce start", out)
+        # It did make progress (5 -> 2), so a timeout alone is not a failure.
+        self.assertEqual(code, 0, out)
+
+    def test_skip_map_reduces_over_the_existing_digests(self):
+        self._write_extractor(self.GOOD)
+        code, out, _err = self._main("--skip-map")
+        self.assertEqual(code, 0, out)
+        self.assertNotIn("map start", out)
+        self.assertIn("reduce start", out)
+
+    def test_a_paused_appliance_does_not_drive_the_browser(self):
+        """`extract-interests` is the fourth PAUSE_GATED command: it holds a
+        claude.ai tab for minutes, which is exactly what `pause` exists to
+        stop. The offline import and sweep are deliberately NOT gated --
+        freezing the sweep would freeze the 30/45-day lifecycle clocks."""
+        from discovery.__main__ import PAUSE_GATED
+
+        self.assertIn("extract-interests", PAUSE_GATED)
+        self.assertNotIn("offers", PAUSE_GATED)
+        self._write_extractor(self.GOOD)
+        conn = db.connect(self.db_path)
+        try:
+            db.init(conn)
+            db.state_set(conn, "paused", "1")
+            conn.commit()
+        finally:
+            conn.close()
+        code, out, _err = self._main()
+        self.assertEqual(code, 0)
+        self.assertIn("paused", out)
+        self.assertFalse(os.path.exists(self.artifact))
+
+
+class InterestPipelineHealthTests(unittest.TestCase):
+    """The three new jobs have to be visible to `health`, because
+    `health --notify` is the only path that reaches the owner's phone. A
+    scheduled job nobody can see failing is the failure mode this whole
+    change exists to prevent."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.conn = db.connect(os.path.join(self.tmp.name, "h.db"))
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def test_health_reports_all_three_pipeline_jobs(self):
+        names = [j["name"] for j in health.check(self.conn, CFG)["jobs"]]
+        for name in ("offers-import", "offers-sweep", "interest-extract"):
+            self.assertIn(name, names)
+
+    def test_a_job_that_has_never_run_is_unknown_not_stale(self):
+        """Adding these to `health` must not alarm the owner before the tasks
+        have had their first chance to fire."""
+        result = health.check(self.conn, CFG)
+        for job in result["jobs"]:
+            if job["name"] in ("offers-import", "offers-sweep", "interest-extract"):
+                self.assertFalse(job["stale"], job)
+        self.assertFalse(result["degraded"])
+
+    def test_a_sweep_that_stopped_running_turns_health_degraded(self):
+        """The 30-day decay and 45-day auto-pause clocks stop dead when the
+        sweep does. That has to be an alert, not a silence."""
+        stale = (datetime.now(timezone.utc)
+                 - timedelta(seconds=CFG.offers_sweep_interval_seconds
+                             * CFG.health_stale_factor + 3600))
+        db.state_set(self.conn, "job:offers-sweep:last_ok", stale.isoformat())
+        result = health.check(self.conn, CFG)
+        sweep = next(j for j in result["jobs"] if j["name"] == "offers-sweep")
+        self.assertTrue(sweep["stale"])
+        self.assertTrue(result["degraded"])
+        self.assertIn("offers-sweep", health.format_report(result))
+
+    def test_a_fresh_sweep_keeps_health_ok(self):
+        db.state_set(self.conn, "job:offers-sweep:last_ok",
+                     datetime.now(timezone.utc).isoformat())
+        result = health.check(self.conn, CFG)
+        sweep = next(j for j in result["jobs"] if j["name"] == "offers-sweep")
+        self.assertFalse(sweep["stale"])
+        self.assertFalse(result["degraded"])
+
+    def test_the_report_still_lines_up_with_the_longest_job_name(self):
+        report = health.format_report(health.check(self.conn, CFG))
+        columns = {line.index("last_ok=") for line in report.splitlines()
+                   if "last_ok=" in line}
+        self.assertEqual(len(columns), 1, report)
 
 
 class InterestSyncV2Tests(unittest.TestCase):

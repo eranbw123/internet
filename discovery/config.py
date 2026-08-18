@@ -65,6 +65,37 @@ class Config:
     # (Task Scheduler's own Repetition+Duration on the CalendarTrigger).
     digest_interval_seconds: int = 3600
     digest_window_end: str = "23:00"    # local HH:MM, last digest slot of the day
+
+    # --- the interest-suggestion pipeline's own cadence (2026-08-18) ---
+    # Three jobs, three very different costs, so three separate fields rather
+    # than one shared "interest" interval. Until now NOTHING scheduled any of
+    # them: the extractor only ever ran by hand, so no new suggestion was ever
+    # produced, and -- the quiet one -- with no sweep timer every lifecycle
+    # rule in the design (30d decay, 45d auto-pause, offer expiry, snooze
+    # wake-up) was inert. A Stop button that can never fire is not a feature.
+    #
+    # interest_extract_time is a plain daily HH:MM, NOT a windowed repeat like
+    # the digest: this is the one job here that spends an LLM budget and holds
+    # a claude.ai tab for minutes at a time, and `map` is incremental, so a
+    # second run the same day re-reduces the same digests for nothing. 03:30
+    # is deliberate -- outside the digest window (digest_time..digest_window_end),
+    # and at an hour the owner is not using Chrome interactively.
+    interest_extract_time: str = "03:30"
+    # Local, offline, and idempotent on the artifact's sha256, so running it
+    # hourly costs a file hash and a state lookup. Hourly (not daily) so an
+    # artifact produced by hand -- which is exactly how the first five offers
+    # arrived -- reaches the inbox within the hour instead of the next night.
+    offers_import_interval_seconds: int = 3600
+    # Local and offline too. The brief is "at least daily"; 6h is four
+    # chances a day, so a machine asleep or off through one slot still sweeps
+    # that day instead of silently skipping a day of the 30/45-day clocks.
+    offers_sweep_interval_seconds: int = 6 * 3600
+    # Wall-clock budget handed to the extractor's `map` stage. `map` is
+    # checkpointed per batch and resumable, so hitting this costs at most one
+    # batch and the next night resumes -- and stopping map on a deadline is
+    # what guarantees `reduce` still gets to run and publish an artifact.
+    interest_extract_map_seconds: int = 60 * 60
+    interest_extract_reduce_seconds: int = 20 * 60
     # Immediate discovery delivery (opt-in). Off by default: DISCOVERY items
     # wait for the daily digest, exactly as before. On (DISCOVERY_IMMEDIATE=1),
     # deliver() also pushes freshly-scored above-bar discoveries the moment a
@@ -189,6 +220,19 @@ def load():
         digest_max_items=int(os.environ.get("DISCOVERY_DIGEST_MAX", "10")),
         digest_interval_seconds=int(os.environ.get("DISCOVERY_DIGEST_INTERVAL", "3600")),
         digest_window_end=os.environ.get("DISCOVERY_DIGEST_WINDOW_END", "23:00"),
+        interest_extract_time=os.environ.get("DISCOVERY_INTEREST_EXTRACT_TIME", "03:30"),
+        offers_import_interval_seconds=int(
+            os.environ.get("DISCOVERY_OFFERS_IMPORT_INTERVAL", "3600")
+        ),
+        offers_sweep_interval_seconds=int(
+            os.environ.get("DISCOVERY_OFFERS_SWEEP_INTERVAL", str(6 * 3600))
+        ),
+        interest_extract_map_seconds=int(
+            os.environ.get("DISCOVERY_INTEREST_EXTRACT_MAP_SECONDS", str(60 * 60))
+        ),
+        interest_extract_reduce_seconds=int(
+            os.environ.get("DISCOVERY_INTEREST_EXTRACT_REDUCE_SECONDS", str(20 * 60))
+        ),
         immediate_discovery=os.environ.get("DISCOVERY_IMMEDIATE", "").strip().lower()
         in ("1", "true"),
         immediate_max_per_cycle=int(os.environ.get("DISCOVERY_IMMEDIATE_MAX_PER_CYCLE", "3")),

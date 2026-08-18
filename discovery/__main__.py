@@ -56,6 +56,10 @@
                   --sweep the expiry/decay/auto-pause timers, and the
                   decisions --accept/--reject/--snooze KEY, plus --undo KEY
                   for the one-click undo of an auto-pause
+    extract-interests  run the `ai` repo's interest extractor (map, then
+                  reduce) to refresh the candidates artifact this repo
+                  imports. The only command here that drives a browser it
+                  does not own; see _extract_interests_cmd
 
 There is no `run`/scheduler loop -- an OS scheduler (see
 ops/install_tasks.py) calls the commands above on their own cadence instead;
@@ -63,9 +67,12 @@ a session-child tick loop gets reaped the moment the SSH session disconnects.
 """
 import argparse
 import json
+import os
 import subprocess
 import sys
+import time
 from collections import Counter
+from pathlib import Path
 
 from datetime import datetime, timezone
 
@@ -213,6 +220,19 @@ def main(argv=None):
     of.add_argument("--undo", metavar="KEY", help="undo an interest's auto-pause")
     of.add_argument("--note", default="", help="note recorded with a decision")
 
+    ex = sub.add_parser(
+        "extract-interests",
+        help="refresh the candidates artifact: the ai repo's extractor, map then reduce",
+    )
+    ex.add_argument(
+        "--skip-map", action="store_true",
+        help="reduce only -- re-propose from the digests already collected",
+    )
+    ex.add_argument(
+        "--map-limit", type=int, default=None,
+        help="cap `map` at N conversations (smoke-testing the wiring; default: all pending)",
+    )
+
     args = parser.parse_args(argv)
     if args.command == "trace-fixture" and not args.db:
         # trace_fixture.build() inserts fixture interests/items/scores/a real
@@ -263,7 +283,12 @@ def main(argv=None):
 # freezes exactly these; `listen --drain` (one free Telegram getUpdates -- it
 # keeps feedback buttons responsive while paused) and `health` (free local
 # checks, pause-aware in health.check) deliberately keep running.
-PAUSE_GATED = ("run-once", "web-tick", "digest")
+# `extract-interests` belongs here for the same reason the other three do: it
+# drives a real claude.ai tab for minutes at a time. `offers --import` and
+# `offers --sweep` deliberately do NOT -- both are offline file/SQLite work,
+# and freezing the sweep would freeze the 30/45-day lifecycle clocks, which is
+# precisely the failure this repo just spent a scheduling pass fixing.
+PAUSE_GATED = ("run-once", "web-tick", "digest", "extract-interests")
 
 
 def _dispatch(conn, cfg, args, provider):
@@ -340,6 +365,10 @@ def _dispatch(conn, cfg, args, provider):
         return _ui_cmd(cfg, args)
     elif args.command == "offers":
         return _offers_cmd(conn, cfg, args)
+    elif args.command == "extract-interests":
+        return _run_job(
+            conn, "interest-extract", lambda: _extract_interests_cmd(conn, cfg, args)
+        )
     return 0
 
 
@@ -750,26 +779,47 @@ def _launch_ngrok(cfg, port):
     return True
 
 
+# `import_artifact` is fail-soft by design -- it returns a summary carrying an
+# `error` string instead of raising, because it runs inside a scheduled tick.
+# That is right for the function and wrong for the exit code: a scheduled task
+# whose artifact has been unreadable for a week must not keep reporting
+# LastTaskResult=0 and stamping job:offers-import:last_ok. These two reasons
+# are the ones that mean "the artifact was read fine, there was simply nothing
+# new in it" -- the steady state of an hourly, idempotent job. Every OTHER
+# reason means the artifact could not be read at all, and is a failure.
+_IMPORT_BENIGN_ERRORS = ("already imported", "no candidates in contract_version")
+
+
+def _import_is_failure(summary):
+    error = summary.get("error") or ""
+    if not error:
+        return False
+    return not error.startswith(_IMPORT_BENIGN_ERRORS)
+
+
 def _offers_cmd(conn, cfg, args):
     """One subcommand over discovery/offers.py. Every branch is offline:
     importing reads a local artifact, the sweeps read the funnel, and the
     decisions write only the offer/interest tables -- no provider is ever
-    built, no model is ever called."""
+    built, no model is ever called.
+
+    `--import` and `--sweep` are the two branches a Scheduled Task fires
+    unattended, so they alone are wrapped in `_run_job`: they get the same
+    `job:<name>:last_ok/last_fail` heartbeat and run_ok/run_failed counters
+    every other scheduled command has, which is what puts them in front of
+    the owner through `health --notify` (health.JOB_INTERVALS) instead of
+    only in a log nobody opens. The interactive branches -- the inbox
+    listing, `--why`, and the accept/reject/snooze decisions -- are the owner
+    typing, not a job, and stay unwrapped so a typo at the keyboard never
+    shows up as a failed scheduled run.
+    """
     if args.why:
         return _offer_why(conn, args.why)
     if args.import_path is not None:
         path = args.import_path or cfg.interest_candidates_path
-        summary = offers.import_artifact(conn, path, interests_path=cfg.interests_path)
-        print_safe(json.dumps(summary, ensure_ascii=False, indent=2))
-        return 0
+        return _run_job(conn, "offers-import", lambda: _offers_import_cmd(conn, cfg, path))
     if args.sweep:
-        summary = offers.sweep(conn)
-        for announcement in summary["announcements"]:
-            print_safe(announcement["text"])
-        print_safe(json.dumps(
-            {k: v for k, v in summary.items() if k != "announcements"}, ensure_ascii=False
-        ))
-        return 0
+        return _run_job(conn, "offers-sweep", lambda: _offers_sweep_cmd(conn))
     for key, action in (
         (args.accept, "accept"), (args.reject, "reject"),
         (args.snooze, "snooze"), (args.undo, "undo"),
@@ -777,6 +827,272 @@ def _offers_cmd(conn, cfg, args):
         if key:
             return _offer_decide(conn, cfg, key, action, args.note)
     return _offers_list(conn, args.status)
+
+
+def _offers_import_cmd(conn, cfg, path):
+    """Import the candidates artifact, and say out loud what it did -- or why
+    it did nothing. The summary is printed on EVERY path, including the ones
+    that import zero offers: "already imported" and "no candidates" are the
+    normal outcomes of an hourly idempotent job, and a log line saying so is
+    the difference between a job that is working and a job that has been dead
+    for a week. From the outside those two look identical otherwise."""
+    print_safe(f"offers --import: reading {path}")
+    summary = offers.import_artifact(conn, path, interests_path=cfg.interests_path)
+    print_safe(json.dumps(summary, ensure_ascii=False, indent=2))
+    if _import_is_failure(summary):
+        # Non-zero, so _run_job stamps job:offers-import:last_fail and
+        # `health` starts counting this job as failing.
+        print_safe(f"offers --import: FAILED -- {summary['error']}")
+        return 2
+    if summary.get("error"):
+        print_safe(f"offers --import: nothing to do -- {summary['error']}")
+    else:
+        print_safe(
+            f"offers --import: {summary['offered']} offered from "
+            f"{summary['imported']} candidates (artifact {summary['artifact_sha256'][:12]})"
+        )
+    return 0
+
+
+def _offers_sweep_cmd(conn):
+    """Every timer-driven transition in the offer/interest lifecycle: expiry,
+    snooze wake-up, decay, auto-pause. `offers.sweep` either performs those
+    transitions or reports, in `skipped`, that it deliberately refused to
+    judge interest silence the pipeline itself caused. That refusal is a
+    correct outcome, not an error, so it exits 0 -- but it is printed,
+    because a sweep that has been skipping for weeks is something the owner
+    should be able to read in a log rather than infer from interests that
+    never decay."""
+    summary = offers.sweep(conn)
+    for announcement in summary["announcements"]:
+        print_safe(announcement["text"])
+    print_safe(json.dumps(
+        {k: v for k, v in summary.items() if k != "announcements"}, ensure_ascii=False
+    ))
+    moved = sum(
+        summary.get(key, 0) for key in
+        ("expired", "woken", "decaying", "recovered", "auto_paused", "retired", "retire_offers")
+    )
+    if summary.get("skipped"):
+        print_safe(f"offers --sweep: interest timers not evaluated -- {summary['skipped']}")
+    elif not moved:
+        print_safe("offers --sweep: nothing was due (no expiry, wake, decay or auto-pause)")
+    else:
+        print_safe(f"offers --sweep: {moved} lifecycle transition(s)")
+    return 0
+
+
+# `map` made no progress on work it had. Distinct from 2 (could not run at
+# all) so a log tells the two apart, and deliberately mirrors _web_tick_cmd's
+# WEB_TICK_UNPRODUCTIVE: a job that ran and achieved nothing must not stamp
+# last_ok, because a heartbeat that keeps advancing while nothing happens is
+# exactly how this appliance went blind for five days.
+EXTRACT_UNPRODUCTIVE = 4
+
+
+def _say(message):
+    """print_safe, then flush. Task Scheduler redirects this job's stdout to a
+    file (ops/run.cmd) and a redirected stdout is block-buffered, so a job
+    killed by its ExecutionTimeLimit loses everything it printed. This is the
+    task most exposed to that -- it is the one with a two-hour limit that
+    spends most of it inside a child process -- and a log that goes silent
+    tells nobody anything. Flushing per line costs nothing at this volume."""
+    print_safe(message)
+    try:
+        sys.stdout.flush()
+    except (AttributeError, ValueError):   # a replaced stream in tests
+        pass
+
+
+def _extractor_paths(cfg):
+    """Locate the `ai` repo's extractor from the hop that is already wired.
+
+    `cfg.interest_candidates_path` (DISCOVERY_INTEREST_CANDIDATES) is the
+    artifact the extractor WRITES and this repo READS -- so its directory is
+    the producer's repo root, and nothing new has to be configured to find the
+    producer itself. Returns ((script, repo_root), "") or (None, reason)."""
+    raw = cfg.interest_candidates_path or ""
+    if not raw:
+        return None, "cfg.interest_candidates_path is empty"
+    repo_root = Path(raw).parent
+    script = repo_root / "interest_extractor.py"
+    if not script.is_file():
+        return None, (
+            f"no interest_extractor.py beside the candidates artifact ({script}) "
+            f"-- DISCOVERY_INTEREST_CANDIDATES must point into the producer repo"
+        )
+    return (script, repo_root), ""
+
+
+def _extractor_env():
+    """The child's environment. PYTHONIOENCODING because the extractor prints
+    the owner's Hebrew conversation titles and this console is cp1255."""
+    env = dict(os.environ)
+    env["PYTHONIOENCODING"] = "utf-8"
+    return env
+
+
+def _extractor_status(python, script, repo_root, timeout=180):
+    """The extractor's own offline `status` subcommand, as a dict. Used as a
+    before/after measurement so this command can tell "there was nothing to
+    do" apart from "it did nothing" -- which is the whole point. Returns {}
+    if it cannot be read: a status that fails is worth a log line, never
+    worth failing the run over."""
+    try:
+        proc = subprocess.run(
+            [python, str(script), "status"], cwd=str(repo_root),
+            capture_output=True, text=True, errors="replace", timeout=timeout,
+            env=_extractor_env(),
+        )
+    except (OSError, subprocess.SubprocessError) as e:
+        _say(f"extract-interests: status unavailable ({e})")
+        return {}
+    if proc.returncode != 0:
+        _say(
+            f"extract-interests: status exited {proc.returncode}: "
+            f"{(proc.stderr or '').strip()[:400]}"
+        )
+        return {}
+    try:
+        return json.loads(proc.stdout)
+    except (ValueError, TypeError):
+        _say("extract-interests: status output was not JSON")
+        return {}
+
+
+def _echo_stage(label, out, err):
+    for stream, text in (("out", out), ("err", err)):
+        for line in (text or "").splitlines():
+            if line.strip():
+                _say(f"  [{label}:{stream}] {line}")
+
+
+def _run_extractor_stage(python, script, repo_root, stage_args, timeout):
+    """Run one extractor stage. Returns (returncode, timed_out); a timeout
+    reports (None, True).
+
+    Output is captured and echoed with a stage label rather than inherited:
+    ops/run.cmd gives the whole invocation ONE log file, and an
+    undifferentiated wall of map output in it is not readable evidence."""
+    label = stage_args[0]
+    _say(f"extract-interests: {label} start (budget {timeout}s) -> {script}")
+    started = time.monotonic()
+    try:
+        proc = subprocess.run(
+            [python, str(script), *stage_args], cwd=str(repo_root),
+            capture_output=True, text=True, errors="replace", timeout=timeout,
+            env=_extractor_env(),
+        )
+    except subprocess.TimeoutExpired as e:
+        _echo_stage(label, e.stdout, e.stderr)
+        _say(
+            f"extract-interests: {label} hit its {timeout}s budget and was stopped "
+            f"after {(time.monotonic() - started) / 60:.1f}m. `map` is checkpointed "
+            f"per batch, so finished work is kept and the next run resumes."
+        )
+        return None, True
+    except OSError as e:
+        _say(f"extract-interests: {label} could not start: {e}")
+        return 2, False
+    _echo_stage(label, proc.stdout, proc.stderr)
+    _say(
+        f"extract-interests: {label} exited {proc.returncode} "
+        f"in {(time.monotonic() - started) / 60:.1f}m"
+    )
+    return proc.returncode, False
+
+
+def _extract_interests_cmd(conn, cfg, args):
+    """Run the `ai` repo's interest extractor -- `map`, then `reduce` -- so the
+    candidates artifact this repo imports is refreshed by a machine instead of
+    by the owner remembering to type two commands in another repo.
+
+    Why this lives in `internet` and not in `ai`: the scheduling convention is
+    here. `ops/install_tasks.py`, `ops/hidden.vbs`, `ops/run.cmd` and the
+    `internet-discovery-*` family are one mechanism with one installer, one
+    log-naming rule and one uninstall whitelist. Standing up a second
+    scheduler in `ai` would mean a second copy of all of that, plus an owner
+    who has to remember which of two places a job is registered in. Running it
+    as a `python -m app` subcommand instead means it needs no new launcher at
+    all -- ops/run.cmd already handles it -- and it inherits `_run_job`'s
+    heartbeat, so `health` (and therefore Telegram) can see it. `ai` keeps
+    owning the extractor; this owns only when it runs.
+
+    Exit codes: 0 worked, 2 could not run at all, EXTRACT_UNPRODUCTIVE (4) ran
+    and got nowhere. `_run_job` turns every non-zero into
+    job:interest-extract:last_fail.
+    """
+    located, why = _extractor_paths(cfg)
+    if located is None:
+        _say(f"extract-interests: cannot locate the extractor -- {why}")
+        return 2
+    script, repo_root = located
+    python = sys.executable or "python"
+    artifact = Path(cfg.interest_candidates_path)
+    before_mtime = artifact.stat().st_mtime if artifact.exists() else None
+
+    before = _extractor_status(python, script, repo_root)
+    pending_before = before.get("pending_conversations")
+    _say(
+        f"extract-interests: repo={repo_root} pending={pending_before} "
+        f"failed={before.get('failed_conversations')} themes={before.get('themes')}"
+    )
+
+    map_timed_out = False
+    if args.skip_map:
+        _say("extract-interests: --skip-map, reducing over the digests already collected")
+    else:
+        map_args = ["map"]
+        if args.map_limit is not None:
+            map_args += ["--limit", str(args.map_limit)]
+        code, map_timed_out = _run_extractor_stage(
+            python, script, repo_root, map_args, cfg.interest_extract_map_seconds
+        )
+        if code not in (0, None):
+            # A map that refuses to start -- cmd_map raises SystemExit when the
+            # claude.ai preflight fails -- is the single most likely failure
+            # here, and it must never look like a good night's run.
+            _say(f"extract-interests: map FAILED (exit {code}) -- not reducing")
+            return 2
+
+    # reduce runs even after a map timeout: a partial digest set still yields a
+    # valid, if slightly staler, candidate list, and publishing something beats
+    # publishing nothing.
+    code, reduce_timed_out = _run_extractor_stage(
+        python, script, repo_root, ["reduce", "--out", str(artifact)],
+        cfg.interest_extract_reduce_seconds,
+    )
+    if reduce_timed_out or code != 0:
+        _say(
+            f"extract-interests: reduce FAILED (exit {code}, timed_out={reduce_timed_out})"
+        )
+        return 2
+
+    after = _extractor_status(python, script, repo_root)
+    pending_after = after.get("pending_conversations")
+    after_mtime = artifact.stat().st_mtime if artifact.exists() else None
+    _say(
+        f"extract-interests: pending {pending_before} -> {pending_after}, "
+        f"failed {before.get('failed_conversations')} -> {after.get('failed_conversations')}, "
+        f"artifact={'rewritten' if after_mtime != before_mtime else 'UNCHANGED'}"
+    )
+
+    if after_mtime is None:
+        _say(f"extract-interests: reduce exited 0 but wrote no artifact at {artifact}")
+        return EXTRACT_UNPRODUCTIVE
+    # The honesty check. `reduce` exiting 0 is not proof anything happened: if
+    # map had pending work and finished with just as much still pending, it
+    # spent browser time and digested nothing, and the next import will
+    # re-import a byte-identical artifact. Say so, and fail.
+    if (not args.skip_map and pending_before and pending_after is not None
+            and pending_after >= pending_before):
+        _say(
+            f"extract-interests: map made no progress -- {pending_before} conversations "
+            f"were pending before and {pending_after} still are"
+            + (" (map timed out)" if map_timed_out else "")
+        )
+        return EXTRACT_UNPRODUCTIVE
+    return 0
 
 
 def _offers_list(conn, status):
