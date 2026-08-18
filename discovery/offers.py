@@ -756,6 +756,91 @@ def wake(conn, key, *, actor=TIMER):
     )
 
 
+def duplicate_pairs(conn, rules=None, now=None):
+    """Every pair of LIVE offers that rest on the same evidence, as
+    (loser_key, winner_key, why), strongest duplicate first.
+
+    Which of a pair survives is decided on how much each one is standing on,
+    never on the composite score: that score was measured to be unanchored --
+    the same document scored .640 and .943 on consecutive days, and the two
+    producers clear a fixed bar at wildly different rates -- so comparing two
+    offers written by different runs on it would be comparing two different
+    rulers. Evidence count is the same quantity for both. Score is used only to
+    break a tie between offers standing on exactly as much, where it is an
+    ordinal within one comparison rather than a threshold, and the key breaks
+    any remaining tie so the result is deterministic.
+    """
+    rules = rules or DEFAULT_RULES
+    rows = list_offers(conn, status=OFFERED)
+    convs = {r["key"]: evidence_conversations(r) for r in rows}
+    rank_of = {
+        r["key"]: (len(convs[r["key"]]), len(r["evidence"]), r["score"] or 0.0, r["key"])
+        for r in rows
+    }
+    pairs = []
+    for i, a in enumerate(rows):
+        for b in rows[i + 1:]:
+            share, shared = _evidence_overlap(convs[a["key"]], convs[b["key"]])
+            if share < rules.evidence_overlap_duplicate or shared < rules.evidence_overlap_min_shared:
+                continue
+            winner, loser = (a, b) if rank_of[a["key"]] >= rank_of[b["key"]] else (b, a)
+            pairs.append((
+                loser["key"], winner["key"],
+                f"{share:.0%} of the smaller offer's evidence ({shared} shared "
+                f"conversation(s)) is the same evidence",
+                share, shared,
+            ))
+    pairs.sort(key=lambda t: (-t[3], -t[4], t[0]))
+    return [(loser, winner, why) for loser, winner, why, _s, _n in pairs]
+
+
+def reconcile_duplicates(conn, *, rules=None, now=None, actor=IMPORTER):
+    """Fold every near-duplicate pair already sitting in the inbox into one
+    offer each, keeping the evidence. Returns a summary; never raises.
+
+    This is the repair half of the offer-vs-offer dedup: _promote() stops new
+    duplicates arriving, and this clears the ones that arrived while the inbox
+    check was exact-key only. It is idempotent -- once a pair is merged there
+    is no pair left to find -- so it is safe to run on every top-up, which is
+    where it runs, so the inbox heals itself rather than waiting to be repaired
+    by hand.
+
+    Pairs are recomputed after each merge rather than taken from one snapshot.
+    Duplicates come in clusters, not only pairs (three offers can share one
+    conversation set), and merging the first pair changes which of the rest are
+    still duplicates -- and enlarges the survivor's evidence, which can reveal
+    a duplicate that was below the bar a moment ago.
+    """
+    rules = rules or DEFAULT_RULES
+    summary = {"merged": 0, "pairs": [], "reason": "", "error": ""}
+    # Bounded: every pass retires exactly one offer, so it cannot outlast the
+    # inbox even if the pair set were somehow unstable.
+    for _ in range(len(list_offers(conn, status=OFFERED)) + 1):
+        pairs = duplicate_pairs(conn, rules, now)
+        if not pairs:
+            break
+        loser, winner, why = pairs[0]
+        try:
+            result = supersede(conn, loser, winner, actor=actor, now=now, why=why,
+                               note="near-duplicate of an offer already in the inbox")
+        except OfferError as e:
+            summary["error"] = f"{type(e).__name__}: {e}"
+            break
+        summary["merged"] += 1
+        summary["pairs"].append({
+            "superseded": loser, "survivor": winner, "why": why,
+            "evidence_added": result["evidence_added"],
+        })
+    if summary["merged"]:
+        summary["reason"] = "; ".join(
+            f"{p['superseded']} -> {p['survivor']} ({p['why']}, "
+            f"+{p['evidence_added']} quote(s) kept)" for p in summary["pairs"]
+        )
+    else:
+        summary["reason"] = summary["error"] or "no near-duplicate pairs in the inbox"
+    return summary
+
+
 def supersede(conn, loser_key, winner_key, *, actor=IMPORTER, note="", now=None, why=""):
     """Fold a duplicate offer into the one it duplicates, keeping the evidence.
 
@@ -1064,8 +1149,15 @@ def top_up(conn, path, *, interests_path=None, rules=None, now=None, actor=IMPOR
     """
     rules = rules or DEFAULT_RULES
     now = _now(now)
+    # Heal, then fill. A near-duplicate pair in the inbox is a wasted slot --
+    # the owner is being asked the same question twice -- so the pairs are
+    # merged first and this same run refills the slots that frees. Doing it
+    # here rather than in a repair script of its own is what makes the inbox
+    # self-healing: any duplicate that ever gets in is gone within the hour.
+    reconciled = reconcile_duplicates(conn, rules=rules, now=now, actor=actor)
     live_before = live_offer_count(conn)
     summary = {
+        "reconciled": reconciled,
         "imported": 0, "offered": 0, "skipped_existing": 0, "skipped_floor": 0,
         "skipped_dedup": 0, "skipped_blocked": 0, "attached": 0, "not_selected": 0,
         "offers": [], "promoted": [], "reasons": [], "artifact_sha256": "", "error": "",
@@ -1075,6 +1167,9 @@ def top_up(conn, path, *, interests_path=None, rules=None, now=None, actor=IMPOR
     }
 
     def done(reason):
+        if reconciled["merged"]:
+            reason = (f"merged {reconciled['merged']} near-duplicate pair(s) "
+                      f"[{reconciled['reason']}]; " + reason)
         summary["reason"] = reason
         summary["live_after"] = live_offer_count(conn)
         _record_topup(conn, summary)
