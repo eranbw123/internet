@@ -809,6 +809,46 @@ network) against a fixture db built by the real `discovery/trace_fixture.py`.
 Skips every test with a loud message (not a failure) if `datasette` genuinely
 isn't installed.
 
+### Observatory write API
+
+The Observatory is no longer read-only. `observatory/manage.py` adds the
+endpoints the interests workspace uses to tend the catalog without a PR and
+without a hand-written DB op:
+
+```
+GET  /observatory/api/offers?status=inbox|all|<status,...>&kind=&limit=
+GET  /observatory/api/offers/<key>/provenance
+POST /observatory/api/offers/<key>/decide   {"action":"accept|reject|snooze",
+                                             "edits": {...}, "note": "",
+                                             "days": 30}
+POST /observatory/api/offers/generate       import/re-rank the latest artifact
+GET  /observatory/api/interests/stats?window=7d|30d|Nd|all
+POST /observatory/api/interests             create   (GET on the same path
+                                                      still lists interests)
+POST /observatory/api/interests/<key>       update, or {"active": false} to
+                                                      retire / true to un-retire
+POST /observatory/api/interests/<key>/revive   one-click undo of an auto-pause
+GET  /observatory/api/edges?min_weight=&kind=
+```
+
+`accept` with `edits` is "edit, then accept" in one request. Every write goes
+through `discovery/offers.py` (decisions, lifecycle) and
+`discovery/interest_sync.py` (interests.json + DB), never around them — so a
+retire made here survives the next `python -m app sync`, which a database-only
+retirement deliberately would not.
+
+Writes are JSON only (`Content-Type: application/json`, else 415 — that check
+is the CSRF boundary for a localhost-bound API) and are **refused in
+`--public` mode** unless `DISCOVERY_UI_ALLOW_PUBLIC_WRITES=1`: the tunnel
+exists for reading the Observatory from a phone, not for rewriting
+`interests.json`. Reads keep the existing posture. Optional
+`"expected_mtime"` on any interests write is a stale-editor precondition — a
+form opened before someone hand-edited `interests.json` gets a 409 instead of
+clobbering that edit.
+
+Tests: `python test_observatory_manage.py` — 61 offline cases, same ASGI
+client idiom, mixed Hebrew/English fixtures, no browser.
+
 ### Observatory frontend (`observatory/frontend/`)
 
 React + TypeScript + React Flow (`@xyflow/react`) + ELK.js (`elkjs`), built
@@ -879,7 +919,11 @@ offline via Datasette's own ASGI test client — see
 [Observatory](#observatory)); both are separate suites, so
 `test_discovery.py` stays importable and green on a machine without
 `datasette` installed. `test_observatory.py` skips itself with a loud
-message instead of failing if `datasette` isn't installed.
+message instead of failing if `datasette` isn't installed. The write API has
+its own suite alongside it — `python test_observatory_manage.py` (61 tests,
+see [Observatory write API](#observatory-write-api)) — kept separate because
+it needs a writable fixture db plus a writable `interests.json`, and it skips
+the same way.
 
 A fourth, separate suite — `python test_observatory_e2e.py` (real headless
 Chrome over CDP) — is not part of this always-run list: it needs a built

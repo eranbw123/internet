@@ -33,6 +33,9 @@ def build_datasette(cfg, public=False):
     _ensure_plugin_registered()
     ds = Datasette(files=[cfg.db_path], settings={"default_allow_sql": True})
     ds._observatory_db_path = cfg.db_path
+    # The write API needs more than the db path (interests.json, the
+    # candidates artifact), so the whole cfg rides along.
+    ds._observatory_cfg = cfg
     ds._observatory_public = public
     ds._observatory_token = cfg.ui_token
     return ds
