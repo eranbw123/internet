@@ -438,7 +438,9 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode, isMobile = false
           {focusMode ? "Show full run" : "Focus: this discovery's path"}
         </button>
         {focusMode && display.hiddenCount > 0 && (
-          <span className="graph-toolbar-note">· {display.hiddenCount} nodes hidden</span>
+          <span className="graph-toolbar-note">
+            {display.hiddenCount} {display.hiddenCount === 1 ? "node" : "nodes"} hidden
+          </span>
         )}
         <button onClick={fitFocusFirst}>Fit to view</button>
         <button className="toolbar-overflow-only" onClick={expandAll}>Expand all</button>

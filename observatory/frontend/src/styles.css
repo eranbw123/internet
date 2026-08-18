@@ -694,6 +694,13 @@ button[aria-selected="true"], button.active, button[aria-pressed="true"] {
   /* ---- graph ----------------------------------------------------------- */
   /* The minimap is screen real estate the flowchart needs on a phone. */
   .graph-minimap { display: none; }
+  /* So are the zoom controls, for the same reason and one more: they are
+     absolutely positioned in the bottom-left corner and sit ON TOP of whatever
+     node lands there -- measured, they covered a score-debug node's timestamp
+     on a fitted trace. Pinch-zoom and drag do everything they do, and the one
+     thing a pinch cannot do, "Fit to view", is already a button in the toolbar
+     above the canvas. */
+  .react-flow__controls { display: none; }
   /* The toolbar wrapped to two rows on a phone, eating the graph's height.
      Primary actions stay visible; the rest move into the overflow menu. */
   .graph-toolbar { flex-wrap: nowrap; gap: 8px; padding: 8px; }
