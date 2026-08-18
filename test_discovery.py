@@ -9426,6 +9426,17 @@ class OffersCLITests(unittest.TestCase):
         self.assertEqual(code, 0)
         self.assertNotIn("top-up after", out)
 
+    def test_the_reconcile_stays_quiet_when_the_inbox_is_already_full(self):
+        """Recording a new artifact sha while adding nothing is NOT work the
+        owner needed. With the inbox at target, whether the event path got
+        there first is invisible to him -- and a warning nobody can act on is
+        how a useful alert turns into noise the real one hides behind."""
+        self._main("offers", "--import", self.artifact)
+        code, out, _err = self._main("offers", "--import", self.artifact)
+        self.assertEqual(code, 0)
+        self.assertNotIn("WARNING", out)
+        self.assertIn("the event path is keeping up", out)
+
     def test_the_reconcile_shouts_when_it_finds_work(self):
         """The backstop's whole value. A pure event chain cannot notice its own
         silence -- if a trigger is missed the inbox just stops refilling, which
