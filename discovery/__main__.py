@@ -68,8 +68,10 @@ a session-child tick loop gets reaped the moment the SSH session disconnects.
 import argparse
 import json
 import os
+import queue
 import subprocess
 import sys
+import threading
 import time
 from collections import Counter
 from pathlib import Path
@@ -1009,53 +1011,122 @@ def _extractor_status(python, script, repo_root, timeout=180):
         return {}
 
 
-def _echo_stage(label, out, err):
-    for stream, text in (("out", out), ("err", err)):
-        for line in (text or "").splitlines():
-            if line.strip():
-                _say(f"  [{label}:{stream}] {line}")
+def _drain_into(stream, queue_):
+    """Reader thread body: every line the child prints goes onto the queue.
+    A thread, rather than iterating the pipe on the main thread, is what makes
+    the deadline enforceable -- a child that hangs without printing would
+    block a direct `for line in proc.stdout` forever, and the budget that is
+    supposed to stop it would never be looked at again."""
+    try:
+        for line in stream:
+            queue_.put(line)
+    except (OSError, ValueError):
+        pass
+    finally:
+        queue_.put(None)   # sentinel: the child closed its end
 
 
 def _run_extractor_stage(python, script, repo_root, stage_args, timeout):
-    """Run one extractor stage. Returns (returncode, timed_out); a timeout
-    reports (None, True).
+    """Run one extractor stage, streaming its output into this job's log as it
+    arrives. Returns (returncode, timed_out); a timeout reports (None, True).
 
-    Output is captured and echoed with a stage label rather than inherited:
-    ops/run.cmd gives the whole invocation ONE log file, and an
-    undifferentiated wall of map output in it is not readable evidence."""
+    Streamed line by line, not collected and echoed at the end. `map` over a
+    full backlog runs for tens of minutes and prints one line per batch, and a
+    stage that says nothing until it finishes is invisible for exactly as long
+    as it is interesting -- if the task is killed at minute 29 of 30, a
+    buffered echo has nothing to hand over. Each line is prefixed with its
+    stage and flushed, so the log always shows how far the run actually got.
+
+    The child gets a PIPE rather than inheriting this process's stdout. Under
+    Task Scheduler that stdout IS the job's log file, opened by ops/run.cmd's
+    `>>` without FILE_SHARE_WRITE, and a child holding that handle is what kept
+    logs/web-tick-*.log locked for days (see health.preflight_gate). stdin is
+    closed for the same family of reasons: nothing here should be able to block
+    on a read from a console that is not there.
+
+    The budget is enforced against wall clock on the main thread, so it stops a
+    stage that has gone quiet as surely as one that is chattering -- a hang is
+    the failure most worth having a deadline for, and it is the one a
+    read-driven loop cannot see.
+    """
     label = stage_args[0]
     _say(f"extract-interests: {label} start (budget {timeout}s) -> {script}")
     started = time.monotonic()
+    deadline = started + timeout
     try:
-        proc = subprocess.run(
+        proc = subprocess.Popen(
             [python, str(script), *stage_args], cwd=str(repo_root),
-            capture_output=True, text=True, errors="replace", timeout=timeout,
-            # capture_output already gives stdout/stderr their own pipes, so
-            # this child cannot inherit the job's log-file handle -- the leak
-            # that kept logs/web-tick-*.log locked for days (see
-            # health.preflight_gate). stdin is the one handle capture_output
-            # does NOT replace, and it is inherited by default, so it is closed
-            # explicitly here: nothing in this path should ever be able to
-            # block on a read from a console that is not there.
-            env=_extractor_env(), stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+            stdin=subprocess.DEVNULL, text=True, errors="replace",
+            bufsize=1, env=_extractor_env(),
         )
-    except subprocess.TimeoutExpired as e:
-        _echo_stage(label, e.stdout, e.stderr)
-        _say(
-            f"extract-interests: {label} hit its {timeout}s budget and was stopped "
-            f"after {(time.monotonic() - started) / 60:.1f}m. `map` is checkpointed "
-            f"per batch, so finished work is kept and the next run resumes."
-        )
-        return None, True
     except OSError as e:
         _say(f"extract-interests: {label} could not start: {e}")
         return 2, False
-    _echo_stage(label, proc.stdout, proc.stderr)
-    _say(
-        f"extract-interests: {label} exited {proc.returncode} "
-        f"in {(time.monotonic() - started) / 60:.1f}m"
-    )
+
+    lines = queue.Queue()
+    reader = threading.Thread(target=_drain_into, args=(proc.stdout, lines), daemon=True)
+    reader.start()
+
+    timed_out = False
+    while True:
+        if time.monotonic() > deadline:
+            timed_out = True
+            break
+        try:
+            line = lines.get(timeout=1.0)
+        except queue.Empty:
+            # No output for a second is normal -- a batch takes ~30s. The only
+            # thing that matters here is that the loop comes back round and
+            # re-checks the clock.
+            if proc.poll() is not None and not reader.is_alive():
+                break
+            continue
+        if line is None:
+            break
+        line = line.rstrip()
+        if line:
+            _say(f"  [{label}] {line}")
+
+    if timed_out:
+        _kill_stage(proc)
+    else:
+        try:
+            proc.wait(timeout=max(deadline - time.monotonic(), 1))
+        except subprocess.TimeoutExpired:
+            timed_out = True
+            _kill_stage(proc)
+    try:
+        if proc.stdout:
+            proc.stdout.close()
+    except OSError:
+        pass
+
+    elapsed = (time.monotonic() - started) / 60
+    if timed_out:
+        _say(
+            f"extract-interests: {label} hit its {timeout}s budget and was stopped "
+            f"after {elapsed:.1f}m. `map` is checkpointed per batch, so finished "
+            f"work is kept and the next run resumes."
+        )
+        return None, True
+    _say(f"extract-interests: {label} exited {proc.returncode} in {elapsed:.1f}m")
     return proc.returncode, False
+
+
+def _kill_stage(proc):
+    """Stop a stage that overran, and do not hang doing it -- terminate, then
+    kill if it will not go. A wrapper that blocks forever waiting on the child
+    it just gave up on is the same outage in a different costume."""
+    for stop in (proc.terminate, proc.kill):
+        try:
+            stop()
+            proc.wait(timeout=15)
+            return
+        except subprocess.TimeoutExpired:
+            continue
+        except OSError:
+            return
 
 
 def _extract_interests_cmd(conn, cfg, args):

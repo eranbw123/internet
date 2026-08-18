@@ -15,6 +15,7 @@ import os
 import sqlite3
 import sys
 import tempfile
+import time
 import types
 import unittest
 import urllib.parse
@@ -9573,6 +9574,54 @@ class ExtractInterestsCLITests(unittest.TestCase):
         self.assertIn("reduce start", out)
         # It did make progress (5 -> 2), so a timeout alone is not a failure.
         self.assertEqual(code, 0, out)
+
+    def test_a_stage_that_hangs_without_printing_is_still_stopped(self):
+        """The budget has to be enforced against the wall clock, not against
+        the arrival of output. A `map` that wedges -- a claude.ai call that
+        never returns, a CDP socket that never answers -- prints nothing at
+        all, and a loop that only re-checks the clock after reading a line
+        would wait on it forever. That is the exact shape of the outage this
+        job is supposed to make impossible, so it gets its own test."""
+        self._write_extractor(
+            "if cmd == 'map':\n"
+            "    import time\n"
+            "    time.sleep(120)\n"     # never prints, never exits
+            "if cmd == 'reduce':\n"
+            "    out = sys.argv[sys.argv.index('--out') + 1]\n"
+            "    open(out, 'w').write('{}')\n"
+            "    raise SystemExit(0)\n"
+        )
+        started = time.monotonic()
+        code, out, _err = self._main(env={"DISCOVERY_INTEREST_EXTRACT_MAP_SECONDS": "2"})
+        elapsed = time.monotonic() - started
+        self.assertLess(elapsed, 60, "the deadline did not stop a silent child")
+        self.assertIn("hit its 2s budget", out)
+        # It printed nothing and digested nothing, so this is the
+        # unproductive case, not a success.
+        from discovery.__main__ import EXTRACT_UNPRODUCTIVE
+
+        self.assertEqual(code, EXTRACT_UNPRODUCTIVE)
+        self.assertIn("map made no progress", out)
+
+    def test_child_output_is_streamed_with_its_stage_label(self):
+        """Each line lands in the log as it arrives and carries the stage it
+        came from, so a run killed part-way still shows how far it got."""
+        self._write_extractor(
+            "if cmd == 'map':\n"
+            "    import os\n"
+            "    print('batch 1 -- 3 digested')\n"
+            "    print('batch 2 -- 3 digested')\n"
+            "    open(os.path.join(os.path.dirname(__file__), 'pending.txt'), 'w').write('0')\n"
+            "    raise SystemExit(0)\n"
+            "if cmd == 'reduce':\n"
+            "    out = sys.argv[sys.argv.index('--out') + 1]\n"
+            "    open(out, 'w').write('{}')\n"
+            "    raise SystemExit(0)\n"
+        )
+        code, out, _err = self._main()
+        self.assertEqual(code, 0, out)
+        self.assertIn("[map] batch 1 -- 3 digested", out)
+        self.assertIn("[map] batch 2 -- 3 digested", out)
 
     def test_skip_map_reduces_over_the_existing_digests(self):
         self._write_extractor(self.GOOD)
