@@ -628,6 +628,11 @@ button[aria-selected="true"], button.active, button[aria-pressed="true"] {
   .explorer-tabs {
     gap: 6px;
     padding: 8px;
+    /* flex: none, or the strip gets shrunk by its flex parent and the buttons
+       are clipped by its own overflow-y: hidden -- measured in landscape,
+       where .explorer becomes a single scroller and the row was squeezed to
+       ~20px with the tab tops poking out under the Filters fold. */
+    flex: none;
     flex-wrap: nowrap;
     overflow-x: auto;
     overflow-y: hidden;
