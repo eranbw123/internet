@@ -504,6 +504,35 @@ button[aria-selected="true"], button.active, button[aria-pressed="true"] {
   .app-title { font-size: 16px; }
   .theme-toggle { min-height: 40px; padding: 0 14px; font-size: 12px; }
 
+  /* Collapse-on-scroll. The app header is the least load-bearing strip on the
+     phone -- the bottom tab bar already says which surface you are on -- so it
+     is the first thing to go when you start reading, and the first thing back
+     when you flick up. Driven by useScrollCollapse(); see that file for why
+     one document-level capturing listener rather than a ref per scroller.
+
+     Animating min-height/padding rather than translating the header keeps it
+     in flow, so the sticky control row beneath rises with it instead of
+     leaving a 59px hole. `visibility` is what actually takes the collapsed
+     header out of the tab order -- a 0-height overflow:hidden element still
+     holds focusable children. */
+  .app.mobile .app-header {
+    overflow: hidden;
+    transition:
+      min-height .18s ease, padding-top .18s ease, padding-bottom .18s ease,
+      opacity .14s ease, visibility .18s;
+  }
+  .app.mobile.is-chrome-collapsed .app-header {
+    min-height: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    opacity: 0;
+    visibility: hidden;
+    border-bottom-color: transparent;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .app.mobile .app-header { transition: none; }
+  }
+
   .pane-mobile { flex: 1; display: flex; flex-direction: column; min-width: 0; min-height: 0; }
   /* Each pane's own child owns its scrolling (.explorer, .inspector and the
      graph canvas are all height:100% flex columns with an internal scroller),

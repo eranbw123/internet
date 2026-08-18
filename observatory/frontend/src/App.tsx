@@ -8,6 +8,7 @@ import { InterestsWorkspace } from "./interests/InterestsWorkspace";
 import { formatHash, parseHash, readBootstrap } from "./deepLink";
 import { useIsMobile } from "./useIsMobile";
 import { MobileNav, type MobileSurface } from "./MobileNav";
+import { useScrollCollapse } from "./useScrollCollapse";
 import { ThemeToggle } from "./ThemeToggle";
 import type { GraphSeed } from "./graph/useGraphData";
 import type { ID, Tab } from "./types";
@@ -234,11 +235,18 @@ export function App() {
      switching tabs is then instant rather than a refetch and a spinner, and
      the tab bar can show the offer count from launch instead of only after
      you visit the inbox. */
+  // Declared unconditionally (hooks cannot sit behind the isMobile branch);
+  // `enabled` makes it inert on a desktop, where nothing collapses.
+  const chromeCollapsed = useScrollCollapse(isMobile, surface + ":" + explorePane);
+
   if (isMobile) {
     const wsView = surface === "offers" ? "offers" : surface === "connections" ? "connections" : "list";
     const onWorkspace = surface === "interests" || surface === "offers" || surface === "connections";
     return (
-      <div className="app mobile" data-testid="app">
+      <div
+        className={`app mobile ${chromeCollapsed ? "is-chrome-collapsed" : ""}`}
+        data-testid="app"
+      >
         <header className="app-header">
           <span className="app-title">{SURFACE_TITLE[surface]}</span>
           <ThemeToggle />

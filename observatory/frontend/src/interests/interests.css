@@ -977,6 +977,42 @@ input[type="range"]::-moz-range-thumb {
   .list-search { flex: 1 1 170px; width: auto; min-width: 0; min-height: 44px; }
   .list-new { flex: none; min-height: 44px; }
 
+  /* The second half of the collapse. Measured on a 393x852 iPhone 15, the
+     sticky control block was 110px of a 852px display, on top of the 59px app
+     header and the 50px tab bar: 219px, 26% of the screen, pinned for as long
+     as you read. Scrolling down drops the search field and "New interest" --
+     neither is something you reach for mid-scroll -- and keeps the one row
+     that answers "which slice am I looking at": the filter tabs. That is the
+     phone's column-header row, and it is what stays. 219px -> 106px.
+
+     Collapsing to height 0 rather than display:none so the row animates with
+     the header above it instead of snapping, and so a mid-collapse tap on the
+     search box is not swallowed by a reflow. */
+  .app.mobile .list-controls .list-search,
+  .app.mobile .list-controls .list-new {
+    transition: min-height .18s ease, height .18s ease, opacity .14s ease,
+      margin .18s ease, padding .18s ease, visibility .18s;
+  }
+  .app.mobile.is-chrome-collapsed .list-controls {
+    gap: 0;
+    padding-bottom: 6px;
+  }
+  .app.mobile.is-chrome-collapsed .list-controls .list-search,
+  .app.mobile.is-chrome-collapsed .list-controls .list-new {
+    min-height: 0;
+    height: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    border-width: 0;
+    opacity: 0;
+    visibility: hidden;
+    overflow: hidden;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .app.mobile .list-controls .list-search,
+    .app.mobile .list-controls .list-new { transition: none; }
+  }
+
   /* the table, as cards */
   .table-scroll { overflow-x: visible; border: none; border-radius: 0; }
   .funnel-table { display: block; background: none; font-size: 13px; }
