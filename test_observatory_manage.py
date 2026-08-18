@@ -1138,5 +1138,107 @@ class ValidationUnitTests(unittest.TestCase):
             })
 
 
+
+
+class DecideRefillTests(ManageApiTestCase):
+    """The owner's other half of "aim to always have 10 suggestions": deciding
+    an offer refills the slot it frees, so working through the inbox refills it
+    instead of draining it."""
+
+    # Genuinely distinct: no shared signal token, no shared conversation, so
+    # none of them is suppressed as a near-duplicate of another.
+    THEMES = [
+        "orexin-wakefulness", "perovskite-tandem", "mangrove-restoration",
+        "lattice-cryptography", "tokamak-confinement", "cuneiform-tablets",
+        "axolotl-regeneration", "hydrofoil-ferries", "gregorian-chant",
+        "sourdough-fermentation", "basque-linguistics", "volcanic-tephra",
+    ]
+
+    def _write_candidates(self, keys):
+        artifact = {
+            "contract_version": 2, "generated_at": "2026-08-18T00:00:00Z",
+            "window_days": 365, "conversation_count": 100,
+            "sources": {"chatgpt": 100}, "topics": [],
+            "candidates": [{
+                "kind": "new", "key": key, "title": key.replace("-", " ").title(),
+                "description": f"{key} research thread.",
+                "positive_signals": [key.split("-")[0], key.split("-")[-1]],
+                "negative_signals": [], "suggested_min_score": 0.7,
+                "sources": ["web_search"], "related_keys": [],
+                "evidence": [
+                    {"date": "2026-08-01", "quote": f"{key} question",
+                     "lang": "en", "depth": 0.8, "conversation_id": f"conv-{key}"},
+                ],
+                "durability": {"n_convs": 9, "active_months": 5, "span_days": 120,
+                               "recency_days": 10},
+                "expected_yield": 0.7, "similarity_to_existing": [],
+            } for key in keys],
+        }
+        with open(self.cfg.interest_candidates_path, "w", encoding="utf-8") as fh:
+            json.dump(artifact, fh, ensure_ascii=False)
+
+    async def test_accepting_an_offer_refills_the_slot_it_frees(self):
+        self._write_candidates(["orexin-wakefulness", "perovskite-tandem"])
+        r = await self.post("/observatory/api/offers/gaming-handhelds-roguelikes/decide",
+                            {"action": "accept"})
+        self.assertEqual(r.status_code, 200, r.text)
+        body = r.json()
+        self.assertEqual(body["status"], "accepted")
+        # The decision's own payload says what the refill did.
+        self.assertGreaterEqual(body["inbox"]["offered"], 1)
+        self.assertIn("orexin-wakefulness", body["inbox"]["offers"])
+        listed = (await self.get("/observatory/api/offers")).json()
+        self.assertIn("orexin-wakefulness", [o["key"] for o in listed["offers"]])
+
+    async def test_rejecting_and_snoozing_refill_too(self):
+        self._write_candidates(self.THEMES)
+        rejected = await self.post(
+            "/observatory/api/offers/gaming-handhelds-roguelikes/decide",
+            {"action": "reject"})
+        self.assertEqual(rejected.status_code, 200, rejected.text)
+        self.assertGreaterEqual(rejected.json()["inbox"]["offered"], 1)
+
+        snoozed = await self.post(
+            "/observatory/api/offers/cognition-in-competitive-games/decide",
+            {"action": "snooze"})
+        self.assertEqual(snoozed.status_code, 200, snoozed.text)
+        # A snoozed offer is hidden, so it does not count toward the target and
+        # its slot is refilled -- while the offer itself waits to wake.
+        self.assertGreaterEqual(snoozed.json()["inbox"]["offered"], 1)
+
+    async def test_a_decision_stands_even_when_the_refill_cannot_run(self):
+        """The artifact is missing entirely here. The decision is the important
+        write and must not depend on the refill succeeding."""
+        r = await self.post("/observatory/api/offers/gaming-handhelds-roguelikes/decide",
+                            {"action": "accept"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["ok"])
+        self.assertEqual(r.json()["status"], "accepted")
+        self.assertEqual(r.json()["inbox"]["offered"], 0)
+        # ...and it says why it added nothing rather than reporting success.
+        self.assertIn("could not be read", r.json()["inbox"]["reason"])
+        keys = [e["key"] for e in self._interests_file()["interests"]]
+        self.assertIn("gaming-handhelds-roguelikes", keys)
+
+    async def test_a_refill_that_raises_still_leaves_the_decision_standing(self):
+        with mock.patch.object(offers, "top_up",
+                               side_effect=RuntimeError("disk went away")):
+            r = await self.post(
+                "/observatory/api/offers/gaming-handhelds-roguelikes/decide",
+                {"action": "accept"})
+        self.assertEqual(r.status_code, 200, r.text)
+        self.assertTrue(r.json()["ok"])
+        self.assertEqual(r.json()["status"], "accepted")
+        self.assertIn("disk went away", r.json()["inbox"]["error"])
+        self.assertIn("the decision itself is unaffected", r.json()["inbox"]["reason"])
+
+    async def test_the_refill_never_exceeds_the_target(self):
+        self._write_candidates(self.THEMES)
+        await self.post("/observatory/api/offers/gaming-handhelds-roguelikes/decide",
+                        {"action": "accept"})
+        listed = (await self.get("/observatory/api/offers")).json()
+        self.assertLessEqual(len(listed["offers"]), offers.DEFAULT_RULES.target_inbox_size)
+
+
 if __name__ == "__main__":
     unittest.main(verbosity=2)
