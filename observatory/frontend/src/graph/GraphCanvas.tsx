@@ -10,6 +10,7 @@ import { useGraphData } from "./useGraphData";
 import { formatEdgeLabel } from "./assemble";
 import { computeLayout, defaultElk, laneLabel, type LayoutResult, type PositionedNode } from "./elkLayout";
 import type { ID } from "../types";
+import { useThemeTokens } from "../useThemeTokens";
 
 function statusClass(status: string | null): string {
   if (!status) return "";
@@ -119,10 +120,23 @@ function ChipNode({ data }: NodeProps) {
 
 // One tint per swimlane, reused by the MiniMap so the columns still read
 // (faintly) at minimap scale instead of every node blurring into one grey.
+//
+// These are token NAMES rather than colours: React Flow takes them as props
+// and writes them into SVG `fill`/`stroke` ATTRIBUTES, where `var()` is not
+// resolved -- a presentation attribute is not a CSS declaration. So the values
+// have to be read out of the cascade with getComputedStyle and handed over
+// concrete, which is what useThemeTokens does, re-reading on every theme
+// change so the minimap does not stay painted in the previous theme.
 const LANE_TINT: Record<string, string> = {
-  "interest-state": "#e8c9c9", council: "#d9c9e8", mission: "#c9d4e8",
-  "candidate-pipeline": "#c9e0e8", scoring: "#cfe0c9", "delivery-feedback": "#e8ddc9",
+  "interest-state": "--lane-1", council: "--lane-2", mission: "--lane-3",
+  "candidate-pipeline": "--lane-4", scoring: "--lane-5", "delivery-feedback": "--lane-6",
 };
+
+/** Every token GraphCanvas has to hand to React Flow as a prop. */
+const GRAPH_TOKENS = [
+  "--lane-1", "--lane-2", "--lane-3", "--lane-4", "--lane-5", "--lane-6",
+  "--edge", "--minimap-node", "--minimap-mask",
+] as const;
 
 const LEGEND_ITEMS: { swatch: string; text: string }[] = [
   { swatch: "columns", text: "Columns are pipeline stages, left → right: Interest → Council → Mission → Candidates → Scoring → Delivery." },
@@ -183,6 +197,9 @@ interface Props {
 }
 
 function GraphCanvasInner({ seed, selectedNodeId, onSelectNode, isMobile = false }: Props) {
+  // React Flow's props are the one place the cascade cannot reach; see
+  // LANE_TINT above.
+  const tokens = useThemeTokens(GRAPH_TOKENS);
   const graphData = useGraphData(seed, isMobile);
   const {
     display, base, loading, error, expandGroup, collapseGroup, expandAll, focusMode, setFocusMode,
@@ -307,6 +324,13 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode, isMobile = false
       id: `band:${band.lane}`,
       type: "laneBand",
       position: { x: band.left, y: band.top },
+      // Both `style` (which sizes the DOM wrapper) and the node's own
+      // width/height (which is what React Flow's store reports). The MiniMap
+      // draws nothing for a node that fails nodeHasDimensions(), and it reads
+      // the node object, not the DOM -- which is why the minimap has always
+      // been an empty rectangle with only a viewport box in it.
+      width: band.width,
+      height: band.height,
       style: { width: band.width, height: band.height },
       zIndex: -10,
       data: { lane: band.lane, i },
@@ -324,6 +348,8 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode, isMobile = false
         // full card -- both need their real size on the flow node itself
         // (React Flow applies `style` to the node wrapper), not the old
         // fixed 220x72 every card used to share.
+        width: n.width,
+        height: n.height,
         style: { width: n.width, height: n.height },
         zIndex: n.isChip ? 10 : undefined,
         data: {
@@ -443,7 +469,9 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode, isMobile = false
         nodesConnectable={false}
         defaultEdgeOptions={{
           type: "smoothstep",
-          markerEnd: { type: MarkerType.ArrowClosed, width: 16, height: 16, color: "#8b98a9" },
+          markerEnd: {
+            type: MarkerType.ArrowClosed, width: 16, height: 16, color: tokens["--edge"],
+          },
         }}
       >
         <Background gap={24} />
@@ -458,10 +486,11 @@ function GraphCanvasInner({ seed, selectedNodeId, onSelectNode, isMobile = false
             // on top of them at that scale.
             if (node.type === "laneBand") return "transparent";
             const swimlane = (node.data as { swimlane?: string })?.swimlane;
-            return (swimlane && LANE_TINT[swimlane]) || "#b9c6d8";
+            const token = swimlane ? LANE_TINT[swimlane] : undefined;
+            return (token && tokens[token as keyof typeof tokens]) || tokens["--minimap-node"];
           }}
-          nodeStrokeColor="#8b98a9"
-          maskColor="rgba(28, 37, 48, 0.08)"
+          nodeStrokeColor={tokens["--edge"]}
+          maskColor={tokens["--minimap-mask"]}
         />
       </ReactFlow>
       {loading && <div className="graph-status">Loading trace…</div>}

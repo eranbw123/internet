@@ -87,6 +87,11 @@ function OfferCard({
         )}
       </header>
 
+      <p className={`offer-intent ${isRetire ? "offer-intent-drop" : "offer-intent-add"}`}>
+        {isRetire
+          ? "Proposing to STOP an interest you already have"
+          : "Proposing a NEW interest, from your conversations"}
+      </p>
       <h3 className="offer-title">
         <BidiText lang={guessLang(offer.title)}>{offer.title}</BidiText>
       </h3>
@@ -183,10 +188,15 @@ export function OffersInbox({ offers, edges, busyId, errors, onDecide, onEdit, l
   if (offers.length === 0) {
     return (
       <div className="ws-empty">
-        <p>Nothing to decide.</p>
+        <p><strong>No suggestions right now.</strong></p>
+        <p>
+          This is where the system proposes new interests, drawn from themes that keep
+          coming back in your own conversations &mdash; and where it proposes dropping ones
+          that have stopped producing. You accept, reject or snooze each one.
+        </p>
         <p className="prov-muted">
-          The generator proposes at most five offers per run, so an empty inbox is the
-          normal state rather than a sign something is broken.
+          New suggestions appear after the extractor runs; it proposes at most five per run,
+          so an empty inbox is the normal state rather than a sign something is broken.
         </p>
       </div>
     );

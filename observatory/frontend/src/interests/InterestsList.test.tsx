@@ -15,6 +15,7 @@ beforeEach(async () => {
 function renderList(over: Partial<Parameters<typeof InterestsList>[0]> = {}) {
   const onEdit = vi.fn();
   const onRevive = vi.fn();
+  const onRetire = vi.fn();
   render(
     <InterestsList
       stats={stats}
@@ -22,10 +23,11 @@ function renderList(over: Partial<Parameters<typeof InterestsList>[0]> = {}) {
       busyKey={null}
       onEdit={onEdit}
       onRevive={onRevive}
+      onRetire={onRetire}
       {...over}
     />,
   );
-  return { onEdit, onRevive };
+  return { onEdit, onRevive, onRetire };
 }
 
 describe("InterestsList", () => {

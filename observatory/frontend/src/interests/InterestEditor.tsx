@@ -213,6 +213,30 @@ export function InterestEditor({
             </div>
           )}
 
+          {/* First, not last. This is the only field that decides whether the
+              interest does anything at all, and it used to sit at the bottom
+              of the form under seven others -- so the sole visible verb
+              anywhere near an interest was "Edit", and removing one looked
+              impossible. */}
+          <div className="field field-lifecycle">
+            <label className="field-label" htmlFor="ed-lifecycle">
+              Collecting?
+              <span className="field-hint">
+                stop it here, or from the Stop button on its row -- either way it keeps its
+                history and can be started again
+              </span>
+            </label>
+            <select
+              id="ed-lifecycle" value={form.lifecycle}
+              onChange={(e) => set("lifecycle", e.target.value as Lifecycle)}
+            >
+              <option value="active">Yes - collecting</option>
+              <option value="decaying">Yes - but fading (auto-pauses at 45 silent days)</option>
+              <option value="paused">No - paused</option>
+              <option value="retired">No - stopped</option>
+            </select>
+          </div>
+
           <div className={`field ${result.errors.title ? "field-invalid" : ""}`}>
             <label className="field-label" htmlFor="ed-title">Title</label>
             <input id="ed-title" value={form.title} onChange={(e) => set("title", e.target.value)} />
@@ -322,20 +346,6 @@ export function InterestEditor({
               {result.errors.parent_key && <p className="field-error">{result.errors.parent_key}</p>}
             </div>
 
-            <div className="field">
-              <label className="field-label" htmlFor="ed-lifecycle">
-                Lifecycle<span className="field-hint">active and decaying collect; paused and retired do not</span>
-              </label>
-              <select
-                id="ed-lifecycle" value={form.lifecycle}
-                onChange={(e) => set("lifecycle", e.target.value as Lifecycle)}
-              >
-                <option value="active">active</option>
-                <option value="decaying">decaying</option>
-                <option value="paused">paused</option>
-                <option value="retired">retired</option>
-              </select>
-            </div>
           </div>
 
           {result.warnings.map((w) => (

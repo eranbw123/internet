@@ -34,7 +34,6 @@ import { InterestsList } from "./InterestsList";
 import { OffersInbox, type OfferDecision } from "./OffersInbox";
 import { ConnectionsView } from "./ConnectionsView";
 import { InterestEditor, type EditorSubject } from "./InterestEditor";
-import "./tokens.fallback.css";
 import "./interests.css";
 
 type View = "list" | "offers" | "connections";
@@ -47,6 +46,10 @@ export function InterestsWorkspace({ onClose }: { onClose?: () => void }) {
   const [view, setView] = useState<View>("list");
   const [stats, setStats] = useState<StatsResponse | null>(null);
   const [offers, setOffers] = useState<Offer[]>([]);
+  // The last interest stopped from the list, so its row can offer an immediate
+  // undo. Reversibility the owner can SEE beats a confirmation dialog they
+  // have to read.
+  const [justRetiredKey, setJustRetiredKey] = useState<string | null>(null);
   const [edges, setEdges] = useState<InterestEdge[]>([]);
   const [loading, setLoading] = useState(true);
   const [loadError, setLoadError] = useState<string | null>(null);
@@ -160,7 +163,30 @@ export function InterestsWorkspace({ onClose }: { onClose?: () => void }) {
     setBusyKey(row.key);
     try {
       await client.updateInterest(row.key, { lifecycle: "active" });
+      setJustRetiredKey((k) => (k === row.key ? null : k));
       note(`${row.key} is collecting again.`);
+      await refresh();
+    } catch (err) {
+      setLoadError(message(err));
+    } finally {
+      setBusyKey(null);
+    }
+  }, [refresh]);
+
+  /** Stop collecting for one interest, straight from its row.
+   *
+   * Deliberately not a confirmation dialog: retiring is reversible (the
+   * lifecycle keeps the interest and its whole history, it just stops
+   * collecting), and a modal asking "are you sure?" trains people to click
+   * through it. The row offers the undo instead, so the reversibility is
+   * something you can see rather than something you have to already know.
+   */
+  const retire = useCallback(async (row: InterestStat) => {
+    setBusyKey(row.key);
+    try {
+      await client.updateInterest(row.key, { lifecycle: "retired" });
+      setJustRetiredKey(row.key);
+      note(`Stopped ${row.title || row.key}. It keeps its history; Undo starts it again.`);
       await refresh();
     } catch (err) {
       setLoadError(message(err));
@@ -231,14 +257,15 @@ export function InterestsWorkspace({ onClose }: { onClose?: () => void }) {
             className={view === "list" ? "is-selected" : ""}
             onClick={() => setView("list")}
           >
-            Active <span className="tab-count">{totals?.active_interests ?? "-"}</span>
+            My interests <span className="tab-count">{totals?.active_interests ?? "-"}</span>
           </button>
           <button
             role="tab" aria-selected={view === "offers"} type="button"
             className={view === "offers" ? "is-selected" : ""}
             onClick={() => setView("offers")}
           >
-            Offers <span className={`tab-count ${offeredCount ? "tab-count-live" : ""}`}>{offeredCount}</span>
+            Suggested for you{" "}
+            <span className={`tab-count ${offeredCount ? "tab-count-live" : ""}`}>{offeredCount}</span>
           </button>
           <button
             role="tab" aria-selected={view === "connections"} type="button"
@@ -262,9 +289,10 @@ export function InterestsWorkspace({ onClose }: { onClose?: () => void }) {
 
       {isMockActive() && (
         <p className="ws-mock-banner" role="status">
-          <strong>Fixture data.</strong> The write API (PR J) is not wired up yet, so this
-          workspace is running on the documented mock client: the funnel numbers are the real
-          measured ones, but decisions are held in memory and nothing is written to the database.
+          <strong>Fixture data.</strong> This workspace is running on the mock client
+          (<code>?interests=mock</code>): the funnel numbers are the real measured ones, but
+          decisions are held in memory and nothing is written to the database. Drop the
+          query parameter for live data.
         </p>
       )}
 
@@ -279,6 +307,8 @@ export function InterestsWorkspace({ onClose }: { onClose?: () => void }) {
             busyKey={busyKey}
             onEdit={openEditor}
             onRevive={revive}
+            onRetire={retire}
+            justRetiredKey={justRetiredKey}
           />
         )}
         {view === "offers" && (

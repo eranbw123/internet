@@ -1,6 +1,9 @@
 /** Resolve CSS custom properties to concrete colour strings, and re-resolve
  * them whenever the theme changes.
  *
+ * Shared by the interests connections graph and the trace explorer's canvas,
+ * which is why it sits at the src root rather than inside either one.
+ *
  * CSS handles theming for every DOM element by itself; React Flow does not.
  * Its edge strokes, markers and minimap take colours as JS props, so those
  * few values have to be READ out of the cascade rather than declared in it.
