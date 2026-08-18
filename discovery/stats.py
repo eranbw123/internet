@@ -220,7 +220,10 @@ def _missions(conn, since):
         "missions (all time): "
         + " ".join(
             f"{status.lower()}={missions.get(status, 0)}"
-            for status in ("PENDING", "RUNNING", "DONE", "FAILED")
+            # CANCELLED: sync v2 retires the pending queue of an interest
+            # the owner dropped from interests.json -- counted, not hidden,
+            # so the queue depth stays explainable after a retirement.
+            for status in ("PENDING", "RUNNING", "DONE", "FAILED", "CANCELLED")
         )
     )
     lines.append("")

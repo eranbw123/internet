@@ -31,6 +31,7 @@ import pathlib
 from datasette import Response, hookimpl
 
 from . import db as odb
+from . import manage
 
 STATIC_DIR = pathlib.Path(__file__).parent / "static"
 
@@ -81,6 +82,19 @@ def permission_allowed(datasette, actor, action, resource):
     if not _public(datasette):
         return True
     return actor is not None
+
+
+@hookimpl
+def skip_csrf(scope):
+    """Datasette wraps its whole app in asgi_csrf, whose token machinery is
+    built for its own HTML forms -- a JSON POST carrying the session cookie
+    but no csrftoken is refused as UNKNOWN_CONTENT_TYPE. The write API
+    (observatory/manage.py) is JSON-only and enforces
+    `Content-Type: application/json` itself, which a cross-site form post
+    cannot set without a preflight this server never answers; that check IS
+    the CSRF boundary here, so exempt our own routes and leave every native
+    Datasette route protected exactly as before."""
+    return scope.get("path", "").startswith("/observatory/api/")
 
 
 def _guard(datasette, request):
@@ -283,7 +297,16 @@ async def run_index_view(request, datasette):
 
 
 async def interest_index_view(request, datasette):
-    denied = _guard(datasette, request) or _require_get(request)
+    denied = _guard(datasette, request)
+    if denied:
+        return denied
+    # One path, two methods: 7.3 puts the interest listing and "create an
+    # interest" both on /api/interests, so the method is what tells them
+    # apart. POST is delegated rather than handled here -- every write lives
+    # in manage.py.
+    if request.method == "POST":
+        return await manage.create_interest_view(request, datasette)
+    denied = _require_get(request)
     if denied:
         return denied
     conn = _connect(datasette)
@@ -348,6 +371,10 @@ def register_routes():
         (r"^/observatory/api/prompt-template$", prompt_template_view),
         (r"^/observatory/api/runs$", run_index_view),
         (r"^/observatory/trace/score/(?P<score_id>[0-9]+)$", trace_score_view),
+        # The write API ( 7.3, observatory/manage.py). Registered here, ahead
+        # of the catch-all below, and self-ordered internally (generate before
+        # <key>, stats before <key>).
+        *manage.routes(),
         # Last: anything under /api/ that matched none of the above is a
         # mistake in the caller, and should say so in JSON. Without this it
         # fell through to Datasette's own routing and 302'd into the raw

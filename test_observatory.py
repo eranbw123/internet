@@ -19,6 +19,7 @@ real web_tick/send_digest/feedback_listener code paths with fake providers,
 same as test_discovery.py's own TraceFixtureTests.
 """
 import os
+import re
 import sqlite3
 import sys
 import tempfile
@@ -1661,6 +1662,237 @@ class ObservatoryRedactionTests(unittest.IsolatedAsyncioTestCase):
             f"/observatory/api/graph?entity_type=candidate_items&entity_id={self.item_id}"
         )
         self.assertNotIn(self.secret_value, r.text)
+
+
+class ObservatoryThemeTokenTests(unittest.TestCase):
+    """The design-token palette (observatory/frontend/src/tokens.css).
+
+    Deliberately NOT gated on datasette, and deliberately here rather than in
+    the vitest suite: this asserts against the stylesheet as a FILE, which is
+    a stdlib-and-a-regex job, and the app tsconfig carries no node types to
+    read a file with (Vite's `?raw` returns "" for a .css file, so there is no
+    no-node way to do it on that side either).
+
+    Two things are checked. First the cascade: a colour whose only definition
+    lives inside a media query or a [data-theme] block is the classic
+    wrong-theme-text bug -- the selector stops matching and the property falls
+    back to inherit/initial rather than to the other theme -- so every token
+    must exist on bare :root, and the theme blocks may only REDEFINE. Second
+    the contrast, computed here rather than copied out of a design doc, so a
+    hand-edit that drops a pair below WCAG AA fails the suite.
+    """
+
+    _HERE = os.path.dirname(os.path.abspath(__file__))
+    CSS_PATH = os.path.join(_HERE, "observatory", "frontend", "src", "tokens.css")
+    STYLES_PATH = os.path.join(_HERE, "observatory", "frontend", "src", "styles.css")
+    INDEX_PATH = os.path.join(_HERE, "observatory", "frontend", "index.html")
+    STATIC_DIR = os.path.join(_HERE, "observatory", "static")
+
+    # WCAG 2.1: 4.5:1 for normal text, 3:1 for a non-text UI component or
+    # graphical object.
+    TEXT = 4.5
+    UI = 3.0
+
+    # Every (foreground, background) pair that actually renders together
+    # somewhere in the Observatory -- status/severity colours and the chart
+    # layer included, not just page chrome.
+    PAIRS = [
+        ("--fg", "--bg", TEXT), ("--fg", "--surface", TEXT), ("--fg", "--surface-raised", TEXT),
+        ("--fg", "--hover", TEXT), ("--fg", "--accent-soft", TEXT),
+        ("--fg-muted", "--bg", TEXT), ("--fg-muted", "--surface", TEXT),
+        ("--fg-muted", "--hover", TEXT), ("--fg-muted", "--neutral-bg", TEXT),
+        ("--fg-faint", "--bg", TEXT), ("--fg-faint", "--surface", TEXT),
+        ("--accent", "--bg", TEXT), ("--accent", "--surface", TEXT),
+        ("--accent", "--accent-soft", TEXT), ("--fg-on-accent", "--accent", TEXT),
+        # status / severity: as text on the page, and as text on its own chip
+        ("--ok", "--bg", TEXT), ("--ok", "--surface", TEXT), ("--ok", "--ok-bg", TEXT),
+        ("--error", "--bg", TEXT), ("--error", "--surface", TEXT), ("--error", "--error-bg", TEXT),
+        ("--active-text", "--bg", TEXT), ("--active-text", "--surface", TEXT),
+        ("--active-text", "--active-bg", TEXT),
+        ("--warn-text", "--bg", TEXT), ("--warn-text", "--surface", TEXT),
+        ("--warn-text", "--warn-bg", TEXT),
+        # status as a graphical object: the node card's left border stripe
+        ("--ok", "--surface-raised", UI), ("--error", "--surface-raised", UI),
+        ("--active", "--surface-raised", UI), ("--accent", "--surface-raised", UI),
+        # grouped / derived nodes
+        ("--group-fg", "--group-bg", TEXT), ("--group-label", "--group-bg", TEXT),
+        ("--group-border", "--group-bg", UI),
+        # JSON syntax highlighting, on the surface the viewer actually paints
+        ("--syn-key", "--surface", TEXT), ("--syn-string", "--surface", TEXT),
+        ("--syn-number", "--surface", TEXT), ("--syn-bool", "--surface", TEXT),
+        # in-text search highlight
+        ("--hit-fg", "--hit-bg", TEXT), ("--hit-active-fg", "--hit-active-bg", TEXT),
+        # chart layer: swimlane tints are decorative fills, but text lands on them
+        ("--lane-fg", "--lane-1", TEXT), ("--lane-fg", "--lane-2", TEXT),
+        ("--lane-fg", "--lane-3", TEXT), ("--lane-fg", "--lane-4", TEXT),
+        ("--lane-fg", "--lane-5", TEXT), ("--lane-fg", "--lane-6", TEXT),
+        ("--lane-title", "--bg", TEXT), ("--edge-text", "--bg", TEXT),
+        # graph chrome that has to stay visible as a graphical object
+        ("--edge", "--bg", UI), ("--minimap-node", "--bg", UI), ("--border-strong", "--bg", UI),
+    ]
+
+    @classmethod
+    def setUpClass(cls):
+        cls.css = cls._read(cls.CSS_PATH)
+        cls.index_html = cls._read(cls.INDEX_PATH)
+        cls.light = cls._block(r'^:root \{(.*?)\n\}')
+        cls.dark_media = cls._block(
+            r'@media \(prefers-color-scheme: dark\) \{\s*'
+            r':root:not\(\[data-theme="light"\]\) \{(.*?)\n  \}'
+        )
+        cls.dark_attr = cls._block(r'^:root\[data-theme="dark"\] \{(.*?)\n\}')
+
+    @staticmethod
+    def _read(path):
+        with open(path, encoding="utf-8") as fh:
+            return fh.read()
+
+    @classmethod
+    def _block(cls, pattern):
+        m = re.search(pattern, cls.css, re.S | re.M)
+        assert m, "tokens.css: no block matching %s" % pattern
+        return dict(re.findall(r'(--[a-z0-9-]+)\s*:\s*([^;]+);', m.group(1)))
+
+    # -- colour maths (WCAG 2.1 relative luminance) ------------------------
+
+    @staticmethod
+    def _luminance(hexc):
+        h = hexc.strip().lstrip("#")
+        if len(h) == 3:
+            h = "".join(c * 2 for c in h)
+        chans = []
+        for i in (0, 2, 4):
+            c = int(h[i:i + 2], 16) / 255
+            chans.append(c / 12.92 if c <= 0.04045 else ((c + 0.055) / 1.055) ** 2.4)
+        return 0.2126 * chans[0] + 0.7152 * chans[1] + 0.0722 * chans[2]
+
+    @classmethod
+    def contrast(cls, a, b):
+        la, lb = cls._luminance(a), cls._luminance(b)
+        hi, lo = max(la, lb), min(la, lb)
+        return (hi + 0.05) / (lo + 0.05)
+
+    # -- cascade -----------------------------------------------------------
+
+    def test_every_colour_is_defined_on_bare_root(self):
+        # Nothing may have its ONLY definition inside a theme block.
+        self.assertEqual(sorted(set(self.dark_attr) - set(self.light)), [])
+
+    def test_every_light_token_is_redefined_for_dark(self):
+        self.assertEqual(sorted(set(self.light) - set(self.dark_attr)), [])
+
+    def test_the_two_dark_blocks_are_identical(self):
+        # CSS cannot share them; this assertion is the only thing stopping the
+        # media-query dark theme drifting from the explicit one.
+        self.assertEqual(self.dark_media, self.dark_attr)
+
+    def test_media_block_is_guarded_so_explicit_light_wins_on_a_dark_os(self):
+        self.assertIn(
+            '@media (prefers-color-scheme: dark) {\n  :root:not([data-theme="light"])',
+            self.css,
+        )
+
+    def test_explicit_dark_block_comes_last_so_it_wins_on_a_light_os(self):
+        self.assertGreater(
+            self.css.index(':root[data-theme="dark"]'),
+            self.css.index("@media (prefers-color-scheme: dark)"),
+        )
+
+    def test_color_scheme_is_set_in_all_three_states(self):
+        # Without it the native controls -- checkboxes, scrollbars, the
+        # viewer's search input -- stay light on a dark page.
+        self.assertEqual(len(re.findall(r"color-scheme: light;", self.css)), 1)
+        self.assertEqual(len(re.findall(r"color-scheme: dark;", self.css)), 2)
+
+    def test_tokens_css_holds_no_component_rules(self):
+        selectors = re.findall(r'^[ \t]*([^@{}\n][^{}\n]*)\{', self.css, re.M)
+        self.assertTrue(all(s.strip().startswith(":root") for s in selectors), selectors)
+
+    # -- contrast ----------------------------------------------------------
+
+    def test_every_token_pair_meets_wcag_aa_in_both_themes(self):
+        for label, tokens in (("light", self.light), ("dark", self.dark_attr)):
+            for fg, bg, floor in self.PAIRS:
+                with self.subTest(theme=label, fg=fg, bg=bg):
+                    got = self.contrast(tokens[fg], tokens[bg])
+                    self.assertGreaterEqual(
+                        got, floor,
+                        "%s: %s %s on %s %s = %.2f:1, needs %s:1"
+                        % (label, fg, tokens[fg], bg, tokens[bg], got, floor),
+                    )
+
+    def test_the_three_light_theme_aa_failures_are_fixed(self):
+        # Measured on the values this repo was actually shipping, against
+        # #ffffff: --ok #2f9e44 was 3.45:1, the "active" amber #f0a500 was
+        # 2.08:1 (below even the 3:1 non-text floor), and the muted text grey
+        # #98a2b0 was 2.58:1. All three were live accessibility defects in the
+        # LIGHT theme, independent of dark mode.
+        self.assertLess(self.contrast("#2f9e44", "#ffffff"), self.TEXT)
+        self.assertLess(self.contrast("#f0a500", "#ffffff"), self.UI)
+        self.assertLess(self.contrast("#98a2b0", "#ffffff"), self.TEXT)
+        self.assertGreaterEqual(self.contrast(self.light["--ok"], "#ffffff"), self.TEXT)
+        self.assertGreaterEqual(self.contrast(self.light["--active-text"], "#ffffff"), self.TEXT)
+        self.assertGreaterEqual(self.contrast(self.light["--fg-faint"], "#ffffff"), self.TEXT)
+
+    def test_the_failing_literals_are_gone_from_the_stylesheet(self):
+        styles = self._read(self.STYLES_PATH)
+        for dead in ("#98a2b0", "#2f9e44", "#f0a500"):
+            self.assertNotIn(dead, styles)
+
+    def test_lane_tints_stay_decorative_rather_than_contrasty(self):
+        # They group nodes; they never encode a value. A loud fill would
+        # compete with the status colours that DO carry meaning.
+        for tokens in (self.light, self.dark_attr):
+            for i in range(1, 7):
+                self.assertLess(self.contrast(tokens["--lane-%d" % i], tokens["--bg"]), 1.6)
+
+    def test_edge_handles_stay_near_invisible_as_styles_css_intends(self):
+        # pointer-events:none anchors that exist only so React Flow can draw an
+        # edge: decoration under WCAG 1.4.11, so the requirement is the
+        # opposite of the usual one.
+        for tokens in (self.light, self.dark_attr):
+            self.assertLess(self.contrast(tokens["--handle"], tokens["--surface-raised"]), 2.5)
+
+    # -- the proof-of-concept surface --------------------------------------
+
+    def test_the_monospace_viewer_surface_has_no_colour_literals_left(self):
+        # PR K migrates exactly one surface end to end, as proof the token
+        # system works; the rest is inventoried in THEME_MIGRATION.md. If a
+        # literal reappears in this block, the proof stops being one.
+        styles = self._read(self.STYLES_PATH)
+        start = styles.index("/* --- monospace viewer ---")
+        end = styles.index("/* --- compare ---", start)
+        self.assertEqual(
+            re.findall(r'#[0-9a-fA-F]{3,8}\b|rgba?\(', styles[start:end]), [],
+            "the proof-of-concept surface must resolve every colour through a token",
+        )
+
+    # -- the no-flash bootstrap --------------------------------------------
+
+    def test_bootstrap_script_matches_apply_theme_and_runs_before_the_bundle(self):
+        self.assertIn('localStorage.getItem("observatory-theme")', self.index_html)
+        self.assertIn('document.documentElement.setAttribute("data-theme", t)', self.index_html)
+        # Before the module script, or it would not prevent the flash.
+        self.assertLess(
+            self.index_html.index("observatory-theme"),
+            self.index_html.index('type="module"'),
+        )
+        # Never writes data-theme="system": that would leave
+        # :root:not([data-theme="light"]) matching inside the media query and
+        # pin a light-OS user to whatever the query happened to say.
+        self.assertIn('t === "light" || t === "dark"', self.index_html)
+
+    def test_built_bundle_carries_the_bootstrap_and_both_theme_blocks(self):
+        # observatory/static/ is committed build output served by plugin.py, so
+        # a stale build is the difference between the theme working and not.
+        self.assertIn("observatory-theme", self._read(os.path.join(self.STATIC_DIR, "index.html")))
+        built = self._read(os.path.join(self.STATIC_DIR, "assets", "index.css"))
+        self.assertIn("prefers-color-scheme:dark", built.replace(" ", ""))
+        # The minifier drops the attribute-value quotes, so match either form.
+        self.assertRegex(built, r'\[data-theme=["\']?dark["\']?\]')
+        # And the dark surface colour itself made it in, not merely a selector
+        # that would have applied it.
+        self.assertIn(self.dark_attr["--bg"].lower(), built.lower())
 
 
 if __name__ == "__main__":

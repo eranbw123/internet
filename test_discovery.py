@@ -6,6 +6,7 @@ network fully stubbed. Nothing here touches an LLM API, Telegram, or Yahoo --
 the pipeline holds an LLMProvider, so a fake object with `complete_json` /
 `search_json` is the whole seam.
 """
+import contextlib
 import dataclasses
 import hashlib
 import io
@@ -29,12 +30,15 @@ from discovery import (
     feedback_listener,
     health,
     interest_state,
+    interest_sync,
     interests,
     matching,
     missions,
     models,
     normalize,
     notify,
+    offer_learning,
+    offers,
     personal_state,
     pipeline,
     providers,
@@ -1221,11 +1225,13 @@ class PersonalStateTests(unittest.TestCase):
         self.assertEqual(state.top_terms(10), ["orexin", "wakefulness", "narcolepsy"])
 
     def test_an_unsupported_version_names_found_and_supported_in_the_message(self):
-        path = self._write(self._artifact(contract_version=2))
+        # 2 is supported since the offers store (contract v2); 99 stands in for
+        # "a version this reader has never heard of".
+        path = self._write(self._artifact(contract_version=99))
         with self.assertRaises(PersonalStateError) as ctx:
             personal_state.load(path)
         message = str(ctx.exception)
-        self.assertIn("2", message)
+        self.assertIn("99", message)
         self.assertIn(str(sorted(personal_state.SUPPORTED_VERSIONS)), message)
         # load_optional never raises -- the fail-soft wrapper the pipeline uses.
         self.assertIsNone(personal_state.load_optional(path))
@@ -8305,6 +8311,1867 @@ class SelfUpdateRunTests(unittest.TestCase):
 
     def _fail_redeploy(self, root, log=print):
         raise AssertionError("redeploy must not run in this case")
+
+
+# --- interest offers (discovery/offers.py) ------------------------------------
+
+OFFER_NOW = datetime(2026, 8, 18, 12, 0, tzinfo=timezone.utc)
+
+
+def _days_ago(days, now=OFFER_NOW):
+    return (now - timedelta(days=days)).isoformat(timespec="seconds")
+
+
+def _candidate(**overrides):
+    """A candidate as the contract-v2 artifact ships it -- the gaming cluster
+    the measured corpus is full of and interests.json covers nowhere."""
+    base = {
+        "kind": "new",
+        "key": "binding-of-isaac-progression",
+        "title": "Binding of Isaac progression and unlocks",
+        "description": "Run strategy, unlock paths and mod-scene news for Isaac.",
+        "positive_signals": ["binding of isaac", "isaac unlocks", "repentance"],
+        "negative_signals": ["isaac newton"],
+        "suggested_min_score": 0.72,
+        "sources": ["web_search"],
+        "related_keys": [],
+        "evidence": [
+            {"date": "2026-07-30", "quote": "Isaac Best Challenge Unlocks", "lang": "en",
+             "depth": 0.7, "conversation_id": "chatgpt:8842"},
+            {"date": "2026-06-11", "quote": "which Azazel run is fastest", "lang": "en",
+             "depth": 0.6, "conversation_id": "chatgpt:8611"},
+        ],
+        "durability": {"n_convs": 6, "active_months": 3, "span_days": 120, "recency_days": 19},
+        "expected_yield": 0.7,
+        "similarity_to_existing": [{"key": "nbis-nebius", "sim": 0.05}],
+    }
+    base.update(overrides)
+    return base
+
+
+def _artifact(candidates, version=2, generated_at="2026-08-17T00:00:00Z"):
+    return {
+        "contract_version": version,
+        "generated_at": generated_at,
+        "window_days": 365,
+        "conversation_count": 263,
+        "sources": {"claude": 21, "chatgpt": 242},
+        "topics": [],
+        "candidates": candidates,
+    }
+
+
+class OfferRankingTests(unittest.TestCase):
+    """score_candidate()/passes_floors()/rank() are pure -- no DB, no clock of
+    their own, and never a model call. The model rates (expected_yield,
+    similarity); code ranks."""
+
+    def test_every_term_is_computed_and_weighted_as_designed(self):
+        score, terms = offers.score_candidate(
+            _candidate(durability={"n_convs": 8, "active_months": 4, "recency_days": 0},
+                       expected_yield=1.0,
+                       similarity_to_existing=[]),
+            now=OFFER_NOW,
+        )
+        # Saturated evidence, full recurrence, today's recency, nothing like
+        # it in the interest set, and the model expecting weekly items.
+        self.assertEqual(terms["evidence_strength"], 1.0)
+        self.assertEqual(terms["recurrence"], 1.0)
+        self.assertEqual(terms["recency"], 1.0)
+        self.assertEqual(terms["novelty"], 1.0)
+        self.assertEqual(terms["expected_yield"], 1.0)
+        self.assertEqual(score, 1.0)
+
+    def test_recency_is_a_90_day_half_life(self):
+        _score, terms = offers.score_candidate(
+            _candidate(durability={"n_convs": 4, "active_months": 2, "recency_days": 90}),
+            now=OFFER_NOW,
+        )
+        self.assertAlmostEqual(terms["recency"], 0.5, places=6)
+
+    def test_recency_falls_back_to_the_newest_evidence_date(self):
+        candidate = _candidate(durability={"n_convs": 4, "active_months": 2})
+        _score, terms = offers.score_candidate(candidate, now=OFFER_NOW)
+        # Newest quote is 2026-07-30, i.e. 19 days before OFFER_NOW.
+        self.assertAlmostEqual(terms["recency_days"], 19.5, places=1)
+
+    def test_novelty_is_the_inverse_of_the_producers_similarity(self):
+        _score, terms = offers.score_candidate(
+            _candidate(similarity_to_existing=[{"key": "a", "sim": 0.2},
+                                               {"key": "b", "sim": 0.65}]),
+            now=OFFER_NOW,
+        )
+        self.assertAlmostEqual(terms["novelty"], 0.35, places=6)
+
+    def test_a_one_off_errand_never_clears_the_durability_gate(self):
+        # Five AirPlay support tickets in one afternoon: recent, repeated,
+        # and exactly what this system must not start following.
+        errand = _candidate(
+            key="airplay-troubleshooting", title="AirPlay troubleshooting",
+            durability={"n_convs": 5, "active_months": 1, "recency_days": 1},
+            evidence=[{"date": "2026-08-17", "quote": "airplay keeps dropping",
+                       "lang": "en", "depth": 0.2}],
+            expected_yield=0.9,
+        )
+        score, _terms = offers.score_candidate(errand, now=OFFER_NOW)
+        ok, why = offers.passes_floors(errand, score, offers.DEFAULT_RULES)
+        self.assertFalse(ok)
+        self.assertIn("durability gate", why)
+
+    def test_a_deep_two_conversation_dive_qualifies(self):
+        dive = _candidate(
+            durability={"n_convs": 2, "active_months": 1, "recency_days": 3},
+            evidence=[{"date": "2026-08-15", "quote": "walk me through the proof",
+                       "lang": "en", "depth": 0.8}],
+        )
+        score, _terms = offers.score_candidate(dive, now=OFFER_NOW)
+        ok, why = offers.passes_floors(dive, score, offers.DEFAULT_RULES)
+        self.assertTrue(ok, why)
+
+    def test_a_revive_offer_must_clear_twice_the_evidence_bar(self):
+        # Exactly the durability that qualifies a new offer is not enough to
+        # bring a theme the owner already retired back -- anti-flapping, the
+        # same shape as interest_state's re-entry multiplier.
+        durability = {"n_convs": 3, "active_months": 2, "recency_days": 5}
+        fresh = _candidate(durability=durability)
+        revived = _candidate(kind="revive", durability=durability)
+        score, _ = offers.score_candidate(fresh, now=OFFER_NOW)
+        self.assertTrue(offers.passes_floors(fresh, score, offers.DEFAULT_RULES)[0])
+        self.assertFalse(offers.passes_floors(revived, score, offers.DEFAULT_RULES)[0])
+
+        strong = _candidate(kind="revive",
+                            durability={"n_convs": 6, "active_months": 2, "recency_days": 5})
+        score, _ = offers.score_candidate(strong, now=OFFER_NOW)
+        self.assertTrue(offers.passes_floors(strong, score, offers.DEFAULT_RULES)[0])
+
+    def test_a_weak_score_is_refused_even_with_good_durability(self):
+        stale = _candidate(
+            durability={"n_convs": 3, "active_months": 2, "recency_days": 900},
+            expected_yield=0.0, similarity_to_existing=[{"key": "a", "sim": 0.6}],
+        )
+        score, _terms = offers.score_candidate(stale, now=OFFER_NOW)
+        ok, why = offers.passes_floors(stale, score, offers.DEFAULT_RULES)
+        self.assertFalse(ok)
+        self.assertIn("below floor", why)
+
+    def test_rank_caps_the_run_and_reserves_the_serendipity_slot(self):
+        scored = [dict(_candidate(key=f"k{i}"), score=0.9 - i * 0.01) for i in range(8)]
+        scored.append(dict(_candidate(key="wildcard", exploratory=True), score=0.46))
+        chosen = offers.rank(scored, offers.DEFAULT_RULES)
+        keys = [c["key"] for c in chosen]
+        self.assertEqual(len(keys), 5)                     # inbox stays a 2-minute decision
+        self.assertIn("wildcard", keys)                     # the reserved slot
+        self.assertEqual(keys[:4], ["k0", "k1", "k2", "k3"])
+
+    def test_rank_is_deterministic_on_ties(self):
+        scored = [dict(_candidate(key=k), score=0.6) for k in ("zeta", "alpha", "mid")]
+        self.assertEqual(
+            [c["key"] for c in offers.rank(scored, offers.DEFAULT_RULES)],
+            ["alpha", "mid", "zeta"],
+        )
+
+    def test_normalize_key_folds_plurals_stopwords_and_order(self):
+        self.assertEqual(
+            offers.normalize_key("Personal Knowledge Graphs"),
+            offers.normalize_key("graph-personal-knowledge"),
+        )
+
+    def test_normalize_key_keeps_hebrew_instead_of_emptying_it(self):
+        # An ASCII-only slug rule would normalize every Hebrew key to "" and
+        # collapse unrelated interests onto each other.
+        self.assertNotEqual(offers.normalize_key("\u05d6\u05d9\u05db\u05e8\u05d5\u05df \u05e2\u05d1\u05d5\u05d3\u05d4"), "")
+        self.assertNotEqual(
+            offers.normalize_key("\u05d6\u05d9\u05db\u05e8\u05d5\u05df \u05e2\u05d1\u05d5\u05d3\u05d4"),
+            offers.normalize_key("\u05e9\u05d9\u05e0\u05d4 \u05d5\u05e2\u05d9\u05e8\u05e0\u05d5\u05ea"),
+        )
+
+    def test_signal_tokens_cover_both_languages(self):
+        tokens = offers.signal_tokens("cognitive load", ["\u05d6\u05d9\u05db\u05e8\u05d5\u05df \u05e2\u05d1\u05d5\u05d3\u05d4"])
+        self.assertIn("cognitive", tokens)
+        self.assertIn("\u05d6\u05d9\u05db\u05e8\u05d5\u05df", tokens)
+
+
+class OfferStoreTests(unittest.TestCase):
+    """The DDL, the importer's idempotency, and the three dedup layers."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+
+    def _write_artifact(self, data, name="interest_candidates.json"):
+        path = os.path.join(self.tmp.name, name)
+        with open(path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+        return path
+
+    def _seed_interest(self, key, title="T", signals=None, active=1, min_score=0.7):
+        db.upsert_interest(self.conn, Interest(
+            key=key, title=title, description="", positive_signals=signals or [],
+            min_score=min_score, sources=["web_search"],
+        ))
+        if not active:
+            self.conn.execute("UPDATE interests SET active = 0 WHERE key = ?", (key,))
+            self.conn.commit()
+
+    def test_migration_is_additive_and_idempotent(self):
+        db.init(self.conn)   # a second init on an existing DB must be a no-op
+        tables = {r["name"] for r in self.conn.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        )}
+        self.assertIn("interest_offers", tables)
+        self.assertIn("offer_events", tables)
+        self.assertIn("interest_edges", tables)
+        columns = {r["name"] for r in self.conn.execute("PRAGMA table_info(interests)")}
+        self.assertIn("parent_key", columns)
+        self.assertIn("lifecycle", columns)
+
+    def test_existing_interest_rows_default_to_the_active_lifecycle(self):
+        self._seed_interest("nbis-nebius")
+        self.assertEqual(offers.interest_lifecycle(self.conn, "nbis-nebius"),
+                         {"lifecycle": "active", "active": True})
+
+    def test_importing_the_same_artifact_twice_creates_offers_exactly_once(self):
+        path = self._write_artifact(_artifact([_candidate()]))
+        first = offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        second = offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(first["offered"], 1)
+        self.assertEqual(second["offered"], 0)
+        self.assertEqual(second["error"], "already imported")
+        self.assertEqual(len(offers.list_offers(self.conn)), 1)
+        # ...and one propose + one offer event, not two of each.
+        events = offers.offer_events(self.conn, "binding-of-isaac-progression")
+        self.assertEqual([e["action"] for e in events], ["propose", "offer"])
+
+    def test_a_rewritten_but_identical_artifact_is_still_one_import(self):
+        # The producer copies the file weekly; identical bytes under a new
+        # name (or mtime) must not re-offer.
+        data = _artifact([_candidate()])
+        offers.import_artifact(self.conn, self._write_artifact(data), now=OFFER_NOW)
+        again = offers.import_artifact(
+            self.conn, self._write_artifact(data, name="copy.json"), now=OFFER_NOW
+        )
+        self.assertEqual(again["error"], "already imported")
+        self.assertEqual(len(offers.list_offers(self.conn)), 1)
+
+    def test_an_offer_carries_its_quotes_and_conversation_ids(self):
+        path = self._write_artifact(_artifact([_candidate()]))
+        offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        offer = offers.get_offer(self.conn, "binding-of-isaac-progression")
+        self.assertEqual(offer["status"], "offered")
+        self.assertEqual([e["quote"] for e in offer["evidence"]],
+                         ["Isaac Best Challenge Unlocks", "which Azazel run is fastest"])
+        self.assertEqual(offer["source_conversations"], ["chatgpt:8611", "chatgpt:8842"])
+        self.assertEqual(offer["artifact_sha256"], offers.artifact_sha256(path))
+        self.assertEqual(offer["generated_at"], "2026-08-17T00:00:00Z")
+        self.assertEqual(offer["score_terms"]["weights"]["evidence_strength"], 0.30)
+
+    def test_hebrew_quotes_survive_the_round_trip_unescaped(self):
+        hebrew = _candidate(
+            key="working-memory-hebrew", title="Working memory",
+            positive_signals=["working memory"],
+            evidence=[{"date": "2026-08-01",
+                       "quote": "\u05d0\u05d9\u05da \u05dc\u05e9\u05e4\u05e8 \u05d0\u05ea \u05d6\u05d9\u05db\u05e8\u05d5\u05df \u05d4\u05e2\u05d1\u05d5\u05d3\u05d4 \u05e9\u05dc\u05d9",
+                       "depth": 0.8, "conversation_id": "chatgpt:7001"}],
+            durability={"n_convs": 5, "active_months": 3, "recency_days": 10},
+        )
+        path = self._write_artifact(_artifact([hebrew]))
+        offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        offer = offers.get_offer(self.conn, "working-memory-hebrew")
+        self.assertEqual(offer["evidence"][0]["quote"],
+                         "\u05d0\u05d9\u05da \u05dc\u05e9\u05e4\u05e8 \u05d0\u05ea \u05d6\u05d9\u05db\u05e8\u05d5\u05df \u05d4\u05e2\u05d1\u05d5\u05d3\u05d4 \u05e9\u05dc\u05d9")
+        self.assertEqual(offer["evidence"][0]["lang"], "he")   # inferred, not shipped
+        # Stored as real characters, not \uXXXX escapes -- the DB stays
+        # readable by eye and by LIKE.
+        raw = self.conn.execute(
+            "SELECT evidence FROM interest_offers WHERE key = ?", ("working-memory-hebrew",)
+        ).fetchone()["evidence"]
+        self.assertIn("\u05d6\u05d9\u05db\u05e8\u05d5\u05df", raw)
+
+    def test_a_paraphrase_of_an_existing_interest_is_dropped_semantically(self):
+        # The exact-hash class of bug, at the interest level: nothing about
+        # this candidate's key or tokens matches, but the producer says it is
+        # the same thing in another language.
+        self._seed_interest("cognitive-load-working-memory", title="Cognitive load",
+                            signals=["cognitive load"])
+        paraphrase = _candidate(
+            key="zikaron-avoda", title="\u05d6\u05d9\u05db\u05e8\u05d5\u05df \u05e2\u05d1\u05d5\u05d3\u05d4",
+            positive_signals=["\u05d6\u05d9\u05db\u05e8\u05d5\u05df \u05e2\u05d1\u05d5\u05d3\u05d4"],
+            similarity_to_existing=[{"key": "cognitive-load-working-memory", "sim": 0.86}],
+        )
+        path = self._write_artifact(_artifact([paraphrase]))
+        summary = offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(summary["skipped_dedup"], 1)
+        self.assertEqual(summary["offered"], 0)
+        self.assertIn("semantic similarity", summary["reasons"][0]["why"])
+
+    def test_similarity_to_a_since_removed_interest_no_longer_suppresses(self):
+        # The producer scored this candidate .86 similar to an interest that
+        # has since been removed. Judging it against an interest the owner no
+        # longer follows would silently keep the theme out forever.
+        paraphrase = _candidate(
+            key="zikaron-avoda", title="Working memory",
+            similarity_to_existing=[{"key": "cognitive-load-working-memory", "sim": 0.86}],
+        )
+        path = self._write_artifact(_artifact([paraphrase]))
+        summary = offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(summary["offered"], 1)
+        # ...but the producer's own reading is still stored, for provenance.
+        self.assertEqual(
+            offers.get_offer(self.conn, "zikaron-avoda")["similarity"],
+            [{"key": "cognitive-load-working-memory", "sim": 0.86}],
+        )
+
+    def test_a_candidate_that_normalizes_onto_an_existing_key_is_dropped(self):
+        self._seed_interest("personal-knowledge-graphs")
+        path = self._write_artifact(_artifact([
+            _candidate(key="Personal Knowledge Graph", similarity_to_existing=[])
+        ]))
+        summary = offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(summary["skipped_dedup"], 1)
+        self.assertIn("normalizes onto", summary["reasons"][0]["why"])
+
+    def test_a_heavy_signal_overlap_becomes_evidence_not_an_offer(self):
+        self._seed_interest(
+            "narcolepsy-eds", title="Narcolepsy and excessive daytime sleepiness",
+            signals=["narcolepsy", "modafinil", "orexin", "sleepiness"],
+        )
+        overlapping = _candidate(
+            key="modafinil-dosing", title="Modafinil dosing",
+            positive_signals=["modafinil", "orexin"],
+            similarity_to_existing=[{"key": "narcolepsy-eds", "sim": 0.4}],
+        )
+        path = self._write_artifact(_artifact([overlapping]))
+        summary = offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(summary["attached"], 1)
+        self.assertEqual(summary["offered"], 0)
+        events = [e for e in db.interest_events(self.conn, "narcolepsy-eds")
+                  if e["action"] == "offer_evidence"]
+        self.assertEqual(len(events), 1)
+        self.assertEqual(events[0]["evidence"]["candidate_key"], "modafinil-dosing")
+        self.assertEqual(events[0]["evidence"]["source_conversations"],
+                         ["chatgpt:8611", "chatgpt:8842"])
+
+    def test_a_rejected_theme_is_not_offered_again(self):
+        path = self._write_artifact(_artifact([_candidate()]))
+        offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        offers.reject(self.conn, "binding-of-isaac-progression", note="not now", now=OFFER_NOW)
+        # A later artifact proposes the same theme under a different key.
+        again = self._write_artifact(_artifact(
+            [_candidate(key="isaac-repentance-unlocks")], generated_at="2026-09-01T00:00:00Z"
+        ))
+        summary = offers.import_artifact(self.conn, again, now=OFFER_NOW + timedelta(days=14))
+        self.assertEqual(summary["skipped_blocked"], 1)
+        self.assertEqual(summary["offered"], 0)
+
+    def test_the_block_expires_after_the_window(self):
+        path = self._write_artifact(_artifact([_candidate()]))
+        offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        offers.reject(self.conn, "binding-of-isaac-progression", now=OFFER_NOW)
+        blocked = offers.blocked_offer_keys(
+            self.conn, now=OFFER_NOW + timedelta(days=181)
+        )
+        self.assertEqual(blocked, set())
+
+    def test_interests_json_blocked_terms_are_honoured_and_appended_to(self):
+        interests_path = os.path.join(self.tmp.name, "interests.json")
+        with open(interests_path, "w", encoding="utf-8") as fh:
+            json.dump({"interests": [], "blocked_derived_terms": ["crypto"]}, fh)
+        blocked_by_file = _candidate(key="crypto-market-moves", title="Crypto market moves",
+                                     positive_signals=["crypto"])
+        path = self._write_artifact(_artifact([blocked_by_file]))
+        summary = offers.import_artifact(
+            self.conn, path, interests_path=interests_path, now=OFFER_NOW
+        )
+        self.assertEqual(summary["skipped_blocked"], 1)
+
+        # And a rejection writes back into the same list.
+        other = self._write_artifact(_artifact([_candidate()], generated_at="2026-09-02T00:00:00Z"))
+        offers.import_artifact(self.conn, other, now=OFFER_NOW)
+        result = offers.reject(self.conn, "binding-of-isaac-progression",
+                               interests_path=interests_path, now=OFFER_NOW)
+        self.assertIn("binding-of-isaac-progression", result["blocked_terms_written"])
+        self.assertEqual(interests.load_blocked(interests_path)[0], "crypto")
+        self.assertIn("binding-of-isaac-progression", interests.load_blocked(interests_path))
+
+    def test_at_most_five_offers_per_run_reach_the_inbox(self):
+        many = [
+            _candidate(key=f"theme-{i}", title=f"Theme {i}",
+                       positive_signals=[f"theme{i}"],
+                       durability={"n_convs": 8, "active_months": 4, "recency_days": i})
+            for i in range(9)
+        ]
+        path = self._write_artifact(_artifact(many))
+        summary = offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(summary["offered"], 5)
+        self.assertEqual(summary["not_selected"], 4)
+        self.assertEqual(len(offers.inbox(self.conn)), 5)
+
+    def test_a_v1_artifact_produces_no_offers_and_is_not_re_read(self):
+        path = self._write_artifact(
+            {"contract_version": 1, "generated_at": "x", "topics": [{"key": "orexin"}]}
+        )
+        summary = offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(summary["offered"], 0)
+        self.assertIn("no candidates", summary["error"])
+        self.assertEqual(
+            offers.import_artifact(self.conn, path, now=OFFER_NOW)["error"], "already imported"
+        )
+
+    def test_a_missing_or_malformed_artifact_is_fail_soft(self):
+        missing = os.path.join(self.tmp.name, "nope.json")
+        summary = offers.import_artifact(self.conn, missing, now=OFFER_NOW)
+        self.assertIn("unreadable", summary["error"])
+
+        bad = os.path.join(self.tmp.name, "bad.json")
+        with open(bad, "w", encoding="utf-8") as fh:
+            fh.write("{not json")
+        with contextlib.redirect_stderr(io.StringIO()):
+            summary = offers.import_artifact(self.conn, bad, now=OFFER_NOW)
+        self.assertIn("malformed", summary["error"])
+        self.assertEqual(offers.list_offers(self.conn), [])
+
+    def test_a_candidate_with_no_evidence_still_imports_but_shows_no_quotes(self):
+        bare = _candidate(key="bare-theme", evidence=[])
+        path = self._write_artifact(_artifact([bare]))
+        offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        offer = offers.get_offer(self.conn, "bare-theme")
+        self.assertEqual(offer["evidence"], [])
+        self.assertEqual(offer["source_conversations"], [])
+
+    def test_a_legacy_0_100_suggested_bar_is_rescaled(self):
+        path = self._write_artifact(_artifact([_candidate(suggested_min_score=75)]))
+        offers.import_artifact(self.conn, path, now=OFFER_NOW)
+        self.assertEqual(
+            offers.get_offer(self.conn, "binding-of-isaac-progression")["suggested_min_score"],
+            0.75,
+        )
+
+
+class OfferLifecycleTests(unittest.TestCase):
+    """The offer half of the state machine: every transition is legal-listed
+    and logged, and nothing skips the inbox."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "a.json")
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(_artifact([_candidate()]), fh)
+        offers.import_artifact(self.conn, self.path, now=OFFER_NOW)
+        self.key = "binding-of-isaac-progression"
+
+    def test_accept_records_the_decision_and_hands_back_a_json_entry(self):
+        result = offers.accept(self.conn, self.key, note="yes please", now=OFFER_NOW)
+        entry = result["entry"]
+        self.assertEqual(entry["key"], self.key)
+        self.assertEqual(entry["min_score"], 0.72)
+        self.assertEqual(entry["sources"], ["web_search"])
+        self.assertEqual(entry["offered_by"]["source_conversations"],
+                         ["chatgpt:8611", "chatgpt:8842"])
+        self.assertEqual(offers.get_offer(self.conn, self.key)["status"], "accepted")
+        self.assertEqual(offers.get_offer(self.conn, self.key)["decided_note"], "yes please")
+
+    def test_accept_with_edits_applies_them_and_keeps_the_diff(self):
+        offers.accept(
+            self.conn, self.key, now=OFFER_NOW,
+            edits={"title": "Isaac", "min_score": 0.65,
+                   "positive_signals": ["isaac", "repentance"]},
+        )
+        offer = offers.get_offer(self.conn, self.key)
+        self.assertEqual(offer["title"], "Isaac")
+        self.assertEqual(offer["suggested_min_score"], 0.65)
+        self.assertEqual(offer["positive_signals"], ["isaac", "repentance"])
+        accept_event = [e for e in offers.offer_events(self.conn, self.key)
+                        if e["action"] == "accept"][0]
+        self.assertEqual(accept_event["detail"]["edits"]["min_score"], 0.65)
+
+    def test_an_unsupported_edit_field_is_refused(self):
+        with self.assertRaises(offers.OfferError):
+            offers.accept(self.conn, self.key, edits={"key": "something-else"})
+
+    def test_accept_can_close_the_loop_through_an_injected_sync(self):
+        # PR I/J own the interests.json + DB write; offers.py only calls it.
+        written = {}
+
+        def fake_sync(entry):
+            written.update(entry)
+            db.upsert_interest(self.conn, Interest(
+                key=entry["key"], title=entry["title"], description=entry["description"],
+                positive_signals=entry["positive_signals"], min_score=entry["min_score"],
+                sources=entry["sources"],
+            ))
+
+        result = offers.accept(self.conn, self.key, sync=fake_sync, now=OFFER_NOW)
+        self.assertEqual(written["key"], self.key)
+        self.assertEqual(result["activated"]["lifecycle"], "active")
+        self.assertEqual(offers.interest_lifecycle(self.conn, self.key),
+                         {"lifecycle": "active", "active": True})
+        chain = [e["action"] for e in db.interest_events(self.conn, self.key)]
+        self.assertIn("offer_accepted", chain)
+
+    def test_activate_refuses_until_the_interest_row_exists(self):
+        offers.accept(self.conn, self.key, now=OFFER_NOW)
+        with self.assertRaises(offers.OfferError):
+            offers.activate(self.conn, self.key)
+
+    def test_an_offer_cannot_skip_the_inbox_or_be_decided_twice(self):
+        fresh = offers.insert_offer(self.conn, {"key": "k2", "title": "K2"}, now=OFFER_NOW)
+        self.assertEqual(fresh["status"], "proposed")
+        with self.assertRaises(offers.InvalidTransition):
+            offers.accept(self.conn, "k2")          # proposed -> accepted is not a transition
+        offers.accept(self.conn, self.key, now=OFFER_NOW)
+        with self.assertRaises(offers.InvalidTransition):
+            offers.reject(self.conn, self.key)      # accepted is final
+
+    def test_deciding_an_unknown_offer_raises_unknown_offer(self):
+        with self.assertRaises(offers.UnknownOffer):
+            offers.snooze(self.conn, "no-such-offer")
+
+    def test_snooze_sleeps_then_wakes_back_into_the_inbox(self):
+        offers.snooze(self.conn, self.key, now=OFFER_NOW)
+        self.assertEqual(offers.inbox(self.conn), [])
+        summary = offers.sweep(self.conn, now=OFFER_NOW + timedelta(days=31))
+        self.assertEqual(summary["woken"], 1)
+        self.assertEqual([o["key"] for o in offers.inbox(self.conn)], [self.key])
+        self.assertIsNone(offers.get_offer(self.conn, self.key)["snoozed_until"])
+
+    def test_a_snoozed_offer_stays_asleep_until_its_timer(self):
+        offers.snooze(self.conn, self.key, now=OFFER_NOW)
+        summary = offers.sweep(self.conn, now=OFFER_NOW + timedelta(days=29))
+        self.assertEqual(summary["woken"], 0)
+
+    def test_an_undecided_offer_expires_after_45_days(self):
+        summary = offers.sweep(self.conn, now=OFFER_NOW + timedelta(days=45))
+        self.assertEqual(summary["expired"], 1)
+        self.assertEqual(offers.get_offer(self.conn, self.key)["status"], "expired")
+        events = [e["action"] for e in offers.offer_events(self.conn, self.key)]
+        self.assertEqual(events[-1], "expire")
+
+    def test_every_transition_is_on_the_append_only_log(self):
+        offers.snooze(self.conn, self.key, now=OFFER_NOW)
+        offers.sweep(self.conn, now=OFFER_NOW + timedelta(days=31))
+        offers.accept(self.conn, self.key, now=OFFER_NOW + timedelta(days=31))
+        chain = [(e["actor"], e["action"], e["from_status"], e["to_status"])
+                 for e in offers.offer_events(self.conn, self.key)]
+        self.assertEqual(chain, [
+            ("importer", "propose", None, "proposed"),
+            ("importer", "offer", "proposed", "offered"),
+            ("owner_ui", "snooze", "offered", "snoozed"),
+            ("timer", "wake", "snoozed", "offered"),
+            ("owner_ui", "accept", "offered", "accepted"),
+        ])
+
+    def test_offer_detail_carries_everything_the_inbox_renders(self):
+        detail = offers.offer_detail(self.conn, self.key)
+        for field in ("evidence", "source_conversations", "score_terms", "durability",
+                      "similarity", "related_keys", "events"):
+            self.assertIn(field, detail)
+        self.assertIsNone(offers.offer_detail(self.conn, "nope"))
+
+
+class OfferSweepTests(unittest.TestCase):
+    """The interest half: decay at 30 days, a reversible auto-pause at 45,
+    and two refusals to judge silence that isn't the interest's fault."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def _interest(self, key="speculative-fiction-ideas", min_score=0.78):
+        db.upsert_interest(self.conn, Interest(
+            key=key, title=key, description="", positive_signals=[key],
+            min_score=min_score, sources=["web_search"],
+        ))
+        return self.conn.execute(
+            "SELECT id FROM interests WHERE key = ?", (key,)
+        ).fetchone()["id"]
+
+    def _score(self, interest_id, *, final_score, created_at, key="k"):
+        cur = self.conn.execute(
+            "INSERT INTO candidate_items (source, type, title, url, dedup_key, url_hash,"
+            " title_hash, origin_interest, first_seen_at) VALUES (?,?,?,?,?,?,?,?,?)",
+            ("web_search", "article", "t", f"https://e.com/{key}", key, key, key,
+             self.conn.execute("SELECT key FROM interests WHERE id = ?",
+                               (interest_id,)).fetchone()["key"], created_at),
+        )
+        item_id = cur.lastrowid
+        self.conn.execute(
+            "INSERT INTO scores (item_id, interest_id, personal_relevance, novelty, depth,"
+            " specificity, importance, surprise, final_score, confidence, created_at)"
+            " VALUES (?,?,0.5,0.5,0.5,0.5,0.5,0.5,?,0.8,?)",
+            (item_id, interest_id, final_score, created_at),
+        )
+        self.conn.commit()
+        return item_id
+
+    def _dead_interest(self, silent_days, key="speculative-fiction-ideas"):
+        """The measured dead-weight shape: items collected and scored, none of
+        them ever above the bar."""
+        interest_id = self._interest(key)
+        for i in range(6):
+            self._score(interest_id, final_score=0.4,
+                        created_at=_days_ago(silent_days + i), key=f"{key}-old-{i}")
+        return interest_id
+
+    def _keep_pipeline_alive(self, key="nbis-nebius"):
+        """A second, healthy interest scoring items right now -- otherwise the
+        sweep correctly refuses to judge anything."""
+        other = self._interest(key, min_score=0.6)
+        self._score(other, final_score=0.9, created_at=_days_ago(0), key="fresh")
+        return other
+
+    def test_thirty_silent_days_flag_an_interest_and_raise_a_retirement_offer(self):
+        self._dead_interest(31)
+        self._keep_pipeline_alive()
+        summary = offers.sweep(self.conn, now=OFFER_NOW)
+        self.assertEqual(summary["decaying"], 1)
+        self.assertEqual(summary["retire_offers"], 1)
+        self.assertEqual(
+            offers.interest_lifecycle(self.conn, "speculative-fiction-ideas"),
+            {"lifecycle": "decaying", "active": True},   # on notice, still collecting
+        )
+        offer = offers.get_offer(self.conn, "retire:speculative-fiction-ideas")
+        self.assertEqual(offer["status"], "offered")
+        self.assertEqual(offer["kind"], "retire")
+        self.assertEqual(offer["score_terms"]["above_bar"], 0)
+        self.assertEqual(offer["score_terms"]["scored"], 6)
+
+    def test_forty_five_silent_days_auto_pause_reversibly_and_announce_it(self):
+        self._dead_interest(46)
+        self._keep_pipeline_alive()
+        said = []
+        summary = offers.sweep(self.conn, now=OFFER_NOW, announce=said.append)
+        self.assertEqual(summary["auto_paused"], 1)
+        self.assertEqual(
+            offers.interest_lifecycle(self.conn, "speculative-fiction-ideas"),
+            {"lifecycle": "paused", "active": False},
+        )
+        # It announces itself, and the announcement carries the way back.
+        self.assertEqual(len(said), 1)
+        self.assertIn("speculative-fiction-ideas", said[0])
+        self.assertIn("--undo", said[0])
+        self.assertEqual(summary["announcements"][0]["kind"], "auto_pause")
+        event = [e for e in db.interest_events(self.conn, "speculative-fiction-ideas")
+                 if e["action"] == "auto_pause"][0]
+        self.assertEqual(event["evidence"]["to_lifecycle"], "paused")
+        self.assertGreaterEqual(event["evidence"]["silent_days"], 45)
+
+    def test_a_failing_announcement_never_fails_the_sweep(self):
+        self._dead_interest(46)
+        self._keep_pipeline_alive()
+
+        def broken(_text):
+            raise RuntimeError("telegram down")
+
+        summary = offers.sweep(self.conn, now=OFFER_NOW, announce=broken)
+        self.assertEqual(summary["auto_paused"], 1)
+        self.assertIn("announce_error", summary["announcements"][0])
+
+    def test_undo_brings_it_back_closes_the_retire_offer_and_resets_the_clock(self):
+        self._dead_interest(46)
+        self._keep_pipeline_alive()
+        offers.sweep(self.conn, now=OFFER_NOW)
+        result = offers.undo_auto_pause(self.conn, "speculative-fiction-ideas", now=OFFER_NOW)
+        self.assertEqual(result["lifecycle"], "active")
+        self.assertEqual(
+            offers.interest_lifecycle(self.conn, "speculative-fiction-ideas"),
+            {"lifecycle": "active", "active": True},
+        )
+        self.assertEqual(
+            offers.get_offer(self.conn, "retire:speculative-fiction-ideas")["status"], "rejected"
+        )
+        # The undo is the new baseline: the very next sweep must not re-pause
+        # the interest it was just told to keep.
+        again = offers.sweep(self.conn, now=OFFER_NOW + timedelta(days=1))
+        self.assertEqual(again["auto_paused"], 0)
+        self.assertEqual(again["decaying"], 0)
+
+    def test_undo_on_an_interest_that_was_never_paused_is_refused(self):
+        self._interest("nbis-nebius")
+        with self.assertRaises(offers.InvalidTransition):
+            offers.undo_auto_pause(self.conn, "nbis-nebius")
+
+    def test_a_paused_pipeline_never_looks_like_a_dead_interest(self):
+        # The live failure mode: the appliance was paused for days. Nothing
+        # scored, so nothing may be judged silent.
+        self._dead_interest(60)
+        summary = offers.sweep(self.conn, now=OFFER_NOW)
+        self.assertEqual(summary["auto_paused"], 0)
+        self.assertEqual(summary["decaying"], 0)
+        self.assertIn("not evaluated", summary["skipped"])
+        self.assertEqual(
+            offers.interest_lifecycle(self.conn, "speculative-fiction-ideas")["lifecycle"],
+            "active",
+        )
+
+    def test_an_interest_the_pipeline_barely_touched_is_never_paused(self):
+        interest_id = self._interest("brand-new-interest")
+        self._score(interest_id, final_score=0.3, created_at=_days_ago(60), key="only-one")
+        self._keep_pipeline_alive()
+        summary = offers.sweep(self.conn, now=OFFER_NOW)
+        self.assertEqual(summary["auto_paused"], 0)
+        self.assertEqual(summary["decaying"], 0)
+
+    def test_an_above_bar_item_returning_restores_a_decaying_interest(self):
+        interest_id = self._dead_interest(31)
+        self._keep_pipeline_alive()
+        offers.sweep(self.conn, now=OFFER_NOW)
+        self.assertEqual(
+            offers.interest_lifecycle(self.conn, "speculative-fiction-ideas")["lifecycle"],
+            "decaying",
+        )
+        self._score(interest_id, final_score=0.95, created_at=_days_ago(0), key="hit")
+        summary = offers.sweep(self.conn, now=OFFER_NOW)
+        self.assertEqual(summary["recovered"], 1)
+        self.assertEqual(
+            offers.interest_lifecycle(self.conn, "speculative-fiction-ideas")["lifecycle"],
+            "active",
+        )
+        self.assertEqual(
+            offers.get_offer(self.conn, "retire:speculative-fiction-ideas")["status"], "rejected"
+        )
+
+    def test_three_negative_reactions_retire_an_already_decaying_interest(self):
+        interest_id = self._dead_interest(31)
+        self._keep_pipeline_alive()
+        offers.sweep(self.conn, now=OFFER_NOW)
+        item_id = self._score(interest_id, final_score=0.2,
+                              created_at=_days_ago(31), key="fb-item")
+        for _ in range(3):
+            db.add_feedback(self.conn, item_id, interest_id, "down")
+        summary = offers.sweep(self.conn, now=OFFER_NOW)
+        self.assertEqual(summary["retired"], 1)
+        self.assertEqual(
+            offers.interest_lifecycle(self.conn, "speculative-fiction-ideas"),
+            {"lifecycle": "retired", "active": False},
+        )
+
+    def test_a_declined_retirement_offer_returns_only_after_its_cool_off(self):
+        healthy = self._dead_interest(31) and self._keep_pipeline_alive()
+        offers.sweep(self.conn, now=OFFER_NOW)
+        offers.reject(self.conn, "retire:speculative-fiction-ideas",
+                      note="keep it", now=OFFER_NOW)
+
+        def sweep_at(days):
+            # The pipeline has to be visibly alive at each instant, or the
+            # sweep refuses to judge (see the paused-pipeline test).
+            when = OFFER_NOW + timedelta(days=days)
+            self._score(healthy, final_score=0.9,
+                        created_at=when.isoformat(timespec="seconds"), key=f"fresh-{days}")
+            return offers.sweep(self.conn, now=when)
+
+        # Still dead a month later, but the owner already said no.
+        self.assertEqual(sweep_at(30)["retire_offers"], 0)
+        self.assertEqual(
+            offers.get_offer(self.conn, "retire:speculative-fiction-ideas")["status"], "rejected"
+        )
+        later = sweep_at(91)
+        self.assertEqual(later["retire_offers"], 1)
+        self.assertEqual(
+            offers.get_offer(self.conn, "retire:speculative-fiction-ideas")["status"], "offered"
+        )
+
+    def test_declining_a_retirement_offer_blocks_nothing(self):
+        # "keep it" must not blocklist the interest's own key and words --
+        # that would be the opposite of the answer, and would poison every
+        # future candidate sharing a word with its title.
+        self._dead_interest(31)
+        self._keep_pipeline_alive()
+        offers.sweep(self.conn, now=OFFER_NOW)
+        result = offers.reject(self.conn, "retire:speculative-fiction-ideas",
+                               note="keep it", now=OFFER_NOW)
+        self.assertEqual(result["blocked_terms"], [])
+        self.assertEqual(offers.blocked_offer_keys(self.conn, now=OFFER_NOW), set())
+
+    def test_a_retired_interest_is_left_alone_by_later_sweeps(self):
+        self._dead_interest(60)
+        self._keep_pipeline_alive()
+        offers.retire_interest(self.conn, "speculative-fiction-ideas", note="done")
+        summary = offers.sweep(self.conn, now=OFFER_NOW)
+        self.assertEqual(summary["auto_paused"], 0)
+        self.assertEqual(summary["decaying"], 0)
+
+    def test_a_healthy_interest_is_untouched(self):
+        interest_id = self._interest("nbis-nebius", min_score=0.6)
+        self._score(interest_id, final_score=0.9, created_at=_days_ago(1), key="a")
+        for i in range(5):
+            self._score(interest_id, final_score=0.5, created_at=_days_ago(i + 2), key=f"b{i}")
+        summary = offers.sweep(self.conn, now=OFFER_NOW)
+        self.assertEqual((summary["decaying"], summary["auto_paused"]), (0, 0))
+        self.assertEqual(offers.interest_lifecycle(self.conn, "nbis-nebius")["lifecycle"],
+                         "active")
+
+    def test_derived_ladder_rows_are_left_to_interest_state(self):
+        # Non-owner rows have their own ladder (discovery/interest_state.py);
+        # this sweep must not touch them.
+        db.upsert_derived_interest(self.conn, Interest(
+            key="derived:orexin", title="orexin", description="Derived interest: orexin",
+            positive_signals=["orexin"], min_score=0.8, sources=[], layer="inferred",
+        ), {"source": "corpus"})
+        derived_id = self.conn.execute(
+            "SELECT id FROM interests WHERE key = ?", ("derived:orexin",)
+        ).fetchone()["id"]
+        for i in range(6):
+            self._score(derived_id, final_score=0.3, created_at=_days_ago(60 + i), key=f"d{i}")
+        self._keep_pipeline_alive()
+        summary = offers.sweep(self.conn, now=OFFER_NOW)
+        self.assertEqual((summary["decaying"], summary["auto_paused"]), (0, 0))
+
+    def test_silence_days_is_none_for_an_interest_the_pipeline_never_worked_on(self):
+        self._interest("untouched")
+        self.assertIsNone(offers.silence_days(self.conn, "untouched", now=OFFER_NOW))
+
+
+class OffersCLITests(unittest.TestCase):
+    """`python -m app offers ...` -- offline end to end, no provider built."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = os.path.join(self.tmp.name, "t.db")
+        self.artifact = os.path.join(self.tmp.name, "interest_candidates.json")
+        with open(self.artifact, "w", encoding="utf-8") as fh:
+            json.dump(_artifact([_candidate()]), fh, ensure_ascii=False)
+
+    def _main(self, *argv, env=None):
+        from discovery.__main__ import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, env or {}), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(["--db", self.db_path, *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def test_import_then_list_then_why(self):
+        code, out, _err = self._main("offers", "--import", self.artifact)
+        self.assertEqual(code, 0)
+        self.assertIn('"offered": 1', out)
+
+        code, out, _err = self._main("offers")
+        self.assertEqual(code, 0)
+        self.assertIn("binding-of-isaac-progression", out)
+        self.assertIn("2 quote(s) from 2 conversation(s)", out)
+
+        code, out, _err = self._main("offers", "--why", "binding-of-isaac-progression")
+        self.assertEqual(code, 0)
+        self.assertIn("Isaac Best Challenge Unlocks", out)
+        self.assertIn("chatgpt:8842", out)
+        self.assertIn("evidence_strength", out)
+
+    def test_import_defaults_to_the_configured_artifact_path(self):
+        code, out, _err = self._main(
+            "offers", "--import", env={"DISCOVERY_INTEREST_CANDIDATES": self.artifact}
+        )
+        self.assertEqual(code, 0)
+        self.assertIn('"offered": 1', out)
+
+    def test_why_on_an_unknown_offer_exits_cleanly(self):
+        code, _out, err = self._main("offers", "--why", "nope")
+        self.assertEqual(code, 2)
+        self.assertIn("no offer with key", err)
+
+    def test_accept_prints_the_interests_json_entry(self):
+        self._main("offers", "--import", self.artifact)
+        code, out, _err = self._main("offers", "--accept", "binding-of-isaac-progression")
+        self.assertEqual(code, 0)
+        entry = json.loads(out[out.index("{"):out.rindex("}") + 1])
+        self.assertEqual(entry["key"], "binding-of-isaac-progression")
+        self.assertEqual(entry["offered_by"]["evidence_count"], 2)
+
+    def test_a_second_decision_on_a_decided_offer_exits_cleanly(self):
+        self._main("offers", "--import", self.artifact)
+        self._main("offers", "--accept", "binding-of-isaac-progression")
+        code, _out, err = self._main("offers", "--reject", "binding-of-isaac-progression")
+        self.assertEqual(code, 2)
+        self.assertIn("not a legal transition", err)
+
+    def test_sweep_runs_and_reports(self):
+        self._main("offers", "--import", self.artifact)
+        code, out, _err = self._main("offers", "--sweep")
+        self.assertEqual(code, 0)
+        self.assertIn('"expired": 0', out)
+
+    def test_import_of_a_missing_artifact_is_fail_soft(self):
+        code, out, _err = self._main("offers", "--import", os.path.join(self.tmp.name, "no.json"))
+        self.assertEqual(code, 0)
+        self.assertIn("unreadable", out)
+
+
+class InterestSyncV2Tests(unittest.TestCase):
+    """Sync v2 (discovery/interest_sync.py): interests.json is the source of
+    truth in BOTH directions. The bug these pin down: v1 only ever inserted,
+    so an interest deleted from the file kept collecting and spending until
+    somebody hand-ran an UPDATE against the live database."""
+
+    HEBREW = {
+        "key": "memory-retrieval-he",
+        "title": "זיכרון ושליפה",
+        "description": "עבודה על זיכרון",
+        "positive_signals": ["זיכרון", "retrieval practice"],
+    }
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.path = os.path.join(self.tmp.name, "interests.json")
+
+    def _write(self, entries, defaults=None):
+        # ensure_ascii=False: the real file carries Hebrew titles and signals.
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"defaults": defaults or {"min_score": 0.7, "sources": ["web_search"]},
+                       "interests": entries}, fh, ensure_ascii=False)
+        return self.path
+
+    def _entry(self, key, **kw):
+        return {"key": key, "title": key.upper(), **kw}
+
+    def _row(self, key):
+        return self.conn.execute("SELECT * FROM interests WHERE key = ?", (key,)).fetchone()
+
+    def _actions(self, key):
+        return [e["action"] for e in db.interest_events(self.conn, key)]
+
+    def _pending(self, key, label="m1", status="PENDING"):
+        self.conn.execute(
+            "INSERT INTO search_missions (interest_key, label, prompt, prompt_sha256,"
+            " status, created_at) VALUES (?, ?, 'p', 'h', ?, ?)",
+            (key, label, status, db.now()),
+        )
+        self.conn.commit()
+
+    # --- the regression this PR exists for ---------------------------------
+
+    def test_an_entry_removed_from_the_file_is_deactivated(self):
+        """v1's never-deactivates bug: `sync` used to leave a dropped interest
+        active forever, so it kept being collected for and scored."""
+        self._write([self._entry("keeper"), self._entry("dropped")])
+        interest_sync.sync(self.conn, self.path)
+        self.assertEqual(self._row("dropped")["active"], 1)
+
+        self._write([self._entry("keeper")])
+        result = interest_sync.sync(self.conn, self.path)
+
+        self.assertEqual(result.deactivated, ["dropped"])
+        self.assertEqual(self._row("dropped")["active"], 0)
+        self.assertEqual(self._row("keeper")["active"], 1)
+        self.assertEqual([i.key for i in db.active_interests(self.conn)], ["keeper"])
+
+    def test_deactivating_cancels_pending_missions_but_never_a_running_one(self):
+        self._write([self._entry("dropped")])
+        interest_sync.sync(self.conn, self.path)
+        self._pending("dropped", "queued")
+        self._pending("dropped", "queued-2")
+        self._pending("dropped", "in-flight", status="RUNNING")
+
+        self._write([])
+        result = interest_sync.sync(self.conn, self.path, force=True)
+
+        self.assertEqual(result.missions_cancelled, 2)
+        rows = dict(self.conn.execute(
+            "SELECT label, status FROM search_missions WHERE interest_key = 'dropped'"
+        ).fetchall())
+        # A RUNNING mission is leased and mid-execution -- its own finish/fail
+        # path owns that row; cancelling it would lose a result already paid for.
+        self.assertEqual(rows, {"queued": "CANCELLED", "queued-2": "CANCELLED",
+                                "in-flight": "RUNNING"})
+        self.assertEqual(
+            self.conn.execute(
+                "SELECT last_error FROM search_missions WHERE label = 'queued'"
+            ).fetchone()["last_error"],
+            interest_sync.CANCEL_REASON,
+        )
+
+    def test_deactivation_is_recorded_as_an_owner_sync_event_with_its_reason(self):
+        self._write([self._entry("dropped")])
+        interest_sync.sync(self.conn, self.path)
+        self._pending("dropped")
+        self._write([])
+        interest_sync.sync(self.conn, self.path, force=True)
+
+        events = db.interest_events(self.conn, "dropped")
+        self.assertEqual([e["action"] for e in events], ["create", "deactivate"])
+        self.assertEqual([e["actor"] for e in events], ["owner_sync", "owner_sync"])
+        # Written by offers.set_lifecycle -- the reason and the mission count
+        # ride along on the same event as the lifecycle move that caused them.
+        self.assertEqual(events[-1]["evidence"], {
+            "from_lifecycle": offers.ACTIVE, "to_lifecycle": offers.RETIRED,
+            "reason": "absent from the file", "missions_cancelled": 1,
+        })
+
+    # --- idempotence -------------------------------------------------------
+
+    def test_re_running_an_unchanged_file_writes_nothing_and_logs_nothing(self):
+        """Safe to run repeatedly against the live DB -- v1 appended one row
+        per interest per run (155 rows saying only 'sync' in production)."""
+        self._write([self._entry("a"), self._entry("b"), self.HEBREW])
+        first = interest_sync.sync(self.conn, self.path)
+        self.assertEqual(len(first.created), 3)
+        events_after_first = self.conn.execute(
+            "SELECT COUNT(*) c FROM interest_events").fetchone()["c"]
+
+        second = interest_sync.sync(self.conn, self.path)
+
+        self.assertEqual(second.changes, 0)
+        self.assertEqual(sorted(second.unchanged), ["a", "b", self.HEBREW["key"]])
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) c FROM interest_events").fetchone()["c"],
+            events_after_first,
+        )
+
+    def test_a_hebrew_entry_does_not_look_changed_on_every_run(self):
+        """Signals are stored as JSON with ensure_ascii=True, so comparing the
+        raw column text would see the escapes and log an update forever."""
+        self._write([self.HEBREW])
+        interest_sync.sync(self.conn, self.path)
+        plan = interest_sync.plan(self.conn, self.path)
+        self.assertEqual(plan.updated, [])
+        self.assertEqual(plan.unchanged, [self.HEBREW["key"]])
+        self.assertEqual(
+            json.loads(self._row(self.HEBREW["key"])["positive_signals"]),
+            self.HEBREW["positive_signals"],
+        )
+
+    def test_an_unchanged_bar_written_on_the_legacy_scale_is_not_a_change(self):
+        self._write([self._entry("a", min_score=0.7)])
+        interest_sync.sync(self.conn, self.path)
+        self._write([self._entry("a", min_score=70)])   # legacy 0-100 scale
+        self.assertEqual(interest_sync.plan(self.conn, self.path).changes, 0)
+
+    # --- retire in place, and revival --------------------------------------
+
+    def test_active_false_retires_the_entry_without_losing_its_definition(self):
+        self._write([self._entry("paused", positive_signals=["keep me"])])
+        interest_sync.sync(self.conn, self.path)
+        self._pending("paused")
+
+        self._write([self._entry("paused", positive_signals=["keep me"], active=False)])
+        result = interest_sync.sync(self.conn, self.path)
+
+        self.assertEqual(result.deactivated, ["paused"])
+        self.assertEqual(result.missions_cancelled, 1)
+        row = self._row("paused")
+        self.assertEqual(row["active"], 0)
+        self.assertEqual(json.loads(row["positive_signals"]), ["keep me"])
+        self.assertEqual(db.interest_events(self.conn, "paused")[-1]["evidence"]["reason"],
+                         "marked inactive in the file")
+
+    def test_removing_the_active_flag_revives_a_retired_interest(self):
+        self._write([self._entry("retired-then-back", active=False)])
+        interest_sync.sync(self.conn, self.path)
+        self.assertEqual(self._row("retired-then-back")["active"], 0)
+        self.assertEqual(self._actions("retired-then-back"), ["create", "deactivate"])
+
+        self._write([self._entry("retired-then-back")])
+        result = interest_sync.sync(self.conn, self.path)
+
+        self.assertEqual(result.reactivated, ["retired-then-back"])
+        row = self._row("retired-then-back")
+        self.assertEqual((row["active"], row["lifecycle"]), (1, offers.ACTIVE))
+        self.assertEqual(self._actions("retired-then-back"),
+                         ["create", "deactivate", "reactivate"])
+
+    def test_an_edit_takes_effect_without_re_initialising(self):
+        """The end-to-end promise: edit the file, call sync, and the next
+        cycle's active_interests() already sees it -- no `init`, no DB op."""
+        self._write([self._entry("bar-tuning", min_score=0.62)])
+        interest_sync.sync(self.conn, self.path)
+        self._write([self._entry("bar-tuning", min_score=0.78,
+                                 positive_signals=["new signal"])])
+
+        interest_sync.sync(self.conn, self.path)
+
+        (live,) = db.active_interests(self.conn)
+        self.assertEqual(live.min_score, 0.78)
+        self.assertEqual(live.positive_signals, ["new signal"])
+        self.assertEqual(db.interest_events(self.conn, "bar-tuning")[-1]["evidence"],
+                         {"changed": ["positive_signals", "min_score"]})
+
+    # --- blast radius ------------------------------------------------------
+
+    def test_a_truncated_file_is_refused_rather_than_retiring_everything(self):
+        self._write([self._entry(f"i{n}") for n in range(8)])
+        interest_sync.sync(self.conn, self.path)
+        self._write([self._entry("i0")])       # 7 of 8 gone: a half-written file
+
+        with self.assertRaises(interest_sync.SyncRefused):
+            interest_sync.sync(self.conn, self.path)
+
+        self.assertEqual(len(db.active_interests(self.conn)), 8)   # nothing written
+
+    def test_the_guard_is_overridable_when_the_purge_is_intended(self):
+        self._write([self._entry(f"i{n}") for n in range(8)])
+        interest_sync.sync(self.conn, self.path)
+        self._write([self._entry("i0")])
+        result = interest_sync.sync(self.conn, self.path, force=True)
+        self.assertEqual(len(result.deactivated), 7)
+        self.assertEqual([i.key for i in db.active_interests(self.conn)], ["i0"])
+
+    def test_ordinary_gardening_is_never_blocked_by_the_guard(self):
+        self._write([self._entry(f"i{n}") for n in range(33)])
+        interest_sync.sync(self.conn, self.path)
+        self._write([self._entry(f"i{n}") for n in range(33) if n > 4])   # retire 5 of 33
+        result = interest_sync.sync(self.conn, self.path)
+        self.assertEqual(len(result.deactivated), 5)
+
+    def test_a_malformed_file_aborts_before_anything_is_deactivated(self):
+        self._write([self._entry("a"), self._entry("b")])
+        interest_sync.sync(self.conn, self.path)
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("{ not json")
+        with self.assertRaises(json.JSONDecodeError):
+            interest_sync.sync(self.conn, self.path)
+        self.assertEqual(len(db.active_interests(self.conn)), 2)
+
+    def test_a_file_disagreeing_with_itself_about_a_key_is_rejected(self):
+        self._write([self._entry("a", min_score=0.6), self._entry("a", min_score=0.9)])
+        with self.assertRaises(ValueError) as ctx:
+            interest_sync.sync(self.conn, self.path)
+        self.assertIn("duplicate interest key", str(ctx.exception))
+
+    # --- boundaries with the layered ladder --------------------------------
+
+    def test_derived_rows_are_invisible_to_sync(self):
+        """interests.json has no authority over derived:* rows -- they belong
+        to interest_state.py's ladder, whatever the file does or does not say."""
+        db.upsert_derived_interest(
+            self.conn, an_interest(key="derived:gizmo", layer="inferred"), {})
+        self._write([self._entry("owned")])
+        result = interest_sync.sync(self.conn, self.path)
+        self.assertEqual(result.deactivated, [])
+        self.assertEqual(self._row("derived:gizmo")["active"], 1)
+
+    def test_plan_writes_nothing(self):
+        self._write([self._entry("a")])
+        interest_sync.sync(self.conn, self.path)
+        self._write([self._entry("b")])
+        before = self.conn.execute("SELECT COUNT(*) c FROM interest_events").fetchone()["c"]
+
+        plan = interest_sync.plan(self.conn, self.path)
+
+        self.assertEqual(plan.created, ["b"])
+        self.assertEqual(plan.deactivated, [("a", "absent from the file")])
+        self.assertIsNone(self._row("b"))
+        self.assertEqual(self._row("a")["active"], 1)
+        self.assertEqual(
+            self.conn.execute("SELECT COUNT(*) c FROM interest_events").fetchone()["c"], before)
+
+    def test_migrate_is_idempotent_and_stamps_synced_at(self):
+        interest_sync.migrate(self.conn)
+        interest_sync.migrate(self.conn)   # would raise if it were not additive-safe
+        self._write([self._entry("a")])
+        interest_sync.sync(self.conn, self.path)
+        self.assertTrue(self._row("a")["synced_at"])
+
+    def test_sync_migrates_a_database_that_predates_the_column(self):
+        """db.init() does not know about synced_at (the column is owned here,
+        not by db.py's ALTER pass), so this is the already-deployed
+        discovery.db case: sync applies its own migration on the way in."""
+        columns = [c[1] for c in self.conn.execute("PRAGMA table_info(interests)")]
+        self.assertNotIn("synced_at", columns)
+
+        self._write([self._entry("a")])
+        interest_sync.sync(self.conn, self.path)
+
+        self.assertTrue(self._row("a")["synced_at"])
+
+    # --- the offers store owns liveness; this module owns the file ---------
+
+    def test_retiring_moves_the_lifecycle_rather_than_only_the_active_flag(self):
+        """One deactivation mechanism, not two: `active` and `lifecycle` must
+        never be able to disagree, so sync drives offers.set_lifecycle()."""
+        self._write([self._entry("dropped")])
+        interest_sync.sync(self.conn, self.path)
+        self.assertEqual(self._row("dropped")["lifecycle"], offers.ACTIVE)
+
+        self._write([])
+        interest_sync.sync(self.conn, self.path)
+
+        row = self._row("dropped")
+        self.assertEqual((row["active"], row["lifecycle"]), (0, offers.RETIRED))
+        self.assertEqual(offers.interest_lifecycle(self.conn, "dropped"),
+                         {"lifecycle": offers.RETIRED, "active": False})
+
+    def test_an_auto_paused_interest_stays_paused_across_a_sync(self):
+        """The decay sweep paused it; the file says nothing about liveness, so
+        a sync that only carries a definition edit must not silently un-pause
+        it -- that would be sync v2 fighting the sweep every cycle."""
+        self._write([self._entry("quiet")])
+        interest_sync.sync(self.conn, self.path)
+        offers.set_lifecycle(self.conn, "quiet", offers.PAUSED,
+                             actor="timer", action="auto_pause")
+
+        self._write([self._entry("quiet", min_score=0.9)])   # an ordinary edit
+        result = interest_sync.sync(self.conn, self.path)
+
+        self.assertEqual(result.reactivated, [])
+        self.assertEqual(result.updated, [("quiet", ["min_score"])])
+        row = self._row("quiet")
+        self.assertEqual((row["active"], row["lifecycle"]), (0, offers.PAUSED))
+        self.assertEqual(row["min_score"], 0.9)   # the edit still landed
+
+    def test_active_true_is_the_owner_overruling_the_sweep(self):
+        self._write([self._entry("quiet")])
+        interest_sync.sync(self.conn, self.path)
+        offers.set_lifecycle(self.conn, "quiet", offers.PAUSED,
+                             actor="timer", action="auto_pause")
+
+        self._write([self._entry("quiet", active=True)])
+        result = interest_sync.sync(self.conn, self.path)
+
+        self.assertEqual(result.reactivated, ["quiet"])
+        row = self._row("quiet")
+        self.assertEqual((row["active"], row["lifecycle"]), (1, offers.ACTIVE))
+
+    def test_entry_writer_is_the_callable_offers_accept_expects(self):
+        """PR H's accept() deliberately writes neither interests.json nor the
+        interests table and takes a `sync` callable instead; this is it. One
+        call: entry in the file, interest in the DB, offer activated."""
+        self._write([self._entry("existing")])
+        interest_sync.sync(self.conn, self.path)
+        offers.insert_offer(self.conn, {
+            "key": "handheld-gaming", "title": "Handheld and roguelike gaming",
+            "description": "Steam Deck and roguelike progression",
+            "positive_signals": ["steam deck"], "suggested_min_score": 0.8,
+            "artifact_sha256": "abc", "generated_at": "2026-08-17T00:00:00+00:00",
+        })
+        offers.offer(self.conn, "handheld-gaming")
+
+        result = offers.accept(self.conn, "handheld-gaming",
+                               sync=interest_sync.entry_writer(self.conn, self.path))
+
+        self.assertTrue(result["ok"])
+        # the interest row exists, live, with the offer's suggested bar
+        row = self._row("handheld-gaming")
+        self.assertEqual((row["active"], row["lifecycle"]), (1, offers.ACTIVE))
+        self.assertEqual(row["min_score"], 0.8)
+        # ... and the file carries it, provenance included, without losing the
+        # entry that was already there
+        entries = json.load(open(self.path, encoding="utf-8-sig"))["interests"]
+        keys = [e["key"] for e in entries]
+        self.assertEqual(keys, ["existing", "handheld-gaming"])
+        self.assertEqual(entries[1]["offered_by"]["artifact_sha256"], "abc")
+        # activate() ran, which it can only do once the interest row exists
+        self.assertEqual(offers.get_offer(self.conn, "handheld-gaming")["status"],
+                         offers.ACCEPTED)
+        self.assertIn("offer_accepted", self._actions("handheld-gaming"))
+
+    def test_set_entry_active_is_what_makes_a_retirement_durable(self):
+        """A retirement recorded only in the DB, while the file still carries
+        the entry saying nothing, is undone by the next sync -- the file is the
+        source of truth. This is the call that keeps the two agreeing."""
+        self._write([self._entry("to-retire")])
+        interest_sync.sync(self.conn, self.path)
+        offers.retire_interest(self.conn, "to-retire")
+
+        interest_sync.set_entry_active(self.path, "to-retire", False)
+        result = interest_sync.sync(self.conn, self.path)
+
+        self.assertEqual(result.reactivated, [])
+        self.assertEqual(self._row("to-retire")["lifecycle"], offers.RETIRED)
+
+    def test_a_db_only_retirement_is_reverted_by_the_file(self):
+        """The other half of the rule above, pinned deliberately: without the
+        file being told, the entry's continued presence revives it."""
+        self._write([self._entry("to-retire")])
+        interest_sync.sync(self.conn, self.path)
+        offers.retire_interest(self.conn, "to-retire")
+
+        result = interest_sync.sync(self.conn, self.path)
+
+        self.assertEqual(result.reactivated, ["to-retire"])
+        self.assertEqual(self._row("to-retire")["lifecycle"], offers.ACTIVE)
+
+    def test_write_entry_replaces_by_key_and_keeps_the_rest_of_the_file(self):
+        self._write([self._entry("a"), self.HEBREW])
+        data = json.load(open(self.path, encoding="utf-8-sig"))
+        data["blocked_derived_terms"] = ["nope"]
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump(data, fh, ensure_ascii=False)
+
+        self.assertEqual(interest_sync.write_entry(
+            self.path, {"key": "a", "title": "A", "min_score": 0.9}), "updated")
+        self.assertEqual(interest_sync.write_entry(
+            self.path, {"key": "new", "title": "New"}), "created")
+
+        after = json.load(open(self.path, encoding="utf-8-sig"))
+        self.assertEqual([e["key"] for e in after["interests"]],
+                         ["a", self.HEBREW["key"], "new"])
+        self.assertEqual(after["interests"][0]["min_score"], 0.9)
+        self.assertEqual(after["blocked_derived_terms"], ["nope"])
+        self.assertEqual(after["defaults"]["min_score"], 0.7)
+        # Hebrew survives the round trip unescaped, as offers.py writes it too.
+        self.assertEqual(after["interests"][1]["title"], self.HEBREW["title"])
+
+    def test_load_stated_active_answers_three_ways(self):
+        """Silent is not active: an entry saying nothing must not appear here,
+        or the sweep's auto-pause would be undone on every sync."""
+        self._write([self._entry("silent"), self._entry("off", active=False),
+                     self._entry("on", active=True)])
+        self.assertEqual(interests.load_stated_active(self.path),
+                         {"off": False, "on": True})
+
+    def test_the_real_interests_file_is_readable_by_the_new_helper(self):
+        # interests.json is real user config; this asserts the flag is
+        # readable on it, not what it says.
+        self.assertIsInstance(interests.load_stated_active("interests.json"), dict)
+
+
+class SyncCLITests(unittest.TestCase):
+    """`python -m app sync` -- the runtime half: an edit takes effect without
+    a redeploy, an `init`, or a hand-written UPDATE."""
+
+    def setUp(self):
+        self.tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self.tmp.cleanup)
+        self.db_path = os.path.join(self.tmp.name, "d.db")
+        self.path = os.path.join(self.tmp.name, "interests.json")
+
+    def _write(self, keys, **extra):
+        with open(self.path, "w", encoding="utf-8") as fh:
+            json.dump({"interests": [{"key": k, "title": k, **extra} for k in keys]}, fh)
+
+    def _main(self, *argv):
+        import contextlib
+
+        from discovery.__main__ import main
+
+        out, err = io.StringIO(), io.StringIO()
+        with mock.patch.dict(os.environ, {"DISCOVERY_INTERESTS": self.path}), \
+             contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = main(["--db", self.db_path, *argv])
+        return code, out.getvalue(), err.getvalue()
+
+    def _conn(self):
+        conn = db.connect(self.db_path)
+        self.addCleanup(conn.close)
+        return conn
+
+    def test_sync_deactivates_a_dropped_interest_with_no_manual_db_op(self):
+        self._write(["keeper", "dropped"])
+        self.assertEqual(self._main("init")[0], 0)
+
+        self._write(["keeper"])
+        code, out, _err = self._main("sync")
+
+        self.assertEqual(code, 0)
+        self.assertIn("1 deactivated", out)
+        self.assertEqual([i.key for i in db.active_interests(self._conn())], ["keeper"])
+
+    def test_dry_run_prints_the_plan_and_writes_nothing(self):
+        self._write(["keeper", "dropped"])
+        self._main("init")
+        self._write(["keeper"])
+        code, out, _err = self._main("sync", "--dry-run")
+        self.assertEqual(code, 0)
+        self.assertIn("nothing written", out)
+        self.assertIn("dropped", out)
+        self.assertEqual(len(db.active_interests(self._conn())), 2)
+
+    def test_the_guard_exits_2_and_force_gets_through(self):
+        self._write([f"i{n}" for n in range(8)])
+        self._main("init")
+        self._write(["i0"])
+
+        code, _out, err = self._main("sync")
+        self.assertEqual(code, 2)
+        self.assertIn("sync refused", err)
+        self.assertEqual(len(db.active_interests(self._conn())), 8)
+
+        code, out, _err = self._main("sync", "--force")
+        self.assertEqual(code, 0)
+        self.assertIn("7 deactivated", out)
+
+    def test_sync_on_a_malformed_file_exits_cleanly(self):
+        self._write(["a"])
+        self._main("init")
+        with open(self.path, "w", encoding="utf-8") as fh:
+            fh.write("{ not json")
+        code, _out, err = self._main("sync")
+        self.assertEqual(code, 2)
+        self.assertIn("malformed interests file", err)
+        self.assertEqual(len(db.active_interests(self._conn())), 1)
+
+    def test_init_reports_what_it_reconciled(self):
+        self._write(["a", "b"])
+        code, out, _err = self._main("init")
+        self.assertEqual(code, 0)
+        self.assertIn("schema ready", out)
+        self.assertIn("2 interests loaded", out)
+        self.assertIn("2 created", out)
+
+
+
+# ---------------------------------------------------------------------------
+# PR N (first half): learning from offer decisions -- discovery/offer_learning.py
+# ---------------------------------------------------------------------------
+# Every case below runs against either the pure functions or the in-memory
+# `MemoryOfferDecisionSource`, so nothing here needs a browser, a provider or a
+# live store. The store-backed cases use PR H's real `offers` API and read the
+# decisions back out of `offer_events`, which is the seam this half consumes.
+
+
+def _decision(key="binding-of-isaac-progression", decision=offer_learning.ACCEPTED,
+              days_ago=1, **overrides):
+    """One owner judgement, as the write API records it."""
+    values = {
+        "offer_key": key,
+        "decision": decision,
+        "decided_at": _days_ago(days_ago),
+        "artifact_sha256": overrides.pop("sha", "sha-run-1"),
+        "signal_terms": offers.signal_tokens(
+            overrides.pop("title", "Binding of Isaac progression"),
+            overrides.pop("signals", ["binding of isaac", "isaac unlocks", "repentance"]),
+        ),
+    }
+    values.update(overrides)
+    return offer_learning.OfferDecision(**values)
+
+
+def _hebrew_decision(decision=offer_learning.REJECTED, days_ago=2, **overrides):
+    """28% of the corpus is Hebrew-titled; a rejection has to bite in both
+    scripts or the same theme walks back in wearing the other one."""
+    return _decision(
+        key="cognitive-load-working-memory", decision=decision, days_ago=days_ago,
+        title="עומס קוגניטיבי וזיכרון עבודה",
+        signals=["זיכרון עבודה", "עומס קוגניטיבי", "cognitive load"],
+        **overrides)
+
+
+class OfferDecisionRecordTests(unittest.TestCase):
+    """What is recorded per decision, and what each decision means."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def test_polarity_is_kind_aware_and_a_retire_answer_is_inverted(self):
+        self.assertEqual(_decision(decision=offers.ACCEPTED).polarity, 1)
+        self.assertEqual(_decision(decision=offers.REJECTED).polarity, -1)
+        # 'not now' and 'no answer' are not judgements about the theme.
+        self.assertEqual(_decision(decision=offers.SNOOZED).polarity, 0)
+        self.assertEqual(_decision(decision=offers.EXPIRED).polarity, 0)
+        # A retirement offer proposes DROPPING an interest, so declining it is
+        # the owner's one-click rescue -- positive for the interest.
+        retire = _decision(key="retire:weird-science", offer_kind="retire")
+        self.assertEqual(retire.polarity, -1)
+        self.assertEqual(
+            _decision(key="retire:weird-science", offer_kind="retire",
+                      decision=offers.REJECTED).polarity, 1)
+
+    def test_only_owner_answers_count_as_decisions(self):
+        self.assertTrue(_decision(decision=offers.SNOOZED).is_owner_decision)
+        self.assertFalse(_decision(decision=offers.EXPIRED).is_owner_decision)
+
+    def test_an_unknown_decision_or_kind_is_refused(self):
+        with self.assertRaises(offer_learning.OfferLearningError):
+            offer_learning.OfferDecision("k", "maybe", _days_ago(1))
+        with self.assertRaises(offer_learning.OfferLearningError):
+            offer_learning.OfferDecision("k", offers.ACCEPTED, _days_ago(1), offer_kind="vibes")
+
+    def test_the_bar_delta_is_the_edit_the_owner_made(self):
+        lowered = _decision(proposed_min_score=0.78, accepted_min_score=0.70)
+        self.assertEqual(lowered.bar_delta, -0.08)
+        self.assertIsNone(_decision(proposed_min_score=0.78).bar_delta)
+
+    def test_the_log_round_trips_hebrew_terms_and_the_edit_diff(self):
+        recorded = _hebrew_decision(
+            decision=offers.ACCEPTED, edits={"min_score": 0.7, "title": "זיכרון עבודה"},
+            proposed_min_score=0.78, accepted_min_score=0.70)
+        self.assertIsNotNone(offer_learning.record_decision(self.conn, recorded))
+        (read_back,) = offer_learning.decisions(self.conn)
+        self.assertIn("זיכרון", read_back.signal_terms)
+        self.assertEqual(read_back.edits["title"], "זיכרון עבודה")
+        self.assertEqual(read_back.bar_delta, -0.08)
+        self.assertEqual(read_back.polarity, 1)
+
+    def test_recording_the_same_decision_twice_appends_once(self):
+        recorded = _decision()
+        self.assertIsNotNone(offer_learning.record_decision(self.conn, recorded))
+        self.assertIsNone(offer_learning.record_decision(self.conn, recorded))
+        self.assertEqual(len(offer_learning.decisions(self.conn)), 1)
+
+    def test_learning_never_touches_the_feedback_table(self):
+        """`feedback` belongs to the delivered-item half, which is deliberately
+        frozen pending the Output Layer decision. This half must be able to run
+        a full pass without writing a row to it."""
+        before = self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"]
+        offer_learning.record_decision(self.conn, _decision())
+        learned = offer_learning.priors(self.conn, now=OFFER_NOW)
+        offer_learning.rank([_candidate(key="something-else")], learned, now=OFFER_NOW)
+        after = self.conn.execute("SELECT COUNT(*) c FROM feedback").fetchone()["c"]
+        self.assertEqual((before, after), (0, 0))
+
+
+class OfferDecisionSyncTests(unittest.TestCase):
+    """`offer_events` is the source of truth; the decision log is its decorated
+    projection, and replaying it must be idempotent."""
+
+    def setUp(self):
+        self.conn = db.connect(":memory:")
+        db.init(self.conn)
+        self.addCleanup(self.conn.close)
+
+    def _offer(self, key, **overrides):
+        candidate = _candidate(key=key, **overrides)
+        score, terms = offers.score_candidate(candidate, now=OFFER_NOW)
+        offers.insert_offer(self.conn, dict(candidate, score=score, score_terms=terms,
+                                            similarity=candidate["similarity_to_existing"]),
+                            now=OFFER_NOW)
+        offers.offer(self.conn, key)
+        return key
+
+    def test_an_accept_with_edits_becomes_one_decision_carrying_what_was_kept(self):
+        key = self._offer("binding-of-isaac-progression")
+        offers.accept(self.conn, key, edits={"min_score": 0.68,
+                                             "positive_signals": ["binding of isaac",
+                                                                  "tainted characters"]},
+                      note="follow it, but wider", now=OFFER_NOW)
+        (decision,) = offer_learning.sync_from_offer_events(self.conn)
+        self.assertEqual((decision.offer_key, decision.decision), (key, offers.ACCEPTED))
+        self.assertEqual(decision.accepted_min_score, 0.68)
+        self.assertEqual(decision.edits["min_score"], 0.68)
+        # Post-edit signals: the owner swapped 'repentance' for 'tainted
+        # characters', and it is the kept wording that teaches.
+        self.assertIn("tainted", decision.signal_terms)
+        self.assertNotIn("repentance", decision.signal_terms)
+        self.assertEqual(decision.polarity, 1)
+
+    def test_replaying_the_event_chain_never_double_counts(self):
+        key = self._offer("binding-of-isaac-progression")
+        offers.reject(self.conn, key, note="not this", now=OFFER_NOW)
+        self.assertEqual(len(offer_learning.sync_from_offer_events(self.conn)), 1)
+        self.assertEqual(offer_learning.sync_from_offer_events(self.conn), [])
+        self.assertEqual(len(offer_learning.decisions(self.conn)), 1)
+
+    def test_a_snooze_records_its_wake_time(self):
+        key = self._offer("binding-of-isaac-progression")
+        offers.snooze(self.conn, key, days=30, now=OFFER_NOW)
+        (decision,) = offer_learning.sync_from_offer_events(self.conn)
+        self.assertEqual(decision.decision, offers.SNOOZED)
+        self.assertTrue(decision.snoozed_until > _days_ago(-29))
+        self.assertEqual(decision.polarity, 0)
+
+    def test_an_expiry_is_logged_but_teaches_nothing(self):
+        key = self._offer("binding-of-isaac-progression")
+        offers.expire(self.conn, key, now=OFFER_NOW)
+        (decision,) = offer_learning.sync_from_offer_events(self.conn)
+        self.assertEqual(decision.decision, offers.EXPIRED)
+        learned = offer_learning.learn([decision], now=OFFER_NOW)
+        self.assertEqual(learned.n_owner_decisions, 0)
+        self.assertEqual(learned.blocked_keys, {})
+        self.assertEqual(learned.prototype, {})
+
+    def test_a_rescued_interest_records_the_stage_it_was_rescued_from(self):
+        """The interest lifecycle has a 30-day 'decaying' stage before the
+        45-day pause, so a rescue is not always an undo of a pause -- the log
+        keeps which stage the owner answered from."""
+        db.upsert_interest(self.conn, Interest(
+            key="weird-science", title="Weird science", description="",
+            positive_signals=["weird science"], sources=["web_search"]))
+        offers.set_lifecycle(self.conn, "weird-science", offers.DECAYING,
+                             actor=offers.TIMER, action="decay")
+        key = offers.RETIRE_PREFIX + "weird-science"
+        offers.insert_offer(self.conn, {
+            "key": key, "kind": "retire", "title": "Retire 'weird-science'?",
+            "description": "", "related_keys": ["weird-science"], "score": None,
+            "score_terms": {}, "evidence": [], "durability": {},
+        }, actor=offers.TIMER, now=OFFER_NOW)
+        offers.offer(self.conn, key, actor=offers.TIMER)
+        offers.reject(self.conn, key, note="keep watching it", now=OFFER_NOW)
+
+        (decision,) = offer_learning.sync_from_offer_events(self.conn)
+        self.assertEqual(decision.offer_kind, "retire")
+        self.assertEqual(decision.interest_key, "weird-science")
+        self.assertEqual(decision.lifecycle, offers.DECAYING)
+        self.assertEqual(decision.polarity, 1)
+
+        learned = offer_learning.learn([decision], now=OFFER_NOW)
+        self.assertEqual(learned.rescued, {"weird-science": offers.DECAYING})
+        # A rescue propagates NO terms in either direction: blocking or
+        # boosting an interest title's generic words would poison the pool,
+        # which is the same call offers.blocked_terms_for() makes.
+        self.assertEqual(learned.blocked_keys, {})
+        self.assertEqual(learned.prototype, {})
+        self.assertEqual(learned.n_owner_decisions, 1)
+
+
+class OfferLearningColdStartTests(unittest.TestCase):
+    """With no history, ranking is the §5.2 evidence terms and nothing else."""
+
+    def test_no_decisions_means_no_adjustment_at_all(self):
+        learned = offer_learning.learn([], now=OFFER_NOW)
+        self.assertTrue(learned.cold_start)
+        self.assertEqual((learned.prototype, learned.bar_shift), ({}, 0.0))
+        (item,) = offer_learning.evaluate([_candidate()], learned, now=OFFER_NOW)
+        self.assertEqual(item.score, item.base_score)
+        self.assertEqual(item.suggested_min_score, 0.72)   # the generator's own number
+        self.assertIn("cold start", offer_learning.explain(item))
+
+    def test_cold_start_ends_after_two_generator_runs(self):
+        first = [_decision(key="a", sha="sha-run-1", days_ago=20)]
+        self.assertTrue(offer_learning.learn(first, now=OFFER_NOW).cold_start)
+        second = first + [_decision(key="b", sha="sha-run-2", days_ago=10)]
+        self.assertFalse(offer_learning.learn(second, now=OFFER_NOW).cold_start)
+
+    def test_two_decisions_from_the_same_run_are_still_one_run(self):
+        same_run = [_decision(key="a", sha="sha-run-1", days_ago=20),
+                    _decision(key="b", sha="sha-run-1", days_ago=20)]
+        learned = offer_learning.learn(same_run, now=OFFER_NOW)
+        self.assertEqual((learned.n_owner_decisions, learned.n_runs), (2, 1))
+        self.assertTrue(learned.cold_start)
+
+    def test_a_rejection_still_bites_during_cold_start(self):
+        """Warming up is not an excuse to re-offer something already refused."""
+        learned = offer_learning.learn([_decision(decision=offers.REJECTED)], now=OFFER_NOW)
+        self.assertTrue(learned.cold_start)
+        (item,) = offer_learning.evaluate([_candidate()], learned, now=OFFER_NOW)
+        self.assertFalse(item.ok)
+        self.assertIn("rejected before", item.reason)
+
+    def test_the_serendipity_slot_is_filled_even_when_it_ranks_last(self):
+        strong = [_candidate(key=f"strong-{i}", expected_yield=1.0,
+                             durability={"n_convs": 8, "active_months": 4, "recency_days": 0})
+                  for i in range(5)]
+        explorer = _candidate(key="one-deliberately-odd-pick", exploratory=True,
+                              expected_yield=0.4,
+                              durability={"n_convs": 4, "active_months": 2, "recency_days": 40})
+        chosen, _skipped = offer_learning.rank(
+            strong + [explorer], offer_learning.learn([], now=OFFER_NOW), now=OFFER_NOW)
+        self.assertEqual(len(chosen), 5)                       # the inbox stays a 2-minute job
+        self.assertIn("one-deliberately-odd-pick", [item.key for item in chosen])
+        (slot,) = [item for item in chosen if item.exploratory]
+        self.assertIn("serendipity slot", offer_learning.explain(slot))
+
+
+class OfferLearningRankingTests(unittest.TestCase):
+    """How past decisions re-rank the next batch."""
+
+    def _warm(self, decisions):
+        """Priors past cold start -- two generator runs of history."""
+        learned = offer_learning.learn(decisions, now=OFFER_NOW)
+        self.assertFalse(learned.cold_start, "fixture must be past cold start")
+        return learned
+
+    def test_an_accepted_theme_lifts_a_similar_candidate_by_at_most_five_points(self):
+        accepted = ["binding of isaac", "isaac unlocks", "repentance"]
+        learned = self._warm([
+            _decision(key="isaac-runs", sha="sha-run-1", days_ago=30, signals=accepted,
+                      title="Binding of Isaac progression"),
+            _decision(key="isaac-mods", sha="sha-run-2", days_ago=10, signals=accepted,
+                      title="Binding of Isaac progression"),
+        ])
+        (twin,) = offer_learning.evaluate(
+            [_candidate(key="isaac-daily-runs", title="Binding of Isaac progression",
+                        positive_signals=accepted)], learned, now=OFFER_NOW)
+        self.assertEqual(twin.learning["prototype_similarity"], 1.0)
+        self.assertEqual(twin.learning["accept_bonus"], 0.05)
+        self.assertEqual(twin.score, round(twin.base_score + 0.05, 4))
+
+        (stranger,) = offer_learning.evaluate(
+            [_candidate(key="dutch-tax-law", title="Dutch tax law",
+                        positive_signals=["belastingdienst", "box three"])],
+            learned, now=OFFER_NOW)
+        self.assertEqual(stranger.learning["accept_bonus"], 0.0)
+        self.assertGreater(twin.score, stranger.score + 0.04)
+
+    def test_the_exploratory_pick_opts_out_of_the_learned_bonus(self):
+        accepted = ["binding of isaac", "isaac unlocks", "repentance"]
+        learned = self._warm([
+            _decision(key="isaac-runs", sha="sha-run-1", days_ago=30, signals=accepted),
+            _decision(key="isaac-mods", sha="sha-run-2", days_ago=10, signals=accepted),
+        ])
+        (explorer,) = offer_learning.evaluate(
+            [_candidate(key="isaac-adjacent-explore", exploratory=True,
+                        title="Binding of Isaac progression", positive_signals=accepted)],
+            learned, now=OFFER_NOW)
+        # Rewarding resemblance to what the owner already likes is exactly
+        # what an exploration lane must not do.
+        self.assertEqual(explorer.learning["accept_bonus"], 0.0)
+        self.assertEqual(explorer.score, explorer.base_score)
+
+    def test_a_learned_bonus_can_never_lift_a_candidate_over_the_floor(self):
+        thin = _candidate(key="thin-evidence", title="Binding of Isaac progression",
+                          durability={"n_convs": 3, "active_months": 2, "recency_days": 180},
+                          expected_yield=0.1,
+                          similarity_to_existing=[{"key": "nbis-nebius", "sim": 0.5}])
+        learned = self._warm([
+            _decision(key="isaac-runs", sha="sha-run-1", days_ago=30),
+            _decision(key="isaac-mods", sha="sha-run-2", days_ago=10),
+        ])
+        (item,) = offer_learning.evaluate([thin], learned, now=OFFER_NOW)
+        self.assertLess(item.base_score, 0.45)
+        self.assertGreater(item.score, 0.45)          # the preference bonus does lift it...
+        chosen, skipped = offer_learning.select([item])
+        self.assertEqual(chosen, [])                  # ...but the floor reads the base score
+        self.assertIn("below floor", skipped[0].reason)
+
+    def test_a_rejection_blocks_the_theme_in_the_other_language_too(self):
+        learned = self._warm([
+            _decision(key="something-else", sha="sha-run-1", days_ago=30),
+            _hebrew_decision(sha="sha-run-2", days_ago=10),
+        ])
+        (paraphrase,) = offer_learning.evaluate(
+            [_candidate(key="working-memory-load", title="זיכרון עבודה",
+                        positive_signals=["זיכרון עבודה", "עומס קוגניטיבי"])],
+            learned, now=OFFER_NOW)
+        self.assertFalse(paraphrase.ok)
+        self.assertIn("overlap", paraphrase.reason)
+
+    def test_a_rejection_expires_after_the_block_window(self):
+        stale = self._warm([
+            _decision(key="something-else", sha="sha-run-1", days_ago=400),
+            _decision(decision=offers.REJECTED, sha="sha-run-2", days_ago=181),
+        ])
+        (item,) = offer_learning.evaluate([_candidate()], stale, now=OFFER_NOW)
+        self.assertTrue(item.ok, item.reason)
+
+    def test_the_store_is_authoritative_about_what_is_blocked(self):
+        learned = offer_learning.learn([], now=OFFER_NOW)
+        (item,) = offer_learning.evaluate(
+            [_candidate()], learned, now=OFFER_NOW,
+            blocked={"binding-of-isaac-progression"})
+        self.assertFalse(item.ok)
+        self.assertIn("offers store", item.reason)
+
+    def test_an_accepted_offer_is_not_offered_again_before_the_next_artifact(self):
+        learned = self._warm([
+            _decision(sha="sha-run-1", days_ago=30),
+            _decision(key="something-else", sha="sha-run-2", days_ago=10),
+        ])
+        (again,) = offer_learning.evaluate([_candidate()], learned, now=OFFER_NOW)
+        self.assertFalse(again.ok)
+        self.assertIn("already accepted", again.reason)
+
+    def test_the_owners_latest_word_wins_over_an_older_rejection(self):
+        learned = self._warm([
+            _decision(decision=offers.REJECTED, sha="sha-run-1", days_ago=60),
+            _decision(decision=offers.ACCEPTED, sha="sha-run-2", days_ago=10),
+        ])
+        self.assertEqual(learned.blocked_keys, {})
+
+    def test_a_snooze_holds_the_door_shut_for_a_paraphrase_and_then_opens_it(self):
+        supplements = ["magnesium glycinate", "creatine", "l-tyrosine"]
+        asleep = self._warm([
+            _decision(key="something-else", sha="sha-run-1", days_ago=30),
+            _decision(key="supplement-stack", decision=offers.SNOOZED, sha="sha-run-2",
+                      days_ago=3, signals=supplements, title="Supplement stack",
+                      snoozed_until=_days_ago(-27)),
+        ])
+        paraphrase = _candidate(key="daily-supplements", title="Supplement stack",
+                                positive_signals=supplements)
+        (blocked,) = offer_learning.evaluate([paraphrase], asleep, now=OFFER_NOW)
+        self.assertFalse(blocked.ok)
+        self.assertIn("snoozed until", blocked.reason)
+        # ...and a snooze that has run out teaches nothing at all.
+        woken = offer_learning.learn(
+            [_decision(key="something-else", sha="sha-run-1", days_ago=30),
+             _decision(key="supplement-stack", decision=offers.SNOOZED, sha="sha-run-2",
+                       days_ago=40, signals=supplements, snoozed_until=_days_ago(10))],
+            now=OFFER_NOW)
+        (open_again,) = offer_learning.evaluate([paraphrase], woken, now=OFFER_NOW)
+        self.assertTrue(open_again.ok, open_again.reason)
+        self.assertEqual([t for t in ("magnesium", "creatine", "tyrosine")
+                          if t in woken.prototype], [])
+
+    def test_repeatedly_lowering_the_bar_lowers_what_gets_suggested(self):
+        learned = self._warm([
+            _decision(key="a", sha="sha-run-1", days_ago=30,
+                      proposed_min_score=0.78, accepted_min_score=0.72),
+            _decision(key="b", sha="sha-run-2", days_ago=10,
+                      proposed_min_score=0.80, accepted_min_score=0.70),
+        ])
+        self.assertEqual((learned.bar_shift, learned.bar_shift_n), (-0.08, 2))
+        (item,) = offer_learning.evaluate(
+            [_candidate(key="fresh-one", suggested_min_score=0.78)], learned, now=OFFER_NOW)
+        self.assertEqual(item.suggested_min_score, 0.70)
+        self.assertEqual(item.learning["bar_shift"], -0.08)
+
+    def test_one_edit_is_not_a_habit_and_a_landslide_is_clamped(self):
+        once = self._warm([
+            _decision(key="a", sha="sha-run-1", days_ago=30,
+                      proposed_min_score=0.78, accepted_min_score=0.72),
+            _decision(key="b", sha="sha-run-2", days_ago=10),
+        ])
+        self.assertEqual(once.bar_shift, 0.0)
+        landslide = self._warm([
+            _decision(key="a", sha="sha-run-1", days_ago=30,
+                      proposed_min_score=0.90, accepted_min_score=0.40),
+            _decision(key="b", sha="sha-run-2", days_ago=10,
+                      proposed_min_score=0.90, accepted_min_score=0.45),
+        ])
+        self.assertEqual(landslide.bar_shift, -0.10)   # a prior nudges, it does not decide
+
+    def test_evidence_terms_are_corpus_facts_and_learning_never_moves_them(self):
+        learned = self._warm([
+            _decision(key="isaac-runs", sha="sha-run-1", days_ago=30),
+            _decision(key="isaac-mods", sha="sha-run-2", days_ago=10),
+        ])
+        candidate = _candidate(key="isaac-daily-runs")
+        cold = offer_learning.evaluate([candidate], offer_learning.learn([], now=OFFER_NOW),
+                                       now=OFFER_NOW)[0]
+        warm = offer_learning.evaluate([candidate], learned, now=OFFER_NOW)[0]
+        for term in ("evidence_strength", "recurrence", "recency", "novelty", "expected_yield"):
+            self.assertEqual(cold.terms[term], warm.terms[term], term)
+
+    def test_a_stored_score_is_read_rather_than_recomputed(self):
+        stored = dict(_candidate(), score=0.91, score_terms={"evidence_strength": 0.42})
+        (item,) = offer_learning.evaluate([stored], offer_learning.learn([], now=OFFER_NOW),
+                                          now=OFFER_NOW)
+        self.assertEqual(item.base_score, 0.91)
+        self.assertEqual(item.terms["evidence_strength"], 0.42)
+
+
+class OfferLearningSeamTests(unittest.TestCase):
+    """The seam PRs H/J plug into: two methods, one fake, one real."""
+
+    def test_the_in_memory_fake_ranks_a_batch_end_to_end(self):
+        source = offer_learning.MemoryOfferDecisionSource(candidates=[
+            _candidate(key="binding-of-isaac-progression"),
+            _candidate(key="supplement-stack", positive_signals=["creatine", "magnesium"]),
+            _candidate(key="one-odd-pick", exploratory=True),
+        ])
+        source.decide("supplement-stack", offers.REJECTED, decided_at=_days_ago(5),
+                      artifact_sha256="sha-run-1",
+                      signal_terms=offers.signal_tokens("Supplement stack",
+                                                        ["creatine", "magnesium"]))
+        source.decide("older-thing", offers.ACCEPTED, decided_at=_days_ago(30),
+                      artifact_sha256="sha-run-2",
+                      signal_terms=offers.signal_tokens("Older thing", ["nebius"]))
+        chosen, skipped = source.rank(now=OFFER_NOW)
+        self.assertEqual(sorted(item.key for item in chosen),
+                         ["binding-of-isaac-progression", "one-odd-pick"])
+        self.assertIn("supplement-stack", [item.key for item in skipped])
+
+    def test_the_store_backed_source_reads_decisions_out_of_offer_events(self):
+        conn = db.connect(":memory:")
+        db.init(conn)
+        self.addCleanup(conn.close)
+        candidate = _candidate(key="binding-of-isaac-progression")
+        score, terms = offers.score_candidate(candidate, now=OFFER_NOW)
+        offers.insert_offer(conn, dict(candidate, score=score, score_terms=terms), now=OFFER_NOW)
+        offers.offer(conn, candidate["key"])
+        offers.reject(conn, candidate["key"], note="not this", now=OFFER_NOW)
+
+        source = offer_learning.StoreOfferDecisionSource(
+            conn, candidates=[_candidate(key="binding-of-isaac-progression"),
+                              _candidate(key="nbis-nebius", title="Nebius AI infrastructure",
+                                         positive_signals=["nebius", "gpu cloud"])],
+            now=OFFER_NOW)
+        self.assertEqual([d.decision for d in source.decisions()], [offers.REJECTED])
+        chosen, skipped = source.rank(now=OFFER_NOW)
+        self.assertEqual([item.key for item in chosen], ["nbis-nebius"])
+        self.assertIn("binding-of-isaac-progression", [item.key for item in skipped])
 
 
 if __name__ == "__main__":
