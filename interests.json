@@ -453,7 +453,8 @@
           "limit": 2,
           "max_searches": 1
         }
-      }
+      },
+      "active": false
     },
     {
       "key": "minimal-knowledge-representations",
