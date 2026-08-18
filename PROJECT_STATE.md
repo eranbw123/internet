@@ -1608,6 +1608,68 @@ the tick yet (PR N); `accept()` deliberately does not write
 `OfferRankingTests`/`OfferStoreTests`/`OfferLifecycleTests`/
 `OfferSweepTests`/`OffersCLITests`, Hebrew fixtures included.
 
+## Observatory write API (PR J)
+`observatory/manage.py` — the HTTP surface the interests workspace (PR L)
+calls. Nine routes, all new, spliced into `plugin.py`'s `register_routes()`
+ahead of its `/api/` catch-all and self-ordered internally (`/offers/generate`
+before `/offers/<key>/...`, `/interests/stats` before `/interests/<key>`):
+
+| method + path | does |
+| --- | --- |
+| `GET  /observatory/api/offers?status=&kind=&limit=` | inbox (default `status=inbox` = `offered`; `all` or a comma list), plus `counts` per status |
+| `GET  /observatory/api/offers/<key>/provenance` | §7.5 in full: quotes with date+lang regrouped by conversation, score terms, durability, similarity, parent/related, artifact sha256+generated_at, event chain, and the funnel numbers for a `retire` offer |
+| `POST /observatory/api/offers/<key>/decide` | `{action: accept\|reject\|snooze, edits?, note?, days?}` |
+| `POST /observatory/api/offers/generate` | `offers.import_artifact` over `cfg.interest_candidates_path` — local rank/dedup/floors, no LLM, idempotent on the artifact sha |
+| `GET  /observatory/api/interests/stats?window=7d` | the funnel per interest (`observatory/funnel.py`) |
+| `POST /observatory/api/interests` | create (same path as the existing GET listing; the method distinguishes them) |
+| `POST /observatory/api/interests/<key>` | update, or `{"active": false\|true}` to retire/un-retire |
+| `POST /observatory/api/interests/<key>/revive` | one-click undo of an auto-pause |
+| `GET  /observatory/api/edges?min_weight=&kind=` | `interest_edges`; live and empty until PR M fills it |
+
+**Owns HTTP only.** Every offer decision is `discovery/offers.py`'s and every
+interests write is `discovery/interest_sync.py`'s; this module routes, guards,
+parses, and maps exceptions to status codes (`UnknownOffer`/`NotFound` → 404,
+`InvalidTransition`/`ConflictError`/`SyncRefused` → 409, `OfferError`/
+`ValidationError` → 400). Accepting is ONE call —
+`offers.accept(conn, key, edits=, note=, sync=interest_sync.entry_writer(...))`
+— using the seam PR H left and PR I filled; there is no second write path into
+`interests.json`. Retire/revive flip the file's `active` flag and let sync v2
+perform the lifecycle move through `offers.set_lifecycle()`, because a
+DB-only retirement is reverted by the next sync by design. Revive calls
+`offers.undo_auto_pause()` first (clock reset + retirement offer closed), then
+brings the file into step. **No migration of its own** — PR H's `db.init()`
+pass and PR I's `interest_sync.migrate()` cover every column used.
+
+`observatory/interests_write.py` is validation + preconditions only: the rules
+mirror `discovery/interests.py` (slug key, no `derived:`/`retire:` prefix, the
+0-100 legacy-bar guard, ≥1 known source and ≥1 positive signal for an active
+interest, key immutable on update), plus an mtime precondition
+(`expected_mtime`) so an editor tab that went stale against a hand edit is
+refused (409) instead of clobbering it. Accept is pre-flighted: the entry it
+would write is validated BEFORE `offers.accept` runs, because acceptance is
+one-way and a failed write would otherwise strand the offer.
+
+`observatory/funnel.py` — read-only, one row per interest:
+collected (`candidate_items.origin_interest`) → scored → above bar
+(`final_score >= interests.min_score`) → notified, over `?window=7d|Nd|all`,
+plus `above_bar_rate`, a daily above-bar sparkline, feedback tally,
+`silence_days` (offers.py's own clock), `synced_at`, `dead_weight`, and
+`lifecycle`/`auto_paused`/`revivable`. Separate from `observatory/db.py` on
+purpose: that module's interests tab is a paginated lister capped at 50.
+
+Auth: unchanged read posture (localhost open, `--public` needs the bearer
+token) plus **writes refuse in `--public` mode** unless
+`DISCOVERY_UI_ALLOW_PUBLIC_WRITES=1`. Writes must be
+`Content-Type: application/json` (415 otherwise) — a cross-site form post
+cannot set that header without a preflight this server never answers, so the
+check is the CSRF boundary; `plugin.py` grows a `skip_csrf` hookimpl for
+`/observatory/api/*` so Datasette's HTML-form token machinery stays out of a
+JSON API, and every native Datasette route stays protected. The unconditional
+deny of Datasette's own write actions is untouched. Shared-file edits are
+deliberately three: the `manage.routes()` splice + `skip_csrf` + the POST
+dispatch in `interest_index_view` (`plugin.py`), and `ds._observatory_cfg`
+(`app.py`). Tests: 61 offline cases in `test_observatory_manage.py`
+(Hebrew/English fixtures throughout, no browser).
 ## offer-decision learning (PR N, first half)
 `discovery/offer_learning.py` (new, stdlib-only, no provider) turns the
 owner's decisions on offers into a ranking effect on the *next* batch. It
