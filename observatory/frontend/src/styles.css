@@ -187,6 +187,17 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .inspector-tabs button[aria-selected="true"] { font-weight: 700; border-bottom: 2px solid var(--accent); }
 .inspector-body { flex: 1; overflow: auto; padding: 8px 10px; }
 
+/* Attempt picker: which retry of a model call the payload tabs are showing.
+   Multi-attempt nodes are the norm, so this strip is usually present. */
+.attempt-picker { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
+.attempt-chip {
+  font-size: 11px; border: 1px solid var(--border); border-radius: 10px;
+  padding: 1px 9px; background: #fff; color: #556; cursor: pointer;
+}
+.attempt-chip.active { border-color: var(--accent); color: var(--accent); font-weight: 600; }
+.attempt-chip-ok { background: #e3f4e8; }
+.attempt-chip-error { background: #fdecea; }
+
 .overview-error {
   background: #fdecea; color: var(--error); border: 1px solid #f2b8b5;
   border-radius: 4px; padding: 6px 8px; margin-bottom: 8px; word-break: break-word;
