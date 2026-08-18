@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useRef, useState } from "react";
 import { fetchInterests, listRows, type ListFilters } from "../api";
 import type { InterestOption, ListResponse, Tab } from "../types";
 import { exactTitle, formatInstant } from "../time";
@@ -108,6 +108,19 @@ export function Explorer({ onSelectDiscovery, onOpenRawDb, selectedRowKey }: Pro
 
   const isMobile = useIsMobile();
 
+  /* The source strip is one sideways-scrolling row on a phone (six sources
+     wrapped to three rows and ate 145px otherwise), so the selected source can
+     sit off-screen -- "Raw databases" is past the right edge at 393px. Bring
+     it into view whenever it changes, so the strip always shows where you are.
+     `block: "nearest"` keeps it from scrolling the page vertically as well. */
+  const tabsRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const strip = tabsRef.current;
+    if (!strip || strip.scrollWidth <= strip.clientWidth) return;
+    const selected = strip.querySelector('[aria-selected="true"]');
+    selected?.scrollIntoView({ inline: "nearest", block: "nearest" });
+  }, [tab]);
+
   return (
     <div className="explorer" data-testid="explorer">
       <div className="explorer-search">
@@ -118,7 +131,7 @@ export function Explorer({ onSelectDiscovery, onOpenRawDb, selectedRowKey }: Pro
           onChange={(e) => setSearch(e.target.value)}
         />
       </div>
-      <div className="explorer-tabs" role="tablist">
+      <div className="explorer-tabs" role="tablist" ref={tabsRef}>
         {TABS.map((t) => (
           <button
             key={t.key}

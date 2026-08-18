@@ -108,7 +108,7 @@ button[aria-selected="true"], button.active, button[aria-pressed="true"] {
 .explorer-tabs { display: flex; flex-wrap: wrap; gap: 2px; padding: 4px 0; }
 .explorer-tabs button[aria-selected="true"] { font-weight: 700; border-bottom: 2px solid var(--accent); }
 .explorer-filters { display: flex; gap: 4px; flex-wrap: wrap; padding: 4px 0; }
-.explorer-rows { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
+.explorer-rows { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; overflow-anchor: none; }
 .explorer-row { padding: 6px 4px; border-bottom: 1px solid var(--border-subtle); cursor: pointer; }
 .explorer-row:hover { background: var(--hover); }
 .row-top, .row-bottom { display: flex; gap: 8px; font-size: 11px; color: var(--fg-muted); }
@@ -600,8 +600,64 @@ button[aria-selected="true"], button.active, button[aria-pressed="true"] {
   .explorer select, .explorer input { max-width: 100%; }
   .explorer-search { padding: 8px 8px 0; }
   .explorer-search input { min-height: 44px; padding: 8px 12px; }
-  .explorer-tabs { gap: 6px; padding: 8px; }
-  .explorer-tabs button { min-height: 44px; padding: 0 14px; font-size: 13px; }
+  /* The six sources (Discoveries / Extractor runs / Council generations /
+     Missions / Failed runs / Raw databases) wrapped to THREE rows at 393px --
+     145px of tab strip, 17% of the display, above a list you came to read.
+     One row that scrolls sideways inside itself instead: the page never
+     scrolls horizontally, and the selected source is scrolled into view on
+     mount so you can always see where you are. 145px -> 60px. */
+  .explorer-tabs {
+    gap: 6px;
+    padding: 8px;
+    flex-wrap: nowrap;
+    overflow-x: auto;
+    overflow-y: hidden;
+    scroll-snap-type: x proximity;
+    -webkit-overflow-scrolling: touch;
+    scrollbar-width: none;
+  }
+  .explorer-tabs::-webkit-scrollbar { display: none; }
+  .explorer-tabs button {
+    min-height: 44px; padding: 0 14px; font-size: 13px;
+    flex: none; white-space: nowrap; scroll-snap-align: start;
+  }
+
+  /* The explorer's own chrome joins the collapse: scrolling the results list
+     sheds the search field, and the source strip stays as the row that says
+     what you are looking at -- the same bargain the interests list strikes. */
+  .app.mobile .explorer-search,
+  .app.mobile .explorer-filters-fold:not([open]) {
+    overflow: hidden;
+    max-height: 80px;
+    transition: max-height .18s ease, padding-top .18s ease,
+      padding-bottom .18s ease, opacity .14s ease, visibility .18s;
+  }
+  .app.mobile.is-chrome-collapsed .explorer-search,
+  .app.mobile.is-chrome-collapsed .explorer-filters-fold:not([open]) {
+    max-height: 0; padding-top: 0; padding-bottom: 0;
+    opacity: 0; visibility: hidden;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    .app.mobile .explorer-search,
+    .app.mobile .explorer-filters-fold:not([open]) { transition: none; }
+  }
+
+  /* The fold read as an empty text box -- a 44px bordered rectangle with the
+     grey word "Filters" in it and no affordance at all. A disclosure marker
+     says it opens. */
+  .explorer-filters-fold > summary::after {
+    content: "";
+    margin-inline-start: auto;
+    width: 8px; height: 8px;
+    border-right: 2px solid currentColor;
+    border-bottom: 2px solid currentColor;
+    transform: rotate(45deg) translate(-2px, -2px);
+    transition: transform .15s ease;
+  }
+  .explorer-filters-fold[open] > summary::after {
+    transform: rotate(-135deg) translate(-2px, -2px);
+  }
+  .explorer-filters-fold > summary::-webkit-details-marker { display: none; }
   .explorer-filters { gap: 8px; padding: 0 8px 8px; }
   .explorer-filters select { flex: 1 1 150px; min-width: 0; min-height: 44px; padding: 0 8px; }
   .explorer-filters select:first-child { flex-basis: 100%; }
