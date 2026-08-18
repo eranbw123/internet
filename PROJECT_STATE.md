@@ -1607,3 +1607,57 @@ the tick yet (PR N); `accept()` deliberately does not write
 (sync v2 = PR I, write API = PR J). Tests: 63 offline cases across
 `OfferRankingTests`/`OfferStoreTests`/`OfferLifecycleTests`/
 `OfferSweepTests`/`OffersCLITests`, Hebrew fixtures included.
+
+## offer-decision learning (PR N, first half)
+`discovery/offer_learning.py` (new, stdlib-only, no provider) turns the
+owner's decisions on offers into a ranking effect on the *next* batch. It
+learns from offer decisions ONLY. Anything derived from delivered items
+(clicks, digest engagement, up/down/fire) is deliberately NOT built: the
+separate "Output Layer" brief rewrites the `feedback` table and the unit of
+feedback itself, so this module never reads or writes `feedback` —
+`Priors.domain_stats` is the recorded-but-unread socket that half plugs into.
+
+Division of labour with `offers.py`: **offers owns "no means no"** — lifecycle,
+`blocked_offer_keys`/`blocked_terms_for`, `dedup_verdict`,
+`score_candidate`/`passes_floors`/`rank`, `normalize_key`/`signal_tokens`,
+the retirement cool-off. All of it is imported, none reimplemented. This
+module owns the *preference* signal: the accept prototype (token cosine ->
++.05 max, §5.6), the bar-suggestion prior (mean of the owner's bar edits,
+needing >=2 of them, clamped to +/-.10), cold start, and snooze suppression of
+a paraphrase while the original sleeps. Scores are READ off the candidate
+(`score`/`score_terms`) when the store already has them, recomputed only when
+it does not.
+
+Storage: one new table, `offer_decision_log` (own file
+`schema_offer_learning.sql`, applied by `offer_learning.ensure_schema()`, not
+by `db.init` — PRs H/I/J are editing `schema.sql` concurrently). It is NOT a
+second event log: `offer_events` is the source of truth and
+`sync_from_offer_events()` projects it, idempotently, adding the three things
+the offer row cannot keep once it is updated in place — the post-edit signal
+tokens, the edit diff, and the interest lifecycle stage (`decaying` vs
+`paused`) a retirement answer came from. The one thing a replay cannot
+recover is the bar the generator suggested before an edited accept overwrote
+it; PR J can pass it via `record_decision(..., proposed_min_score=)` at
+decision time, and without it that decision simply sits out the bar prior.
+
+Polarity is kind-aware: accept=+1 / reject=-1 for every kind EXCEPT `retire`,
+where it inverts (declining "retire this?" is the owner's rescue). A rescue
+propagates no terms in either direction — blocking or boosting an interest
+title's generic words poisons the pool, the same call `blocked_terms_for()`
+makes. `expired` is a timer, never a rejection, and does not count toward
+leaving cold start.
+
+Cold start = fewer than 2 distinct `artifact_sha256` runs of owner decisions
+(falling back to distinct decision days): no prototype bonus, no bar shift,
+cap 5, serendipity slot filled — but exclusions still bite, so something
+rejected in run 1 cannot return in run 2. The exploratory pick keeps its
+reserved slot and opts OUT of the prototype bonus by design. Floors read the
+BASE score, so a learned preference can never lift a candidate over the
+evidence bar.
+
+Seam (pending PR J): `OfferDecisionSource` = `decisions()` + `candidates()`
+(+ `blocked()`). `StoreOfferDecisionSource` is the real one over
+`offer_events`; `MemoryOfferDecisionSource` is the in-memory fake the tests
+also use. Tests: `OfferDecisionRecordTests`, `OfferDecisionSyncTests`,
+`OfferLearningColdStartTests`, `OfferLearningRankingTests`,
+`OfferLearningSeamTests` in `test_discovery.py`, Hebrew fixtures included.
