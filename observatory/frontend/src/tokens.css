@@ -14,8 +14,8 @@
       attribute block comes last so an explicit dark choice still wins on a
       light-preferring OS. Three states, both directions.
    3. The two dark blocks are byte-identical. CSS has no way to share them,
-      so tokens.test.ts asserts it instead -- keep them in sync or the suite
-      fails.
+      so test_observatory.py's ObservatoryThemeTokenTests asserts it instead
+      -- keep them in sync or the suite fails.
    4. No component rule ever lives in here, and no theme block ever contains
       anything but token declarations.
 
@@ -180,7 +180,8 @@
 }
 
 /* Explicit dark: last, so it also wins on a light-preferring OS. Must stay
-   byte-identical to the media block above (tokens.test.ts checks). */
+   byte-identical to the media block above (ObservatoryThemeTokenTests
+   checks). */
 :root[data-theme="dark"] {
   color-scheme: dark;
   --bg: #141920;
