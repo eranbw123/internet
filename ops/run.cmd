@@ -23,5 +23,17 @@ rem silently dropped run with no log line, no heartbeat, no counter.
 set LOGNAME=%*
 set LOGNAME=%LOGNAME: =_%
 set LOGFILE=logs\%LOGNAME%-%LOGDATE%.log
+
+rem A run must never be dropped just because its log file is unavailable.
+rem cmd's `>>` opens the log without FILE_SHARE_WRITE, so anything else
+rem holding that handle makes the redirect fail and the whole run vanish
+rem before python starts -- no line, no heartbeat, no counter, and a task
+rem that looks like it ran. It happened for real: a Chrome launched by
+rem health.preflight_gate inherited this very handle and held it for days
+rem (see discovery/health.py). That leak is fixed at the source now; this is
+rem the belt to its braces, because "silently did nothing" is the one
+rem outcome this appliance must never have again.
+(type nul >> "%LOGFILE%") 2>nul || set LOGFILE=logs\%LOGNAME%-%LOGDATE%-alt.log
+
 python -m app %* >> "%LOGFILE%" 2>&1
 exit /b %ERRORLEVEL%

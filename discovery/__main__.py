@@ -222,6 +222,18 @@ def main(argv=None):
         # real database.
         print("trace-fixture requires --db PATH -- refusing to default to the production db", file=sys.stderr)
         return 2
+    # Task Scheduler redirects stdout to a file (ops/run.cmd), and a redirected
+    # stdout is block-buffered: a job killed by its ExecutionTimeLimit loses
+    # everything it printed. That is why logs/web-tick-*.log simply stopped
+    # having lines while the tick was failing every single minute. Line
+    # buffering costs nothing here and means whatever a job managed to say
+    # survives being killed.
+    try:
+        sys.stdout.reconfigure(line_buffering=True)
+        sys.stderr.reconfigure(line_buffering=True)
+    except (AttributeError, ValueError):  # a replaced/duck-typed stream in tests
+        pass
+
     cfg = config.load()
     if args.db:
         cfg.db_path = args.db
@@ -370,17 +382,54 @@ def _run_once_cmd(conn, provider, cfg, sources, dry_run, job_name):
     return 0
 
 
+# _run_job turns this into job:web:last_fail instead of last_ok. Distinct from
+# 3 (preflight refused to start) so the two are told apart in a log: 3 means
+# the tick never began, 4 means it began and got nothing done.
+WEB_TICK_UNPRODUCTIVE = 4
+
+
 def _web_tick_cmd(conn, provider, cfg, dry_run):
     """`provider` here is the scoring provider (built from cfg.provider by
     the CLI's shared provider() closure, same as run-once) -- web_tick()
     builds its own search-capable mission provider internally from
     cfg.mission_provider and gates on that provider's own preflight, so
-    there is no separate health.preflight_gate() call here."""
+    there is no separate health.preflight_gate() call here.
+
+    Exit code is the tick's honesty mechanism. A tick that planned nothing,
+    ran nothing and delivered nothing returns WEB_TICK_UNPRODUCTIVE when
+    something went wrong, so _run_job records job:web:last_fail and `health`
+    shows web as failing -- rather than 0, which stamps last_ok and tells
+    every monitor the web collector is alive. Silent success here is what let
+    the owner's web discovery die on 2026-08-13 and stay dead, invisibly,
+    for five days: the log had no line, the heartbeat kept advancing, and the
+    scheduler kept reporting LastTaskResult=0."""
+    # Printed BEFORE the work, and line-buffered (see main()), so the log
+    # proves the run started even if something kills it mid-tick. A log whose
+    # last line is a `start` with no matching summary is a diagnosis; a log
+    # with no line at all -- which is what five days of this outage looked
+    # like -- is not.
+    print_safe(
+        f"web-tick: start budget={cfg.web_tick_budget_seconds}s "
+        f"provider={cfg.mission_provider}/{cfg.mission_model}"
+    )
     result = missions.web_tick(conn, cfg, provider=provider, dry_run=dry_run)
     if not result["preflight_ok"]:
         return 3
-    print(result)
-    return 0
+    print_safe(_web_tick_summary(result))
+    for failure in result["failures"]:
+        print_safe(f"  ! {failure}")
+    if result["productive"]:
+        return 0
+    print_safe(f"web-tick did nothing: {result['reason']}")
+    return WEB_TICK_UNPRODUCTIVE if result["failures"] else 0
+
+
+def _web_tick_summary(result):
+    return (
+        "web-tick: planned={generated} leased={leased} executed={executed}"
+        " ok={executed_ok} collected={collected} notified={notified}"
+        " abandoned={abandoned}".format(**result)
+    )
 
 
 def _digest_cmd(conn, cfg, dry_run):
