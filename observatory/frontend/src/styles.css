@@ -1,12 +1,10 @@
+/* Every colour in this file comes from tokens.css: one semantic palette,
+   defined for light, for "system says dark", and for an explicit dark pick.
+   Add colours there, never here. */
+@import "./tokens.css";
+
 :root {
   --lane-gap: 24px;
-  --border: #d8dee6;
-  --bg: #ffffff;
-  --fg: #1c2530;
-  --accent: #2f6feb;
-  --error: #c0392b;
-  --ok: #2f9e44;
-  --active: #f0a500;
 }
 
 * { box-sizing: border-box; }
@@ -19,6 +17,15 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
   border-bottom: 1px solid var(--border);
 }
 .app-title { font-weight: 600; }
+/* Theme control: pushed to the right end of the header, per the design. */
+.theme-toggle {
+  margin-left: auto; display: inline-flex; align-items: center; gap: 5px;
+  font: inherit; font-size: 11px; padding: 2px 9px; cursor: pointer;
+  color: var(--fg-muted); background: var(--surface-raised);
+  border: 1px solid var(--border); border-radius: 12px;
+}
+.theme-toggle:hover { border-color: var(--accent); color: var(--fg); }
+.theme-toggle:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
 .drawer-toggle { display: none; }
 .app-body { flex: 1; display: flex; min-height: 0; }
 
@@ -138,7 +145,7 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
    else in the pipeline -- recede instead of competing visually with the
    branch that actually led somewhere. */
 .node-card.node-dimmed { opacity: .55; }
-.node-type { font-size: 9px; text-transform: uppercase; letter-spacing: .04em; color: #98a2b0; }
+.node-type { font-size: 9px; text-transform: uppercase; letter-spacing: .04em; color: var(--fg-faint); }
 .node-label { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .node-summary { color: #556; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 .node-meta { display: flex; gap: 6px; font-size: 10px; color: #778; white-space: nowrap; overflow: hidden; }
@@ -211,12 +218,15 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
   cursor: pointer; padding: 4px 8px; font-size: 12px; font-family: ui-monospace, Consolas, monospace;
   background: #f6f8fb;
 }
-.prompt-section-size { color: #98a2b0; font-size: 10px; }
-.viewer-size { font-size: 10px; color: #98a2b0; margin: 2px 0 4px; }
-.viewer-search { font-size: 11px; padding: 1px 6px; border: 1px solid var(--border); border-radius: 3px; }
-.viewer-search-count { font-size: 10px; color: #667; display: inline-flex; align-items: center; gap: 2px; }
-.search-hit { background: #fff2a8; }
-.search-hit-active { background: #ffc400; }
+.prompt-section-size { color: var(--fg-faint); font-size: 10px; }
+.viewer-size { font-size: 10px; color: var(--fg-faint); margin: 2px 0 4px; }
+.viewer-search {
+  font-size: 11px; padding: 1px 6px; border-radius: 3px;
+  border: 1px solid var(--border); background: var(--surface-raised); color: var(--fg);
+}
+.viewer-search-count { font-size: 10px; color: var(--fg-muted); display: inline-flex; align-items: center; gap: 2px; }
+.search-hit { background: var(--hit-bg); color: var(--hit-fg); }
+.search-hit-active { background: var(--hit-active-bg); color: var(--hit-active-fg); }
 
 /* The operational row behind a node: sub-scores, item text, delivery, mission. */
 .entity-facts { margin: 8px 0; }
@@ -232,7 +242,7 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .score-bar-track { background: #eef1f5; border-radius: 3px; height: 8px; overflow: hidden; }
 .score-bar-fill { display: block; height: 100%; background: var(--accent); }
 .score-bar-value { text-align: right; font-variant-numeric: tabular-nums; }
-.score-bar-weight { color: #98a2b0; }
+.score-bar-weight { color: var(--fg-faint); }
 
 /* Explorer: visible filter state and a visible selection. */
 .filter-chips { display: flex; flex-wrap: wrap; gap: 3px; padding: 0 6px 4px; }
@@ -243,16 +253,16 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .filter-chip-clear { background: #fff; }
 .explorer-row.selected { background: #e8f0fb; box-shadow: inset 3px 0 0 var(--accent); }
 .explorer-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
-.tab-count { color: #98a2b0; font-weight: 400; }
+.tab-count { color: var(--fg-faint); font-weight: 400; }
 .row-active-yes { color: var(--ok); }
-.row-active-no { color: #98a2b0; }
+.row-active-no { color: var(--fg-faint); }
 .row-error { color: var(--error); }
 
 /* Interest panel: what an interest is and what it has produced. */
 .interest-counts { display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0; font-size: 11px; color: #667; }
-.interest-count b { color: var(--ink, #223); font-size: 13px; }
+.interest-count b { color: var(--fg); font-size: 13px; }
 .interest-actions { margin: 6px 0 10px; }
-.interest-row-meta { color: #98a2b0; font-size: 10px; }
+.interest-row-meta { color: var(--fg-faint); font-size: 10px; }
 .signal-list { margin: 0 0 8px; padding-left: 16px; font-size: 12px; }
 .signal-list li { margin-bottom: 1px; }
 
@@ -276,11 +286,11 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .status-chip-active { background: #fdf3dc; color: #9a6b00; }
 .overview-section-title {
   font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
-  color: #98a2b0; margin: 10px 0 4px;
+  color: var(--fg-faint); margin: 10px 0 4px;
 }
 .overview-connections ul { list-style: none; margin: 0; padding: 0; }
 .overview-connections li { display: flex; gap: 6px; align-items: baseline; padding: 1px 0; min-width: 0; }
-.connection-rel { font-size: 10px; color: #98a2b0; white-space: nowrap; }
+.connection-rel { font-size: 10px; color: var(--fg-faint); white-space: nowrap; }
 .connection-link {
   border: none; background: none; padding: 0; font: inherit; color: var(--accent);
   cursor: pointer; text-align: left; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
@@ -292,23 +302,37 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 }
 .connection-showall:hover { text-decoration: underline; }
 .overview-preview .monospace-viewer:not(.fullscreen) .viewer-content { max-height: 45vh; }
-.overview-nothing { color: #98a2b0; font-style: italic; margin: 10px 0; }
+.overview-nothing { color: var(--fg-faint); font-style: italic; margin: 10px 0; }
 .overview-links { display: flex; flex-direction: column; gap: 2px; margin-bottom: 8px; }
 
-.monospace-viewer { display: flex; flex-direction: column; height: 100%; }
-.monospace-viewer.fullscreen { position: fixed; inset: 0; z-index: 1000; background: #fff; }
-.viewer-toolbar { display: flex; gap: 8px; padding: 4px; }
-.viewer-truncated-warning { background: #fff3cd; color: #7a5b00; padding: 4px; font-size: 11px; }
+/* --- monospace viewer ---
+   The proof-of-concept surface for the token system (PR K): every colour
+   below, and every colour in MonospaceViewer.tsx's markup, resolves through
+   tokens.css. Nothing here is a literal, so this whole component -- including
+   its full-screen mode, which IS the entire viewport -- themes correctly on
+   its own. The rest of the stylesheet's literals are inventoried in
+   observatory/frontend/THEME_MIGRATION.md and land in the follow-up. */
+.monospace-viewer { display: flex; flex-direction: column; height: 100%; color: var(--fg); }
+.monospace-viewer.fullscreen { position: fixed; inset: 0; z-index: 1000; background: var(--bg); }
+.viewer-toolbar { display: flex; gap: 8px; padding: 4px; align-items: center; color: var(--fg-muted); }
+.viewer-toolbar button {
+  font: inherit; font-size: 11px; padding: 1px 8px; cursor: pointer; border-radius: 3px;
+  border: 1px solid var(--border); background: var(--surface-raised); color: var(--fg);
+}
+.viewer-toolbar button:hover { border-color: var(--accent); }
+.viewer-toolbar button:disabled { color: var(--fg-faint); cursor: default; border-color: var(--border-subtle); }
+.viewer-truncated-warning { background: var(--warn-bg); color: var(--warn-text); padding: 4px; font-size: 11px; }
 .viewer-content {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
   white-space: pre; overflow: auto; flex: 1; margin: 0; padding: 6px;
-  background: #fafbfc; user-select: text;
+  background: var(--surface); color: var(--fg);
+  border-top: 1px solid var(--border-subtle); user-select: text;
 }
 .viewer-content.wrap { white-space: pre-wrap; word-break: break-word; }
-.json-key { color: #8250df; }
-.json-string { color: #0a7d3c; }
-.json-number { color: #b35900; }
-.json-bool, .json-null { color: #cf222e; }
+.json-key { color: var(--syn-key); }
+.json-string { color: var(--syn-string); }
+.json-number { color: var(--syn-number); }
+.json-bool, .json-null { color: var(--syn-bool); }
 
 /* --- compare --- */
 /* Two graphs side by side needs width; below the mobile breakpoint they stack

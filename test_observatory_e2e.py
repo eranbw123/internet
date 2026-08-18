@@ -618,5 +618,160 @@ class ObservatoryE2EMobileTests(_E2EFixture, unittest.TestCase):
         self.assertIn("threshold", node_types)
 
 
+@unittest.skipUnless(CHROME_PATH, "no Chrome/Chromium binary found on this machine -- set DISCOVERY_UI_E2E_CHROME")
+class ObservatoryE2EThemeTests(_E2EFixture, unittest.TestCase):
+    """Dark mode, in its own fixture (see _E2EFixture's docstring for why).
+
+    Everything here is asserted through *computed* style rather than through
+    class names, because the bug this feature can actually have is "the
+    cascade picked the wrong block" -- which a DOM assertion cannot see. The
+    OS preference is driven with CDP's Emulation.setEmulatedMedia, so the
+    three-state cascade is exercised in both directions on a real engine:
+    explicit light on a dark-preferring OS, and explicit dark on a
+    light-preferring one.
+
+    Deliberately four tests with three navigations, per the request-ceiling
+    note in _E2EFixture's docstring -- test_04 continues on the page test_03
+    already loaded instead of navigating again.
+    """
+
+    LIGHT_BG = "rgb(255, 255, 255)"  # --bg, light
+    DARK_BG = "rgb(20, 25, 32)"      # --bg, dark  (#141920)
+    DARK_SURFACE = "rgb(27, 34, 43)"  # --surface, dark (#1B222B)
+
+    def emulate_os(self, prefers):
+        """Make the headless browser report an OS colour preference."""
+        self.conn.send("Emulation.setEmulatedMedia", {
+            "features": [{"name": "prefers-color-scheme", "value": prefers}],
+        })
+
+    def body_bg(self):
+        return self.js("getComputedStyle(document.body).backgroundColor")
+
+    def choice(self):
+        return self.js("document.documentElement.getAttribute('data-theme')")
+
+    def stored(self):
+        return self.js("localStorage.getItem('observatory-theme')")
+
+    def test_01_toggle_cycles_system_light_dark_and_persists_each_step(self):
+        self.set_viewport(DESKTOP_VIEWPORT)
+        self.emulate_os("light")
+        self.js("localStorage.removeItem('observatory-theme')")
+        self.navigate("/observatory/")
+        self.wait_for("!!document.querySelector('.theme-toggle')", message="theme toggle rendered")
+
+        # Starts on system, which on a light-preferring OS paints light and
+        # sets no attribute at all -- data-theme="system" would leave the
+        # media query's :root:not([data-theme="light"]) matching.
+        self.assertIsNone(self.choice())
+        self.assertEqual(self.body_bg(), self.LIGHT_BG)
+
+        self.click(".theme-toggle")  # system -> light
+        self.assertEqual(self.choice(), "light")
+        self.assertEqual(self.stored(), "light")
+        self.assertEqual(self.body_bg(), self.LIGHT_BG)
+
+        self.click(".theme-toggle")  # light -> dark
+        self.assertEqual(self.choice(), "dark")
+        self.assertEqual(self.stored(), "dark")
+        self.assertEqual(self.body_bg(), self.DARK_BG)
+        # The whole point: the ink flipped with the paper.
+        self.assertEqual(
+            self.js("getComputedStyle(document.body).color"), "rgb(217, 225, 234)"
+        )
+
+        self.click(".theme-toggle")  # dark -> system
+        self.assertIsNone(self.choice())
+        self.assertEqual(self.stored(), "system")
+        self.assertEqual(self.body_bg(), self.LIGHT_BG)
+
+    def test_02_three_states_resolve_correctly_in_both_directions(self):
+        # Still on the page test_01 left, sitting on "system".
+        self.emulate_os("dark")
+        self.assertEqual(self.body_bg(), self.DARK_BG, "system must follow a dark OS")
+
+        self.click(".theme-toggle")  # system -> light, on a DARK-preferring OS
+        self.assertEqual(
+            self.body_bg(), self.LIGHT_BG,
+            "an explicit light choice must beat the OS preference -- this is what "
+            "the :not([data-theme=\"light\"]) guard on the media query is for",
+        )
+
+        self.emulate_os("light")
+        self.click(".theme-toggle")  # light -> dark, on a LIGHT-preferring OS
+        self.assertEqual(
+            self.body_bg(), self.DARK_BG,
+            "an explicit dark choice must beat the OS preference -- this is what "
+            "ordering the [data-theme=\"dark\"] block last is for",
+        )
+
+    def test_03_the_choice_survives_a_reload(self):
+        # test_02 left an explicit dark stored, on a light-preferring OS.
+        self.emulate_os("light")
+        self.navigate("/observatory/")
+        self.wait_for("!!document.querySelector('.theme-toggle')")
+        self.assertEqual(self.stored(), "dark")
+        self.assertEqual(self.choice(), "dark")
+        self.assertEqual(self.body_bg(), self.DARK_BG)
+        # index.html's pre-mount script is what set the attribute (it runs
+        # before the bundle); React only re-applies it. If it had not, the
+        # first paint would have been white -- the reload flash.
+        self.assertEqual(
+            self.js("document.querySelector('script:not([src]):not([type])')"
+                    "?.textContent.includes('observatory-theme')"),
+            True,
+        )
+
+    def test_04_the_migrated_viewer_surface_themes_and_leaves_hebrew_intact(self):
+        # Continues on test_03's dark page rather than navigating again.
+        self.wait_for("document.querySelectorAll('.explorer-row').length > 0")
+        self.click(".explorer-row")
+        self.wait_for("document.querySelectorAll('.node-card').length > 0")
+        self.click(".node-card")
+        self.wait_for("!!document.querySelector('[data-testid=\"monospace-content\"]')",
+                      message="the monospace viewer (PR K's migrated surface) rendered")
+
+        # PR K migrates exactly this surface end to end, so every colour on it
+        # must have come from the dark palette.
+        self.assertEqual(
+            self.js("getComputedStyle(document.querySelector("
+                    "'[data-testid=\"monospace-content\"]')).backgroundColor"),
+            self.DARK_SURFACE,
+        )
+        self.assertEqual(
+            self.js("getComputedStyle(document.querySelector("
+                    "'[data-testid=\"monospace-content\"]')).color"),
+            "rgb(217, 225, 234)",
+        )
+
+        # ~28% of the owner's conversation titles are Hebrew, and interest
+        # names may be too. The viewer is `white-space: pre`, so the risk is a
+        # theming change quietly introducing a direction/unicode-bidi rule
+        # that reorders RTL runs. Nothing in PR K sets either -- assert it.
+        hebrew = self.js(
+            "(() => {"
+            "  const pre = document.querySelector('[data-testid=\"monospace-content\"]');"
+            "  const probe = document.createElement('span');"
+            "  probe.textContent = 'זיכרון ושליפה';"
+            "  pre.appendChild(probe);"
+            "  const cs = getComputedStyle(probe);"
+            "  const out = {"
+            "    text: probe.textContent,"
+            "    direction: cs.direction,"
+            "    unicodeBidi: cs.unicodeBidi,"
+            "    width: probe.getBoundingClientRect().width,"
+            "    color: cs.color,"
+            "  };"
+            "  probe.remove();"
+            "  return out;"
+            "})()"
+        )
+        self.assertEqual(hebrew["text"], "זיכרון ושליפה", "Hebrew round-tripped through the DOM unchanged")
+        self.assertEqual(hebrew["direction"], "ltr", "no stray direction rule was introduced")
+        self.assertEqual(hebrew["unicodeBidi"], "normal", "no stray unicode-bidi rule was introduced")
+        self.assertGreater(hebrew["width"], 0, "Hebrew actually laid out rather than collapsing")
+        self.assertEqual(hebrew["color"], "rgb(217, 225, 234)", "Hebrew inherits the themed ink")
+
 if __name__ == "__main__":
     unittest.main()

@@ -6,6 +6,7 @@ import { InterestPanel } from "./interest/InterestPanel";
 import { CompareView } from "./compare/CompareView";
 import { formatHash, parseHash, readBootstrap } from "./deepLink";
 import { useIsMobile } from "./useIsMobile";
+import { ThemeToggle } from "./ThemeToggle";
 import type { GraphSeed } from "./graph/useGraphData";
 import type { ID, Tab } from "./types";
 
@@ -186,6 +187,7 @@ export function App() {
         <button className="drawer-toggle" onClick={() => setDrawerOpen((v) => !v)} aria-label="Toggle explorer">☰</button>
         <span className="app-title">Observatory</span>
         <button onClick={() => setCompareOpen((v) => !v)}>{compareOpen ? "Close compare" : "Compare"}</button>
+        <ThemeToggle />
       </header>
       <div className="app-body">
         <div className={`pane pane-explorer ${isMobile ? "drawer" : ""} ${drawerOpen ? "open" : ""}`}>
