@@ -31,6 +31,7 @@ before this step.
 """
 import dataclasses
 import sys
+import time
 from collections import Counter
 
 from . import council, db, health, pipeline, providers, trace
@@ -89,8 +90,9 @@ def _web_tick(conn, cfg, provider, dry_run, tracer):
     # provider_down/job:web:last_fail bookkeeping health.py/stats.py already
     # read -- a bare preflight() call would silently drop both.
     if not health.preflight_gate(conn, mission_provider, cfg, "web"):
-        return {"leased": 0, "executed": 0, "notified": 0, "preflight_ok": False}
+        return _tick_result(preflight_ok=False, reason="provider preflight failed")
 
+    deadline = time.monotonic() + cfg.web_tick_budget_seconds
     all_interests = db.active_interests(conn)
     owner_interests = [i for i in all_interests if i.layer == "owner"]
     interest_state_node = tracer.node(
@@ -98,17 +100,36 @@ def _web_tick(conn, cfg, provider, dry_run, tracer):
         input_json={"owner_interests": [i.key for i in owner_interests]},
     )
 
-    _replenish(conn, cfg, mission_provider, owner_interests, tracer, interest_state_node)
+    failures = []
+    generated = _replenish(
+        conn, cfg, mission_provider, owner_interests, tracer, interest_state_node, failures,
+    )
 
     mission_ids = _select_fair(conn, cfg, owner_interests)
     leased_ids = db.lease_missions(conn, mission_ids, cfg.mission_lease_seconds)
 
     budget, explore_budget = pipeline.budgets_for(cfg)
+    executed = executed_ok = collected = abandoned = 0
     for mission_id in leased_ids:
-        _execute_mission(
+        # Checked BETWEEN missions, never mid-mission: a leased mission we do
+        # not start stays leased until its lease expires and
+        # recover_stale_missions() hands it back, which is exactly what the
+        # lease is for. Stopping here is what keeps the tick inside the
+        # scheduler's ExecutionTimeLimit -- and, unlike being killed, it gets
+        # to say so.
+        if time.monotonic() >= deadline:
+            abandoned += 1
+            continue
+        executed += 1
+        items, error = _execute_mission(
             conn, cfg, mission_provider, scoring_provider, all_interests,
             mission_id, budget, explore_budget, tracer,
         )
+        collected += items
+        if error:
+            failures.append(f"mission {mission_id}: {error}")
+        else:
+            executed_ok += 1
 
     lane_notified = Counter()
     notified = pipeline.deliver(conn, cfg, dry_run, lane_counts=lane_notified, tracer=tracer)
@@ -118,15 +139,59 @@ def _web_tick(conn, cfg, provider, dry_run, tracer):
     })
     db.record_usage(conn, mission_provider)
     db.record_usage(conn, scoring_provider)
+    if abandoned:
+        failures.append(
+            f"{abandoned} leased mission(s) left unexecuted -- the tick's "
+            f"{cfg.web_tick_budget_seconds}s budget ran out"
+        )
+    return _tick_result(
+        leased=len(leased_ids), executed=executed, executed_ok=executed_ok, notified=notified,
+        generated=generated, collected=collected, abandoned=abandoned, failures=failures,
+        owner_interests=len(owner_interests),
+    )
+
+
+def _tick_result(leased=0, executed=0, executed_ok=0, notified=0, generated=0, collected=0,
+                  abandoned=0, failures=(), owner_interests=0, preflight_ok=True, reason=None):
+    """One tick's outcome, and -- when the outcome was nothing -- WHY.
+
+    `productive` is the honest answer to "did this tick do any work": it is
+    what the CLI turns into an exit code, and therefore what decides whether
+    `job:web:last_ok` moves. A tick that planned nothing, ran nothing and
+    delivered nothing must never stamp a heartbeat that tells `health` the
+    web collector is alive; that is the bug that hid five days of total
+    web-discovery failure behind a green health report.
+
+    `reason` is always populated when nothing happened, so no caller has to
+    infer silence from a row of zeros."""
+    failures = list(failures)
+    # A mission that RAN and honestly found nothing is work; a mission that
+    # ran and failed is not. Counting `executed` here instead of `executed_ok`
+    # would let a tick whose every mission errored still stamp job:web:last_ok
+    # -- the same lie, one layer down.
+    productive = bool(generated or executed_ok or collected or notified)
+    if reason is None and not productive:
+        if failures:
+            reason = "; ".join(failures)
+        elif not owner_interests:
+            reason = "no active owner interests -- nothing to plan or search for"
+        else:
+            reason = (
+                f"nothing to do: every one of {owner_interests} owner interest(s) is at or "
+                f"above its mission low-water mark and no mission was eligible to run"
+            )
     return {
-        "leased": len(leased_ids), "executed": len(leased_ids),
-        "notified": notified, "preflight_ok": True,
+        "leased": leased, "executed": executed, "executed_ok": executed_ok,
+        "notified": notified, "generated": generated, "collected": collected,
+        "abandoned": abandoned, "failures": failures, "productive": productive,
+        "reason": reason, "preflight_ok": preflight_ok,
     }
 
 
 # --- step 2: replenish at most one interest -----------------------------------
 
-def _replenish(conn, cfg, mission_provider, owner_interests, tracer, interest_state_node=None):
+def _replenish(conn, cfg, mission_provider, owner_interests, tracer,
+                interest_state_node=None, failures=None):
     """One Council call per tick, at most: the owner interest with the
     fewest PENDING missions below cfg.mission_low_water, tie-broken by
     longest-since-last-generation (never-generated sorts first), then by key
@@ -139,20 +204,37 @@ def _replenish(conn, cfg, mission_provider, owner_interests, tracer, interest_st
     cfg.mission_retry_seconds has passed (same knob search_missions' own
     fail_mission() cool-off uses) -- otherwise a Council that keeps
     returning malformed output would burn one real provider call every
-    single tick for as long as it stays broken."""
+    single tick for as long as it stays broken.
+
+    Returns how many missions this tick actually planned (0 when there was
+    nothing to replenish, or when the Council call failed -- the failure is
+    appended to `failures` so the caller can say so out loud rather than
+    reporting a row of zeros)."""
+    failures = [] if failures is None else failures
     candidates = []
+    cooling = 0
     for interest in owner_interests:
         pending = db.pending_mission_count(conn, interest.key)
         if pending >= cfg.mission_low_water:
             continue
         if _generation_in_cooldown(conn, interest.key, cfg.mission_retry_seconds):
+            cooling += 1
             continue
         candidates.append((pending, _last_generation_at(conn, interest.key) or "", interest))
     if not candidates:
-        return
+        if cooling:
+            failures.append(
+                f"no interest could be replenished: {cooling} below low-water but still in "
+                f"cool-off after a failed Council generation (mission_retry_seconds="
+                f"{cfg.mission_retry_seconds})"
+            )
+        return 0
     candidates.sort(key=lambda c: (c[0], c[1], c[2].key))
     _, _, interest = candidates[0]
-    _generate_for(conn, cfg, mission_provider, interest, tracer, interest_state_node)
+    planned, error = _generate_for(conn, cfg, mission_provider, interest, tracer, interest_state_node)
+    if error:
+        failures.append(f"Council generation for '{interest.key}' failed: {error}")
+    return planned
 
 
 def _last_generation_at(conn, interest_key):
@@ -174,7 +256,11 @@ def _generation_in_cooldown(conn, interest_key, retry_seconds):
 
 
 def _generate_for(conn, cfg, mission_provider, interest, tracer, interest_state_node=None):
-    """The generation row is inserted before build_context()/plan_missions()
+    """Plan one interest's missions. Returns (missions_planned, error) --
+    (n, None) on success, (0, "why") when the Council call failed, so the
+    tick can report the failure instead of silently returning zeros.
+
+    The generation row is inserted before build_context()/plan_missions()
     run, and the try/except wraps both -- any exception either can raise
     (CouncilError, a ProviderError, or something a live provider's own
     parsing didn't anticipate, e.g. a malformed non-dict CDP reply) is
@@ -225,10 +311,14 @@ def _generate_for(conn, cfg, mission_provider, interest, tracer, interest_state_
                 mission_provider, interest, context, cfg.council_missions_per_generation
             )
     except Exception as e:  # noqa: BLE001 -- one interest's planning failure must not crash the tick
+        # Printed, not just persisted: the generation row and the trace node
+        # are only visible to someone already looking. The tick's log is where
+        # an outage gets noticed, so a dead Council has to appear there.
+        print(f"Council generation for '{interest.key}' failed: {e}", file=sys.stderr)
         db.finish_generation(conn, generation_id, "FAILED", 0, str(e))
         tracer.finish_node(generation_node, status="error", error=str(e))
         _maybe_enqueue_fallback(conn, cfg, interest, tracer)
-        return
+        return 0, str(e)
     tracer.finish_node(council_node, status="ok")
     _persist_deliberation(tracer, council_node, deliberation)
 
@@ -237,6 +327,7 @@ def _generate_for(conn, cfg, mission_provider, interest, tracer, interest_state_
     tracer.finish_node(
         generation_node, status="ok", output_json={"missions_returned": len(missions)},
     )
+    planned = len(missions)
     mission_rows = {r["label"]: r["id"] for r in conn.execute(
         "SELECT id, label FROM search_missions WHERE generation_id = ?", (generation_id,)
     ).fetchall()}
@@ -249,6 +340,7 @@ def _generate_for(conn, cfg, mission_provider, interest, tracer, interest_state_
             label=m["label"], summary=m["rationale"], input_json={"prompt": m["prompt"]},
         )
         tracer.edge(generation_node, mission_node, "generated", ordinal=ordinal)
+    return planned, None
 
 
 def _persist_deliberation(tracer, council_node, deliberation):
@@ -411,10 +503,14 @@ def _eligible_mission_ids(conn, interest_key, limit):
 
 def _execute_mission(conn, cfg, mission_provider, scoring_provider, interests,
                       mission_id, budget, explore_budget, tracer=None):
+    """Returns (items_ingested, error): (n, None) when the mission ran --
+    n may legitimately be 0, a search that honestly found nothing is still
+    work -- and (0, "why") when it failed. The caller counts both, so a tick
+    in which every mission errored cannot pass itself off as a healthy run."""
     tracer = tracer or trace.NULL_TRACER
     mission = db.mission_by_id(conn, mission_id)
     if mission is None:   # defensive -- lease_missions() only returns ids it just claimed
-        return
+        return 0, f"mission {mission_id} vanished between lease and execution"
     mission_node = tracer.node(
         tracer.run_id, "mission-execution", entity_type="search_missions", entity_id=mission_id,
         label=mission["label"], summary=mission["rationale"],
@@ -440,7 +536,7 @@ def _execute_mission(conn, cfg, mission_provider, scoring_provider, interests,
         print(f"mission {mission_id} ({mission['label']}) failed: {e}", file=sys.stderr)
         tracer.finish_node(mission_node, status="error", error=str(e))
         db.fail_mission(conn, mission_id, str(e), cfg.mission_max_attempts, cfg.mission_retry_seconds)
-        return
+        return 0, f"{mission['label']}: {e}"
 
     # One node per RAW returned result, before dedup/normalization, so a
     # duplicate-rejected or junk (no-url) raw result still has a persistent
@@ -497,6 +593,7 @@ def _execute_mission(conn, cfg, mission_provider, scoring_provider, interests,
 
     tracer.finish_node(mission_node, status="ok", output_json={"items_returned": len(items)})
     db.finish_mission(conn, mission_id, len(items))
+    return len(items), None
 
 
 def _raw_label(raw, ordinal):

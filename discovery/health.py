@@ -70,6 +70,20 @@ def preflight_gate(conn, provider, cfg, job_name):
             subprocess.run(
                 ["cmd", "/d", "/c", cfg.chrome_launch_cmd],
                 check=False, timeout=cfg.chrome_launch_wait_seconds,
+                # DEVNULL on all three, and this is not cosmetic. Under Task
+                # Scheduler this process's stdout IS the job's log file, opened
+                # by ops/run.cmd's `>>` without FILE_SHARE_WRITE. A child
+                # inherits those handles, and the child here is a BROWSER that
+                # deliberately outlives us -- so the Chrome we launch keeps the
+                # log file locked for its entire life, and every later run of
+                # this job dies inside cmd at the redirect, before python
+                # starts: no output, no heartbeat, no counter, nothing to see.
+                # That is exactly how logs/web-tick-20260818.log stopped at
+                # 14:44 (Chrome pid 7324, launched 14:43:47, held it) while the
+                # scheduler cheerfully went on reporting success every minute.
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
             )
         except (OSError, subprocess.TimeoutExpired) as e:
             print_safe(f"job '{job_name}': chrome_launch_cmd failed to start: {e}")
