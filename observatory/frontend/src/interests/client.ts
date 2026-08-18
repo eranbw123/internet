@@ -11,23 +11,26 @@
  *                  real mutation semantics, so the whole workspace is
  *                  demonstrable today.
  *
- * INTEGRATION (the small, obvious change PR J unblocks):
- *   1. flip USE_MOCK_CLIENT to false
- *   2. delete the `mockClient` import and mockData.ts / mockClient.ts
- * Nothing else in the workspace refers to fetch, to a URL, or to the mock.
- * That is the entire swap.
+ * INTEGRATION: done. PR J landed, USE_MOCK_CLIENT is false, and the workspace
+ * runs against the real endpoints. The mock is kept rather than deleted --
+ * `?interests=mock` still reaches it, which is how the two are compared when a
+ * number in the UI looks wrong, and it is what the component tests run
+ * against so they need no server.
  *
- * The `?interests=live` / `?interests=mock` query override exists so the two
- * can be compared side by side during integration without a rebuild.
+ * One thing the swap needed beyond the flag: `adaptStats` below. PR J serves
+ * the funnel under the names the Python side has always used, and this module
+ * owns the translation to the names the components were written against. The
+ * alternative -- renaming the fields in the components -- would have spread
+ * the server's vocabulary across a dozen files.
  */
 import type {
   DecideRequest, DecideResponse, EdgesResponse, GenerateResponse, InterestDetailResponse,
-  InterestPayload, OffersResponse, OfferStatus, SaveResponse, StatsResponse,
+  InterestPayload, InterestStat, OffersResponse, OfferStatus, SaveResponse, StatsResponse,
 } from "./types";
 import { mockClient } from "./mockClient";
 
-/** Flip to false when PR J lands. See INTEGRATION above. */
-export const USE_MOCK_CLIENT = true;
+/** PR J has landed; the workspace is live. `?interests=mock` still overrides. */
+export const USE_MOCK_CLIENT = false;
 
 /** Mirrors ../api.ts's ApiError, kept local so the interests surface does not
  * reach into the read-only trace API's module for an error class. */
@@ -91,8 +94,98 @@ async function request<T>(
   return resp.json() as Promise<T>;
 }
 
-/** The real section 7.3 client. Untested against a live server by
- * construction -- PR J is being written concurrently against this same spec. */
+/** The wire shape PR J actually serves for one funnel row.
+ *
+ * It differs from `InterestStat` in three places, all of them the Python
+ * side's older vocabulary rather than a disagreement about meaning:
+ * `notified` is what the UI calls `delivered`, `sparkline` is a sparse list of
+ * {date, above_bar} rather than a dense array, and the response carries
+ * `window_days` + `generated_at` where the UI wants a `from`/`to` pair. */
+interface WireStat {
+  key: string;
+  notified: number;
+  sparkline: { date: string; above_bar: number }[];
+  [field: string]: unknown;
+}
+
+interface WireStats {
+  window: string;
+  window_days: number | null;
+  generated_at: string;
+  totals: Record<string, number>;
+  interests: WireStat[];
+}
+
+const DAY_MS = 86_400_000;
+
+/** Sparse {date, above_bar} points -> one value per day across the window,
+ * oldest first.
+ *
+ * Two things this has to get right, both of which fail quietly:
+ *
+ *   - The server ships only days that HAVE a count (90 zeros per interest
+ *     would dwarf the payload). Drawing that list directly would compress the
+ *     idle stretches out and make a dying interest draw the same shape as a
+ *     healthy one, so the zeros go back in.
+ *   - The last bucket is `to`, not `to - 1`. The window is anchored at its
+ *     end: a "7d" window is the seven days ENDING today, and an array that
+ *     stopped at yesterday would hide today's items entirely -- on the one
+ *     view whose job is to show whether an interest is still producing.
+ */
+function densify(
+  points: { date: string; above_bar: number }[],
+  from: Date,
+  to: Date,
+): number[] {
+  const byDate = new Map(points.map((p) => [p.date, p.above_bar]));
+  const days = Math.max(1, Math.round((to.getTime() - from.getTime()) / DAY_MS));
+  const out: number[] = [];
+  for (let i = days - 1; i >= 0; i -= 1) {
+    const d = new Date(to.getTime() - i * DAY_MS);
+    out.push(byDate.get(d.toISOString().slice(0, 10)) ?? 0);
+  }
+  return out;
+}
+
+/** The server's funnel payload in the names the components use. */
+export function adaptStats(raw: WireStats): StatsResponse {
+  const to = new Date(raw.generated_at);
+  // `all` has no fixed start, so the window opens at the oldest day any
+  // interest actually has data for rather than at an arbitrary constant.
+  const earliest = raw.interests
+    .flatMap((r) => r.sparkline.map((p) => p.date))
+    .sort()[0];
+  const from = raw.window_days
+    ? new Date(to.getTime() - raw.window_days * DAY_MS)
+    : new Date(earliest ?? to.toISOString().slice(0, 10));
+
+  const interests = raw.interests.map((row) => {
+    const { notified, sparkline, ...rest } = row;
+    return {
+      ...rest,
+      delivered: notified,
+      daily_above_bar: densify(sparkline, from, to),
+    } as unknown as InterestStat;
+  });
+
+  return {
+    window: raw.window,
+    from: from.toISOString().slice(0, 10),
+    to: to.toISOString().slice(0, 10),
+    interests,
+    totals: {
+      collected: raw.totals.collected ?? 0,
+      matched: raw.totals.matched ?? 0,
+      above_bar: raw.totals.above_bar ?? 0,
+      delivered: raw.totals.notified ?? 0,
+      active_interests: raw.totals.active ?? 0,
+      total_interests: raw.totals.interests ?? 0,
+      dead_weight: raw.totals.dead_weight ?? 0,
+    },
+  };
+}
+
+/** The real section 7.3 client. */
 export const httpClient: InterestsClient = {
   listOffers(status = "offered") {
     return request<OffersResponse>("/observatory/api/offers", { params: { status } });
@@ -102,8 +195,10 @@ export const httpClient: InterestsClient = {
       method: "POST", body: req,
     });
   },
-  interestStats(window = "7d") {
-    return request<StatsResponse>("/observatory/api/interests/stats", { params: { window } });
+  async interestStats(window = "7d") {
+    return adaptStats(
+      await request<WireStats>("/observatory/api/interests/stats", { params: { window } }),
+    );
   },
   interestDetail(key) {
     return request<InterestDetailResponse>(`/observatory/api/interest/${encodeURIComponent(key)}`);

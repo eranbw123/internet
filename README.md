@@ -46,7 +46,8 @@ a long-lived session.
 
 | Command | What it does |
 | --- | --- |
-| `init` | Create/upgrade `discovery.db` and load `interests.json` |
+| `init` | Create/upgrade `discovery.db` and reconcile `interests.json` into it |
+| `sync [--dry-run] [--force]` | Reconcile `interests.json` into a running database: upsert edits, deactivate entries the file dropped or marked `"active": false`, and cancel those interests' pending missions. Takes effect on the next cycle — no re-`init`, no manual DB write. `--dry-run` prints the plan; `--force` overrides the truncated-file guard — see [interests.json](#interestsjson) |
 | `run-once [--source X]` | One collect → score → notify cycle (stocks/youtube; web discovery is scheduled via `web-tick` instead, see below). Gated by a provider preflight — exits 3 without touching a collector/LLM if Chrome/CDP is down |
 | `web-tick` | One continuous Council-driven web discovery tick — replenish, lease and execute a fair slice of pending research missions through the real pipeline. Gated by the mission provider's own preflight, same exit-3 convention — see [Continuous web discovery](#continuous-web-discovery-council-missions) |
 | `listen` | Long-polls Telegram for feedback buttons, blocking — interactive use |
@@ -60,6 +61,7 @@ a long-lived session.
 | `ui [--host] [--port] [--public]` | Serve the Observatory: a read-only Datasette UI + JSON API over the trace tables — see [Observatory](#observatory) |
 | `interests [--layer L] [--why KEY] [--refresh]` | Layered interest state: list (owner rows first, `--layer` filters), `--why <key>` prints the append-only provenance chain, `--refresh` runs promotion/decay — a no-op unless `DISCOVERY_DYNAMIC_INTERESTS` is set — see [Layered interest state](#layered-interest-state) |
 | `health [--notify]` | Job staleness, provider reachability, pending/abandoned sends; `--notify` alerts on degraded/recovery, rate-limited |
+| `pause [--why]` / `resume` | Owner token freeze: while paused, `run-once`/`web-tick`/`digest` exit immediately (0 LLM spend, no provider construction) and `health` reports PAUSED instead of degraded. This flag is the guarantee; the dev bot's `/pause` · `/resume` (all-stop) and `/news pause`/`/news resume` additionally disable/re-enable the scheduled tasks themselves (best-effort), so nothing even fires — feedback button presses queue on Telegram and are drained after resume |
 | `personal-state [--path]` | Print the sibling `ai` repo's personal-state artifact as this repo would read it — see [Personal-state contract](#personal-state-contract) |
 | `teach [--list\|--explain\|--send]` | Label the highest information-value scored-but-unlabeled items — see [Teach](#teach) |
 | `trace-fixture --db PATH` | Build the deterministic trace acceptance fixture (offline, fake providers) at `PATH`. `--db` is required — refuses (exit 2) rather than defaulting to the production `discovery.db`, since the fixture writes real interests/items/scores/feedback through production code paths — see [Trace backbone](#trace-backbone) |
@@ -153,6 +155,46 @@ place rather than duplicating it. Every interest loaded from this file is
 layer `owner` — the layer that's immutable to automation; see
 [Layered interest state](#layered-interest-state) for how the system can add
 its own interests alongside these.
+
+**This file is the source of truth in both directions.** Edit it, then run
+`python -m app sync` — the change is live on the next cycle:
+
+```bash
+python -m app sync --dry-run    # what would change, writes nothing
+python -m app sync              # apply it
+```
+
+| In the file | In the database |
+| --- | --- |
+| present, new | created and live |
+| present, saying nothing about `active` | definition updated; **liveness left alone**, so an interest the decay sweep auto-paused stays paused |
+| present with `"active": false` | **retired** — the definition is kept, so reviving it is one flag rather than re-authoring the entry |
+| present with `"active": true` | forced live, overruling the sweep |
+| present again after being retired | revived — re-adding an entry *is* the revival |
+| removed entirely | **retired**, and its pending research missions are cancelled |
+
+Retirement and revival are not written here directly: they go through the
+interest lifecycle state machine in `discovery/offers.py`
+(`active`/`decaying`/`paused`/`retired`), so there is one deactivation
+mechanism in the engine and the `lifecycle` and `active` columns can never
+disagree. Every actual change appends an `owner_sync` row to `interest_events`
+(`python -m app interests --why <key>` prints the chain); an unchanged file
+writes nothing at all, so `sync` is safe to run on a schedule. Retiring an
+interest never deletes its row — its items, scores and provenance stay
+queryable.
+
+Because the file is the source of truth, a retirement made only in the
+database (`offers.retire_interest()`) while the entry still sits in the file
+saying nothing is undone by the next sync. `interest_sync.set_entry_active()`
+is the call that writes the decision back to the file, and
+`interest_sync.entry_writer()` is the callable `offers.accept(sync=...)`
+takes — accepting an offer writes its entry into `interests.json`, syncs it
+into the database, and activates the offer in one call.
+
+Because a truncated or half-written file must not be able to retire the whole
+engine, `sync` refuses any run that would deactivate more than half the active
+interests (above 3 of them) and tells you to re-run with `--force` if you
+meant it.
 
 `min_score` is a **0–1** threshold on the final score. (It used to be 0–100;
 anything above 1 is treated as the old scale and divided by 100, so a stale
@@ -768,6 +810,46 @@ network) against a fixture db built by the real `discovery/trace_fixture.py`.
 Skips every test with a loud message (not a failure) if `datasette` genuinely
 isn't installed.
 
+### Observatory write API
+
+The Observatory is no longer read-only. `observatory/manage.py` adds the
+endpoints the interests workspace uses to tend the catalog without a PR and
+without a hand-written DB op:
+
+```
+GET  /observatory/api/offers?status=inbox|all|<status,...>&kind=&limit=
+GET  /observatory/api/offers/<key>/provenance
+POST /observatory/api/offers/<key>/decide   {"action":"accept|reject|snooze",
+                                             "edits": {...}, "note": "",
+                                             "days": 30}
+POST /observatory/api/offers/generate       import/re-rank the latest artifact
+GET  /observatory/api/interests/stats?window=7d|30d|Nd|all
+POST /observatory/api/interests             create   (GET on the same path
+                                                      still lists interests)
+POST /observatory/api/interests/<key>       update, or {"active": false} to
+                                                      retire / true to un-retire
+POST /observatory/api/interests/<key>/revive   one-click undo of an auto-pause
+GET  /observatory/api/edges?min_weight=&kind=
+```
+
+`accept` with `edits` is "edit, then accept" in one request. Every write goes
+through `discovery/offers.py` (decisions, lifecycle) and
+`discovery/interest_sync.py` (interests.json + DB), never around them — so a
+retire made here survives the next `python -m app sync`, which a database-only
+retirement deliberately would not.
+
+Writes are JSON only (`Content-Type: application/json`, else 415 — that check
+is the CSRF boundary for a localhost-bound API) and are **refused in
+`--public` mode** unless `DISCOVERY_UI_ALLOW_PUBLIC_WRITES=1`: the tunnel
+exists for reading the Observatory from a phone, not for rewriting
+`interests.json`. Reads keep the existing posture. Optional
+`"expected_mtime"` on any interests write is a stale-editor precondition — a
+form opened before someone hand-edited `interests.json` gets a 409 instead of
+clobbering that edit.
+
+Tests: `python test_observatory_manage.py` — 61 offline cases, same ASGI
+client idiom, mixed Hebrew/English fixtures, no browser.
+
 ### Observatory frontend (`observatory/frontend/`)
 
 React + TypeScript + React Flow (`@xyflow/react`) + ELK.js (`elkjs`), built
@@ -838,7 +920,11 @@ offline via Datasette's own ASGI test client — see
 [Observatory](#observatory)); both are separate suites, so
 `test_discovery.py` stays importable and green on a machine without
 `datasette` installed. `test_observatory.py` skips itself with a loud
-message instead of failing if `datasette` isn't installed.
+message instead of failing if `datasette` isn't installed. The write API has
+its own suite alongside it — `python test_observatory_manage.py` (61 tests,
+see [Observatory write API](#observatory-write-api)) — kept separate because
+it needs a writable fixture db plus a writable `interests.json`, and it skips
+the same way.
 
 A fourth, separate suite — `python test_observatory_e2e.py` (real headless
 Chrome over CDP) — is not part of this always-run list: it needs a built
@@ -946,3 +1032,60 @@ This worktree has no `discovery.db`, so every number above comes from
 synthetic in-memory fixtures in `test_discovery.py`'s `ExplorationLaneTests`
 -- not a real-corpus reading. Live readout once dynamic interests are
 running for real: `python -m app stats --days 7`, EXPLORATION section.
+
+
+## Interest offers (contract v2)
+
+The `ai` repo can also publish an evidence-bearing **contract v2** artifact:
+the same schema as the personal-state one plus a `candidates[]` array, each
+candidate a proposed interest with the quotes -- and the conversation ids --
+that produced it. `discovery/personal_state.py` reads both versions
+(`SUPPORTED_VERSIONS = {1, 2}`); `discovery/offers.py` is what turns
+candidates into offers you decide on.
+
+```bash
+python -m app offers --import                 # import the artifact (idempotent per sha256)
+python -m app offers                          # the inbox: what you're being asked to decide
+python -m app offers --why KEY                # quotes, conversations, every score term, event chain
+python -m app offers --accept KEY             # prints the interests.json entry it becomes
+python -m app offers --reject KEY             # and blocks its terms for 180 days
+python -m app offers --snooze KEY             # ask me again in 30 days
+python -m app offers --sweep                  # the timers: expiry, decay, auto-pause
+python -m app offers --undo KEY               # one-click undo of an auto-pause
+```
+
+The artifact path comes from `DISCOVERY_INTEREST_CANDIDATES` (default
+`interest_candidates.json` at the repo root -- gitignored, inbound only). An
+import is a no-op after the first time it sees a given file's sha256, so a
+re-run, a double copy, or a re-copied half-written file cannot duplicate an
+offer.
+
+**Ranking is arithmetic, never a model call.** `offers.py` holds no provider
+and makes no network call: the model rates (`expected_yield`, and the
+similarity of a candidate to each existing interest), and code ranks --
+evidence strength .30, recurrence .15, recency .15, novelty .20, expected
+yield .20, floored at .45 with a durability gate (3 conversations across 2
+months, or a deep 2-conversation dive). At most five offers reach the inbox
+per run, one slot reserved for the deliberately exploratory pick.
+
+Dedup against what you already follow is **semantic, not exact-hash**: a key
+that normalizes onto an existing interest is dropped, a candidate whose
+signals overlap an active interest by half or more is attached to it as
+evidence instead of being offered, and a candidate the producer scored >= .70
+similar to something you already follow never becomes an offer -- in either
+language.
+
+**Decay, and the reversible auto-pause.** `--sweep` also runs the interest
+half of the lifecycle. An interest with no item above its bar for 30 days
+becomes `decaying` and raises a retirement offer; at 45 days it **auto-pauses
+itself, announces that it did, and can be undone with one click**
+(`--undo KEY`, which also restarts its silence clock and closes the
+retirement offer). Two refusals to judge are built in: nothing is paused when
+the pipeline itself has scored nothing recently (it can be paused for days --
+that is the pipeline being quiet, not the interest), and nothing is paused
+before at least five items have ever been attributed to it.
+
+Accepting an offer does not itself write `interests.json` or the `interests`
+table -- that is the sync/write-API path; `accept()` returns the entry and
+takes an optional `sync` callable, and `offers.activate()` starts the
+interest's lifecycle once its row exists.

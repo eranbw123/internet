@@ -104,6 +104,14 @@ def init(conn):
         ("interests", "last_observed_at", "TEXT"),
         ("candidate_items", "duplicate_of", "INTEGER REFERENCES candidate_items(id)"),
         ("candidate_items", "dup_reason", "TEXT"),
+        # Offers (discovery/offers.py). `parent_key` carries an accepted
+        # offer's single-level hierarchy; `lifecycle` is the post-acceptance
+        # half of the offer state machine (active|decaying|paused|retired),
+        # deliberately orthogonal to `layer` -- an owner row's layer is
+        # immutable by trigger, but its lifecycle is exactly what the
+        # decay/auto-pause sweep moves.
+        ("interests", "parent_key", "TEXT"),
+        ("interests", "lifecycle", "TEXT NOT NULL DEFAULT 'active'"),
     ):
         try:
             conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {decl}")
@@ -117,11 +125,15 @@ def init(conn):
 
 # --- interests ---------------------------------------------------------------
 
-def upsert_interest(conn, interest):
+def upsert_interest(conn, interest, active=1):
     """Insert or update by `key`. interests.json is the source of truth, so a
-    re-load overwrites the stored copy rather than merging. Always writes
-    layer='owner'; the ON CONFLICT branch only fires `WHERE layer = 'owner'`,
-    so this can never overwrite a derived row (structurally impossible
+    re-load overwrites the stored copy rather than merging. `active` defaults
+    to 1 (every pre-sync-v2 call site is byte-identical); sync v2 passes 0 for
+    an entry the file marks `"active": false`, so retiring an interest in the
+    file and re-writing its definition are one atomic row write rather than an
+    insert that briefly reactivates it. Always writes layer='owner'; the ON
+    CONFLICT branch only fires `WHERE layer = 'owner'`, so this can never
+    overwrite a derived row (structurally impossible
     anyway -- interests.load_file() rejects an owner key carrying
     DERIVED_KEY_PREFIX -- but guarded here too, defense in depth)."""
     conn.execute(
@@ -129,7 +141,7 @@ def upsert_interest(conn, interest):
         INSERT INTO interests
             (key, title, description, positive_signals, negative_signals,
              min_score, sources, source_config, active, layer)
-        VALUES (?, ?, ?, ?, ?, ?, ?, ?, 1, 'owner')
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'owner')
         ON CONFLICT(key) DO UPDATE SET
             title = excluded.title,
             description = excluded.description,
@@ -138,7 +150,7 @@ def upsert_interest(conn, interest):
             min_score = excluded.min_score,
             sources = excluded.sources,
             source_config = excluded.source_config,
-            active = 1,
+            active = excluded.active,
             layer = 'owner'
         WHERE interests.layer = 'owner'
         """,
@@ -151,6 +163,7 @@ def upsert_interest(conn, interest):
             interest.min_score,
             json.dumps(interest.sources),
             json.dumps(interest.source_config),
+            active,
         ),
     )
     conn.commit()
@@ -566,6 +579,9 @@ def notification_id_for_score(conn, score_id):
     return row["id"] if row else None
 
 
+# HELD: n-delivery -- schema/semantics of `feedback` may change under the pending
+# Output Layer decision; read entry 'n-delivery' in C:\Users\eranb\.claude\held\HELD.md
+# before extending feedback writes or building delivery-engagement learning on them.
 def add_feedback(conn, item_id, interest_id, verdict, note="", original_score=None):
     cur = conn.execute(
         """

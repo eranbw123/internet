@@ -3,6 +3,11 @@
 `python -m app <command>` is the same CLI under a shorter name.
 
     init          create/upgrade discovery.db and load interests.json
+    sync          reconcile interests.json into the DB at runtime: upsert
+                  edits, deactivate entries the file dropped or marked
+                  "active": false, and cancel those interests' pending
+                  missions. --dry-run prints the plan; --force overrides
+                  the truncated-file guard. No re-init, no manual DB op
     run-once      one collect -> score -> notify cycle (--source to limit
                   collection to one collector; Alerts still send immediately,
                   Discovery items still just queue for `digest`). Gated by a
@@ -32,6 +37,12 @@
                   promotion/decay (a no-op unless DISCOVERY_DYNAMIC_INTERESTS)
     health        job staleness, provider reachability, pending sends;
                   --notify alerts on degraded/recovery (rate-limited)
+    pause         freeze the LLM-spending scheduled commands: run-once,
+                  web-tick and digest exit immediately (0 tokens, no
+                  provider construction) until `resume`; `listen --drain`
+                  and `health` keep running so feedback buttons and the
+                  remote resume path stay alive. --why records a note.
+    resume        lift `pause`
     personal-state  print the ai repo's personal-state contract artifact
     teach         rank scored-but-unlabeled items by expected information
                   value and record labels; --list/--explain/--send
@@ -39,6 +50,12 @@
                   Datasette UI + JSON API over the trace tables, bound to
                   localhost by default; --public additionally requires
                   DISCOVERY_UI_TOKEN and DISCOVERY_NGROK_CMD (see README)
+    offers        AI-generated interest offers (discovery/offers.py): the
+                  inbox (--status), one offer's provenance (--why KEY),
+                  --import [PATH] a contract-v2 candidates artifact,
+                  --sweep the expiry/decay/auto-pause timers, and the
+                  decisions --accept/--reject/--snooze KEY, plus --undo KEY
+                  for the one-click undo of an auto-pause
 
 There is no `run`/scheduler loop -- an OS scheduler (see
 ops/install_tasks.py) calls the commands above on their own cadence instead;
@@ -52,13 +69,14 @@ from collections import Counter
 
 from datetime import datetime, timezone
 
-from . import config, db, feedback_listener, health, interests, missions, personal_state, providers, stats, teach, trace
+from . import config, db, feedback_listener, health, interests, missions, offers, personal_state, providers, stats, teach, trace
 from .collectors import COLLECTORS
 from .models import CandidateItem
 from .notify import FEEDBACK_VERDICTS, print_safe
 from .personal_state import PersonalStateError
 from .pipeline import Budget, deliver, ingest, outcome_metric, run_once, send_digest
 from . import interest_state
+from . import interest_sync
 
 
 def main(argv=None):
@@ -72,6 +90,20 @@ def main(argv=None):
     sub = parser.add_subparsers(dest="command", required=True)
 
     sub.add_parser("init", help="create the DB and load interests.json")
+    sy = sub.add_parser(
+        "sync",
+        help="reconcile interests.json into the DB now -- upsert, and deactivate what the file dropped",
+    )
+    sy.add_argument(
+        "--force", action="store_true",
+        help="apply even when the mass-deactivation guard trips (truncated-file protection)",
+    )
+    sy.add_argument(
+        # default=SUPPRESS so the flag can also be given before the subcommand
+        # (`--dry-run sync`), same reason trace-fixture's --db does it.
+        "--dry-run", action="store_true", default=argparse.SUPPRESS,
+        help="print the plan and write nothing",
+    )
     ro = sub.add_parser("run-once", help="one cycle")
     ro.add_argument(
         "--source", choices=sorted(COLLECTORS), help="collect only this collector's items"
@@ -115,6 +147,11 @@ def main(argv=None):
         "--notify", action="store_true",
         help="alert on degraded/recovery over Telegram, rate-limited",
     )
+    pa = sub.add_parser(
+        "pause", help="freeze run-once/web-tick/digest until `resume` (0 LLM spend)"
+    )
+    pa.add_argument("--why", default="", help="optional note echoed by health and the skip message")
+    sub.add_parser("resume", help="lift `pause`")
     it = sub.add_parser(
         "interests", help="layered interest state: list, --why <key>, --refresh"
     )
@@ -160,6 +197,21 @@ def main(argv=None):
         "--public", action="store_true",
         help="expose via ngrok, token-gated -- requires DISCOVERY_UI_TOKEN and DISCOVERY_NGROK_CMD",
     )
+    of = sub.add_parser(
+        "offers", help="interest offers: inbox, import, decisions, and the lifecycle sweeps"
+    )
+    of.add_argument("--status", help="filter the listing (default: the 'offered' inbox)")
+    of.add_argument("--why", metavar="KEY", help="print one offer's evidence, scores and event chain")
+    of.add_argument(
+        "--import", dest="import_path", nargs="?", const="", metavar="PATH",
+        help="import a contract-v2 candidates artifact (default: cfg.interest_candidates_path)",
+    )
+    of.add_argument("--sweep", action="store_true", help="run the expiry/decay/auto-pause timers")
+    of.add_argument("--accept", metavar="KEY", help="accept an offer (prints the interests.json entry)")
+    of.add_argument("--reject", metavar="KEY", help="reject an offer and block its terms")
+    of.add_argument("--snooze", metavar="KEY", help="snooze an offer back into the inbox later")
+    of.add_argument("--undo", metavar="KEY", help="undo an interest's auto-pause")
+    of.add_argument("--note", default="", help="note recorded with a decision")
 
     args = parser.parse_args(argv)
     if args.command == "trace-fixture" and not args.db:
@@ -207,17 +259,28 @@ def main(argv=None):
         conn.close()   # Windows keeps the .db file locked otherwise
 
 
+# Commands that spend LLM/API calls when the OS scheduler fires them. `pause`
+# freezes exactly these; `listen --drain` (one free Telegram getUpdates -- it
+# keeps feedback buttons responsive while paused) and `health` (free local
+# checks, pause-aware in health.check) deliberately keep running.
+PAUSE_GATED = ("run-once", "web-tick", "digest")
+
+
 def _dispatch(conn, cfg, args, provider):
+    # Checked before any provider construction or _run_job heartbeat: a gated
+    # invocation is a deliberate no-op, not a run -- run_ok/last_ok would lie.
+    if args.command in PAUSE_GATED and db.state_get(conn, "paused") == "1":
+        why = db.state_get(conn, "paused_why") or ""
+        note = f" ({why})" if why else ""
+        print(f"paused{note} -- {args.command} skipped; `python -m app resume` lifts it")
+        return 0
     if args.command == "init":
-        try:
-            count = interests.sync(conn, cfg.interests_path)
-        except FileNotFoundError:
-            print(f"interests file not found: {cfg.interests_path}", file=sys.stderr)
+        result = _sync_interests(conn, cfg)
+        if result is None:
             return 2
-        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
-            print(f"malformed interests file {cfg.interests_path}: {e}", file=sys.stderr)
-            return 2
-        print(f"{cfg.db_path}: schema ready, {count} interests loaded")
+        print(f"{cfg.db_path}: schema ready, {result.describe()}")
+    elif args.command == "sync":
+        return _sync_cmd(conn, cfg, args)
     elif args.command == "run-once":
         sources = [args.source] if args.source else None
         job_name = health.job_name_for_source(args.source)
@@ -252,6 +315,17 @@ def _dispatch(conn, cfg, args, provider):
         print_safe(stats.report(conn, args.days, cfg))
     elif args.command == "health":
         return _health_cmd(conn, cfg, provider(), args)
+    elif args.command == "pause":
+        db.state_set(conn, "paused", "1")
+        db.state_set(conn, "paused_why", args.why)
+        print(
+            "paused -- run-once/web-tick/digest exit immediately until `resume`"
+            " (feedback drain and health keep running)"
+        )
+    elif args.command == "resume":
+        db.state_set(conn, "paused", "0")
+        db.state_set(conn, "paused_why", "")
+        print("resumed")
     elif args.command == "interests":
         return _interests_cmd(conn, cfg, args)
     elif args.command == "personal-state":
@@ -264,6 +338,8 @@ def _dispatch(conn, cfg, args, provider):
         print(trace_fixture.build(conn, cfg))
     elif args.command == "ui":
         return _ui_cmd(cfg, args)
+    elif args.command == "offers":
+        return _offers_cmd(conn, cfg, args)
     return 0
 
 
@@ -461,6 +537,45 @@ def _list_items(conn, limit, min_score):
         print_safe(f"      {row['url']}")
 
 
+def _sync_interests(conn, cfg, force=False):
+    """Shared by `init` and `sync`: run sync v2, or print why it could not and
+    return None so the caller exits 2. A malformed/absent file must never fall
+    through to a deactivation pass."""
+    try:
+        return interest_sync.sync(conn, cfg.interests_path, force=force)
+    except FileNotFoundError:
+        print(f"interests file not found: {cfg.interests_path}", file=sys.stderr)
+    except interest_sync.SyncRefused as e:
+        print(f"sync refused: {e}", file=sys.stderr)
+    except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+        print(f"malformed interests file {cfg.interests_path}: {e}", file=sys.stderr)
+    return None
+
+
+def _sync_cmd(conn, cfg, args):
+    """`python -m app sync` -- the runtime half of sync v2. Editing
+    interests.json and running this takes effect on the next pipeline cycle
+    (db.active_interests() reads the DB live); no re-init, no hand-written
+    UPDATE, no redeploy."""
+    if args.dry_run:
+        try:
+            planned = interest_sync.plan(conn, cfg.interests_path)
+        except FileNotFoundError:
+            print(f"interests file not found: {cfg.interests_path}", file=sys.stderr)
+            return 2
+        except (json.JSONDecodeError, KeyError, TypeError, ValueError) as e:
+            print(f"malformed interests file {cfg.interests_path}: {e}", file=sys.stderr)
+            return 2
+        print(f"dry run -- {planned.changes} changes, nothing written")
+        print(planned.describe())
+        return 0
+    result = _sync_interests(conn, cfg, force=args.force)
+    if result is None:
+        return 2
+    print(result.describe())
+    return 0
+
+
 def _interests_cmd(conn, cfg, args):
     if args.why:
         return _interests_why(conn, args.why)
@@ -633,6 +748,102 @@ def _launch_ngrok(cfg, port):
         print(f"ui --public: failed to launch ngrok ({cmd_str!r}): {e}", file=sys.stderr)
         return False
     return True
+
+
+def _offers_cmd(conn, cfg, args):
+    """One subcommand over discovery/offers.py. Every branch is offline:
+    importing reads a local artifact, the sweeps read the funnel, and the
+    decisions write only the offer/interest tables -- no provider is ever
+    built, no model is ever called."""
+    if args.why:
+        return _offer_why(conn, args.why)
+    if args.import_path is not None:
+        path = args.import_path or cfg.interest_candidates_path
+        summary = offers.import_artifact(conn, path, interests_path=cfg.interests_path)
+        print_safe(json.dumps(summary, ensure_ascii=False, indent=2))
+        return 0
+    if args.sweep:
+        summary = offers.sweep(conn)
+        for announcement in summary["announcements"]:
+            print_safe(announcement["text"])
+        print_safe(json.dumps(
+            {k: v for k, v in summary.items() if k != "announcements"}, ensure_ascii=False
+        ))
+        return 0
+    for key, action in (
+        (args.accept, "accept"), (args.reject, "reject"),
+        (args.snooze, "snooze"), (args.undo, "undo"),
+    ):
+        if key:
+            return _offer_decide(conn, cfg, key, action, args.note)
+    return _offers_list(conn, args.status)
+
+
+def _offers_list(conn, status):
+    rows = offers.list_offers(conn, status=status or offers.OFFERED)
+    if not rows:
+        print_safe(f"no offers with status '{status or offers.OFFERED}'")
+        return 0
+    for row in rows:
+        score = "  -  " if row["score"] is None else f"{row['score']:.2f}"
+        print_safe(
+            f"{row['key']}  {row['kind']}  score={score}  status={row['status']}  "
+            f"evidence={len(row['evidence'])} quote(s) from "
+            f"{len(row['source_conversations'])} conversation(s)"
+        )
+    return 0
+
+
+def _offer_why(conn, key):
+    """The provenance answer for one offer: which conversations, which
+    verbatim quotes, every score term, and the whole event chain."""
+    detail = offers.offer_detail(conn, key)
+    if detail is None:
+        print(f"no offer with key {key!r}", file=sys.stderr)
+        return 2
+    print_safe(f"{detail['key']}  ({detail['kind']}, {detail['status']})")
+    print_safe(f"  title: {detail['title']}")
+    if detail["score"] is not None:
+        print_safe(f"  score: {detail['score']:.3f}")
+        print_safe(f"  terms: {json.dumps(detail['score_terms'], ensure_ascii=False)}")
+    print_safe(f"  durability: {json.dumps(detail['durability'], ensure_ascii=False)}")
+    print_safe(f"  similarity: {json.dumps(detail['similarity'], ensure_ascii=False)}")
+    print_safe(f"  conversations: {', '.join(detail['source_conversations']) or '-'}")
+    for quote in detail["evidence"]:
+        print_safe(
+            f"  [{quote['date']}] ({quote['lang']}, depth {quote['depth']:.2f}, "
+            f"conv {quote['conversation_id'] or '-'}) {quote['quote']}"
+        )
+    for event in detail["events"]:
+        print_safe(
+            f"  {event['at']}  {event['actor']}  {event['action']}  "
+            f"{event['from_status'] or '-'} -> {event['to_status'] or '-'}"
+        )
+    return 0
+
+
+def _offer_decide(conn, cfg, key, action, note):
+    try:
+        if action == "accept":
+            result = offers.accept(conn, key, note=note)
+            print_safe(json.dumps(result["entry"], ensure_ascii=False, indent=2))
+            print_safe(
+                "accepted -- the interests sync writes it into interests.json and the DB "
+                "(offers.activate() then starts its lifecycle)"
+            )
+        elif action == "reject":
+            result = offers.reject(conn, key, note=note, interests_path=cfg.interests_path)
+            print_safe(f"rejected {key} -- blocked terms: {', '.join(result['blocked_terms'])}")
+        elif action == "snooze":
+            result = offers.snooze(conn, key, note=note)
+            print_safe(f"snoozed {key} until {result['snoozed_until']}")
+        else:
+            offers.undo_auto_pause(conn, key, note=note)
+            print_safe(f"{key} is active again -- the silence clock restarts from now")
+    except offers.OfferError as e:
+        print(f"{action} failed: {e}", file=sys.stderr)
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

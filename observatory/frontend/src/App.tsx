@@ -7,6 +7,7 @@ import { CompareView } from "./compare/CompareView";
 import { InterestsWorkspace } from "./interests/InterestsWorkspace";
 import { formatHash, parseHash, readBootstrap } from "./deepLink";
 import { useIsMobile } from "./useIsMobile";
+import { ThemeToggle } from "./ThemeToggle";
 import type { GraphSeed } from "./graph/useGraphData";
 import type { ID, Tab } from "./types";
 
@@ -197,6 +198,7 @@ export function App() {
           {interestsOpen ? "Close interests" : "Interests"}
         </button>
         <button onClick={() => setCompareOpen((v) => !v)}>{compareOpen ? "Close compare" : "Compare"}</button>
+        <ThemeToggle />
       </header>
       {interestsOpen ? (
         <div className="app-body">

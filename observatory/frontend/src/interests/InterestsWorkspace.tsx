@@ -109,13 +109,15 @@ export function InterestsWorkspace({ onClose }: { onClose?: () => void }) {
         const blocked = res.blocked_terms?.length ?? 0;
         note(`Rejected ${d.offer.key}${blocked ? ` and blocked ${blocked} terms for 180 days` : ""}.`);
       } else if (d.action === "retire") {
+        // A retirement offer is NOT accepted through the decide endpoint --
+        // that endpoint's accept path builds an interest out of the offer, and
+        // a retirement offer describes an interest that already exists, so the
+        // server refuses it with a 400 that says so. The retirement is the
+        // lifecycle write, and the server closes the open proposal as part of
+        // it (the mirror of what revive does on the way back up), so this is
+        // one call and the inbox stops asking.
         const target = retireTargetKey(d.offer);
-        await client.decideOffer(d.offer.id, { action: "accept", note: "retire confirmed" });
-        const fresh = await client.interestStats("7d");
-        const row = fresh.interests.find((i) => i.key === target);
-        if (row && row.lifecycle !== "retired") {
-          await client.updateInterest(target, { lifecycle: "retired" });
-        }
+        await client.updateInterest(target, { lifecycle: "retired" });
         note(`Retired ${target}. It keeps its history and stops collecting.`);
       } else if (d.action === "lower-bar") {
         const target = retireTargetKey(d.offer);

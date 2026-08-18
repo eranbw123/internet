@@ -127,6 +127,9 @@ CREATE TABLE IF NOT EXISTS notifications (
     attempts  INTEGER NOT NULL DEFAULT 1
 );
 
+-- HELD: n-delivery -- do not alter this table or build delivered-item engagement
+-- learning before reading entry 'n-delivery' in C:\Users\eranb\.claude\held\HELD.md.
+-- The *unit* of feedback may change under the pending Output Layer decision.
 CREATE TABLE IF NOT EXISTS feedback (
     id              INTEGER PRIMARY KEY,
     item_id         INTEGER NOT NULL REFERENCES candidate_items(id),
@@ -312,3 +315,77 @@ CREATE TABLE IF NOT EXISTS model_calls (
 );
 
 CREATE INDEX IF NOT EXISTS idx_model_calls_node ON model_calls(trace_node_id);
+
+-- AI-generated interest offers (discovery/offers.py). One row per proposed
+-- interest, carrying the evidence that produced it: verbatim quotes from the
+-- owner's own conversations plus the conversation ids they came from, the
+-- durability counts behind them, and every term of the composite score, so
+-- the inbox can answer "why is this being offered?" without joining back to
+-- the `ai` repo. `key` is UNIQUE: an artifact re-proposing a theme that was
+-- already offered, accepted or rejected updates nothing (the importer never
+-- mutates a row past 'proposed'), which is what makes a repeated import a
+-- no-op. Retirement offers raised by the decay sweep are keyed
+-- 'retire:<interest_key>' so they can never collide with a new-interest
+-- offer for the same theme.
+CREATE TABLE IF NOT EXISTS interest_offers (
+    id                   INTEGER PRIMARY KEY,
+    key                  TEXT NOT NULL UNIQUE,
+    kind                 TEXT NOT NULL DEFAULT 'new',   -- new|bridge|merge|split|revive|retire
+    title                TEXT NOT NULL,
+    description          TEXT NOT NULL DEFAULT '',
+    positive_signals     TEXT NOT NULL DEFAULT '[]',    -- JSON array
+    negative_signals     TEXT NOT NULL DEFAULT '[]',    -- JSON array
+    suggested_min_score  REAL,
+    suggested_sources    TEXT NOT NULL DEFAULT '["web_search"]',  -- JSON array
+    parent_key           TEXT,                          -- single-level hierarchy
+    related_keys         TEXT NOT NULL DEFAULT '[]',    -- JSON array (bridge parents, merge targets)
+    score                REAL,                          -- composite, computed here
+    score_terms          TEXT NOT NULL DEFAULT '{}',    -- JSON: every term of it, for the UI
+    evidence             TEXT NOT NULL DEFAULT '[]',    -- JSON [{date, quote, lang, depth, conversation_id}]
+    source_conversations TEXT NOT NULL DEFAULT '[]',    -- JSON array of the distinct conversation ids above
+    durability           TEXT NOT NULL DEFAULT '{}',    -- JSON {n_convs, active_months, span_days, recency_days}
+    similarity           TEXT NOT NULL DEFAULT '[]',    -- JSON [{key, sim}] against existing interests
+    exploratory          INTEGER NOT NULL DEFAULT 0,    -- the run's deliberate serendipity pick
+    status               TEXT NOT NULL DEFAULT 'proposed',
+                         -- proposed|offered|accepted|rejected|snoozed|expired
+    snoozed_until        TEXT,
+    artifact_sha256      TEXT NOT NULL DEFAULT '',      -- '' for sweep-raised offers
+    generated_at         TEXT NOT NULL DEFAULT '',
+    created_at           TEXT NOT NULL,
+    decided_at           TEXT,
+    decided_note         TEXT NOT NULL DEFAULT ''
+);
+
+CREATE INDEX IF NOT EXISTS idx_interest_offers_status ON interest_offers(status, score);
+
+-- Append-only lifecycle log for offers, mirroring interest_events. Nothing
+-- ever UPDATEs or DELETEs a row here. `actor` is generator|importer|owner_ui|
+-- timer|pipeline.
+CREATE TABLE IF NOT EXISTS offer_events (
+    id           INTEGER PRIMARY KEY,
+    at           TEXT NOT NULL,
+    offer_key    TEXT NOT NULL,
+    actor        TEXT NOT NULL,
+    action       TEXT NOT NULL,
+    from_status  TEXT,
+    to_status    TEXT,
+    detail       TEXT NOT NULL DEFAULT '{}'             -- JSON
+);
+
+CREATE INDEX IF NOT EXISTS idx_offer_events_key ON offer_events(offer_key);
+
+-- Connections between interests. Written by the nightly lift computation and
+-- the weekly semantic pass (both later PRs); the table lands here so the
+-- schema is complete in one migration. Raw keyword co-match is deliberately
+-- NOT a source: 97% of items match >=2 interests, so it measures the
+-- matcher's looseness, not a relationship.
+CREATE TABLE IF NOT EXISTS interest_edges (
+    id           INTEGER PRIMARY KEY,
+    a_key        TEXT NOT NULL,
+    b_key        TEXT NOT NULL,
+    kind         TEXT NOT NULL,              -- co_engagement|semantic|bridge_offer|parent
+    weight       REAL NOT NULL,
+    evidence     TEXT NOT NULL DEFAULT '{}', -- JSON: lift, shared items, or bridging quotes
+    computed_at  TEXT NOT NULL,
+    UNIQUE(a_key, b_key, kind)
+);

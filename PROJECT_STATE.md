@@ -1,6 +1,33 @@
 # PROJECT_STATE.md — `internet`
 
-Updated 2026-08-12. Imported by `CLAUDE.md`. Current state only — not a log.
+Updated 2026-08-13. Imported by `CLAUDE.md`. Current state only — not a log.
+
+## pause switch (owner token freeze)
+`python -m app pause [--why]` / `resume` set `service_state` keys
+`paused`/`paused_why`. `__main__.PAUSE_GATED` = run-once/web-tick/digest:
+while paused each exits 0 at the very top of `_dispatch` — before provider
+construction and before `_run_job`, so no `run_ok`/`last_ok` is stamped for
+a skipped run. `listen --drain` and `health` deliberately keep running
+(free — feedback buttons and the remote resume path stay alive).
+`health.check` is pause-aware: staleness/provider never set `degraded`
+while paused, the provider preflight is skipped ("not checked (paused)"),
+and `format_report` leads with a PAUSED line. The flag is the guarantee —
+it works even when `schtasks /change` is ACCESS DENIED (tasks registered
+from an elevated shell deny an unelevated process; observed live
+2026-08-13 until a task re-registration made them changeable again).
+Telegram control lives in engine-control: global `/pause` · `/resume`
+(all-stop: worker dispatch + this flag + best-effort `schtasks
+/disable|/enable` over the six tasks, via `newsops.pause/resume`) and
+`/news pause`/`/news resume` for the appliance alone. While fully paused
+the feedback drain task is disabled too — product-bot button presses
+queue on Telegram (~24h retention) and are drained after resume.
+Live-verified 2026-08-13 through the real scheduled task ("web-tick
+skipped" in the task log). `internet-discovery-update` (the 30-min
+self-updater; its `self_update.py` re-registers ALL tasks via
+`install_tasks.py --install` on every run, resetting manual task state)
+is deliberately NOT in the pause/resume task set and was disabled outright
+2026-08-13 (owner all-stop); re-enable: `schtasks /change /tn
+internet-discovery-update /enable`. 3 new CLITests (492 → 495).
 
 ## provider fallback
 `discovery/providers/fallback.py`: `FallbackProvider` wraps two real providers;
@@ -1053,6 +1080,23 @@ drain instead of lost. Send-retry policy moved onto `Config`
 3/15min module-constant defaults, which stay as `db.pending_notifications`'s
 own fallback); `pipeline._send_one` bumps `send_failed` on a failed send.
 
+## hidden task launch (2026-08-13): no console windows from scheduled tasks
+`ops/hidden.vbs` (new) + `install_tasks._action_command()`: every task action
+is now `wscript.exe //B //Nologo ops\hidden.vbs cmd.exe /d /c ops\<script> ...`
+— wscript is a GUI-subsystem host, so no console ever flashes in the
+interactive session (`collect-web` fires every 60s; the owner was seeing a
+cmd window blink each time). hidden.vbs waits on the child and propagates
+its exit code, so IgnoreNew/RestartOnFailure/Last Result are unchanged.
+Machine-wide convention, not just this repo: `C:\projects\engine-control`
+(control.py tick/listener installers + claude_runner.py's ec-* task lane,
+which now writes a `launch.cmd` into the run's artifact dir to stay under
+schtasks' ~240-char /tr cap) and `C:\Users\eranb\ssh_watch` each carry their
+own copy of hidden.vbs. Any future Scheduled Task (engine-lab one-shots
+included) must launch through it. Elevation trap: tasks registered from an
+elevated shell can't be overwritten unelevated (`--install` fails Access
+denied); fix is a one-time elevated delete, then unelevated re-create.
+1 new test (`test_action_launches_hidden_via_wscript`).
+
 ## personal-state contract (consumer side)
 `discovery/personal_state.py` is the ONLY reader of the `ai` repo's derived
 personal-state artifact (schema owned by `ai`'s `PERSONAL_STATE_CONTRACT.md`);
@@ -1124,9 +1168,58 @@ collectors already fetch — no new collector call); promotion past
 at/above today's owner bars). CLI: `python -m app interests [--layer L]
 [--why KEY] [--refresh]` — list (owner first), provenance chain, or run
 `apply_transitions` (prints the off-message and changes nothing if the flag
-is off). `interests.sync` now appends one 'owner_sync' event per interest.
+is off). `interests.sync` now appends one 'owner_sync' event per interest (superseded
+by sync v2 below: one event per actual change).
 Scheduling the refresh on a cadence is deferred to a later step — not
 wired into `ops/install_tasks.py` here.
+
+## interest sync v2 (deactivation-aware, callable)
+`discovery/interest_sync.py` — `interests.json` is now the source of truth in
+BOTH directions. v1 only ever inserted/updated, so an interest deleted from
+the file kept collecting and spending until somebody hand-ran an UPDATE on the
+live DB (that is what the 13 `active=0` owner rows in production are, and why
+the standing procedure was "JSON PR **and** a live-DB op" — obsolete now).
+`plan(conn, path)` computes the reconciliation without writing;
+`apply(conn, plan, force)` writes it; `sync()` is both. New entry → created
+live; entry saying nothing about `active` → definition updated, **liveness
+untouched** (an auto-paused interest stays paused — sync must not fight the
+decay sweep); `"active": false` (new optional field, read three-way by
+`interests.load_stated_active`, mirroring `load_blocked`) → retired,
+definition intact; `"active": true` → forced live, overruling the sweep;
+present again after being retired → revived; absent → retired. Retiring
+cancels the interest's PENDING `search_missions` (RUNNING is left alone — its
+lease owns that row).
+
+**Liveness is never written here.** Retirement/revival go through
+`offers.set_lifecycle()`, so there is one deactivation mechanism and
+`lifecycle`/`active` can never disagree; this module owns the reconciliation
+(what the file says), `offers.py` owns the state machine (what happens to an
+interest once it exists). The seam runs both ways: `entry_writer(conn, path)`
+is the callable `offers.accept(sync=...)` takes — entry into interests.json,
+sync into the DB, `offers.activate()` finds its row — and `write_entry()` /
+`set_entry_active()` are the atomic interests.json writers (same shape as
+`offers.append_blocked_terms`). A retirement made only in the DB while the
+file still carries the entry is reverted by the next sync **by design**: the
+file is the source of truth, so the write API (PR J) must call
+`set_entry_active()` alongside every retire/undo.
+
+One `owner_sync` `interest_events` row per *actual* change (`create`/`update`
+from here, `reactivate`/`deactivate` from `set_lifecycle`, carrying the
+changed fields or the reason plus missions cancelled); an unchanged file
+writes nothing, so repeat runs are free. Only `layer='owner'` rows are
+visible; derived rows stay `interest_state.py`'s. Guard: a run that would
+retire >50% of the non-retired set (above 3) raises `SyncRefused` unless
+forced — a truncated/half-written file must not retire the engine. Migration
+owned by this module (`MIGRATION`/`migrate()`, additive ALTER applied on
+demand by every `plan()`, deliberately NOT in `db.init()`'s pass, so it stays
+clear of the offers store's columns): `interests.synced_at`.
+`db.upsert_interest` gained `active=1` (every prior call site unchanged).
+CLI `python -m app sync [--dry-run] [--force]`; `init` routes through the same
+call and reports what it reconciled. Rehearsed on a copy of the production DB:
+the first run retires the 13 owner rows that were hand-deactivated by live-DB
+ops (PR H's backfill had set them all `lifecycle='active'` while `active=0`),
+writes 13 provenance events, and touches none of the 153 pending missions;
+the second run is a no-op. 32 new tests (green).
 
 ## engine lab (`experiments/lab/`, branch `engine-lab`)
 Reusable prompt-optimization loop for the whole engine, generalized from the
@@ -1459,3 +1552,217 @@ gates which derived scores can notify at all; this step only needed distinct
 in `test_discovery.py`'s `ExplorationLaneTests` is a synthetic in-memory
 fixture. Live readout once dynamic interests are running for real:
 `python -m app stats --days 7`, EXPLORATION section.
+
+
+## observatory dark mode (PR K) -- FOUNDATIONS LANDED, MIGRATION DEFERRED
+
+`observatory/frontend/src/tokens.css` is now the only place a colour is
+allowed to be written. ~60 semantic tokens (surfaces, lines, ink, accent,
+status/severity, group, JSON syntax, search highlight, the six swimlane chart
+tints, graph chrome, effects), defined three times: bare `:root` (complete
+light set), `@media (prefers-color-scheme: dark) { :root:not([data-theme=
+"light"]) }`, and `:root[data-theme="dark"]` last. No colour has its only
+definition inside a theme block -- the theme blocks redefine, never introduce
+-- and `color-scheme` is set in all three so native controls follow.
+
+Theme state is `src/theme.ts` (`observatory-theme` in localStorage, same
+namespace as `observatory-inspector-width`): three states, `system` default,
+`applyTheme()` REMOVES `data-theme` for system rather than writing
+`data-theme="system"` (which would leave the media query's `:not()` matching).
+`src/ThemeToggle.tsx` cycles system -> light -> dark from the app header. A
+four-line inline script in `index.html`, before the module bundle, applies the
+stored choice pre-mount -- that is what stops the reload flash. `App.tsx`
+changed by exactly two lines.
+
+**Scope was deliberate.** Only ONE surface was migrated off literals as proof
+(MonospaceViewer: `.monospace-viewer`, `.viewer-*`, `.json-*`, `.search-hit*`
+-- self-contained, densest literal cluster, its full-screen mode is a whole
+viewport painted only from tokens). 88 literal occurrences remain (78 in
+`styles.css`, 10 in `graph/GraphCanvas.tsx`); the complete literal->token
+mapping table, in migration order, is `observatory/frontend/THEME_MIGRATION.md`.
+Do that as its own PR, after the frontend redesign lands -- it touches nearly
+every line both workstreams touch. Until then two spots look wrong in dark:
+`.graph-toolbar` (white bar, white labels) and the React Flow minimap.
+
+**Three live light-theme AA failures were fixed on the way**, all real defects
+independent of dark mode: `--ok` `#2f9e44` 3.45:1 -> `#1F7A38` 5.39:1,
+the `--active` amber `#f0a500` 2.08:1 -> `--active-text` `#956700` 4.98:1
+(with `--active` `#B87D00` kept as the 3:1 border-stripe variant, since no one
+amber does both jobs on white), and muted text `#98a2b0` 2.58:1 ->
+`--fg-faint` `#697381` 4.81:1 (ten call sites). Every shipped pair is
+re-measured from `tokens.css` itself by
+`test_observatory.py::ObservatoryThemeTokenTests` (15 tests, not gated on
+datasette) -- 104 pair assertions, all >= AA in both themes -- so the palette
+cannot drift. `test_observatory_e2e.py::ObservatoryE2EThemeTests` (4 tests)
+drives the cascade on a real engine via `Emulation.setEmulatedMedia`,
+including explicit-light-on-a-dark-OS and explicit-dark-on-a-light-OS, and
+checks Hebrew/RTL still renders inside the migrated surface.
+## interest offers store + lifecycle (PR H)
+`discovery/offers.py` (new, stdlib-only, **no provider, no LLM/network call
+ever**) is the store for AI-generated interest offers. Schema (additive, via
+`schema.sql` + `db.init`'s ALTER pass): `interest_offers` (key UNIQUE, kind
+new|bridge|merge|split|revive|retire, evidence JSON `[{date, quote, lang,
+depth, conversation_id}]`, `source_conversations`, `score_terms`,
+`durability`, `similarity`, status, `artifact_sha256`), append-only
+`offer_events` (actor generator|importer|owner_ui|timer|pipeline),
+`interest_edges` (empty until PR M), and two columns on `interests`:
+`parent_key` and `lifecycle` (active|decaying|paused|retired, default
+'active' -- deliberately orthogonal to `layer`, whose owner-immutability
+triggers stay untouched). Verified additive against a read-only snapshot of
+the live 93 MB DB: 3 tables + 2 columns added, all 46 interests / 2,114
+scores preserved, every row backfilled to lifecycle='active'.
+
+`personal_state.py` now reads contract v2 (`SUPPORTED_VERSIONS = {1, 2}`):
+v2 adds `candidates[]` beside v1's `topics[]`, and either half may be absent
+(nightly map publishes topics, weekly reduce publishes candidates). Path:
+`DISCOVERY_INTEREST_CANDIDATES` / `cfg.interest_candidates_path`.
+
+State machines, both enforced as data (`TRANSITIONS`,
+`LIFECYCLE_TRANSITIONS`) with one append-only event per move: offers go
+proposed -> offered -> accepted|rejected|snoozed|expired (snoozed wakes back
+to offered; a decided offer can never be re-decided), and an accepted offer's
+interest goes active -> decaying (30 idle days, raises a `retire:<key>`
+offer) -> paused (45 idle days, reversible + announced) / retired (owner
+click, or 3 negative reactions while decaying). `undo_auto_pause()` restores
+the interest, closes the retirement offer, and resets the silence clock (the
+undo event is the new baseline). Two guards: the sweep refuses to judge
+silence when the pipeline scored nothing in the last 7 days, and never pauses
+an interest with fewer than 5 attributed items. Derived (non-owner) rows are
+left entirely to `interest_state.py`.
+
+Ranking is code, rating is the model's (weights .30/.15/.15/.20/.20, floor
+.45, durability gate 3 convs x 2 months or a deep pair, 5 offers/run with one
+serendipity slot). Dedup is semantic in three layers: slug normalization,
+>=.5 signal-token overlap (attaches the quotes to the existing interest as an
+`offer_evidence` interest_event instead of offering), and the producer's
+similarity >= .70. Rejections block the key + its tokens for 180 days from
+the offer row itself, and append to `interests.json`'s
+`blocked_derived_terms` when a path is given (atomic rewrite).
+
+Import is idempotent on the artifact sha256 (`service_state` key
+`offers:artifact:<sha>`) and fail-soft (missing/malformed/v1 -> a summary
+with a reason, never an exception). CLI: `python -m app offers
+[--status S] [--why KEY] [--import [PATH]] [--sweep] [--accept/--reject/
+--snooze/--undo KEY] [--note TEXT]`. Not wired into any scheduled task or
+the tick yet (PR N); `accept()` deliberately does not write
+`interests.json`/`interests` -- it returns the entry, takes an optional
+`sync` callable, and `activate()` starts the lifecycle once the row exists
+(sync v2 = PR I, write API = PR J). Tests: 63 offline cases across
+`OfferRankingTests`/`OfferStoreTests`/`OfferLifecycleTests`/
+`OfferSweepTests`/`OffersCLITests`, Hebrew fixtures included.
+
+## Observatory write API (PR J)
+`observatory/manage.py` — the HTTP surface the interests workspace (PR L)
+calls. Nine routes, all new, spliced into `plugin.py`'s `register_routes()`
+ahead of its `/api/` catch-all and self-ordered internally (`/offers/generate`
+before `/offers/<key>/...`, `/interests/stats` before `/interests/<key>`):
+
+| method + path | does |
+| --- | --- |
+| `GET  /observatory/api/offers?status=&kind=&limit=` | inbox (default `status=inbox` = `offered`; `all` or a comma list), plus `counts` per status |
+| `GET  /observatory/api/offers/<key>/provenance` | §7.5 in full: quotes with date+lang regrouped by conversation, score terms, durability, similarity, parent/related, artifact sha256+generated_at, event chain, and the funnel numbers for a `retire` offer |
+| `POST /observatory/api/offers/<key>/decide` | `{action: accept\|reject\|snooze, edits?, note?, days?}` |
+| `POST /observatory/api/offers/generate` | `offers.import_artifact` over `cfg.interest_candidates_path` — local rank/dedup/floors, no LLM, idempotent on the artifact sha |
+| `GET  /observatory/api/interests/stats?window=7d` | the funnel per interest (`observatory/funnel.py`) |
+| `POST /observatory/api/interests` | create (same path as the existing GET listing; the method distinguishes them) |
+| `POST /observatory/api/interests/<key>` | update, or `{"active": false\|true}` to retire/un-retire |
+| `POST /observatory/api/interests/<key>/revive` | one-click undo of an auto-pause |
+| `GET  /observatory/api/edges?min_weight=&kind=` | `interest_edges`; live and empty until PR M fills it |
+
+**Owns HTTP only.** Every offer decision is `discovery/offers.py`'s and every
+interests write is `discovery/interest_sync.py`'s; this module routes, guards,
+parses, and maps exceptions to status codes (`UnknownOffer`/`NotFound` → 404,
+`InvalidTransition`/`ConflictError`/`SyncRefused` → 409, `OfferError`/
+`ValidationError` → 400). Accepting is ONE call —
+`offers.accept(conn, key, edits=, note=, sync=interest_sync.entry_writer(...))`
+— using the seam PR H left and PR I filled; there is no second write path into
+`interests.json`. Retire/revive flip the file's `active` flag and let sync v2
+perform the lifecycle move through `offers.set_lifecycle()`, because a
+DB-only retirement is reverted by the next sync by design. Revive calls
+`offers.undo_auto_pause()` first (clock reset + retirement offer closed), then
+brings the file into step. **No migration of its own** — PR H's `db.init()`
+pass and PR I's `interest_sync.migrate()` cover every column used.
+
+`observatory/interests_write.py` is validation + preconditions only: the rules
+mirror `discovery/interests.py` (slug key, no `derived:`/`retire:` prefix, the
+0-100 legacy-bar guard, ≥1 known source and ≥1 positive signal for an active
+interest, key immutable on update), plus an mtime precondition
+(`expected_mtime`) so an editor tab that went stale against a hand edit is
+refused (409) instead of clobbering it. Accept is pre-flighted: the entry it
+would write is validated BEFORE `offers.accept` runs, because acceptance is
+one-way and a failed write would otherwise strand the offer.
+
+`observatory/funnel.py` — read-only, one row per interest:
+collected (`candidate_items.origin_interest`) → scored → above bar
+(`final_score >= interests.min_score`) → notified, over `?window=7d|Nd|all`,
+plus `above_bar_rate`, a daily above-bar sparkline, feedback tally,
+`silence_days` (offers.py's own clock), `synced_at`, `dead_weight`, and
+`lifecycle`/`auto_paused`/`revivable`. Separate from `observatory/db.py` on
+purpose: that module's interests tab is a paginated lister capped at 50.
+
+Auth: unchanged read posture (localhost open, `--public` needs the bearer
+token) plus **writes refuse in `--public` mode** unless
+`DISCOVERY_UI_ALLOW_PUBLIC_WRITES=1`. Writes must be
+`Content-Type: application/json` (415 otherwise) — a cross-site form post
+cannot set that header without a preflight this server never answers, so the
+check is the CSRF boundary; `plugin.py` grows a `skip_csrf` hookimpl for
+`/observatory/api/*` so Datasette's HTML-form token machinery stays out of a
+JSON API, and every native Datasette route stays protected. The unconditional
+deny of Datasette's own write actions is untouched. Shared-file edits are
+deliberately three: the `manage.routes()` splice + `skip_csrf` + the POST
+dispatch in `interest_index_view` (`plugin.py`), and `ds._observatory_cfg`
+(`app.py`). Tests: 61 offline cases in `test_observatory_manage.py`
+(Hebrew/English fixtures throughout, no browser).
+## offer-decision learning (PR N, first half)
+`discovery/offer_learning.py` (new, stdlib-only, no provider) turns the
+owner's decisions on offers into a ranking effect on the *next* batch. It
+learns from offer decisions ONLY. Anything derived from delivered items
+(clicks, digest engagement, up/down/fire) is deliberately NOT built: the
+separate "Output Layer" brief rewrites the `feedback` table and the unit of
+feedback itself, so this module never reads or writes `feedback` —
+`Priors.domain_stats` is the recorded-but-unread socket that half plugs into.
+
+Division of labour with `offers.py`: **offers owns "no means no"** — lifecycle,
+`blocked_offer_keys`/`blocked_terms_for`, `dedup_verdict`,
+`score_candidate`/`passes_floors`/`rank`, `normalize_key`/`signal_tokens`,
+the retirement cool-off. All of it is imported, none reimplemented. This
+module owns the *preference* signal: the accept prototype (token cosine ->
++.05 max, §5.6), the bar-suggestion prior (mean of the owner's bar edits,
+needing >=2 of them, clamped to +/-.10), cold start, and snooze suppression of
+a paraphrase while the original sleeps. Scores are READ off the candidate
+(`score`/`score_terms`) when the store already has them, recomputed only when
+it does not.
+
+Storage: one new table, `offer_decision_log` (own file
+`schema_offer_learning.sql`, applied by `offer_learning.ensure_schema()`, not
+by `db.init` — PRs H/I/J are editing `schema.sql` concurrently). It is NOT a
+second event log: `offer_events` is the source of truth and
+`sync_from_offer_events()` projects it, idempotently, adding the three things
+the offer row cannot keep once it is updated in place — the post-edit signal
+tokens, the edit diff, and the interest lifecycle stage (`decaying` vs
+`paused`) a retirement answer came from. The one thing a replay cannot
+recover is the bar the generator suggested before an edited accept overwrote
+it; PR J can pass it via `record_decision(..., proposed_min_score=)` at
+decision time, and without it that decision simply sits out the bar prior.
+
+Polarity is kind-aware: accept=+1 / reject=-1 for every kind EXCEPT `retire`,
+where it inverts (declining "retire this?" is the owner's rescue). A rescue
+propagates no terms in either direction — blocking or boosting an interest
+title's generic words poisons the pool, the same call `blocked_terms_for()`
+makes. `expired` is a timer, never a rejection, and does not count toward
+leaving cold start.
+
+Cold start = fewer than 2 distinct `artifact_sha256` runs of owner decisions
+(falling back to distinct decision days): no prototype bonus, no bar shift,
+cap 5, serendipity slot filled — but exclusions still bite, so something
+rejected in run 1 cannot return in run 2. The exploratory pick keeps its
+reserved slot and opts OUT of the prototype bonus by design. Floors read the
+BASE score, so a learned preference can never lift a candidate over the
+evidence bar.
+
+Seam (pending PR J): `OfferDecisionSource` = `decisions()` + `candidates()`
+(+ `blocked()`). `StoreOfferDecisionSource` is the real one over
+`offer_events`; `MemoryOfferDecisionSource` is the in-memory fake the tests
+also use. Tests: `OfferDecisionRecordTests`, `OfferDecisionSyncTests`,
+`OfferLearningColdStartTests`, `OfferLearningRankingTests`,
+`OfferLearningSeamTests` in `test_discovery.py`, Hebrew fixtures included.
