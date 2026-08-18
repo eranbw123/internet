@@ -28,6 +28,7 @@ import "@xyflow/react/dist/style.css";
 import type { EdgeKind, InterestEdge, InterestStat } from "./types";
 import { defaultElk, type ElkLike } from "../graph/elkLayout";
 import { useThemeTokens } from "../useThemeTokens";
+import { exactTitle, formatDay } from "../time";
 import { BidiText, Quote, guessLang } from "./Bidi";
 
 const NODE_W = 190;
@@ -290,7 +291,7 @@ function Graph({ edges, interests, loading }: Props) {
                     {selectedEdge.evidence.quotes.map((q, i) => (
                       <li className="prov-quote-row" key={i}>
                         <div className="prov-quote-meta">
-                          <time dateTime={q.date}>{q.date}</time>
+                          <time dateTime={q.date} title={exactTitle(q.date)}>{formatDay(q.date)}</time>
                           {q.conversation_title && (
                             <BidiText className="prov-conv" lang={guessLang(q.conversation_title)}>
                               {q.conversation_title}

@@ -21,6 +21,7 @@ import { useState } from "react";
 import type { InterestEdge, Offer } from "./types";
 import { isDecidable, retireTargetKey } from "./types";
 import { BidiText, guessLang } from "./Bidi";
+import { exactTitle, formatDay } from "../time";
 import { OfferProvenance } from "./Provenance";
 
 /** The bar a retirement offer proposes as the alternative to retiring. */
@@ -80,7 +81,9 @@ function OfferCard({
           </span>
         )}
         {offer.status === "snoozed" && offer.snoozed_until && (
-          <span className="chip chip-warn">snoozed until {offer.snoozed_until}</span>
+          <span className="chip chip-warn" title={exactTitle(offer.snoozed_until)}>
+            snoozed until {formatDay(offer.snoozed_until)}
+          </span>
         )}
         {offer.score !== null && (
           <span className="offer-score" title="composite offer score">{dec2(offer.score)}</span>

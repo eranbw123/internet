@@ -28,6 +28,7 @@ import type {
   InterestPayload, InterestStat, OffersResponse, OfferStatus, SaveResponse, StatsResponse,
 } from "./types";
 import { mockClient } from "./mockClient";
+import { formatDay } from "../time";
 
 /** PR J has landed; the workspace is live. `?interests=mock` still overrides. */
 export const USE_MOCK_CLIENT = false;
@@ -170,8 +171,11 @@ export function adaptStats(raw: WireStats): StatsResponse {
 
   return {
     window: raw.window,
-    from: from.toISOString().slice(0, 10),
-    to: to.toISOString().slice(0, 10),
+    // Displayed, so local. The Date objects above stay UTC-keyed because
+    // densify() matches them against the server's sparkline buckets, which are
+    // substr(created_at, 1, 10) -- UTC days.
+    from: formatDay(from.toISOString()),
+    to: formatDay(to.toISOString()),
     interests,
     totals: {
       collected: raw.totals.collected ?? 0,

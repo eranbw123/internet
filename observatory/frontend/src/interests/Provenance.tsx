@@ -29,17 +29,18 @@ import { useState } from "react";
 import type { EvidenceQuote, InterestEdge, Offer, ScoreTerms } from "./types";
 import { SCORE_TERM_WEIGHTS, retireTargetKey } from "./types";
 import { BidiText, Quote, guessLang } from "./Bidi";
+import { exactTitle, formatDay } from "../time";
 
 /** How many quotes are visible before the expander. Three is enough to show a
  * theme recurring across time without turning the inbox into a reading task --
  * the inbox is meant to be a two-minute ritual. */
 const QUOTES_SHOWN = 3;
 
+// Was `toLocaleDateString(undefined, ...)`, i.e. whatever zone the browser
+// happens to be in -- accidentally right on the owner's machine and wrong
+// anywhere else. The zone is a decision, so it is made in one place.
 function fmtDate(iso: string): string {
-  if (!iso) return "";
-  const d = new Date(iso);
-  if (Number.isNaN(d.getTime())) return iso;
-  return d.toLocaleDateString(undefined, { year: "numeric", month: "short", day: "numeric" });
+  return formatDay(iso);
 }
 
 /** ".92" rather than "0.92": these are all 0-1 and the leading zero is noise
@@ -77,7 +78,7 @@ export function EvidenceList({ quotes, conversationCount }: EvidenceProps) {
         {shown.map((q, i) => (
           <li className="prov-quote-row" key={`${q.conversation_id}-${q.date}-${i}`}>
             <div className="prov-quote-meta">
-              <time dateTime={q.date}>{fmtDate(q.date)}</time>
+              <time dateTime={q.date} title={exactTitle(q.date)}>{fmtDate(q.date)}</time>
               {/* The conversation this came from. PR H persists only an id, so
                   the title renders when present and the id stands in when not
                   -- either way the owner can find the original. */}

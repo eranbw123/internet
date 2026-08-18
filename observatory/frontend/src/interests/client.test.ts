@@ -79,10 +79,10 @@ describe("adaptStats", () => {
     expect(daily).toEqual([0, 2, 0, 0, 0, 3, 0]);
   });
 
-  it("derives the window bounds the header prints", () => {
+  it("derives the window bounds the header prints, in the owner's calendar", () => {
     const stats = adaptStats(wire());
-    expect(stats.to).toBe("2026-08-18");
-    expect(stats.from).toBe("2026-08-11");
+    expect(stats.to).toBe("18 Aug 2026");
+    expect(stats.from).toBe("11 Aug 2026");
     expect(stats.window).toBe("7d");
   });
 
@@ -90,8 +90,8 @@ describe("adaptStats", () => {
     // `all` has no fixed start. Falling back to a constant would print a
     // "from" date that predates the engine.
     const stats = adaptStats(wire({ window: "all", window_days: null }));
-    expect(stats.from).toBe("2026-08-13");
-    expect(stats.to).toBe("2026-08-18");
+    expect(stats.from).toBe("13 Aug 2026");
+    expect(stats.to).toBe("18 Aug 2026");
   });
 
   it("survives an interest that has never produced anything", () => {

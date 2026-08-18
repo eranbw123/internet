@@ -47,7 +47,10 @@ describe("OffersInbox", () => {
   it("still allows a decision on a snoozed offer", () => {
     renderInbox([{ ...offer("handheld-and-roguelike-gaming"), status: "snoozed", snoozed_until: "2026-09-16" }]);
     expect(screen.getByText("Accept")).toBeInTheDocument();
-    expect(screen.getByText("snoozed until 2026-09-16")).toBeInTheDocument();
+    // Rendered in the owner's calendar, like every other date in the UI.
+    // ("Sept" is en-GB's abbreviation for September; the other months are
+    // three letters.)
+    expect(screen.getByText(/16 Sept 2026/)).toBeInTheDocument();
   });
 
   it("asks before rejecting, and says what rejection blocks", () => {
