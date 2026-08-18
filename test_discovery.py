@@ -4731,6 +4731,8 @@ class CLITests(unittest.TestCase):
         result = health.check(conn, config.load(), provider=None)
         conn.close()
         self.assertTrue(result["degraded"])
+
+    def test_personal_state_probe_survives_an_off_contract_generated_at(self):
         # valid JSON, valid v1 shape, but generated_at that isn't a proper
         # "Z"-suffixed UTC timestamp must fall back to "age unknown" rather
         # than tracebacking on offset-naive/None subtraction.
