@@ -767,13 +767,26 @@ button[aria-selected="true"], button.active, button[aria-pressed="true"] {
   /* The tab bar goes icon-beside-label, the way iOS compacts its own. */
   .mobile-nav button.mobile-nav-item {
     flex-direction: row;
-    gap: 7px;
+    gap: 11px;
     min-height: 44px;
     padding: 4px 2px;
     font-size: 11px;
   }
   .mobile-nav-icon { height: 20px; }
-  .mobile-nav-badge { inset-inline-start: 10px; }
+  /* Icon-beside-label means the badge no longer has the label BELOW it to
+     overlap into -- at 16px wide starting 10px along a 22px icon it ran past
+     the icon and sat on top of the word "Suggested". Smaller, and lifted
+     up-and-left so it overlaps the icon it belongs to instead. */
+  .mobile-nav-badge {
+    inset-inline-start: 9px;
+    top: -7px;
+    min-width: 14px;
+    height: 14px;
+    padding: 0 3px;
+    border-radius: 7px;
+    font-size: 9px;
+    line-height: 14px;
+  }
 
   /* One scroller, so the search box and the tab row scroll away. */
   .explorer { overflow-y: auto; }

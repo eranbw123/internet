@@ -961,7 +961,20 @@ input[type="range"]::-moz-range-thumb {
   .stop-confirm { width: 100%; }
   .stop-confirm-text { flex-basis: 100%; font-size: 13px; }
   .stop-confirm .btn { flex: 1 1 40%; min-height: 44px; font-size: 14px; }
-  .summary-caveat > summary { min-height: 40px; display: flex; align-items: center; }
+  /* display:flex on a <summary> removes the browser's disclosure triangle, so
+     the caveat rendered as a line of plain grey prose that happens to be
+     clickable -- exactly the defect the explorer's Filters fold had. Put the
+     marker back explicitly. */
+  .summary-caveat > summary {
+    min-height: 40px; display: flex; align-items: center; gap: 6px;
+  }
+  .summary-caveat > summary::after {
+    content: "›";
+    display: inline-block;
+    transition: transform .15s ease;
+  }
+  .summary-caveat[open] > summary::after { content: "⌄"; }
+  .summary-caveat > summary::-webkit-details-marker { display: none; }
   .summary-note { font-size: 12.5px; line-height: 1.5; }
 
   /* 3 + 1 orphan at 393px; an even 2x2 reads as one block instead. Each tile
@@ -1265,6 +1278,38 @@ input[type="range"]::-moz-range-thumb {
   input[type="range"]::-moz-range-thumb { width: 24px; height: 24px; }
   .checkbox { min-height: 44px; font-size: 14px; }
   .checkbox input { width: 22px; height: 22px; }
+
+  /* ---- phone held sideways -- 852 x 393 -------------------------------- */
+  /* Measured before this block: the funnel tiles, the summary sentence, the
+     caveat fold, the filter tabs and the search row came to ~300px of a 393px
+     viewport, so the first screen of the interests list showed one card TITLE
+     and nothing else. Everything above the list gets shorter, and the cards go
+     two across -- 852px is wide enough for two 410px cards, and in a viewport
+     this short doubling the density per screen is the whole game. */
+  @media (max-height: 500px) and (max-width: 950px) {
+    .interests-list { padding: 8px 12px; }
+    .list-summary { margin-bottom: 8px; }
+    .funnel-steps { gap: 5px; }
+    .funnel-steps li { padding: 4px 7px; }
+    .funnel-n { font-size: 14px; }
+    .funnel-l { font-size: 9px; }
+    .summary-note { margin-top: 4px; }
+    .summary-caveat > summary { min-height: 32px; }
+    .list-controls { padding: 6px 12px; }
+    .filter-tabs button { min-height: 36px; }
+    .list-search, .list-new { min-height: 38px; }
+
+    .funnel-table tbody {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      align-items: start;
+      gap: 10px;
+    }
+    .cell-actions .btn { min-height: 38px; }
+    .offers-inbox { padding: 8px 12px; }
+    .offer-buttons .btn { min-height: 40px; }
+    .offer-buttons-row .btn { min-height: 38px; }
+  }
 
   /* ---- connections ----------------------------------------------------- */
   /* One scroller, the workspace body: the fixed 520px floor and the nested
