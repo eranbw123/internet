@@ -123,7 +123,15 @@ export function Explorer({ onSelectDiscovery, onOpenRawDb, selectedRowKey }: Pro
             {tab === t.key && result ? <span className="tab-count"> {result.total.toLocaleString()}</span> : null}
           </button>
         ))}
-        {onOpenRawDb && <button role="tab" onClick={onOpenRawDb}>Raw database</button>}
+        {onOpenRawDb && (
+          <button
+            role="tab"
+            onClick={onOpenRawDb}
+            title="Open Datasette over every mounted database -- the trace tables, and any extra ones configured with DISCOVERY_UI_EXTRA_DBS (the raw conversations corpus)"
+          >
+            Raw databases
+          </button>
+        )}
       </div>
       <FilterBar tab={tab} filters={filters} interests={interests} onChange={setFilters} />
       <ActiveFilterChips tab={tab} filters={filters} onChange={setFilters} />

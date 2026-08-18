@@ -1,5 +1,5 @@
 import { describe, expect, it, vi } from "vitest";
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { OffersInbox } from "./OffersInbox";
 import { MOCK_EDGES, MOCK_OFFERS } from "./mockData";
 import type { Offer } from "./types";
@@ -107,8 +107,27 @@ describe("OffersInbox", () => {
   });
 
   it("explains an empty inbox rather than looking broken", () => {
+    // An empty inbox has to say what WOULD appear here. "Nothing to decide."
+    // was accurate and useless: the owner read it, found no other mention of
+    // suggesting interests anywhere in the UI, and concluded the Observatory
+    // could not do it at all.
     renderInbox([]);
-    expect(screen.getByText("Nothing to decide.")).toBeInTheDocument();
-    expect(screen.getByText(/at most five offers per run/)).toBeInTheDocument();
+    expect(screen.getByText("No suggestions right now.")).toBeInTheDocument();
+    expect(screen.getByText(/proposes new interests/)).toBeInTheDocument();
+    expect(screen.getByText(/accept, reject or snooze/)).toBeInTheDocument();
+    expect(screen.getByText(/at most five per run/)).toBeInTheDocument();
+  });
+
+  it("distinguishes a proposal to drop an interest from one to add", () => {
+    // Opposite actions must not look alike. They previously differed only by a
+    // small "retire?" chip in the corner of an otherwise identical card.
+    renderInbox([{ ...MOCK_OFFERS[0], kind: "new" }]);
+    expect(screen.getByText(/Proposing a NEW interest/)).toBeInTheDocument();
+    cleanup();
+    renderInbox([{
+      ...MOCK_OFFERS[0], kind: "retire", key: "retire:some-interest",
+      related_keys: ["some-interest"],
+    }]);
+    expect(screen.getByText(/Proposing to STOP an interest/)).toBeInTheDocument();
   });
 });

@@ -107,7 +107,7 @@
   --edge-label-bg: rgba(255, 255, 255, .85);
   --handle: #C3CCD8;
   --minimap-mask: rgba(28, 37, 48, .08);
-  --minimap-node: #7E96B7;
+  --minimap-node: #7791B3;
 
   /* -- effects ---------------------------------------------------------- */
   --shadow: rgba(28, 37, 48, .12);
@@ -172,7 +172,7 @@
     --edge-label-bg: rgba(20, 25, 32, .85);
     --handle: #4A5666;
     --minimap-mask: rgba(8, 11, 15, .55);
-    --minimap-node: #566682;
+    --minimap-node: #5C6D8B;
     --shadow: rgba(0, 0, 0, .55);
     --shadow-strong: rgba(0, 0, 0, .65);
     --scrim: rgba(0, 0, 0, .62);
@@ -237,7 +237,7 @@
   --edge-label-bg: rgba(20, 25, 32, .85);
   --handle: #4A5666;
   --minimap-mask: rgba(8, 11, 15, .55);
-  --minimap-node: #566682;
+  --minimap-node: #5C6D8B;
   --shadow: rgba(0, 0, 0, .55);
   --shadow-strong: rgba(0, 0, 0, .65);
   --scrim: rgba(0, 0, 0, .62);

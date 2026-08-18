@@ -11,6 +11,59 @@
 html, body, #root { height: 100%; margin: 0; }
 body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(--bg); }
 
+/* Native controls.
+
+   `color-scheme: dark` alone is not a dark theme for form controls -- it just
+   swaps the UA's own palette in, and Chrome's is a flat neutral grey --
+   measured at 107,107,107 for a button and 59,59,59 for a field. Against
+   this blue-tinted page
+   those read as washed-out grey slabs: the single biggest reason the explorer
+   sidebar looked like a light UI with the lights turned off rather than
+   something designed dark. Every control is given the token surface instead.
+
+   Element selectors on purpose, so every component class in this file and in
+   interests.css still wins on specificity; this is the floor, not the rule. */
+button, select, input, textarea {
+  font: inherit;
+  color: var(--fg);
+  background: var(--surface-raised);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+}
+button { padding: 3px 9px; cursor: pointer; }
+button:hover:not(:disabled) { background: var(--hover); border-color: var(--border-strong); }
+button:disabled { opacity: .55; cursor: default; }
+button:focus-visible, select:focus-visible, input:focus-visible, textarea:focus-visible {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+select, input, textarea { padding: 3px 6px; background: var(--surface); }
+select:hover, input:hover, textarea:hover { border-color: var(--border-strong); }
+input::placeholder, textarea::placeholder { color: var(--fg-faint); opacity: 1; }
+/* The pressed/selected state of a plain button has to be visible without a
+   component class, or a filter that IS applied looks identical to one that is
+   not. */
+button[aria-selected="true"], button.active, button[aria-pressed="true"] {
+  background: var(--accent-soft);
+  border-color: var(--accent);
+  color: var(--fg);
+}
+
+/* Scrollbars. The UA paints these from `color-scheme` too, and the horizontal
+   one along the bottom of the explorer was a pale strip across an otherwise
+   dark page. Firefox takes the standard property; Chrome needs the -webkit
+   pseudo-elements, and both are cheap. */
+* { scrollbar-color: var(--border-strong) var(--surface); scrollbar-width: thin; }
+::-webkit-scrollbar { width: 10px; height: 10px; }
+::-webkit-scrollbar-track { background: var(--surface); }
+::-webkit-scrollbar-thumb {
+  background: var(--border-strong);
+  border-radius: 6px;
+  border: 2px solid var(--surface);
+}
+::-webkit-scrollbar-thumb:hover { background: var(--fg-faint); }
+::-webkit-scrollbar-corner { background: var(--surface); }
+
 .app { display: flex; flex-direction: column; height: 100vh; }
 .app-header {
   display: flex; align-items: center; gap: 12px; padding: 8px 12px;
@@ -40,7 +93,7 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
   flex: 0 0 6px; cursor: col-resize; border-left: 1px solid var(--border);
   background: transparent; transition: background .1s ease;
 }
-.pane-resizer:hover, .app.resizing .pane-resizer { background: rgba(47, 111, 235, .25); }
+.pane-resizer:hover, .app.resizing .pane-resizer { background: var(--accent-ring); }
 .app.resizing { user-select: none; cursor: col-resize; }
 .app.resizing .pane { pointer-events: none; }
 
@@ -51,9 +104,9 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .explorer-tabs button[aria-selected="true"] { font-weight: 700; border-bottom: 2px solid var(--accent); }
 .explorer-filters { display: flex; gap: 4px; flex-wrap: wrap; padding: 4px 0; }
 .explorer-rows { list-style: none; margin: 0; padding: 0; overflow-y: auto; flex: 1; }
-.explorer-row { padding: 6px 4px; border-bottom: 1px solid #eee; cursor: pointer; }
-.explorer-row:hover { background: #f5f8ff; }
-.row-top, .row-bottom { display: flex; gap: 8px; font-size: 11px; color: #667; }
+.explorer-row { padding: 6px 4px; border-bottom: 1px solid var(--border-subtle); cursor: pointer; }
+.explorer-row:hover { background: var(--hover); }
+.row-top, .row-bottom { display: flex; gap: 8px; font-size: 11px; color: var(--fg-muted); }
 .row-title { font-weight: 600; }
 .row-sent-sent { color: var(--ok); font-weight: 600; }
 .row-sent-failed { color: var(--error); font-weight: 600; }
@@ -69,15 +122,20 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .graph-canvas-body { position: relative; flex: 1; min-height: 0; }
 .graph-toolbar {
   display: flex; align-items: center; gap: 6px; flex-wrap: wrap;
-  padding: 6px 8px; border-bottom: 1px solid var(--border); background: #fff;
+  padding: 6px 8px; border-bottom: 1px solid var(--border); background: var(--surface-raised);
 }
 .graph-toolbar button {
   font-size: 11px; padding: 3px 8px; border: 1px solid var(--border); border-radius: 4px;
-  background: rgba(255,255,255,.92); cursor: pointer;
+  /* `color` is not inherited by <button>: without an explicit value these fall
+     back to the UA's button text, which is what made the toolbar unreadable in
+     dark mode even after the bar itself stopped being a white literal. Any
+     element that
+     paints its own background has to state its ink too. */
+  background: var(--surface-raised); color: var(--fg); cursor: pointer;
 }
 .graph-toolbar button:hover { border-color: var(--accent); }
-.graph-toolbar button[aria-pressed="true"] { background: var(--accent); color: #fff; border-color: var(--accent); }
-.graph-toolbar-note { font-size: 11px; color: #778; }
+.graph-toolbar button[aria-pressed="true"] { background: var(--accent); color: var(--fg-on-accent); border-color: var(--accent); }
+.graph-toolbar-note { font-size: 11px; color: var(--fg-faint); }
 .graph-toolbar-spacer-left { margin-left: auto; }
 /* Swimlanes as vertical columns (elkLayout.ts's partitioned layout) --
    rendered as real, low-z React Flow nodes sized per-band via `style`, so
@@ -85,70 +143,70 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
    pan the way a screen-space overlay would. */
 .lane-band {
   width: 100%; height: 100%;
-  background: rgba(28,37,48,.025);
-  border-left: 1px dashed #dfe5ec;
+  background: var(--lane-band);
+  border-left: 1px dashed var(--lane-line);
   pointer-events: none;
 }
-.lane-band-odd { background: rgba(47,111,235,.03); }
+.lane-band-odd { background: var(--lane-band-odd); }
 .lane-band-title {
   font-size: 22px; font-weight: 600; text-transform: uppercase; letter-spacing: .1em;
-  color: #a8b3c2; padding: 10px 16px; white-space: nowrap;
+  color: var(--lane-title); padding: 10px 16px; white-space: nowrap;
   overflow: hidden; text-overflow: ellipsis;
 }
-.graph-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: #889; }
+.graph-empty { position: absolute; inset: 0; display: flex; align-items: center; justify-content: center; color: var(--fg-faint); }
 
 /* Dismissible key for the color coding -- there was previously no legend
    anywhere in the UI at all. */
 .graph-legend {
   position: absolute; top: 8px; right: 8px; z-index: 7; width: 260px;
-  background: #fff; border: 1px solid var(--border); border-radius: 8px;
-  padding: 10px 12px; font-size: 11px; box-shadow: 0 2px 10px rgba(28,37,48,.12);
+  background: var(--surface-raised); border: 1px solid var(--border); border-radius: 8px;
+  padding: 10px 12px; font-size: 11px; box-shadow: 0 2px 10px var(--shadow);
 }
 .graph-legend-title { font-weight: 700; margin-bottom: 6px; }
 .graph-legend ul { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
-.graph-legend li { display: flex; gap: 6px; align-items: flex-start; color: #556; line-height: 1.4; }
+.graph-legend li { display: flex; gap: 6px; align-items: flex-start; color: var(--fg-muted); line-height: 1.4; }
 .legend-swatch { width: 10px; height: 10px; border-radius: 2px; flex: none; margin-top: 2px; }
-.legend-swatch-columns { background: linear-gradient(90deg, #c9d4e8, #cfe0c9); }
+.legend-swatch-columns { background: linear-gradient(90deg, var(--lane-3), var(--lane-5)); }
 .legend-swatch-path { background: var(--accent); border-radius: 50%; }
 .legend-swatch-status { background: linear-gradient(90deg, var(--ok), var(--error)); }
 .legend-swatch-verdict { background: var(--ok); border-radius: 50%; }
-.legend-swatch-group { background: #f6f4ff; border: 1px dashed #6b5bd2; }
+.legend-swatch-group { background: var(--group-bg); border: 1px dashed var(--group-border); }
 .legend-swatch-dim { background: var(--border); opacity: .6; }
 .graph-status {
   position: absolute; top: 44px; left: 50%; transform: translateX(-50%);
-  background: rgba(255,255,255,.95); border: 1px solid var(--border); border-radius: 6px;
-  padding: 4px 12px; font-size: 12px; color: #556; z-index: 6;
+  background: var(--surface-raised); border: 1px solid var(--border); border-radius: 6px;
+  padding: 4px 12px; font-size: 12px; color: var(--fg-muted); z-index: 6;
 }
-.graph-status-error { color: var(--error); border-color: #f2b8b5; background: #fdecea; }
+.graph-status-error { color: var(--error); border-color: var(--error); background: var(--error-bg); }
 
 .node-card {
   border: 1px solid var(--border); border-left-width: 3px; border-radius: 6px;
-  background: #fff; box-shadow: 0 1px 2px rgba(28,37,48,.08);
+  background: var(--surface-raised); box-shadow: 0 1px 2px var(--shadow);
   padding: 6px 8px; font-size: 11px; width: 100%; height: 100%; overflow: hidden;
 }
-.node-card.emphasized { border-color: var(--accent); border-left-color: var(--accent); box-shadow: 0 0 0 2px rgba(47,111,235,.3); }
+.node-card.emphasized { border-color: var(--accent); border-left-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-ring); }
 .node-card.status-active { border-left-color: var(--active); }
-.node-card.status-error { border-left-color: var(--error); background: #fff6f5; }
+.node-card.status-error { border-left-color: var(--error); background: var(--error-bg); }
 .node-card.status-ok { border-left-color: var(--ok); }
-.node-card.node-group { background: #f6f4ff; cursor: pointer; border-style: dashed; }
+.node-card.node-group { background: var(--group-bg); cursor: pointer; border-style: dashed; }
 .node-card.node-group-expanded { overflow: visible; }
-.node-group .node-type { font-weight: 700; color: #6b5bd2; }
-.node-group .node-label { color: #4a3fa8; }
+.node-group .node-type { font-weight: 700; color: var(--group-label); }
+.node-group .node-label { color: var(--group-fg); }
 /* The threshold card's own verdict (assemble.ts/GraphCanvas.tsx's
    thresholdVerdict) -- previously this decision lived only in a small,
    easy-to-miss edge label. Comes after the generic .status-ok/-error rules
    above so it wins the cascade on the (usual) case where a threshold node's
    execution status is "ok" regardless of which way the score fell. */
 .node-card.threshold-pass { border-left-color: var(--ok); }
-.node-card.threshold-fail { border-left-color: var(--error); background: #fff6f5; }
+.node-card.threshold-fail { border-left-color: var(--error); background: var(--error-bg); }
 /* Dead ends -- a duplicate or a dropped search result never went anywhere
    else in the pipeline -- recede instead of competing visually with the
    branch that actually led somewhere. */
 .node-card.node-dimmed { opacity: .55; }
 .node-type { font-size: 9px; text-transform: uppercase; letter-spacing: .04em; color: var(--fg-faint); }
 .node-label { font-weight: 600; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.node-summary { color: #556; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-.node-meta { display: flex; gap: 6px; font-size: 10px; color: #778; white-space: nowrap; overflow: hidden; }
+.node-summary { color: var(--fg-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.node-meta { display: flex; gap: 6px; font-size: 10px; color: var(--fg-faint); white-space: nowrap; overflow: hidden; }
 
 /* A group's expanded children -- see assemble.ts's containerId,
    elkLayout.ts's chipGrid -- render as this compact grid INSIDE the
@@ -156,12 +214,12 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
    highlighted, instead of exploding into free-floating peer cards. */
 .node-chip {
   width: 100%; height: 100%; display: flex; align-items: center;
-  border: 1px solid var(--border); border-radius: 5px; background: #fff;
-  padding: 2px 8px; font-size: 10px; box-shadow: 0 1px 1px rgba(28,37,48,.06);
+  border: 1px solid var(--border); border-radius: 5px; background: var(--surface-raised);
+  padding: 2px 8px; font-size: 10px; box-shadow: 0 1px 1px var(--shadow);
 }
 .node-chip-label { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-.node-chip-top { border-color: var(--accent); background: #eef4ff; font-weight: 600; }
-.node-chip.emphasized { border-color: var(--accent); box-shadow: 0 0 0 2px rgba(47,111,235,.3); }
+.node-chip-top { border-color: var(--accent); background: var(--accent-soft); font-weight: 600; }
+.node-chip.emphasized { border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-ring); }
 /* Scope to the path: the class lands on the edge's whole <g>, and a bare
    stroke there also paints the label's background rect blue. */
 .edge-emphasized .react-flow__edge-path { stroke: var(--accent) !important; stroke-width: 2.5 !important; }
@@ -171,22 +229,75 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .node-card .react-flow__handle,
 .react-flow__node .react-flow__handle {
   width: 5px; height: 5px; min-width: 5px; min-height: 5px;
-  background: #c3ccd8; border: none; pointer-events: none;
+  background: var(--handle); border: none; pointer-events: none;
 }
-.react-flow__edge-path { stroke: #8b98a9; stroke-width: 1.25; }
+/* React Flow paints its own chrome -- minimap, controls, attribution, the
+   background dots -- from variables declared inside its vendored stylesheet,
+   all of them light-theme literals. Redeclaring them here points the library's
+   own chrome at the token palette without patching the library, which is why
+   the minimap stayed a white rectangle on a dark page after everything else
+   had been migrated: none of it is reachable from our own selectors. */
+.react-flow {
+  --xy-background-color: var(--bg);
+  --xy-background-pattern-color: var(--border-subtle);
+  --xy-minimap-background-color: var(--surface);
+  --xy-minimap-mask-background-color: var(--minimap-mask);
+  --xy-minimap-mask-stroke-color: var(--border);
+  --xy-minimap-node-background-color: var(--minimap-node);
+  --xy-minimap-node-stroke-color: var(--edge);
+  --xy-controls-button-background-color: var(--surface-raised);
+  --xy-controls-button-background-color-hover: var(--hover);
+  --xy-controls-button-color: var(--fg);
+  --xy-controls-button-color-hover: var(--accent);
+  --xy-controls-button-border-color: var(--border);
+  --xy-controls-box-shadow: 0 2px 10px var(--shadow);
+  --xy-attribution-background-color: transparent;
+  --xy-edge-stroke: var(--edge);
+  --xy-edge-stroke-selected: var(--accent);
+  --xy-node-border: 1px solid var(--border);
+  --xy-node-background-color: var(--surface-raised);
+  --xy-node-color: var(--fg);
+  --xy-handle-background-color: var(--handle);
+  --xy-handle-border-color: var(--handle);
+  --xy-selection-background-color: var(--accent-ring);
+  --xy-selection-border: 1px dotted var(--accent);
+  --xy-resize-background-color: var(--accent);
+}
+
+/* The minimap's own surround, which the library paints from an inline default
+   rather than from a variable. */
+.react-flow__minimap {
+  background-color: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+}
+
+.react-flow__controls-button {
+  background: var(--surface-raised);
+  color: var(--fg);
+  border-bottom: 1px solid var(--border);
+  fill: currentColor;
+}
+.react-flow__controls-button:hover { background: var(--hover); }
+.react-flow__controls-button svg { fill: currentColor; }
+
+.react-flow__attribution { background: transparent; }
+.react-flow__attribution a { color: var(--fg-faint); }
+
+.react-flow__edge-path { stroke: var(--edge); stroke-width: 1.25; }
 .react-flow__edge.selected .react-flow__edge-path { stroke: var(--accent); }
-.react-flow__edge-textbg { fill: rgba(255,255,255,.85); }
-.react-flow__edge-text { font-size: 9px; fill: #66707d; }
+.react-flow__edge-textbg { fill: var(--edge-label-bg); }
+.react-flow__edge-text { font-size: 9px; fill: var(--edge-text); }
 .graph-minimap { width: 160px !important; height: 110px !important; }
 
 /* --- inspector --- */
 .inspector { display: flex; flex-direction: column; height: 100%; }
-.inspector-empty, .inspector-loading { display: flex; align-items: center; justify-content: center; color: #889; padding: 16px; }
+.inspector-empty, .inspector-loading { display: flex; align-items: center; justify-content: center; color: var(--fg-faint); padding: 16px; }
 .inspector-header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; padding: 8px 10px; border-bottom: 1px solid var(--border); }
 .inspector-title { min-width: 0; }
 .inspector-node-type {
   display: inline-block; font-size: 9px; text-transform: uppercase; letter-spacing: .04em;
-  color: #66707d; background: #eef1f5; border-radius: 8px; padding: 1px 7px; margin-right: 6px;
+  color: var(--fg-muted); background: var(--neutral-bg); border-radius: 8px; padding: 1px 7px; margin-right: 6px;
   vertical-align: middle;
 }
 .inspector-label { font-weight: 600; }
@@ -199,24 +310,24 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .attempt-picker { display: flex; flex-wrap: wrap; gap: 4px; margin-bottom: 8px; }
 .attempt-chip {
   font-size: 11px; border: 1px solid var(--border); border-radius: 10px;
-  padding: 1px 9px; background: #fff; color: #556; cursor: pointer;
+  padding: 1px 9px; background: var(--surface-raised); color: var(--fg-muted); cursor: pointer;
 }
 .attempt-chip.active { border-color: var(--accent); color: var(--accent); font-weight: 600; }
-.attempt-chip-ok { background: #e3f4e8; }
-.attempt-chip-error { background: #fdecea; }
+.attempt-chip-ok { background: var(--ok-bg); }
+.attempt-chip-error { background: var(--error-bg); }
 
 /* Prompt tab: the headline payload, so it gets room and structure. */
 .prompt-provenance {
-  font-size: 11px; color: #667; background: #f4f7fb; border-left: 3px solid var(--accent);
+  font-size: 11px; color: var(--fg-muted); background: var(--accent-soft); border-left: 3px solid var(--accent);
   padding: 4px 8px; margin-bottom: 6px;
 }
 .prompt-actions { margin-bottom: 6px; }
 .prompt-diff, .prompt-diff-unavailable { margin-bottom: 8px; }
-.prompt-diff-unavailable { font-size: 12px; color: #8a6100; background: #fdf3dc; padding: 6px 8px; border-radius: 4px; }
+.prompt-diff-unavailable { font-size: 12px; color: var(--warn-text); background: var(--active-bg); padding: 6px 8px; border-radius: 4px; }
 .prompt-sections > details { margin-bottom: 6px; border: 1px solid var(--border); border-radius: 4px; }
 .prompt-sections > details > summary {
   cursor: pointer; padding: 4px 8px; font-size: 12px; font-family: ui-monospace, Consolas, monospace;
-  background: #f6f8fb;
+  background: var(--surface);
 }
 .prompt-section-size { color: var(--fg-faint); font-size: 10px; }
 .viewer-size { font-size: 10px; color: var(--fg-faint); margin: 2px 0 4px; }
@@ -231,15 +342,15 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 /* The operational row behind a node: sub-scores, item text, delivery, mission. */
 .entity-facts { margin: 8px 0; }
 .entity-fold { margin: 6px 0; border: 1px solid var(--border); border-radius: 4px; }
-.entity-fold > summary { cursor: pointer; padding: 4px 8px; font-size: 12px; background: #f6f8fb; }
+.entity-fold > summary { cursor: pointer; padding: 4px 8px; font-size: 12px; background: var(--surface); }
 .entity-duplicate {
-  font-size: 12px; background: #f4f7fb; border-left: 3px solid var(--accent);
+  font-size: 12px; background: var(--accent-soft); border-left: 3px solid var(--accent);
   padding: 4px 8px; margin: 6px 0;
 }
 .score-bars { list-style: none; margin: 0 0 8px; padding: 0; font-size: 11px; }
 .score-bars li { display: grid; grid-template-columns: 8.5em 1fr 6.5em; gap: 6px; align-items: center; margin-bottom: 2px; }
-.score-bar-name { color: #667; }
-.score-bar-track { background: #eef1f5; border-radius: 3px; height: 8px; overflow: hidden; }
+.score-bar-name { color: var(--fg-muted); }
+.score-bar-track { background: var(--track); border-radius: 3px; height: 8px; overflow: hidden; }
 .score-bar-fill { display: block; height: 100%; background: var(--accent); }
 .score-bar-value { text-align: right; font-variant-numeric: tabular-nums; }
 .score-bar-weight { color: var(--fg-faint); }
@@ -248,10 +359,10 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .filter-chips { display: flex; flex-wrap: wrap; gap: 3px; padding: 0 6px 4px; }
 .filter-chip {
   font-size: 10px; border: 1px solid var(--border); border-radius: 9px;
-  padding: 0 7px; background: #eef1f5; color: #556; cursor: pointer;
+  padding: 0 7px; background: var(--neutral-bg); color: var(--fg-muted); cursor: pointer;
 }
-.filter-chip-clear { background: #fff; }
-.explorer-row.selected { background: #e8f0fb; box-shadow: inset 3px 0 0 var(--accent); }
+.filter-chip-clear { background: var(--surface-raised); }
+.explorer-row.selected { background: var(--accent-soft); box-shadow: inset 3px 0 0 var(--accent); }
 .explorer-row:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .tab-count { color: var(--fg-faint); font-weight: 400; }
 .row-active-yes { color: var(--ok); }
@@ -259,7 +370,7 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .row-error { color: var(--error); }
 
 /* Interest panel: what an interest is and what it has produced. */
-.interest-counts { display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0; font-size: 11px; color: #667; }
+.interest-counts { display: flex; flex-wrap: wrap; gap: 10px; margin: 8px 0; font-size: 11px; color: var(--fg-muted); }
 .interest-count b { color: var(--fg); font-size: 13px; }
 .interest-actions { margin: 6px 0 10px; }
 .interest-row-meta { color: var(--fg-faint); font-size: 10px; }
@@ -267,7 +378,7 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .signal-list li { margin-bottom: 1px; }
 
 .overview-error {
-  background: #fdecea; color: var(--error); border: 1px solid #f2b8b5;
+  background: var(--error-bg); color: var(--error); border: 1px solid var(--error);
   border-radius: 4px; padding: 6px 8px; margin-bottom: 8px; word-break: break-word;
 }
 .overview-summary { margin: 0 0 8px; }
@@ -275,15 +386,15 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
   display: grid; grid-template-columns: max-content 1fr; gap: 3px 12px;
   margin: 0 0 10px; font-size: 12px;
 }
-.overview-facts dt { color: #778; }
+.overview-facts dt { color: var(--fg-faint); }
 .overview-facts dd { margin: 0; min-width: 0; word-break: break-word; }
 .status-chip {
   display: inline-block; font-size: 10px; font-weight: 600; border-radius: 8px; padding: 0 8px;
-  background: #eef1f5; color: #556;
+  background: var(--neutral-bg); color: var(--fg-muted);
 }
-.status-chip-ok { background: #e3f4e8; color: var(--ok); }
-.status-chip-error { background: #fdecea; color: var(--error); }
-.status-chip-active { background: #fdf3dc; color: #9a6b00; }
+.status-chip-ok { background: var(--ok-bg); color: var(--ok); }
+.status-chip-error { background: var(--error-bg); color: var(--error); }
+.status-chip-active { background: var(--active-bg); color: var(--active-text); }
 .overview-section-title {
   font-size: 10px; font-weight: 600; text-transform: uppercase; letter-spacing: .05em;
   color: var(--fg-faint); margin: 10px 0 4px;
@@ -362,18 +473,18 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
   .app-body { position: relative; }
   .pane-explorer.drawer {
     position: fixed; inset: 0 30% 0 0; z-index: 20; transform: translateX(-100%);
-    transition: transform .2s ease; background: #fff;
+    transition: transform .2s ease; background: var(--surface-raised);
   }
   .pane-explorer.drawer.open { transform: translateX(0); }
-  .drawer-scrim { position: fixed; inset: 0; background: rgba(0,0,0,.3); z-index: 15; }
+  .drawer-scrim { position: fixed; inset: 0; background: var(--scrim); z-index: 15; }
   .pane-inspector { display: none; }
   .bottom-sheet {
     position: fixed; left: 0; right: 0; bottom: 0; height: 0; overflow: hidden;
-    background: #fff; border-top: 1px solid var(--border); transition: height .2s ease; z-index: 25;
+    background: var(--surface-raised); border-top: 1px solid var(--border); transition: height .2s ease; z-index: 25;
   }
   .bottom-sheet.open { height: 85vh; overflow: auto; }
   .bottom-sheet-handle { height: 24px; display: flex; align-items: center; justify-content: center; }
-  .bottom-sheet-handle::before { content: ""; width: 40px; height: 4px; background: #ccc; border-radius: 2px; }
+  .bottom-sheet-handle::before { content: ""; width: 40px; height: 4px; background: var(--border-strong); border-radius: 2px; }
 
   /* The toolbar wrapped to two rows on a phone, eating the graph's height.
      Primary actions stay visible; the rest move into the overflow menu. */
@@ -383,9 +494,9 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 
 .toolbar-overflow { position: relative; margin-left: auto; }
 .toolbar-overflow-menu {
-  position: absolute; right: 0; top: 100%; z-index: 30; background: #fff;
+  position: absolute; right: 0; top: 100%; z-index: 30; background: var(--surface-raised);
   border: 1px solid var(--border); border-radius: 4px; padding: 4px;
   display: flex; flex-direction: column; gap: 2px; min-width: 160px;
-  box-shadow: 0 4px 12px rgba(0,0,0,.12);
+  box-shadow: 0 4px 12px var(--shadow-strong);
 }
 .toolbar-overflow-menu button { text-align: left; white-space: nowrap; }

@@ -1729,6 +1729,25 @@ class ObservatoryThemeTokenTests(unittest.TestCase):
         ("--lane-title", "--bg", TEXT), ("--edge-text", "--bg", TEXT),
         # graph chrome that has to stay visible as a graphical object
         ("--edge", "--bg", UI), ("--minimap-node", "--bg", UI), ("--border-strong", "--bg", UI),
+        # The minimap is painted as its own panel on --surface rather than
+        # blending into the canvas, so its nodes -- the graphical object that
+        # says where in the trace you are -- have to clear the bar against
+        # THAT, not just against the page. Both values were originally tuned
+        # to 3.03/3.04 on --bg, which did not survive the move.
+        ("--minimap-node", "--surface", UI),
+        # Ink on the raised surfaces the migration tokenised: cards, chips,
+        # menus, the drawer and the bottom sheet all paint --surface-raised
+        # and now state their own colour instead of inheriting the UA's.
+        ("--fg", "--surface-raised", TEXT), ("--fg-muted", "--surface-raised", TEXT),
+        ("--fg-faint", "--surface-raised", TEXT),
+        # Panels tinted with the soft accent, and the warn text that lands on
+        # the amber chip.
+        ("--fg-muted", "--accent-soft", TEXT), ("--warn-text", "--active-bg", TEXT),
+        # Muted ink on the neutral fills: chips, and the score bar's label
+        # beside its own track.
+        ("--fg-muted", "--neutral-bg", TEXT), ("--fg-muted", "--track", TEXT),
+        # The connections graph draws parent edges in the group colour.
+        ("--group-fg", "--bg", UI), ("--group-fg", "--surface", UI),
     ]
 
     @classmethod
@@ -1833,6 +1852,35 @@ class ObservatoryThemeTokenTests(unittest.TestCase):
         self.assertGreaterEqual(self.contrast(self.light["--ok"], "#ffffff"), self.TEXT)
         self.assertGreaterEqual(self.contrast(self.light["--active-text"], "#ffffff"), self.TEXT)
         self.assertGreaterEqual(self.contrast(self.light["--fg-faint"], "#ffffff"), self.TEXT)
+
+    def test_no_colour_literal_survives_outside_tokens_css(self):
+        """The migration's finish line, kept as a guard.
+
+        PR K shipped the token system with one migrated surface and left 88
+        literals behind in a written-down plan. They are now all gone, and this
+        is what stops the next hand-edit reintroducing one: a literal anywhere
+        but tokens.css is a colour that cannot be themed, and it will be
+        noticed as a white island on a dark page rather than as a failing test
+        unless something asserts it here.
+
+        Test files are excluded -- they carry ids like "#187 - web-tick" that
+        the regex cannot tell from a three-digit hex colour, and no test paints
+        anything.
+        """
+        root = os.path.join(self._HERE, "observatory", "frontend", "src")
+        literal = re.compile(r"#[0-9a-fA-F]{3,8}\b|rgba?\(")
+        offenders = {}
+        for dirpath, _dirs, files in os.walk(root):
+            for name in files:
+                if not name.endswith((".css", ".ts", ".tsx")):
+                    continue
+                if name == "tokens.css" or ".test." in name:
+                    continue
+                path = os.path.join(dirpath, name)
+                found = literal.findall(self._read(path))
+                if found:
+                    offenders[os.path.relpath(path, root)] = found
+        self.assertEqual(offenders, {})
 
     def test_the_failing_literals_are_gone_from_the_stylesheet(self):
         styles = self._read(self.STYLES_PATH)

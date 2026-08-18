@@ -27,14 +27,14 @@ import {
 import "@xyflow/react/dist/style.css";
 import type { EdgeKind, InterestEdge, InterestStat } from "./types";
 import { defaultElk, type ElkLike } from "../graph/elkLayout";
-import { useThemeTokens } from "./useThemeTokens";
+import { useThemeTokens } from "../useThemeTokens";
 import { BidiText, Quote, guessLang } from "./Bidi";
 
 const NODE_W = 190;
 const NODE_H = 56;
 
 const TOKENS = [
-  "--accent", "--fg-muted", "--fg-faint", "--border", "--surface", "--group-text",
+  "--accent", "--fg-muted", "--fg-faint", "--border", "--surface", "--group-fg",
 ] as const;
 
 const EDGE_DASH: Record<EdgeKind, string | undefined> = {
@@ -180,15 +180,15 @@ function Graph({ edges, interests, loading }: Props) {
       // the page instead of freezing whatever was right at build time.
       style: {
         stroke: e.kind === "bridge_offer"
-          ? (tokens["--group-text"] || "#6b3fa0")
-          : isSelected ? (tokens["--accent"] || "#2f6feb") : (tokens["--fg-faint"] || "#6e7887"),
+          ? (tokens["--group-fg"] || undefined)
+          : isSelected ? (tokens["--accent"] || undefined) : (tokens["--fg-faint"] || undefined),
         strokeWidth: 1 + e.weight * 4,
         strokeDasharray: EDGE_DASH[e.kind],
         opacity: isSelected ? 1 : 0.85,
       },
       label: e.evidence.lift !== undefined ? `${e.evidence.lift.toFixed(1)}x` : undefined,
-      labelStyle: { fill: tokens["--fg-muted"] || "#5b6675", fontSize: 10 },
-      labelBgStyle: { fill: tokens["--surface"] || "#f7f9fa" },
+      labelStyle: { fill: tokens["--fg-muted"] || undefined, fontSize: 10 },
+      labelBgStyle: { fill: tokens["--surface"] || undefined },
       labelBgPadding: [3, 2] as [number, number],
     };
   }), [shown, tokens, selectedEdge]);
@@ -241,7 +241,7 @@ function Graph({ edges, interests, loading }: Props) {
               proOptions={{ hideAttribution: true }}
               minZoom={0.2}
             >
-              <Background color={tokens["--border"] || "#d8dee6"} gap={20} />
+              <Background color={tokens["--border"] || undefined} gap={20} />
               <Controls showInteractive={false} />
             </ReactFlow>
           )}

@@ -1,7 +1,7 @@
 /* Interests workspace styles.
  *
  * NO COLOUR LITERALS. Every colour is a semantic token from the design's
- * section 8.2 vocabulary (--bg/--surface/--fg/--fg-muted/--accent/--ok-text/
+ * section 8.2 vocabulary (--bg/--surface/--fg/--fg-muted/--accent/--ok/
  * ...), so this surface themes with PR K's light/dark/system system for free.
  * The tokens resolve today via tokens.fallback.css, which is deleted when PR K
  * lands; if PR K renames anything, the fix is a find-replace here and nowhere
@@ -19,6 +19,11 @@
   flex-direction: column;
   height: 100%;
   min-height: 0;
+  /* .app-body is a flex ROW, and a flex child with no grow sizes to its
+     content -- which left the whole workspace hugging the left edge with a
+     third of the window as dead space beside it. */
+  flex: 1;
+  min-width: 0;
   background: var(--bg);
   color: var(--fg);
 }
@@ -52,7 +57,7 @@
   color: var(--fg);
   font-weight: 600;
 }
-.tab-count {
+.ws-tabs .tab-count {
   display: inline-block;
   margin-inline-start: 6px;
   padding: 0 6px;
@@ -62,7 +67,7 @@
   font-size: 11px;
   font-variant-numeric: tabular-nums;
 }
-.tab-count-live { background: var(--accent); color: var(--accent-contrast); }
+.ws-tabs .tab-count-live { background: var(--accent); color: var(--fg-on-accent); }
 .ws-header-actions { margin-inline-start: auto; display: flex; gap: 8px; }
 
 .ws-mock-banner {
@@ -77,14 +82,14 @@
   margin: 0;
   padding: 8px 16px;
   background: var(--error-bg);
-  color: var(--error-text);
+  color: var(--error);
   border-bottom: 1px solid var(--border);
 }
 .ws-toast {
   margin: 0;
   padding: 8px 16px;
   background: var(--ok-bg);
-  color: var(--ok-text);
+  color: var(--ok);
   border-bottom: 1px solid var(--border);
   font-size: 12px;
 }
@@ -108,15 +113,46 @@
 .btn-primary {
   background: var(--accent);
   border-color: var(--accent);
-  color: var(--accent-contrast);
+  color: var(--fg-on-accent);
   font-weight: 600;
 }
 .btn-primary:hover:not(:disabled) { filter: brightness(1.06); background: var(--accent); }
-.btn-danger { border-color: var(--error-text); color: var(--error-text); }
+.btn-danger { border-color: var(--error); color: var(--error); }
 .btn-danger:hover:not(:disabled) { background: var(--error-bg); }
 .btn-quiet { border-color: transparent; background: none; color: var(--fg-muted); }
 .btn-quiet:hover:not(:disabled) { background: var(--hover); color: var(--fg); }
 .btn-small { padding: 3px 8px; font-size: 12px; }
+/* The undo that appears on a row the moment it is stopped. Reversibility you
+   can see beats a confirmation dialog you have to read -- and beats one you
+   learn to click through. */
+.btn-undo {
+  border-color: var(--accent);
+  color: var(--accent);
+  background: var(--accent-soft);
+}
+.btn-undo:hover:not(:disabled) { background: var(--hover); }
+
+/* Adding an interest and dropping one are opposite actions; before this they
+   differed only by a small chip in the corner of an otherwise identical card. */
+.offer-intent {
+  margin: 0 0 4px;
+  font-size: 11px;
+  font-weight: 600;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+}
+.offer-intent-add { color: var(--accent); }
+.offer-intent-drop { color: var(--error); }
+
+/* The one field that decides whether an interest does anything at all, now at
+   the top of the editor instead of below the fold. */
+.field-lifecycle {
+  padding: 10px 12px;
+  border: 1px solid var(--border);
+  border-left: 3px solid var(--accent);
+  border-radius: 6px;
+  background: var(--surface);
+}
 
 .link-button {
   background: none;
@@ -139,11 +175,11 @@
   background: var(--border-subtle);
   color: var(--fg-muted);
 }
-.chip-ok { background: var(--ok-bg); color: var(--ok-text); }
+.chip-ok { background: var(--ok-bg); color: var(--ok); }
 .chip-warn { background: var(--warn-bg); color: var(--warn-text); }
-.chip-error { background: var(--error-bg); color: var(--error-text); }
+.chip-error { background: var(--error-bg); color: var(--error); }
 .chip-muted { background: var(--border-subtle); color: var(--fg-muted); }
-.chip-group { background: var(--group-bg); color: var(--group-text); }
+.chip-group { background: var(--group-bg); color: var(--group-fg); }
 
 .key-chip {
   font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
@@ -209,7 +245,7 @@
 }
 .funnel-n { font-size: 18px; font-weight: 600; font-variant-numeric: tabular-nums; }
 .funnel-l { font-size: 11px; color: var(--fg-muted); }
-.funnel-zero .funnel-n { color: var(--error-text); }
+.funnel-zero .funnel-n { color: var(--error); }
 .funnel-steps-retire { margin-bottom: 8px; }
 
 /* --- offers inbox -------------------------------------------------------- */
@@ -237,14 +273,14 @@
    never the only signal. */
 .offer-card { border-inline-start: 3px solid var(--border); }
 .offer-kind-new { border-inline-start-color: var(--accent); }
-.offer-kind-bridge { border-inline-start-color: var(--group-text); }
-.offer-kind-retire { border-inline-start-color: var(--error-text); }
+.offer-kind-bridge { border-inline-start-color: var(--group-fg); }
+.offer-kind-retire { border-inline-start-color: var(--error); }
 
 .offer-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
 .kind-chip { font-weight: 600; }
 .kind-new { background: var(--accent-soft); color: var(--accent); }
-.kind-bridge { background: var(--group-bg); color: var(--group-text); }
-.kind-retire { background: var(--error-bg); color: var(--error-text); }
+.kind-bridge { background: var(--group-bg); color: var(--group-fg); }
+.kind-retire { background: var(--error-bg); color: var(--error); }
 .offer-score {
   margin-inline-start: auto;
   font-size: 16px;
@@ -258,7 +294,7 @@
   padding: 6px 8px;
   border-radius: 6px;
   background: var(--error-bg);
-  color: var(--error-text);
+  color: var(--error);
   font-size: 12px;
 }
 
@@ -269,7 +305,7 @@
   padding: 8px 10px;
   border-radius: 6px;
   background: var(--error-bg);
-  color: var(--error-text);
+  color: var(--error);
   font-size: 12px;
 }
 .offer-confirm-text code { font-size: 11px; }
@@ -369,7 +405,7 @@
 .prov-sim-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .prov-sim { display: grid; grid-template-columns: auto 90px 1fr; align-items: center; gap: 10px; font-size: 12px; }
 .prov-sim-bar { height: 6px; border-radius: 3px; background: var(--border-subtle); overflow: hidden; }
-.prov-sim-fill { display: block; height: 100%; background: var(--group-text); }
+.prov-sim-fill { display: block; height: 100%; background: var(--group-fg); }
 
 .prov-bridge { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-bottom: 6px; }
 .prov-bridge-x { color: var(--fg-faint); }
@@ -462,7 +498,7 @@
 .cell-sub { display: block; margin-top: 3px; font-size: 11px; color: var(--fg-muted); }
 .num { text-align: end; font-variant-numeric: tabular-nums; white-space: nowrap; }
 .num-muted { color: var(--fg-faint); }
-.num-zero { color: var(--error-text); font-weight: 600; }
+.num-zero { color: var(--error); font-weight: 600; }
 .cell-actions { white-space: nowrap; }
 .cell-actions .btn + .btn { margin-inline-start: 4px; }
 .row-dead { background: var(--error-bg); }
@@ -477,7 +513,7 @@
   min-width: 46px;
 }
 .spark-bar { width: 5px; background: var(--accent); border-radius: 1px; }
-.spark-dead .spark-bar { background: var(--error-text); }
+.spark-dead .spark-bar { background: var(--error); }
 .spark-empty { color: var(--fg-faint); }
 
 /* --- editor -------------------------------------------------------------- */
@@ -546,9 +582,9 @@
 }
 .field textarea { resize: vertical; line-height: 1.5; }
 .field-invalid input, .field-invalid textarea, .field-invalid select, .field-invalid .chip-input {
-  border-color: var(--error-text);
+  border-color: var(--error);
 }
-.field-error { margin: 0; font-size: 11px; color: var(--error-text); }
+.field-error { margin: 0; font-size: 11px; color: var(--error); }
 
 .chip-input {
   display: flex;
@@ -587,7 +623,7 @@
   line-height: 1;
   padding: 0 3px;
 }
-.signal-chip button:hover { color: var(--error-text); }
+.signal-chip button:hover { color: var(--error); }
 
 .bar-row { display: flex; align-items: center; gap: 12px; }
 /* `.field input { width: 100% }` is (0,1,1) and out-specifies a bare
@@ -595,6 +631,40 @@
    the number box across the row. Both selectors below are qualified so they
    win on their own terms. */
 .field .bar-row input[type="range"] { flex: 1; width: auto; accent-color: var(--accent); }
+input[type="range"] {
+  appearance: none;
+  -webkit-appearance: none;
+  height: 18px;
+  padding: 0;
+  border: none;
+  background: transparent;
+}
+input[type="range"]::-webkit-slider-runnable-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--track);
+}
+input[type="range"]::-moz-range-track {
+  height: 4px;
+  border-radius: 2px;
+  background: var(--track);
+}
+input[type="range"]::-webkit-slider-thumb {
+  -webkit-appearance: none;
+  width: 14px;
+  height: 14px;
+  margin-top: -5px;
+  border-radius: 50%;
+  border: 1px solid var(--bg);
+  background: var(--accent);
+}
+input[type="range"]::-moz-range-thumb {
+  width: 14px;
+  height: 14px;
+  border-radius: 50%;
+  border: 1px solid var(--bg);
+  background: var(--accent);
+}
 .field input.bar-number {
   width: 84px;
   flex: none;
@@ -620,7 +690,7 @@
   background: var(--fg-faint);
   opacity: .55;
 }
-.bar-tick.tick-clears { background: var(--ok-text); opacity: .9; height: 18px; top: 4px; }
+.bar-tick.tick-clears { background: var(--ok); opacity: .9; height: 18px; top: 4px; }
 .bar-marker {
   position: absolute;
   top: -2px;
@@ -652,7 +722,7 @@
 .cx-legend li { display: flex; align-items: center; gap: 6px; }
 .cx-legend-line { display: block; width: 22px; height: 0; border-top: 2px solid var(--fg-faint); }
 .cx-legend-semantic { border-top-style: dashed; }
-.cx-legend-bridge_offer { border-top-style: dotted; border-top-color: var(--group-text); }
+.cx-legend-bridge_offer { border-top-style: dotted; border-top-color: var(--group-fg); }
 .cx-legend-parent { border-top-style: dashed; border-top-width: 3px; }
 
 .cx-body { flex: 1; display: flex; min-height: 0; }
@@ -682,7 +752,7 @@
   box-shadow: var(--shadow);
 }
 .cx-node.cx-selected { border-color: var(--accent); }
-.cx-node.cx-dead { border-color: var(--error-text); }
+.cx-node.cx-dead { border-color: var(--error); }
 .cx-node-title { font-weight: 600; font-size: 12px; line-height: 1.3; margin-bottom: 4px; }
 .cx-node-meta { display: flex; align-items: center; gap: 6px; justify-content: space-between; }
 .cx-node-count { color: var(--fg-muted); white-space: nowrap; }

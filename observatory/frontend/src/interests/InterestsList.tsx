@@ -35,7 +35,12 @@ interface Props {
   loading: boolean;
   onEdit: (row: InterestStat) => void;
   onRevive: (row: InterestStat) => void;
+  /** Stop collecting for this interest. Reversible -- see the row's Undo. */
+  onRetire: (row: InterestStat) => void;
   busyKey: string | null;
+  /** Key most recently stopped, so its row can offer an immediate undo
+   * instead of making the reversibility something you have to already know. */
+  justRetiredKey?: string | null;
 }
 
 function conversion(row: InterestStat): number {
@@ -80,7 +85,9 @@ function Sparkline({ values, dead }: { values: number[]; dead: boolean }) {
   );
 }
 
-export function InterestsList({ stats, loading, onEdit, onRevive, busyKey }: Props) {
+export function InterestsList({
+  stats, loading, onEdit, onRevive, onRetire, busyKey, justRetiredKey,
+}: Props) {
   const [sort, setSort] = useState<SortKey>("collected");
   const [asc, setAsc] = useState(false);
   const [filter, setFilter] = useState<Filter>("collecting");
@@ -148,7 +155,9 @@ export function InterestsList({ stats, loading, onEdit, onRevive, busyKey }: Pro
               <>
                 {" "}
                 <button type="button" className="link-button" onClick={() => setFilter("dead")}>
-                  {t.dead_weight} are dead weight
+                  {t.dead_weight === 1
+                    ? "1 is dead weight"
+                    : `${t.dead_weight} are dead weight`}
                 </button>.
               </>
             )}
@@ -241,6 +250,35 @@ export function InterestsList({ stats, loading, onEdit, onRevive, busyKey }: Pro
                   <button type="button" className="btn btn-small" onClick={() => onEdit(row)}>
                     Edit
                   </button>
+                  {/* Removal used to live only as a `Lifecycle` dropdown at the
+                      BOTTOM of the edit modal, below seven other fields and
+                      usually below the fold -- so the only visible verb on a
+                      row was "Edit", and the owner reasonably concluded the
+                      Observatory could not remove an interest at all. The verb
+                      belongs on the row. It is reversible, so it asks once and
+                      then offers the undo rather than opening a dialog. */}
+                  {isCollecting(row.lifecycle) && (
+                    <button
+                      type="button"
+                      className="btn btn-small btn-danger"
+                      disabled={busyKey === row.key}
+                      title="stop collecting for this interest -- it keeps its history and can be started again"
+                      onClick={() => onRetire(row)}
+                    >
+                      Stop
+                    </button>
+                  )}
+                  {justRetiredKey === row.key && (
+                    <button
+                      type="button"
+                      className="btn btn-small btn-undo"
+                      disabled={busyKey === row.key}
+                      title="start collecting again"
+                      onClick={() => onRevive(row)}
+                    >
+                      Stopped &mdash; undo
+                    </button>
+                  )}
                   {(row.lifecycle === "paused" || row.lifecycle === "decaying") && (
                     <button
                       type="button"
