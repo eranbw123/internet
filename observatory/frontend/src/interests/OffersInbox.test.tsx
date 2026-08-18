@@ -30,7 +30,9 @@ describe("OffersInbox", () => {
   it("offers the four decisions on a live offer", () => {
     renderInbox([offer("handheld-and-roguelike-gaming")]);
     expect(screen.getByText("Accept")).toBeInTheDocument();
-    expect(screen.getByText("Edit and accept")).toBeInTheDocument();
+    // "Edit and accept" shortened to "Edit" when the three secondary
+    // decisions moved onto one row -- see interests.css.
+    expect(screen.getByText("Edit")).toBeInTheDocument();
     expect(screen.getByText("Snooze 30d")).toBeInTheDocument();
     expect(screen.getByText("Reject")).toBeInTheDocument();
   });
@@ -118,7 +120,10 @@ describe("OffersInbox", () => {
     expect(screen.getByText("No suggestions right now.")).toBeInTheDocument();
     expect(screen.getByText(/proposes new interests/)).toBeInTheDocument();
     expect(screen.getByText(/accept, reject or snooze/)).toBeInTheDocument();
-    expect(screen.getByText(/at most five per run/)).toBeInTheDocument();
+    // Deliberately no per-run number here any more: the extractor cap is
+    // the extractor's business and has already moved from five to ten.
+    expect(screen.getByText(/after the extractor runs/)).toBeInTheDocument();
+    expect(screen.queryByText(/at most five per run/)).toBeNull();
   });
 
   it("distinguishes a proposal to drop an interest from one to add", () => {
