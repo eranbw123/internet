@@ -509,7 +509,7 @@ button[aria-selected="true"], button.active, button[aria-pressed="true"] {
   /* ---- shell ---------------------------------------------------------- */
   .app-header { gap: 10px; padding: 10px 16px; min-height: 48px; }
   .app-title { font-size: 16px; }
-  .theme-toggle { min-height: 40px; padding: 0 14px; font-size: 12px; }
+  .theme-toggle { min-height: 44px; padding: 0 14px; font-size: 12px; }
 
   /* Collapse-on-scroll. The app header is the least load-bearing strip on the
      phone -- the bottom tab bar already says which surface you are on -- so it
@@ -564,7 +564,7 @@ button[aria-selected="true"], button.active, button[aria-pressed="true"] {
     border-bottom: 1px solid var(--border);
   }
   .pane-switch button {
-    flex: 1; min-height: 40px; padding: 0 8px;
+    flex: 1; min-height: 44px; padding: 0 8px;
     font-size: 13px; font-weight: 600; border-radius: 8px;
     color: var(--fg-muted); background: var(--surface-raised); border: 1px solid var(--border);
   }
@@ -684,7 +684,7 @@ button[aria-selected="true"], button.active, button[aria-pressed="true"] {
   .explorer-filters-fold[open] > summary { margin-bottom: 8px; color: var(--fg); }
   .explorer-filters-fold .explorer-filters { padding: 0; }
   .filter-chips { gap: 6px; padding: 0 8px 8px; }
-  .filter-chip { min-height: 36px; padding: 0 14px; font-size: 12px; border-radius: 18px; }
+  .filter-chip { min-height: 44px; padding: 0 14px; font-size: 12px; border-radius: 22px; }
   .explorer-row { padding: 12px; }
   .row-top, .row-bottom { font-size: 12px; }
   .row-title { font-size: 14px; line-height: 1.35; }
@@ -698,24 +698,24 @@ button[aria-selected="true"], button.active, button[aria-pressed="true"] {
      Primary actions stay visible; the rest move into the overflow menu. */
   .graph-toolbar { flex-wrap: nowrap; gap: 8px; padding: 8px; }
   .graph-toolbar .toolbar-overflow-only { display: none; }
-  .graph-toolbar button { min-height: 40px; padding: 0 12px; font-size: 13px; }
+  .graph-toolbar button { min-height: 44px; padding: 0 12px; font-size: 13px; }
   .graph-toolbar-note { font-size: 12px; }
   .toolbar-overflow-menu button { min-height: 44px; }
-  .react-flow__controls-button { width: 40px; height: 40px; }
+  .react-flow__controls-button { width: 44px; height: 44px; }
   .graph-legend { width: auto; inset-inline: 8px; top: 8px; }
 
   /* ---- inspector / details --------------------------------------------- */
   .inspector-tabs { gap: 4px; padding: 6px; }
-  .inspector-tabs button { min-height: 40px; padding: 0 12px; font-size: 13px; }
+  .inspector-tabs button { min-height: 44px; padding: 0 12px; font-size: 13px; }
   .inspector-header { padding: 12px; }
   .inspector-body { padding: 12px; }
-  .attempt-chip { min-height: 36px; padding: 0 12px; }
+  .attempt-chip { min-height: 44px; padding: 0 12px; }
   .overview-connections li { padding: 3px 0; }
   .overview-links { gap: 8px; }
   .prompt-sections > details > summary,
   .entity-fold > summary { min-height: 44px; display: flex; align-items: center; }
-  .viewer-search { min-height: 40px; padding: 0 10px; }
-  .viewer-toolbar label { display: inline-flex; align-items: center; gap: 6px; min-height: 40px; }
+  .viewer-search { min-height: 44px; padding: 0 10px; }
+  .viewer-toolbar label { display: inline-flex; align-items: center; gap: 6px; min-height: 44px; }
   .viewer-toolbar input[type="checkbox"] { width: 20px; height: 20px; }
   /* Overlay hit areas, for the same reason as .link-button in interests.css:
      these sit inside running text and must not change the line box. */
@@ -730,7 +730,7 @@ button[aria-selected="true"], button.active, button[aria-pressed="true"] {
     inset: -13px 0;
   }
   .viewer-toolbar { flex-wrap: wrap; padding: 8px; }
-  .viewer-toolbar button { min-height: 40px; padding: 0 12px; font-size: 13px; }
+  .viewer-toolbar button { min-height: 44px; padding: 0 12px; font-size: 13px; }
   .score-bars li { grid-template-columns: 7.5em 1fr 5em; }
 
   /* ---- compare --------------------------------------------------------- */
@@ -764,12 +764,12 @@ button[aria-selected="true"], button.active, button[aria-pressed="true"] {
    the whole screen once you start moving.
    ========================================================================== */
 @media (max-height: 500px) and (max-width: 950px) {
-  .app-header { min-height: 40px; padding: 4px 12px; }
+  .app-header { min-height: 44px; padding: 4px 12px; }
   .app-title { font-size: 14px; }
-  .theme-toggle { min-height: 32px; padding: 0 12px; }
+  .theme-toggle { min-height: 44px; padding: 0 12px; }
 
   .pane-switch { padding: 4px 6px; }
-  .pane-switch button { min-height: 34px; font-size: 12px; }
+  .pane-switch button { min-height: 44px; font-size: 12px; }
 
   /* The tab bar goes icon-beside-label, the way iOS compacts its own. */
   .mobile-nav button.mobile-nav-item {
@@ -799,21 +799,21 @@ button[aria-selected="true"], button.active, button[aria-pressed="true"] {
   .explorer { overflow-y: auto; }
   .explorer-rows { flex: none; overflow-y: visible; }
   .explorer-search { padding: 6px 8px 0; }
-  .explorer-search input { min-height: 38px; }
+  .explorer-search input { min-height: 44px; }
   .explorer-tabs { padding: 6px 8px; gap: 4px; }
-  .explorer-tabs button { min-height: 38px; }
-  .explorer-filters-fold > summary { min-height: 38px; }
-  .explorer-filters select { min-height: 38px; }
-  .filter-chip { min-height: 32px; }
-  .explorer-pager button { min-height: 38px; }
+  .explorer-tabs button { min-height: 44px; }
+  .explorer-filters-fold > summary { min-height: 44px; }
+  .explorer-filters select { min-height: 44px; }
+  .filter-chip { min-height: 44px; }
+  .explorer-pager button { min-height: 44px; }
 
   .graph-toolbar { padding: 6px 8px; }
-  .graph-toolbar button { min-height: 36px; }
-  .inspector-tabs button { min-height: 36px; }
+  .graph-toolbar button { min-height: 44px; }
+  .inspector-tabs button { min-height: 44px; }
 
   .editor-head { padding: 8px 16px; }
   .editor-foot { padding: 8px 16px; }
-  .editor-foot .btn { min-height: 40px; }
+  .editor-foot .btn { min-height: 44px; }
 }
 
 /* Full-screen overlays are position:fixed, so they escape the safe-area

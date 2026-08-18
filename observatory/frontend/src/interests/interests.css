@@ -929,7 +929,7 @@ input[type="range"]::-moz-range-thumb {
     background: none;
     gap: 8px;
   }
-  .ws-header-compact .btn { min-height: 40px; }
+  .ws-header-compact .btn { min-height: 44px; }
   .ws-mock-banner, .ws-error, .ws-toast { padding: 10px 12px; }
 
   /* ---- interests list -------------------------------------------------- */
@@ -966,7 +966,7 @@ input[type="range"]::-moz-range-thumb {
      clickable -- exactly the defect the explorer's Filters fold had. Put the
      marker back explicitly. */
   .summary-caveat > summary {
-    min-height: 40px; display: flex; align-items: center; gap: 6px;
+    min-height: 44px; display: flex; align-items: center; gap: 6px;
   }
   .summary-caveat > summary::after {
     content: "›";
@@ -992,7 +992,7 @@ input[type="range"]::-moz-range-thumb {
 
   .list-controls { gap: 8px; align-items: stretch; }
   .filter-tabs { flex-basis: 100%; }
-  .filter-tabs button { flex: 1; min-width: 0; min-height: 40px; padding: 0 4px; font-size: 12px; }
+  .filter-tabs button { flex: 1; min-width: 0; min-height: 44px; padding: 0 4px; font-size: 12px; }
   .list-search { flex: 1 1 170px; width: auto; min-width: 0; min-height: 44px; }
   .list-new { flex: none; min-height: 44px; }
 
@@ -1259,13 +1259,14 @@ input[type="range"]::-moz-range-thumb {
   .field input, .field textarea, .field select { min-height: 44px; padding: 10px 12px; }
   .field textarea { min-height: 120px; }
   .chip-input { gap: 6px; padding: 6px; }
-  .chip-input input { min-height: 40px; }
-  .signal-chip { font-size: 13px; min-height: 40px; padding: 0 4px 0 12px; }
-  /* 36px, not 44: a 44px remove button makes every chip 44px tall, and five
-     signals then run to 260px of form. The chip itself is the 40px target. */
+  .chip-input input { min-height: 44px; }
+  .signal-chip { font-size: 13px; min-height: 44px; padding: 0 4px 0 12px; }
+  /* The chip is 44px tall now, so a 44px remove costs nothing extra in
+     height -- the reason this was held at 36 (five signals running to 260px of
+     form) no longer applies. */
   .signal-chip button {
-    min-width: 36px;
-    min-height: 36px;
+    min-width: 44px;
+    min-height: 44px;
     display: inline-flex;
     align-items: center;
     justify-content: center;
@@ -1273,7 +1274,7 @@ input[type="range"]::-moz-range-thumb {
   }
   .bar-row { gap: 10px; }
   .field input.bar-number { width: 92px; min-height: 44px; }
-  input[type="range"] { height: 40px; }
+  input[type="range"] { height: 44px; }
   input[type="range"]::-webkit-slider-thumb { width: 24px; height: 24px; margin-top: -10px; }
   input[type="range"]::-moz-range-thumb { width: 24px; height: 24px; }
   .checkbox { min-height: 44px; font-size: 14px; }
@@ -1294,10 +1295,10 @@ input[type="range"]::-moz-range-thumb {
     .funnel-n { font-size: 14px; }
     .funnel-l { font-size: 9px; }
     .summary-note { margin-top: 4px; }
-    .summary-caveat > summary { min-height: 32px; }
+    .summary-caveat > summary { min-height: 44px; }
     .list-controls { padding: 6px 12px; }
-    .filter-tabs button { min-height: 36px; }
-    .list-search, .list-new { min-height: 38px; }
+    .filter-tabs button { min-height: 44px; }
+    .list-search, .list-new { min-height: 44px; }
 
     .funnel-table tbody {
       display: grid;
@@ -1305,10 +1306,10 @@ input[type="range"]::-moz-range-thumb {
       align-items: start;
       gap: 10px;
     }
-    .cell-actions .btn { min-height: 38px; }
+    .cell-actions .btn { min-height: 44px; }
     .offers-inbox { padding: 8px 12px; }
-    .offer-buttons .btn { min-height: 40px; }
-    .offer-buttons-row .btn { min-height: 38px; }
+    .offer-buttons .btn { min-height: 44px; }
+    .offer-buttons-row .btn { min-height: 44px; }
   }
 
   /* ---- connections ----------------------------------------------------- */
