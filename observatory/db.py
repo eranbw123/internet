@@ -30,6 +30,12 @@ COLLAPSE_THRESHOLD = 3
 # results) makes opening it exactly as unusable as never collapsing at all.
 MAX_CHILDREN = 500
 
+# A candidate can fan out to several score attempts across retried runs; a
+# borrowed prompt is a convenience, so cap how many neighbours we will pull
+# calls from rather than letting one node's detail response grow unbounded
+# (prompts average ~14kB each).
+MAX_RELATED_CALL_NODES = 4
+
 # node_type -> swimlane, exactly the six named in the plan. Anything not
 # listed here (there shouldn't be anything -- this is meant to cover every
 # node_type discovery/{missions,pipeline,council,feedback_listener}.py
@@ -671,6 +677,70 @@ def children(conn, node_id=None, group=None):
 
 # --- /api/node/<id> --------------------------------------------------------------
 
+# Only three node types ever carry model calls (score-attempt, mission-execution
+# and council), but the nodes a reader actually clicks are the ones telling the
+# story: the candidate card with the item's title, the threshold card with the
+# pass/fail verdict, the score-debug card holding the reasoning. Those had no
+# calls of their own, so the prompt that produced them was simply absent from
+# the panel -- the single most-asked-for thing in the whole UI.
+#
+# Each entry maps a node type to the neighbours worth borrowing calls from:
+# (edge direction relative to this node, relationship or None for any,
+# neighbour node_type). Kept to one hop, and to relationships that mean "this
+# node was produced by that call", so a borrowed prompt is never a guess.
+_CALL_NEIGHBORS = {
+    "candidate": [("out", "scored", "score-attempt")],
+    "threshold": [("in", None, "score-attempt")],       # cleared_threshold | rejected
+    "score-debug": [("in", "generated", "score-attempt")],
+    "mission": [("out", "executed", "mission-execution")],
+    "raw-result": [("in", "returned", "mission-execution")],
+    "raw-result-dropped": [("in", "returned", "mission-execution")],
+    "council-context": [("out", "executed", "council")],
+}
+
+
+def _related_model_calls(conn, node, database):
+    """Model calls belonging to an adjacent node that explains this one.
+
+    Tagged with their provenance (`via_node_id`/`via_node_type`) so the UI can
+    say "prompt from score-attempt #25686" rather than implying the call hung
+    off the node the reader is looking at.
+    """
+    specs = _CALL_NEIGHBORS.get(node["node_type"])
+    if not specs:
+        return []
+    out = []
+    for direction, relationship, neighbor_type in specs:
+        if direction == "out":
+            sql = """
+                SELECT n.id, n.node_type FROM trace_edges e JOIN trace_nodes n ON n.id = e.to_node_id
+                WHERE e.from_node_id = ? AND n.node_type = ?
+            """
+        else:
+            sql = """
+                SELECT n.id, n.node_type FROM trace_edges e JOIN trace_nodes n ON n.id = e.from_node_id
+                WHERE e.to_node_id = ? AND n.node_type = ?
+            """
+        params = [node["id"], neighbor_type]
+        if relationship is not None:
+            sql += " AND e.relationship = ?"
+            params.append(relationship)
+        sql += " ORDER BY n.id ASC LIMIT ?"
+        params.append(MAX_RELATED_CALL_NODES)
+        for neighbor in _rows(conn, sql, tuple(params)):
+            calls = _rows(
+                conn,
+                "SELECT * FROM model_calls WHERE trace_node_id = ? ORDER BY id ASC",
+                (neighbor["id"],),
+            )
+            for c in calls:
+                detail = _model_call_detail(c, database)
+                detail["via_node_id"] = neighbor["id"]
+                detail["via_node_type"] = neighbor["node_type"]
+                out.append(detail)
+    return out
+
+
 def node_detail(conn, node_id, database):
     node = _row(conn, "SELECT * FROM trace_nodes WHERE id = ?", (node_id,))
     if node is None:
@@ -704,6 +774,10 @@ def node_detail(conn, node_id, database):
         "output": _maybe_json(node["output_json"]),
         "exact_text": node["exact_text"],
         "model_calls": [_model_call_detail(c, database) for c in calls],
+        # Only looked up when the node has no calls of its own, so the common
+        # case costs nothing and no node ever shows a borrowed prompt next to
+        # its own.
+        "related_model_calls": [] if calls else _related_model_calls(conn, node, database),
         "config": _maybe_json(run["config_json"]) if run else None,
         "run": {"id": run["id"], "kind": run["kind"], "status": run["status"]} if run else None,
         "inbound_edges": [
@@ -843,6 +917,76 @@ def _compare_model_calls(conn, a_id, b_id):
         "prompt_diff": _line_diff(a["exact_user_prompt"] or "", b["exact_user_prompt"] or ""),
         "response_diff": _line_diff(a["raw_response_text"] or "", b["raw_response_text"] or ""),
     }
+
+
+# --- /api/prompt-template --------------------------------------------------------
+
+def prompt_template(conn, call_id):
+    """The prompt template a stored call was built from, plus a diff.
+
+    "What exactly did we ask the model, and is that still what we ask today?"
+    is the question the Prompt tab exists to answer, and the second half of it
+    can't be answered from the trace alone: model_calls stores the rendered
+    prompt, never the template it came from.
+
+    scores.prompt_hash is a fingerprint of SYSTEM+PROMPT at scoring time, so it
+    tells us whether the template has moved since. When it has, the diff would
+    be a mix of "the template changed" and "this item's substitutions" with no
+    way to tell them apart, so we report the mismatch and skip the diff rather
+    than render something wrong-but-plausible. The old template text is not
+    stored anywhere, so reconstructing it is not on the table.
+    """
+    call = _row(conn, "SELECT * FROM model_calls WHERE id = ?", (call_id,))
+    if call is None:
+        raise LookupError(f"model_call id not found: {call_id}")
+    if call["call_role"] != "scoring":
+        # council/mission_search prompts are assembled from per-run context
+        # rather than one module-level template -- there is nothing stable to
+        # diff against, so say so instead of guessing.
+        return {
+            "call_id": call_id, "role": call["call_role"], "available": False,
+            "reason": f"no stable template is recorded for {call['call_role']!r} calls",
+        }
+
+    from discovery import scoring
+
+    template = f"{scoring.SYSTEM}\n\n{scoring.PROMPT}"
+    fingerprint = scoring.prompt_fingerprint()
+    stored_hash = _stored_prompt_hash(conn, call["trace_node_id"])
+    matches = stored_hash is not None and stored_hash == fingerprint
+
+    result = {
+        "call_id": call_id, "role": "scoring", "available": True,
+        "fingerprint": fingerprint, "stored_prompt_hash": stored_hash,
+        "matches_current": matches, "template": template,
+        "diff": _line_diff(template, call["exact_user_prompt"] or "") if matches else [],
+    }
+    if not matches:
+        result["reason"] = (
+            "template has changed since this score was written "
+            f"(stored {stored_hash or 'none'}, current {fingerprint})"
+        )
+    return trace_mod.redact_json(result)
+
+
+def _stored_prompt_hash(conn, trace_node_id):
+    """scores.prompt_hash for the score a scoring call produced.
+
+    A score-attempt node's entity is the candidate_item (verified live: all
+    1,305 of them), not the score row -- the scores row is reachable through
+    that item id.
+    """
+    if trace_node_id is None:
+        return None
+    node = _row(conn, "SELECT entity_type, entity_id FROM trace_nodes WHERE id = ?", (trace_node_id,))
+    if node is None or node["entity_type"] != "candidate_items" or node["entity_id"] is None:
+        return None
+    row = _row(
+        conn,
+        "SELECT prompt_hash FROM scores WHERE item_id = ? ORDER BY id DESC LIMIT 1",
+        (node["entity_id"],),
+    )
+    return row["prompt_hash"] if row else None
 
 
 def _line_diff(a_text, b_text):

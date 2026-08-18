@@ -1252,6 +1252,123 @@ class ObservatoryAuthTests(unittest.IsolatedAsyncioTestCase):
 
 
 @unittest.skipUnless(HAVE_DATASETTE, "datasette not installed")
+@unittest.skipUnless(HAVE_DATASETTE, "datasette not installed")
+class ObservatoryPromptVisibilityTests(unittest.IsolatedAsyncioTestCase):
+    """The prompt is stored byte-exact but was unreachable from the nodes a
+    reader actually clicks: only score-attempt/mission-execution/council carry
+    model calls, while the cards telling the story (candidate, threshold,
+    score-debug) carry none. node_detail() now lends those nodes the calls of
+    the adjacent node that produced them, tagged with provenance."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.db_path, cls.cfg = _build_fixture_db()
+
+    def setUp(self):
+        self.ds = build_datasette(self.cfg, public=False)
+        raw = sqlite3.connect(self.db_path)
+        raw.row_factory = sqlite3.Row
+        self.addCleanup(raw.close)
+        self.raw = raw
+
+    def _node_id(self, node_type):
+        row = self.raw.execute(
+            "SELECT id FROM trace_nodes WHERE node_type = ? ORDER BY id ASC LIMIT 1", (node_type,)
+        ).fetchone()
+        self.assertIsNotNone(row, f"fixture has no {node_type} node")
+        return row["id"]
+
+    async def test_threshold_node_borrows_the_score_attempts_prompt(self):
+        r = await self.ds.client.get(f"/observatory/api/node/{self._node_id('threshold')}")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertEqual(body["model_calls"], [], "threshold nodes carry no calls of their own")
+        borrowed = body["related_model_calls"]
+        self.assertTrue(borrowed, "threshold node borrowed no calls from its score-attempt")
+        self.assertTrue(any(c["exact_user_prompt"] for c in borrowed))
+        for c in borrowed:
+            self.assertEqual(c["via_node_type"], "score-attempt")
+            self.assertIsNotNone(c["via_node_id"])
+
+    async def test_candidate_node_borrows_through_the_scored_edge(self):
+        r = await self.ds.client.get(f"/observatory/api/node/{self._node_id('candidate')}")
+        body = r.json()
+        self.assertEqual(body["model_calls"], [])
+        self.assertTrue(body["related_model_calls"], "candidate borrowed nothing via its scored edge")
+
+    async def test_a_node_with_its_own_calls_borrows_nothing(self):
+        r = await self.ds.client.get(f"/observatory/api/node/{self._node_id('score-attempt')}")
+        body = r.json()
+        self.assertTrue(body["model_calls"], "fixture score-attempt should carry calls")
+        self.assertEqual(
+            body["related_model_calls"], [],
+            "a node with its own calls must not also show a neighbour's",
+        )
+
+    async def test_unrelated_node_type_borrows_nothing(self):
+        r = await self.ds.client.get(f"/observatory/api/node/{self._node_id('interest-state')}")
+        if r.status_code == 200:
+            self.assertEqual(r.json()["related_model_calls"], [])
+
+    async def test_prompt_template_diffs_a_scoring_call_against_the_live_template(self):
+        call_id = self.raw.execute(
+            "SELECT id FROM model_calls WHERE call_role = 'scoring' ORDER BY id ASC LIMIT 1"
+        ).fetchone()["id"]
+        r = await self.ds.client.get(f"/observatory/api/prompt-template?call={call_id}")
+        self.assertEqual(r.status_code, 200)
+        body = r.json()
+        self.assertTrue(body["available"])
+        self.assertEqual(body["role"], "scoring")
+        # The fixture's scores carry the current fingerprint, so a real diff is
+        # produced rather than the "template moved on" degradation.
+        self.assertTrue(body["matches_current"], body.get("reason"))
+        # The template still carries its un-substituted placeholders, which is
+        # what makes it a template rather than another copy of the prompt.
+        template = body["template"] or ""
+        self.assertIn("{interests}", template)
+        self.assertIn("{item}" if "{item}" in template else "personal_relevance", template)
+        self.assertTrue(body["diff"], "a matching fingerprint should still diff the substitutions")
+
+    async def test_prompt_template_declines_roles_with_no_stable_template(self):
+        call_id = self.raw.execute(
+            "SELECT id FROM model_calls WHERE call_role = 'council' ORDER BY id ASC LIMIT 1"
+        ).fetchone()["id"]
+        body = (await self.ds.client.get(f"/observatory/api/prompt-template?call={call_id}")).json()
+        self.assertFalse(body["available"])
+        self.assertIn("council", body["reason"])
+
+    async def test_prompt_template_reports_a_moved_template_instead_of_a_wrong_diff(self):
+        call_id = self.raw.execute(
+            "SELECT id FROM model_calls WHERE call_role = 'scoring' ORDER BY id ASC LIMIT 1"
+        ).fetchone()["id"]
+        writable = sqlite3.connect(self.db_path)
+        writable.execute("UPDATE scores SET prompt_hash = 'deadbeefcafe'")
+        writable.commit()
+        writable.close()
+        self.addCleanup(self._restore_prompt_hashes)
+
+        body = (await self.ds.client.get(f"/observatory/api/prompt-template?call={call_id}")).json()
+        self.assertFalse(body["matches_current"])
+        self.assertEqual(body["diff"], [], "a diff across template versions would be misleading")
+        self.assertIn("deadbeefcafe", body["reason"])
+
+    def _restore_prompt_hashes(self):
+        import discovery.scoring as scoring
+        writable = sqlite3.connect(self.db_path)
+        writable.execute("UPDATE scores SET prompt_hash = ?", (scoring.prompt_fingerprint(),))
+        writable.commit()
+        writable.close()
+
+    async def test_prompt_template_404s_on_an_unknown_call(self):
+        r = await self.ds.client.get("/observatory/api/prompt-template?call=999999")
+        self.assertEqual(r.status_code, 404)
+
+    async def test_prompt_template_rejects_a_non_integer_call(self):
+        r = await self.ds.client.get("/observatory/api/prompt-template?call=abc")
+        self.assertEqual(r.status_code, 400)
+
+
+@unittest.skipUnless(HAVE_DATASETTE, "datasette not installed")
 class ObservatoryRedactionTests(unittest.IsolatedAsyncioTestCase):
     """Task 1's redaction happens at write time; this proves the SECOND,
     independent read-time pass (observatory/db.py routing everything through
@@ -1283,6 +1400,13 @@ class ObservatoryRedactionTests(unittest.IsolatedAsyncioTestCase):
             "UPDATE model_calls SET raw_response_text = raw_response_text || ? WHERE trace_node_id = ?",
             (f" secret={self.secret_value}", self.node_id),
         )
+        # Also planted in the prompt itself: the prompt-template endpoint echoes
+        # exact_user_prompt back inside its diff, so that path needs its own
+        # proof it goes through redaction rather than around it.
+        raw.execute(
+            "UPDATE model_calls SET exact_user_prompt = exact_user_prompt || ? WHERE trace_node_id = ?",
+            (f" secret={self.secret_value}", self.node_id),
+        )
         raw.commit()
         raw.close()
         self.env_patch = mock.patch.dict(os.environ, {"TEST_PLANTED_API_KEY": self.secret_value})
@@ -1295,6 +1419,32 @@ class ObservatoryRedactionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(r.status_code, 200)
         self.assertNotIn(self.secret_value, r.text)
         self.assertIn("REDACTED:TEST_PLANTED_API_KEY", r.text)
+
+    async def test_planted_secret_is_redacted_from_the_prompt_template_diff(self):
+        raw = sqlite3.connect(self.db_path)
+        raw.row_factory = sqlite3.Row
+        call_id = raw.execute(
+            "SELECT id FROM model_calls WHERE trace_node_id = ? ORDER BY id ASC LIMIT 1", (self.node_id,)
+        ).fetchone()["id"]
+        raw.close()
+        r = await self.ds.client.get(f"/observatory/api/prompt-template?call={call_id}")
+        self.assertEqual(r.status_code, 200)
+        self.assertNotIn(self.secret_value, r.text)
+
+    async def test_planted_secret_is_redacted_from_a_borrowed_prompt(self):
+        raw = sqlite3.connect(self.db_path)
+        raw.row_factory = sqlite3.Row
+        threshold_id = raw.execute(
+            "SELECT t.id FROM trace_nodes t JOIN trace_edges e ON e.to_node_id = t.id "
+            "WHERE t.node_type = 'threshold' AND e.from_node_id = ? LIMIT 1", (self.node_id,)
+        ).fetchone()
+        raw.close()
+        if threshold_id is None:
+            self.skipTest("planted node has no threshold neighbour in this fixture")
+        r = await self.ds.client.get(f"/observatory/api/node/{threshold_id['id']}")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn("related_model_calls", r.json())
+        self.assertNotIn(self.secret_value, r.text)
 
     async def test_planted_secret_is_redacted_from_the_graph(self):
         r = await self.ds.client.get(

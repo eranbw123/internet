@@ -5,7 +5,11 @@ import type { ModelCallDetail, NodeDetail } from "../types";
 // fetchNode is the only thing Inspector pulls from the API layer; mocking it
 // keeps these tests free of the network without a fixture server.
 const fetchNode = vi.fn();
-vi.mock("../api", () => ({ fetchNode: (id: unknown) => fetchNode(id) }));
+const fetchPromptTemplate = vi.fn();
+vi.mock("../api", () => ({
+  fetchNode: (id: unknown) => fetchNode(id),
+  fetchPromptTemplate: (id: unknown) => fetchPromptTemplate(id),
+}));
 
 const { Inspector, bestCall } = await import("./Inspector");
 
@@ -27,8 +31,8 @@ function detail(over: Partial<NodeDetail> = {}): NodeDetail {
       entity_type: null, entity_id: null, label: "an item", status: "ok",
       summary: null, started_at: null, finished_at: null, error: null,
     },
-    input: null, output: null, exact_text: null, model_calls: [], config: null,
-    run: null, inbound_edges: [], outbound_edges: [], row_urls: {}, truncated: false,
+    input: null, output: null, exact_text: null, model_calls: [], related_model_calls: [],
+    config: null, run: null, inbound_edges: [], outbound_edges: [], row_urls: {}, truncated: false,
     ...over,
   };
 }
@@ -131,6 +135,47 @@ describe("Inspector", () => {
     render(<Inspector nodeId={1} />);
     expect(await screen.findByText("Run")).toBeInTheDocument();
     expect(screen.getByText(/#187 · web-tick/)).toBeInTheDocument();
+  });
+
+  it("shows the prompt on a node whose own calls are absent, attributed to its neighbour", async () => {
+    // A candidate/threshold/score-debug card carries no model calls of its
+    // own -- which is exactly why the prompt used to be invisible on the nodes
+    // people actually click.
+    fetchNode.mockResolvedValue(detail({
+      overview: { ...detail().overview, node_type: "threshold" },
+      model_calls: [],
+      related_model_calls: [call({
+        id: 55, attempt: 2, validation_result: "valid", raw_response_text: "ok",
+        exact_user_prompt: "SCORE THIS ITEM", via_node_id: 25686, via_node_type: "score-attempt",
+      })],
+    }));
+    render(<Inspector nodeId={1} />);
+    fireEvent.click(await screen.findByRole("tab", { name: "Prompt" }));
+    expect(screen.getByTestId("monospace-content").textContent).toContain("SCORE THIS ITEM");
+    expect(screen.getByText(/belongs to the score-attempt node/)).toBeInTheDocument();
+  });
+
+  it("does not offer a Prompt tab when no call anywhere carries one", async () => {
+    fetchNode.mockResolvedValue(detail({
+      model_calls: [call({ id: 1, attempt: 1, exact_user_prompt: null, raw_response_text: "x" })],
+    }));
+    render(<Inspector nodeId={1} />);
+    await screen.findByRole("tab", { name: "Raw response" });
+    expect(screen.queryByRole("tab", { name: "Prompt" })).toBeNull();
+  });
+
+  it("reports that a diff is impossible when the template moved on", async () => {
+    fetchNode.mockResolvedValue(detail({
+      model_calls: [call({ id: 9, attempt: 1, exact_user_prompt: "OLD PROMPT", validation_result: "valid", raw_response_text: "x" })],
+    }));
+    fetchPromptTemplate.mockResolvedValue({
+      call_id: 9, role: "scoring", available: true, matches_current: false, diff: [],
+      reason: "template has changed since this score was written (stored 92954b87de02, current 7044a467d659)",
+    });
+    render(<Inspector nodeId={1} />);
+    fireEvent.click(await screen.findByRole("tab", { name: "Prompt" }));
+    fireEvent.click(screen.getByText("Diff vs current template"));
+    expect(await screen.findByText(/template has changed since this score/)).toBeInTheDocument();
   });
 
   it("offers an Exact text tab for render nodes", async () => {

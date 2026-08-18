@@ -73,6 +73,27 @@ export interface ModelCallDetail {
   finished_at: string | null;
   error: string | null;
   row_url: string;
+  // Present only on related_model_calls: which adjacent node this call was
+  // borrowed from, so the UI can attribute it instead of implying it hung off
+  // the node being inspected.
+  via_node_id?: ID;
+  via_node_type?: string;
+}
+
+/** /api/prompt-template?call=<id>. `available` is false for call roles with no
+ * stable module-level template (council, mission_search); `matches_current` is
+ * false when scores.prompt_hash predates the current template, in which case
+ * `diff` is empty and `reason` explains why. */
+export interface PromptTemplate {
+  call_id: number;
+  role: string;
+  available: boolean;
+  reason?: string;
+  fingerprint?: string;
+  stored_prompt_hash?: string | null;
+  matches_current?: boolean;
+  template?: string;
+  diff: string[];
 }
 
 export interface NodeDetail {
@@ -81,6 +102,9 @@ export interface NodeDetail {
   output: unknown;
   exact_text: string | null;
   model_calls: ModelCallDetail[];
+  /** Calls borrowed from the adjacent node that explains this one; populated
+   * only when the node has no calls of its own. */
+  related_model_calls: ModelCallDetail[];
   config: unknown;
   run: { id: number; kind: string; status: string } | null;
   inbound_edges: { from: ID; relationship: string; from_label: string; from_node_type: string }[];
