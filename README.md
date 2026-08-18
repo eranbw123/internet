@@ -657,7 +657,7 @@ change and a re-`--install` is all it takes to reschedule:
 | `-health` | 3h | fixed |
 | `-update` | 30m | fixed |
 | `-offers-sweep` | 6h | `DISCOVERY_OFFERS_SWEEP_INTERVAL` |
-| `-offers-import` | 1h | `DISCOVERY_OFFERS_IMPORT_INTERVAL` |
+| `-offers-import` | daily (reconcile only) | `DISCOVERY_OFFERS_IMPORT_INTERVAL` |
 | `-interest-extract` | daily 03:30 | `DISCOVERY_INTEREST_EXTRACT_TIME` |
 
 `collect-web` runs `web-tick` (see [Continuous web
@@ -674,6 +674,32 @@ anything: it shells out to the sibling `ai` repo's `interest_extractor.py`
 share -- so the extractor keeps living in `ai` while this repo owns *when* it
 runs. It fires at 03:30, outside the digest window and at an hour nobody is
 driving Chrome by hand.
+
+### The inbox refills on events, not on a timer
+
+Nothing polls to keep the offers inbox current. There are exactly three things
+that can change what it should hold, and each triggers the refill itself:
+
+| event | what fires it |
+| --- | --- |
+| a new candidates artifact exists | `extract-interests` imports it the moment its `reduce` stage publishes, in the same process |
+| the owner accepts/rejects/snoozes | the decide path in `manage.py` tops the inbox back up |
+| a timer frees a slot | `offers --sweep` tops up when it has actually expired or woken something |
+
+The producer triggering the consumer is what makes this event-driven *without
+a listener*: no watcher daemon to supervise and restart, no interval to tune,
+and no race between the file being written and the file being read, because
+`reduce` has already exited by the time the import runs. It works for a
+hand-run `python -m app extract-interests` too, because the trigger is in the
+command rather than in the schedule.
+
+`-offers-import` survives only as a once-a-day **reconcile**, and only because
+a pure event chain cannot notice its own silence: if a trigger is ever missed
+the inbox just stops refilling, and that is discovered by someone eventually
+wondering. So it is built to be boring. When it finds nothing it says the
+event path is keeping up; if it ever *does* add an offer, an event that should
+have fired did not, and it says so with `WARNING -- ... an event trigger was
+missed`. That line is the early warning that the listener is broken.
 
 `-offers-sweep` is the quiet one, and the reason it exists at all: without a
 sweep timer the entire offer/interest lifecycle is inert -- offers never
