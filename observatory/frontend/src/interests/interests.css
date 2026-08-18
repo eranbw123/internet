@@ -1192,12 +1192,22 @@ input[type="range"]::-moz-range-thumb {
      grows the hit area to ~44px and moves nothing. */
   .link-button { position: relative; }
   .link-button::after { content: ""; position: absolute; inset: -13px 0; }
+  /* Third instance of the same bug: display:flex on a <summary> removes the
+     browser's disclosure triangle, so "Why it ranks" and "Against what you
+     already track" rendered as headings with nothing to say they open. */
   .prov-fold > summary {
     min-height: 44px;
     display: flex;
     align-items: center;
+    gap: 6px;
     cursor: pointer;
   }
+  .prov-fold > summary::after {
+    content: "›";
+    color: var(--fg-faint);
+  }
+  .prov-fold[open] > summary::after { content: "⌄"; }
+  .prov-fold > summary::-webkit-details-marker { display: none; }
   /* One consequential decision per full-width button. A wrapped row of four
      30px-tall buttons is where a mis-tap costs you an interest. */
   .offer-buttons { display: flex; flex-direction: column; gap: 8px; }
