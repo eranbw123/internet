@@ -64,10 +64,10 @@ def _fixture_cfg(db_path, **overrides):
     return cfg
 
 
-def _build_fixture_db():
+def _build_fixture_db(**cfg_overrides):
     tmp_dir = tempfile.mkdtemp()
     db_path = os.path.join(tmp_dir, "fixture.db")
-    cfg = _fixture_cfg(db_path)
+    cfg = _fixture_cfg(db_path, **cfg_overrides)
     conn = db.connect(db_path)
     db.init(conn)
     trace_fixture.build(conn, cfg)
@@ -1366,6 +1366,83 @@ class ObservatoryPromptVisibilityTests(unittest.IsolatedAsyncioTestCase):
     async def test_prompt_template_rejects_a_non_integer_call(self):
         r = await self.ds.client.get("/observatory/api/prompt-template?call=abc")
         self.assertEqual(r.status_code, 400)
+
+
+@unittest.skipUnless(HAVE_DATASETTE, "datasette not installed")
+class ObservatoryRunIndexAndRoutingTests(unittest.IsolatedAsyncioTestCase):
+    """Compare asked for run ids as raw numbers and the UI displayed one
+    nowhere, so the view built for comparing runs had no way to discover its
+    own inputs."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.db_path, cls.cfg = _build_fixture_db()
+
+    def setUp(self):
+        self.ds = build_datasette(self.cfg, public=False)
+
+    async def test_run_index_lists_runs_newest_first(self):
+        body = (await self.ds.client.get("/observatory/api/runs")).json()
+        runs = body["runs"]
+        self.assertTrue(runs)
+        self.assertEqual(set(runs[0]), {"id", "kind", "status", "started_at", "node_count"})
+        self.assertEqual([r["id"] for r in runs], sorted((r["id"] for r in runs), reverse=True))
+
+    async def test_run_index_counts_nodes_per_run(self):
+        runs = (await self.ds.client.get("/observatory/api/runs")).json()["runs"]
+        raw = sqlite3.connect(self.db_path)
+        for run in runs:
+            expected = raw.execute(
+                "SELECT COUNT(*) FROM trace_nodes WHERE run_id = ?", (run["id"],)
+            ).fetchone()[0]
+            self.assertEqual(run["node_count"], expected)
+        raw.close()
+
+    async def test_unknown_api_path_404s_as_json_instead_of_redirecting(self):
+        # A synthetic group id ("12:matched:match") misses the digits-only node
+        # route; it used to fall through to Datasette's own routing and 302 into
+        # the raw database UI, which is a confusing thing to find in a network
+        # tab when a fetch "fails".
+        r = await self.ds.client.get("/observatory/api/node/12:matched:match")
+        self.assertEqual(r.status_code, 404)
+        self.assertIn("error", r.json())
+
+    async def test_unknown_api_endpoint_404s(self):
+        r = await self.ds.client.get("/observatory/api/not-a-thing")
+        self.assertEqual(r.status_code, 404)
+        self.assertIn("no such endpoint", r.json()["error"])
+
+    async def test_real_endpoints_still_win_over_the_catch_all(self):
+        for path in ("/observatory/api/list", "/observatory/api/runs", "/observatory/api/interests"):
+            with self.subTest(path=path):
+                self.assertEqual((await self.ds.client.get(path)).status_code, 200)
+
+
+@unittest.skipUnless(HAVE_DATASETTE, "datasette not installed")
+class ObservatoryPublicModeTests(unittest.IsolatedAsyncioTestCase):
+    """In --public mode the raw-database button opened '/' with no bearer
+    token, landing on a 403 behind the standing tunnel."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.db_path, cls.cfg = _build_fixture_db(ui_token="tok-123")
+
+    async def test_bootstrap_reports_public_mode_so_the_ui_can_hide_that_button(self):
+        ds = build_datasette(self.cfg, public=True)
+        r = await ds.client.get("/observatory/?token=tok-123")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('"public": true', r.text.replace('"public":true', '"public": true'))
+
+    async def test_private_mode_bootstrap_reports_not_public(self):
+        ds = build_datasette(self.cfg, public=False)
+        r = await ds.client.get("/observatory/")
+        self.assertEqual(r.status_code, 200)
+        self.assertIn('"public": false', r.text.replace('"public":false', '"public": false'))
+
+    async def test_catch_all_still_refuses_unauthenticated_requests(self):
+        ds = build_datasette(self.cfg, public=True)
+        r = await ds.client.get("/observatory/api/not-a-thing")
+        self.assertEqual(r.status_code, 403, "the 404 catch-all must not become an auth bypass")
 
 
 @unittest.skipUnless(HAVE_DATASETTE, "datasette not installed")

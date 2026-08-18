@@ -123,7 +123,7 @@ async def index_view(request, datasette):
     if denied:
         return denied
     import json as _json
-    return Response.html(_shell_html(_json.dumps({"focus": None})))
+    return Response.html(_shell_html(_json.dumps({"focus": None, "public": _public(datasette)})))
 
 
 async def static_view(request, datasette):
@@ -264,6 +264,24 @@ async def compare_view(request, datasette):
     return Response.json(result)
 
 
+async def api_not_found_view(request, datasette):
+    denied = _guard(datasette, request)
+    if denied:
+        return denied
+    return Response.json({"error": f"no such endpoint: {request.path}"}, status=404)
+
+
+async def run_index_view(request, datasette):
+    denied = _guard(datasette, request) or _require_get(request)
+    if denied:
+        return denied
+    conn = _connect(datasette)
+    try:
+        return Response.json(odb.run_index(conn))
+    finally:
+        conn.close()
+
+
 async def interest_index_view(request, datasette):
     denied = _guard(datasette, request) or _require_get(request)
     if denied:
@@ -310,7 +328,7 @@ async def trace_score_view(request, datasette):
         return Response.text(f"no trace found for score {score_id}", status=404)
     import json as _json
     focus = {"kind": "score", **target}
-    return Response.html(_shell_html(_json.dumps({"focus": focus})))
+    return Response.html(_shell_html(_json.dumps({"focus": focus, "public": _public(datasette)})))
 
 
 @hookimpl
@@ -328,5 +346,13 @@ def register_routes():
         (r"^/observatory/api/interest/(?P<key>[^/]+)$", interest_view),
         (r"^/observatory/api/compare$", compare_view),
         (r"^/observatory/api/prompt-template$", prompt_template_view),
+        (r"^/observatory/api/runs$", run_index_view),
         (r"^/observatory/trace/score/(?P<score_id>[0-9]+)$", trace_score_view),
+        # Last: anything under /api/ that matched none of the above is a
+        # mistake in the caller, and should say so in JSON. Without this it
+        # fell through to Datasette's own routing and 302'd into the raw
+        # database UI -- e.g. /api/node/12:matched:match (a synthetic group
+        # id) misses the digits-only node route and redirected instead of
+        # 404ing, which is a confusing thing to find in a network tab.
+        (r"^/observatory/api/.*$", api_not_found_view),
     ]

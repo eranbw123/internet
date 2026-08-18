@@ -311,8 +311,16 @@ body { font: 13px/1.4 system-ui, sans-serif; color: var(--fg); background: var(-
 .json-bool, .json-null { color: #cf222e; }
 
 /* --- compare --- */
+/* Two graphs side by side needs width; below the mobile breakpoint they stack
+   instead, since 2x190px of flowchart is not a comparison of anything. The
+   fixed 320px height also becomes a taller share of the viewport when
+   stacked, so each pane stays readable rather than being a letterbox. */
 .compare-split { display: flex; gap: 8px; height: 320px; }
-.compare-pane { flex: 1; border: 1px solid var(--border); position: relative; }
+.compare-pane { flex: 1; border: 1px solid var(--border); position: relative; min-width: 0; }
+@media (max-width: 768px) {
+  .compare-split { flex-direction: column; height: auto; }
+  .compare-pane { height: 45vh; }
+}
 .compare-diffs { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; padding: 8px; }
 .diff-section { border: 1px solid var(--border); border-radius: 4px; overflow: hidden; }
 .diff-section h4 { margin: 4px 8px; }
